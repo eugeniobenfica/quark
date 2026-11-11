@@ -36,7 +36,7 @@ done
 if "$Q" build tests/run/loops.qk -o "$tmp/loops.exe" 2> /dev/null && "$tmp/loops.exe" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/run/loops.out; then ok; else bad "quark build"; fi
 # embedding: the engine example (host functions, events, hot reload, panics, budget, graphs, catalog)
 H=$(dirname "$Q")/host.exe
-if "$H" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" examples/host/host.out; then ok; else bad "host example"; diff examples/host/host.out "$tmp/out" | head -10; fi
+if "$H" 2>&1 | tr -d '\r' > "$tmp/out" && cmp -s "$tmp/out" examples/host/host.out; then ok; else bad "host example"; diff examples/host/host.out "$tmp/out" | head -10; fi
 P="--prelude examples/host/engine.qk"
 "$Q" fmt examples/host/ship.qk > "$tmp/a.qk"
 if cmp -s examples/host/ship.qk "$tmp/a.qk"; then ok; else bad "ship.qk is not in canonical form"; fi

@@ -1,0 +1,35 @@
+compile examples/host/ship.qk
+  fn start(self: Object) -> Ship  [IFI]
+  fn update(self: Object, ship: Ship, dt: Float) -> Ship  [IFIFFI]
+  fn hit(self: Object, other: Object)  [II]
+start
+  ship1 says "ready"
+  ship2 says "ready"
+  ship1 color 0.9 0.7 0.2 1.0
+120 frames (space held from frame 60)
+  ship1: x 78.00, speed 180.0, laps 1
+  ship2: x 228.00, speed 180.0, laps 1
+hit
+  ship1 says "hit"
+  ship2 is destroyed
+hot reload: laps no longer speed the ship up
+  ship1: x 186.00, speed 180.0, laps 3
+  ship2: x 228.00, speed 180.0, laps 1 (destroyed)
+a script that fails
+  ship1 stopped: broken.qk:14: index 8 is outside the array (its length is 3)
+  ship1: x 186.00, speed 180.0, laps 3
+  ship2: x 228.00, speed 180.0, laps 1 (destroyed)
+  the engine goes on with the good one:
+  ship1: x 189.00, speed 180.0, laps 3
+  ship2: x 228.00, speed 180.0, laps 1 (destroyed)
+a script that never stops
+  ship1 stopped: forever.qk:2: the program ran too long (its budget ran out)
+  ship1: x 189.00, speed 180.0, laps 3
+  ship2: x 228.00, speed 180.0, laps 1 (destroyed)
+from the node editor: text -> graph -> compiled
+  update/at placed at (40, 120): yes
+  ship1 says "ready"
+  start from the graph gives speed 120.0, laps 0
+a graph with a mistake: errors point at nodes
+  error at node update/@3: ship.graph:18:5: unknown name "moveByy": did you mean "moveBy"?
+catalog: built-ins, the engine's externs, the script's events

@@ -21,12 +21,14 @@ quark text hello.json       ... and back, to the same text
 quark fmt hello.qk          the one canonical layout
 ```
 
-**MVP.** This is the first version. It is the language's core and its compiler, and it is not yet
-connected to Montage, Depict or Artifice.
+**Ready to embed.** A C program links `build/libquark.a`, gives Quark its API as `extern fn`s, and
+calls scripts and node graphs: see [docs/EMBEDDING.md](docs/EMBEDDING.md). How Artifice's node system
+maps onto it is in [docs/ARTIFICE.md](docs/ARTIFICE.md). It is not connected to Montage, Depict or
+Artifice yet.
 
 ## The idea
 
-- **Elegant.** 19 keywords. camelCase for values and PascalCase for types, enforced. One canonical
+- **Elegant.** 20 keywords. camelCase for values and PascalCase for types, enforced. One canonical
   layout. Values that never change behind your back. See [docs/LANGUAGE.md](docs/LANGUAGE.md).
 - **Fast.** Quark compiles to machine code itself, with no C compiler, no LLVM and no interpreter. A
   pipeline (`map`, `filter`, `histogram`...) becomes one fused loop. Lambdas and one-expression
@@ -87,9 +89,33 @@ The compiler is C11 with no library beyond the C runtime. Any C compiler builds 
 programs never need one.
 
 ```bash
-./build.sh            # or build.bat (MSYS2 gcc), or: cc -std=c11 -O2 -o build/quark.exe src/*.c -lm
-tests/run.sh          # programs, errors, panics, canonical text, graph round trips, quark build
+./build.sh            # build/libquark.a, build/quark.exe, build/host.exe (or build.bat with MSYS2)
+tests/run.sh          # programs, errors, panics, canonical text, graph round trips, quark build, the host
 ```
+
+## Embedding
+
+```c
+QkVm* vm = qkVmNew();
+qkVmPrelude(vm, "extern type Object\n"
+                "extern fn moveBy(o: Object, dx: Float, dy: Float)\n");
+qkVmHost(vm, "moveBy", (void*)moveBy);               // void moveBy(int64_t o, double dx, double dy)
+QkModule* m = qkCompile(vm, "ship.qk", text, len);   // NULL: qkDiagnosticAt says why
+QkValue args[2] = {{.i = id}, {.f = 1.0 / 60}};
+if (!qkCall(m, qkFind(m, "update"), args, 2, NULL, 0))
+    puts(qkLastError(vm));                            // a script's panic never ends the host
+```
+
+The API covers:
+
+- host functions with any number of arguments, struct results, text and handles;
+- a budget per call, and panics that stop the call instead of the host;
+- an arena per call, and hot reload (compile, swap the module);
+- graphs both ways, with `"pos"` from a layout file and errors keyed to nodes;
+- a catalog of every node an editor can offer.
+
+[`examples/host/host.c`](examples/host/host.c) is a small engine in Artifice's style that uses all of
+it, and the tests check its output.
 
 ## Inside
 
@@ -104,21 +130,29 @@ tests/run.sh          # programs, errors, panics, canonical text, graph round tr
 | `src/runtime.c` | what compiled code calls: print, arena memory, math, panics; the loader |
 | `src/format.c` | the canonical text |
 | `src/graph.c` | node graph (JSON) out and in |
+| `src/api.c` | the embedding API (`include/quark.h`): machines, preludes, host functions, calls, catalog |
 | `src/main.c` | the command line; executables carry their machine code at their end |
+| `examples/host/` | an engine in Artifice's style: its prelude, a ship script, the C host |
 
-About 7,400 lines. Today the backend targets x86-64 Windows. System V (Linux, macOS) and ARM64
+About 8,900 lines. Today the backend targets x86-64 Windows. System V (Linux, macOS) and ARM64
 backends come next. The IR is shared, so only `x64.c`'s calling convention and a second encoder
 differ.
 
 ## Status and next steps
 
-The MVP is done: the language core, a native compiler, the formatter, node graphs both ways,
-standalone executables, and tests.
+Done:
 
-Next, in the order that leads to replacing Lua in Montage, Depict and Artifice:
+- the language core and a native compiler;
+- the formatter, and node graphs both ways;
+- standalone executables;
+- the embedding API, with host functions, safe calls, hot reload, node keys and layout, and the
+  catalog;
+- tests.
 
-1. An embedding API (`quark.h`: compile, find a function, call it with a struct), with host functions
-   declared by `extern` and capabilities (`effect`) in place of the Lua sandbox.
-2. The plugin API: the `draw(o, g)` of objects and panels, and commands with `doc`.
-3. A node editor view in Cascade, reading and writing `quark graph` / `quark text`.
-4. System V and ARM64 backends.
+Next, in the order that leads to replacing Lua in Artifice, Montage and Depict:
+
+1. System V and ARM64 backends: Linux, macOS and Android exports.
+2. Artifice: its prelude (one `extern fn` per node) and its node editor reading Quark's graphs. See
+   [docs/ARTIFICE.md](docs/ARTIFICE.md).
+3. Text operations (join, compare, format) and capabilities (`effect`) in place of the Lua sandbox.
+4. Montage's plugin API: the `draw(o, g)` of objects and panels, and commands with `doc`.

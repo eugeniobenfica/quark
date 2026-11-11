@@ -1,7 +1,7 @@
 /* Quark — types: every expression gets one, inferred from its parts; only function parameters (and record
  * fields) are written. An Int goes where a Float is wanted; a loop (map, filter, a range) goes where an array
  * is wanted. A let holding a loop that is used once, in the same loop depth, is fused into that use. */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +36,9 @@ static Interned* internFor(Type* elem) {
 }
 
 Type* qkTypeArray(Type* elem) { return internFor(elem)->array; }
+
+/* With the compiler's memory (qkNewReset): the interned types lived there. */
+void qkTypesReset(void) { interned = NULL; }
 Type* qkTypeIter(Type* elem) { return internFor(elem)->iter; }
 
 bool qkTypeSame(const Type* a, const Type* b) { return a == b || a->kind == TY_ERROR || b->kind == TY_ERROR; }
@@ -50,7 +53,7 @@ void qkTypeName(const Type* t, QkBuf* out) {
     case TY_TEXT: qkBufPuts(out, "Text"); break;
     case TY_VEC: qkBufPrintf(out, "Vec%d", t->n); break;
     case TY_ARRAY: qkBufPuts(out, "["); qkTypeName(t->elem, out); qkBufPuts(out, "]"); break;
-    case TY_RECORD: case TY_ENUM: qkBufPuts(out, t->decl->name); break;
+    case TY_RECORD: case TY_ENUM: case TY_HANDLE: qkBufPuts(out, t->decl->name); break;
     case TY_RANGE: qkBufPuts(out, "a range of Int"); break;
     case TY_ITER: qkBufPuts(out, "a loop of "); qkTypeName(t->elem, out); break;
     }
@@ -58,7 +61,7 @@ void qkTypeName(const Type* t, QkBuf* out) {
 
 int qkTypeSlots(const Type* t) {
     switch (t->kind) {
-    case TY_INT: case TY_FLOAT: case TY_BOOL: case TY_ENUM: return 1;
+    case TY_INT: case TY_FLOAT: case TY_BOOL: case TY_ENUM: case TY_HANDLE: return 1;
     case TY_TEXT: case TY_ARRAY: return 2;
     case TY_VEC: return t->n;
     case TY_RECORD: {
@@ -538,6 +541,10 @@ static Type* fnReturnType(Checker* c, Decl* d, const Expr* at);
 
 static Type* checkCall(Checker* c, Expr* e) {
     Decl* d = qkFindDecl(c->prog, e->name);
+    if (d && d->kind == D_TYPE && d->isExtern) {
+        qkError(c->src, e->line, e->col, "%s comes from the host: it is given to the program, never made by it", d->name);
+        return &qkTypeError;
+    }
     if (d && d->kind == D_TYPE) { /* a record */
         e->decl = d;
         if (e->argCount != d->paramCount) {
@@ -925,7 +932,7 @@ static Type* checkBinary(Checker* c, Expr* e) {
             unifyNumeric(c, &e->a, &e->b);
             return &qkTypeBool;
         }
-        if (a == b && (a->kind == TY_BOOL || a->kind == TY_ENUM || a->kind == TY_VEC)) return &qkTypeBool;
+        if (a == b && (a->kind == TY_BOOL || a->kind == TY_ENUM || a->kind == TY_VEC || a->kind == TY_HANDLE)) return &qkTypeBool;
         typeError(c, e, "== compares numbers, Bools, enum cases or vectors of one kind, not %s and %s", a, b);
         return &qkTypeError;
     default: /* < <= > >= */
@@ -1159,7 +1166,20 @@ static void checkFnBody(Checker* c, Decl* d) {
     d->state = 2;
 }
 
-bool qkCheck(Program* p) {
+void qkAddPrelude(Program* p, const Program* prelude) {
+    int n = p->count + prelude->count;
+    Decl** decls = qkNew(sizeof(Decl*) * (size_t)(n ? n : 1));
+    for (int i = 0; i < prelude->count; i++) {
+        decls[i] = prelude->decls[i];
+        decls[i]->fromPrelude = true;
+    }
+    for (int i = 0; i < p->count; i++) decls[prelude->count + i] = p->decls[i];
+    for (int i = 0; i < n; i++) decls[i]->index = i;
+    p->decls = decls;
+    p->count = p->cap = n;
+}
+
+bool qkCheck(Program* p, bool needMain) {
     int errorsBefore = qkErrorCount;
     Checker c = {0};
     c.prog = p;
@@ -1172,7 +1192,7 @@ bool qkCheck(Program* p) {
         if (builtinNamed(d->name)) qkError(c.src, d->line, d->col, "\"%s\" is a built-in name", d->name);
         if (d->kind != D_FN) {
             d->type = qkNew(sizeof(Type));
-            d->type->kind = d->kind == D_TYPE ? TY_RECORD : TY_ENUM;
+            d->type->kind = d->kind == D_ENUM ? TY_ENUM : d->isExtern ? TY_HANDLE : TY_RECORD;
             d->type->decl = d;
         }
     }
@@ -1195,16 +1215,23 @@ bool qkCheck(Program* p) {
             b->isParam = true;
             prm->binding = b;
             if (b->type == d->type) qkError(c.src, prm->line, prm->col, "%s cannot hold itself", d->name);
+            if (d->isExtern && (b->type->kind == TY_RANGE || b->type->kind == TY_ITER))
+                qkError(c.src, prm->line, prm->col, "a host function takes values, not loops");
+        }
+        if (d->kind == D_FN && d->isExtern) { /* the host's: its signature is all there is */
+            d->retType = d->ret ? resolveType(&c, d->ret) : &qkTypeVoid;
+            d->state = 2;
         }
     }
     if (qkErrorCount > errorsBefore) return false;
     for (int i = 0; i < p->count; i++)
-        if (p->decls[i]->kind == D_FN) {
+        if (p->decls[i]->kind == D_FN && !p->decls[i]->isExtern) {
             c.scopeCount = 0;
             c.letCount = 0;
             checkFnBody(&c, p->decls[i]);
         }
     Decl* main = qkFindDecl(p, "main");
+    if (!main && !needMain) return qkErrorCount == errorsBefore;
     if (!main || main->kind != D_FN) qkError(c.src, 1, 1, "a program starts at fn main() { ... }");
     else if (main->paramCount || (main->retType && main->retType->kind != TY_VOID))
         qkError(c.src, main->line, main->col, "main takes nothing and gives nothing: fn main() { ... }");

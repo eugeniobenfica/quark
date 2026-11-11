@@ -1,6 +1,5 @@
 // A bar chart's layout, the way the Charts plugin draws one: each bar grows in, one after another.
 type Row { label: Text, value: Float }
-
 type Bar { x: Float, y: Float, width: Float, height: Float }
 enum Easing { Linear, EaseOut, BackOut }
 

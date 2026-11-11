@@ -2,19 +2,19 @@
  * cases); a name with an underscore is an error, which keeps every program in one style. A line break ends a
  * statement after something that can end one, except inside ( ) and [ ], and before a line that starts
  * with .name (a chained call) or with else. */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdlib.h>
 
 const char* const qkKeywords[] = {"fn",  "let",   "var",   "type",     "enum", "if",  "else", "match", "for",  "in",
-                                  "while", "return", "break", "continue", "and", "or", "not",  "true",  "false"};
+                                  "while", "return", "break", "continue", "and", "or", "not",  "true",  "false", "extern"};
 const int qkKeywordCount = (int)(sizeof qkKeywords / sizeof qkKeywords[0]);
 
 const char* qkTokName(TokKind k) {
     static const char* const names[] = {
         "end of file", "end of line", "name", "type name", "number", "number", "text",
         "fn", "let", "var", "type", "enum", "if", "else", "match", "for", "in", "while", "return", "break", "continue",
-        "and", "or", "not", "true", "false",
+        "and", "or", "not", "true", "false", "extern",
         "(", ")", "{", "}", "[", "]", ",", ".", "..", ":", "->", "=>", "=", "+=", "-=", "*=", "/=", "+", "-", "*",
         "/", "%", "==", "!=", "<", "<=", ">", ">=", "_"};
     return names[k];
@@ -145,7 +145,7 @@ void qkLex(const QkSource* src, Lexed* out) {
             TokKind kind = (c >= 'A' && c <= 'Z') ? T_TYPENAME : T_NAME;
             for (int k = 0; k < qkKeywordCount; k++)
                 if ((int)strlen(qkKeywords[k]) == len && memcmp(qkKeywords[k], start, (size_t)len) == 0) kind = (TokKind)(T_FN + k);
-            static const char* const reserved[] = {"use", "pub", "extern", "effect", "self"};
+            static const char* const reserved[] = {"use", "pub", "effect"};
             for (size_t k = 0; k < sizeof reserved / sizeof reserved[0]; k++)
                 if ((int)strlen(reserved[k]) == len && memcmp(reserved[k], start, (size_t)len) == 0)
                     qkError(src, lx.line, (int)(start - lx.lineStart) + 1, "\"%s\" is kept for a later version of Quark: pick another name", reserved[k]);

@@ -8,7 +8,7 @@
  * Calls between Quark functions: arguments go to [rsp + 8i] of the caller (its outgoing area), the callee
  * reads them at [rbp + 16 + 8i] and writes its results there before returning; the caller reads them back.
  * Calls to the runtime follow Windows x64 (rcx, rdx, r8, r9 / xmm0-3, 32 bytes of shadow space). */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -782,6 +782,44 @@ static void genIns(Gen* g, const IrIns* ins) {
         }
         break;
     }
+    case IR_HOSTCALL: {
+        /* Windows x64: argument i in rcx/rdx/r8/r9 or xmm0-3 by position, the fifth on at [rsp + 8i]; several
+         * results come back through a hidden first argument pointing at room after the arguments */
+        const IrExtern* x = &g->prog->externs[ins->imm];
+        static const int gprArgs[] = {RCX, RDX, R8, R9};
+        int hidden = ins->retCount > 1 ? 1 : 0;
+        int positions = ins->argCount + hidden;
+        int buffer = 8 * (positions > 4 ? positions : 4);
+        for (int i = 0; i < ins->argCount; i++) { /* the stack ones first: they go through rax */
+            int pos = i + hidden;
+            if (pos < 4) continue;
+            loadBits(g, RAX, ins->args[i]);
+            rm(g, true, OP_MOV_STORE, 1, RAX, RSP, 8 * pos);
+        }
+        for (int i = 0; i < ins->argCount; i++) {
+            int pos = i + hidden;
+            if (pos >= 4) continue;
+            if (x->argKinds[i] == 'F') loadF(g, pos, ins->args[i]);
+            else loadBits(g, gprArgs[pos], ins->args[i]);
+        }
+        if (hidden) { /* lea rcx, [rsp + buffer] */
+            static const uint8_t LEA[] = {0x8D};
+            rm(g, true, LEA, 1, RCX, RSP, buffer);
+        }
+        movReloc(g, RAX, RELOC_HOST, ins->imm);
+        byte(g, 0xFF); /* call rax */
+        byte(g, 0xD0);
+        if (hidden) {
+            for (int i = 0; i < ins->retCount; i++) {
+                rm(g, true, OP_MOV_LOAD, 1, RAX, RSP, buffer + 8 * i);
+                storeBits(g, ins->rets[i], RAX);
+            }
+        } else if (ins->retCount) {
+            if (x->retKinds[0] == 'F') storeF(g, ins->rets[0], 0);
+            else storeBits(g, ins->rets[0], RAX);
+        }
+        break;
+    }
     case IR_RET:
         for (int i = 0; i < ins->argCount; i++) {
             loadBits(g, RAX, ins->args[i]);
@@ -918,7 +956,7 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut, int* gprUsed, int* xm
     static const int poolSize[2] = {8, 15};
     bool* crosses = qkNew((size_t)n);
     for (int k = 0; k < f->count; k++) {
-        if (f->code[k].op != IR_CALL && f->code[k].op != IR_RTCALL) continue;
+        if (f->code[k].op != IR_CALL && f->code[k].op != IR_RTCALL && f->code[k].op != IR_HOSTCALL) continue;
         for (int v = 0; v < f->vregCount; v++)
             if (first[v] < k && last[v] >= k) crosses[v] = true;
     }
@@ -1069,6 +1107,125 @@ static void genFn(Gen* g, const IrFn* f) {
     }
 }
 
+/* ---- the way in from C, and the way out of a panic ------------------------------------------------ */
+
+static void jumpBack(Gen* g, int cc, int target) { /* a short jump to an earlier place; cc < 0: always */
+    int rel = target - (here(g) + 2);
+    if (cc < 0) byte(g, 0xEB);
+    else byte(g, 0x70 | cc);
+    byte(g, (int)(int8_t)rel);
+}
+
+/* int64_t enter(QkEnter* e) — Windows x64. Saves every callee-saved register (a panic abandons the frames
+ * that would restore them), keeps its stack pointer where the escape finds it, copies the argument slots to
+ * the outgoing area, calls the function, copies the result slots back, returns 0.
+ * void escape(void) — from the runtime's panic: back onto that stack, return 1 from enter.
+ * Frame: rbp-8..-56 pushed GPRs, rbp-216..-56 xmm6-15, rbp-224 the escape stack saved by an outer call. */
+static void genTrampoline(Gen* g) {
+    static const int saved[] = {RBX, RSI, RDI, R12, R13, R14, R15};
+    static const uint8_t CMOVL[] = {0x0F, 0x4C};
+    while (g->b->len % 16) byte(g, 0xCC);
+    g->mc->enter = here(g);
+    byte(g, 0x55); /* push rbp */
+    movRR(g, RBP, RSP);
+    for (int i = 0; i < 7; i++) {
+        rex(g, false, 0, 0, saved[i], false);
+        byte(g, 0x50 | (saved[i] & 7));
+    }
+    rex(g, true, 0, 0, RSP, false); /* sub rsp, 168 */
+    byte(g, 0x81);
+    byte(g, 0xEC);
+    i32(g, 168);
+    for (int i = 0; i < 10; i++) { /* movups [rbp - 216 + 16i], xmm(6+i) */
+        int x = 6 + i;
+        rex(g, false, x, 0, RBP, false);
+        byte(g, 0x0F);
+        byte(g, 0x11);
+        byte(g, 0x80 | (x & 7) << 3 | RBP);
+        i32(g, -216 + 16 * i);
+    }
+    movReloc(g, R11, RELOC_ESCAPE, 0);
+    rm(g, true, OP_MOV_LOAD, 1, RAX, R11, 0); /* the outer call's escape stack, kept */
+    rm(g, true, OP_MOV_STORE, 1, RAX, RBP, -224);
+    rm(g, true, OP_MOV_STORE, 1, RSP, R11, 0); /* ours */
+    movRR(g, RBX, RCX); /* e */
+    /* the outgoing area: 8 bytes per slot (arguments or results, the larger), 32 at least, 16 aligned */
+    rm(g, true, OP_MOV_LOAD, 1, RAX, RBX, 16);
+    rm(g, true, OP_MOV_LOAD, 1, RDX, RBX, 32);
+    rr(g, true, OP_CMP, 1, RAX, RDX);
+    rr(g, true, CMOVL, 2, RAX, RDX);
+    shiftImm(g, RAX, 4, 3);
+    rex(g, true, 0, 0, RAX, false); /* add rax, 47 */
+    byte(g, 0x83);
+    byte(g, 0xC0);
+    byte(g, 47);
+    rex(g, true, 0, 0, RAX, false); /* and rax, -16 */
+    byte(g, 0x83);
+    byte(g, 0xE0);
+    byte(g, 0xF0);
+    rr(g, true, OP_SUB, 1, RSP, RAX);
+    /* arguments */
+    rm(g, true, OP_MOV_LOAD, 1, RSI, RBX, 8);
+    rm(g, true, OP_MOV_LOAD, 1, RCX, RBX, 16);
+    rr(g, false, OP_XOR, 1, RDX, RDX);
+    int loop1 = here(g);
+    rr(g, true, OP_CMP, 1, RDX, RCX);
+    int done1 = jccShort(g, CC_GE);
+    memOp(g, 0, true, OP_MOV_LOAD, 1, RAX, (Mem){RSI, RDX, 8, 0});
+    memOp(g, 0, true, OP_MOV_STORE, 1, RAX, (Mem){RSP, RDX, 8, 0});
+    rex(g, true, 0, 0, RDX, false); /* inc rdx */
+    byte(g, 0xFF);
+    byte(g, 0xC2);
+    jumpBack(g, -1, loop1);
+    land(g, done1);
+    byte(g, 0xFF); /* call qword [rbx] */
+    byte(g, 0x13);
+    /* results */
+    rm(g, true, OP_MOV_LOAD, 1, RDI, RBX, 24);
+    rm(g, true, OP_MOV_LOAD, 1, RCX, RBX, 32);
+    rr(g, false, OP_XOR, 1, RDX, RDX);
+    int loop2 = here(g);
+    rr(g, true, OP_CMP, 1, RDX, RCX);
+    int done2 = jccShort(g, CC_GE);
+    memOp(g, 0, true, OP_MOV_LOAD, 1, RAX, (Mem){RSP, RDX, 8, 0});
+    memOp(g, 0, true, OP_MOV_STORE, 1, RAX, (Mem){RDI, RDX, 8, 0});
+    rex(g, true, 0, 0, RDX, false);
+    byte(g, 0xFF);
+    byte(g, 0xC2);
+    jumpBack(g, -1, loop2);
+    land(g, done2);
+    rr(g, false, OP_XOR, 1, RAX, RAX);
+    int exit = here(g);
+    movReloc(g, R11, RELOC_ESCAPE, 0); /* the outer call's escape stack back */
+    rm(g, true, OP_MOV_LOAD, 1, RCX, RBP, -224);
+    rm(g, true, OP_MOV_STORE, 1, RCX, R11, 0);
+    for (int i = 0; i < 10; i++) {
+        int x = 6 + i;
+        rex(g, false, x, 0, RBP, false);
+        byte(g, 0x0F);
+        byte(g, 0x10);
+        byte(g, 0x80 | (x & 7) << 3 | RBP);
+        i32(g, -216 + 16 * i);
+    }
+    static const uint8_t LEA[] = {0x8D};
+    rm(g, true, LEA, 1, RSP, RBP, -56);
+    for (int i = 6; i >= 0; i--) {
+        rex(g, false, 0, 0, saved[i], false);
+        byte(g, 0x58 | (saved[i] & 7));
+    }
+    byte(g, 0x5D); /* pop rbp */
+    byte(g, 0xC3);
+
+    while (g->b->len % 16) byte(g, 0xCC);
+    g->mc->escape = here(g);
+    movReloc(g, R11, RELOC_ESCAPE, 0);
+    rm(g, true, OP_MOV_LOAD, 1, RSP, R11, 0);
+    rm(g, true, LEA, 1, RBP, RSP, 224);
+    movImm(g, RAX, 1);
+    byte(g, 0xE9);
+    i32(g, exit - (here(g) + 4));
+}
+
 bool qkGenX64(const IrProgram* p, MachineCode* out) {
     memset(out, 0, sizeof *out);
     Gen g = {0};
@@ -1081,25 +1238,13 @@ bool qkGenX64(const IrProgram* p, MachineCode* out) {
         g.fnAt[i] = here(&g);
         genFn(&g, &p->fns[i]);
     }
-    /* the entry: void entry(void), called from C */
-    while (g.b->len % 16) byte(&g, 0xCC);
-    out->entry = here(&g);
-    rex(&g, true, 0, 0, RSP, false); /* sub rsp, 40 */
-    byte(&g, 0x83);
-    byte(&g, 0xEC);
-    byte(&g, 40);
-    byte(&g, 0xE8);
-    Fixup f = {here(&g), p->mainIndex};
-    QK_PUSH(g.callFixups, g.callCount, g.callCap, f);
-    i32(&g, 0);
-    rex(&g, true, 0, 0, RSP, false); /* add rsp, 40 */
-    byte(&g, 0x83);
-    byte(&g, 0xC4);
-    byte(&g, 40);
-    byte(&g, 0xC3);
+    genTrampoline(&g);
     for (int i = 0; i < g.callCount; i++) {
         int32_t rel = g.fnAt[g.callFixups[i].target] - (g.callFixups[i].at + 4);
         memcpy(g.b->data + g.callFixups[i].at, &rel, 4);
     }
+    out->fnCount = p->count;
+    out->fnAt = qkNew(sizeof(int32_t) * (size_t)(p->count ? p->count : 1));
+    for (int i = 0; i < p->count; i++) out->fnAt[i] = g.fnAt[i];
     return true;
 }

@@ -26,7 +26,8 @@ void qkBufPrintf(QkBuf* b, const char* fmt, ...);
 void qkBufByte(QkBuf* b, uint8_t v);
 void qkBufFree(QkBuf* b);
 
-void* qkNew(size_t bytes); /* zeroed; the compiler is short lived, so nothing is freed */
+void* qkNew(size_t bytes); /* zeroed; freed all at once by qkNewReset (after a compile) */
+void qkNewReset(void);
 char* qkDup(const char* s, size_t n);
 char* qkReadFile(const char* path, size_t* len);
 bool qkWriteFile(const char* path, const void* data, size_t len);
@@ -51,6 +52,8 @@ typedef struct QkSource {
 } QkSource;
 
 extern int qkErrorCount;
+/* Where errors go: NULL prints them to stderr (the command line); an embedding host collects them. */
+extern void (*qkErrorSink)(const char* path, int line, int col, const char* message);
 void qkError(const QkSource* src, int line, int col, const char* fmt, ...);
 const char* qkClosest(const char* name, const char* const* candidates, int count);
 
@@ -60,7 +63,7 @@ typedef enum TokKind {
     T_EOF, T_NEWLINE, T_NAME, T_TYPENAME, T_INT, T_FLOAT, T_TEXT,
     /* keywords */
     T_FN, T_LET, T_VAR, T_TYPE, T_ENUM, T_IF, T_ELSE, T_MATCH, T_FOR, T_IN, T_WHILE, T_RETURN, T_BREAK, T_CONTINUE,
-    T_AND, T_OR, T_NOT, T_TRUE, T_FALSE,
+    T_AND, T_OR, T_NOT, T_TRUE, T_FALSE, T_EXTERN,
     /* punctuation */
     T_LPAREN, T_RPAREN, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET, T_COMMA, T_DOT, T_DOTDOT, T_COLON, T_ARROW,
     T_FATARROW, T_ASSIGN, T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
@@ -207,6 +210,8 @@ struct Decl {
     Type* retType;
     int state;     /* 0 unchecked, 1 checking, 2 done */
     int index;
+    bool isExtern;    /* extern fn (no body: the host's) or extern type (a host handle) */
+    bool fromPrelude; /* the host's declarations: not printed, not in graphs */
 };
 
 typedef struct Program {
@@ -222,7 +227,7 @@ Expr* qkNewExpr(ExprKind kind, int line, int col);
 /* ---- types and checking (check.c) ---------------------------------------------------------------- */
 
 typedef enum TypeKind {
-    TY_ERROR, TY_VOID, TY_INT, TY_FLOAT, TY_BOOL, TY_TEXT, TY_VEC, TY_ARRAY, TY_RECORD, TY_ENUM, TY_RANGE, TY_ITER
+    TY_ERROR, TY_VOID, TY_INT, TY_FLOAT, TY_BOOL, TY_TEXT, TY_VEC, TY_ARRAY, TY_RECORD, TY_ENUM, TY_RANGE, TY_ITER, TY_HANDLE
 } TypeKind;
 
 struct Type {
@@ -270,7 +275,11 @@ void qkTypeSlotKinds(const Type* t, char* out); /* 'I' or 'F' per slot */
 bool qkIsIterable(const Type* t);
 Type* qkElemType(const Type* t);
 
-bool qkCheck(Program* p);
+/* main: a program must have fn main() (the command line); a library for a host need not. */
+bool qkCheck(Program* p, bool needMain);
+/* Puts the host's declarations (another parsed program) before a program's own. */
+void qkAddPrelude(Program* p, const Program* prelude);
+void qkTypesReset(void); /* after qkNewReset */
 Decl* qkFindDecl(Program* p, const char* name);
 
 /* ---- formatting (format.c) ----------------------------------------------------------------------- */
@@ -282,6 +291,10 @@ void qkFormatTypeExpr(const TypeExpr* t, QkBuf* out);
 /* ---- node graphs (graph.c) ----------------------------------------------------------------------- */
 
 void qkGraphExport(const Program* p, QkBuf* out);
+/* layoutJson (may be NULL): {"key": [x, y]} adds "pos" to the nodes with those keys. */
+void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson);
+/* The graph key of the statement a line of the canonical text belongs to. */
+bool qkKeyAtLine(const Program* p, int line, char* out, size_t size);
 bool qkGraphImport(const char* json, size_t len, const char* path, Program* out);
 
 /* ---- intermediate code (lower.c) ----------------------------------------------------------------- */
@@ -306,6 +319,7 @@ typedef enum IrOp {
     IR_RTCALL,    /* rets = runtime function imm (args) */
     IR_RET,       /* return args */
     IR_FUEL,      /* one unit of the budget */
+    IR_HOSTCALL,  /* rets = host function imm (args), C calling convention */
     IR_NOP
 } IrOp;
 
@@ -339,12 +353,22 @@ typedef struct IrFn {
     int64_t* constValue;
 } IrFn;
 
+typedef struct IrExtern {
+    const char* name;
+    char* argKinds; /* 'I' / 'F' per slot */
+    int argCount;
+    char* retKinds;
+    int retCount;
+} IrExtern;
+
 typedef struct IrProgram {
     IrFn* fns;
     int count;
-    int mainIndex;
-    QkBuf data;       /* text literals */
+    int mainIndex;  /* -1: none */
+    QkBuf data;     /* text literals */
     bool fuel;
+    IrExtern* externs; /* host functions called, by IR_HOSTCALL's imm */
+    int externCount;
 } IrProgram;
 
 bool qkLower(Program* p, IrProgram* out, bool fuel);
@@ -358,13 +382,14 @@ void qkOptimize(IrProgram* p);
 typedef struct RtFn {
     const char* name;
     void* addr;
-    const char* args; /* 'I' or 'F' per argument (at most 4) */
+    const char* args; /* 'I' or 'F' per argument */
     char ret;         /* 'I', 'F' or 'V' */
 } RtFn;
 
 typedef enum RtId {
     RT_PANIC, RT_PRINT_INT, RT_PRINT_FLOAT, RT_PRINT_BOOL, RT_PRINT_TEXT, RT_PRINT_SEP, RT_PRINT_END, RT_ALLOC,
     RT_GROW, RT_COPY, RT_NOW, RT_SIN, RT_COS, RT_TAN, RT_ASIN, RT_ACOS, RT_ATAN, RT_ATAN2, RT_EXP, RT_LOG, RT_POW, RT_FUEL_OUT,
+    RT_PRINT_HANDLE,
     RT_COUNT
 } RtId;
 
@@ -376,11 +401,21 @@ extern const char* qkRunPath; /* for messages */
 
 enum { PANIC_INDEX = 1, PANIC_DIVIDE = 2, PANIC_FUEL = 3, PANIC_HISTOGRAM = 4, PANIC_EMPTY = 5, PANIC_SIZE = 6 };
 
+/* A panic during a call through the entry trampoline returns from that call (qkEnter gives 1) with this
+ * message; with no call in progress it prints and ends the process (the command line). */
+extern char qkPanicText[512];
+extern void* qkEscapeRsp;          /* the trampoline's stack, saved for the escape (0: no call) */
+extern void (*qkEscapeStub)(void); /* jumps back into the trampoline: the call returns 1 */
+void qkArenaReset(void);           /* frees what the last call allocated (keeps the memory) */
+
 /* ---- machine code (x64.c) ------------------------------------------------------------------------ */
+
+enum { RELOC_RUNTIME, RELOC_DATA, RELOC_FUEL, RELOC_HOST, RELOC_ESCAPE };
 
 typedef struct Reloc {
     int32_t at;    /* where the 8-byte address goes */
-    int32_t kind;  /* 0: a runtime function (target: RtId), 1: the data block (target: offset) */
+    int32_t kind;  /* RELOC_*: a runtime function (target: RtId), the data block (+ target), the fuel counter,
+                    * a host function (target: extern index), the trampoline's saved stack */
     int64_t target;
 } Reloc;
 
@@ -388,12 +423,35 @@ typedef struct MachineCode {
     QkBuf code;
     Reloc* relocs;
     int relocCount, relocCap;
-    int32_t entry; /* offset of the entry stub: void entry(void) */
+    int32_t* fnAt;    /* each function's offset */
+    int fnCount;
+    int32_t enter;    /* int64_t enter(QkEnter*): calls a function with slots, catches panics */
+    int32_t escape;   /* void escape(void): back to the trampoline, from a panic */
 } MachineCode;
 
+/* What the trampoline gets: the function, its argument slots in, its result slots out. */
+typedef struct QkEnter {
+    void* fn;
+    const uint64_t* args;
+    int64_t argCount;
+    uint64_t* results;
+    int64_t resultCount;
+} QkEnter;
+
 bool qkGenX64(const IrProgram* p, MachineCode* out);
-/* Copies code and data into executable memory, patches addresses, returns the entry point. */
-void (*qkLoad(const uint8_t* code, size_t codeLen, const uint8_t* data, size_t dataLen, const Reloc* relocs,
-              int relocCount, int32_t entry))(void);
+
+/* Code and data in executable memory, addresses patched (host functions from `hosts`, by extern index). */
+typedef struct Loaded {
+    uint8_t* code;
+    size_t codeLen;
+    uint8_t* data;
+    int64_t (*enter)(QkEnter* e);
+    void (*escape)(void);
+} Loaded;
+bool qkLoad(const uint8_t* code, size_t codeLen, const uint8_t* data, size_t dataLen, const Reloc* relocs, int relocCount,
+            int32_t enter, int32_t escape, void* const* hosts, Loaded* out);
+void qkUnload(Loaded* l);
+/* Calls through the trampoline; false when it panicked (qkPanicText says why). */
+bool qkRunEntry(const Loaded* l, void* fn, const uint64_t* args, int argCount, uint64_t* results, int resultCount);
 
 #endif

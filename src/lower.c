@@ -2,7 +2,7 @@
  * one, a Vec3 three, an array two: its address and length), so records and vectors live in registers, never
  * in memory. Loops are fused: map, filter and the like do not build arrays; they add code inside the one
  * loop of their source (a range or an array), and sum, fold, histogram... end it. Lambdas are inlined. */
-#include "quark.h"
+#include "qk.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -36,6 +36,7 @@ struct Lower {
         Val result; /* where they leave their value */
     } inlining[8];  /* functions being inlined, innermost last */
     Decl* current;     /* the function being lowered */
+    int* externIndex;  /* decl index -> the program's host function list, or -1 */
     int inlineDepth;
 };
 typedef struct InlineFrame InlineFrame;
@@ -587,6 +588,12 @@ static void printVal(Lower* L, Val v, const Type* t) {
     case TY_FLOAT: rtcall(L, RT_PRINT_FLOAT, v.r, 1, 'V', 0); break;
     case TY_BOOL: rtcall(L, RT_PRINT_BOOL, v.r, 1, 'V', 0); break;
     case TY_TEXT: rtcall(L, RT_PRINT_TEXT, v.r, 2, 'V', 0); break;
+    case TY_HANDLE: { /* Object#12 */
+        const char* name = t->decl->name;
+        int args[3] = {dataAddress(L, dataText(L, name, (int)strlen(name))), iconst(L, (int64_t)strlen(name)), v.r[0]};
+        rtcall(L, RT_PRINT_HANDLE, args, 3, 'V', 0);
+        break;
+    }
     case TY_ENUM: {
         /* a table of (offset, length) per case in the data block */
         Decl* d = t->decl;
@@ -873,6 +880,45 @@ static int blockSize(const Block* b) {
     return n;
 }
 
+/* A call to the host: its C function, one argument per slot. */
+static Val hostCall(Lower* L, Expr* e, Decl* d, Val* args, int total) {
+    int index = L->externIndex[d->index];
+    if (index < 0) { /* the first call: the host function joins the program's list */
+        index = L->externIndex[d->index] = L->out->externCount++;
+        IrExtern* x = &L->out->externs[index];
+        x->name = d->name;
+        x->argCount = 0;
+        for (int i = 0; i < d->paramCount; i++) x->argCount += qkTypeSlots(d->params[i].binding->type);
+        x->argKinds = qkNew((size_t)x->argCount + 1);
+        for (int i = 0, at = 0; i < d->paramCount; i++) {
+            qkTypeSlotKinds(d->params[i].binding->type, x->argKinds + at);
+            at += qkTypeSlots(d->params[i].binding->type);
+        }
+        x->retCount = qkTypeSlots(d->retType);
+        x->retKinds = qkNew((size_t)x->retCount + 1);
+        qkTypeSlotKinds(d->retType, x->retKinds);
+    }
+    IrIns* ins = emit(L, IR_HOSTCALL, -1, -1, -1);
+    ins->imm = index;
+    ins->line = e->line;
+    ins->args = regList(total);
+    ins->argCount = total;
+    for (int i = 0, k = 0; i < e->argCount; i++)
+        for (int j = 0; j < args[i].n; j++) ins->args[k++] = args[i].r[j];
+    Val r = valOf(L, d->retType);
+    ins = &L->fn->code[L->fn->count - 1];
+    ins->rets = r.r;
+    ins->retCount = r.n;
+    for (int i = 0; i < ins->argCount; i++) use(L, ins->args[i]);
+    for (int i = 0; i < r.n; i++) use(L, r.r[i]);
+    /* the outgoing area: the shadow space, the arguments (a hidden pointer first when several results come
+     * back), then room for those results */
+    int hidden = r.n > 1 ? 1 : 0;
+    int slots = (total + hidden > 4 ? total + hidden : 4) + (r.n > 1 ? r.n : 0);
+    if (slots > L->fn->maxOut) L->fn->maxOut = slots;
+    return r;
+}
+
 static Val lowerCall(Lower* L, Expr* e) {
     if (e->builtin) return lowerBuiltin(L, e);
     Decl* d = e->decl;
@@ -901,6 +947,7 @@ static Val lowerCall(Lower* L, Expr* e) {
         args[i] = lowerExpr(L, e->args[i]);
         total += args[i].n;
     }
+    if (d->isExtern) return hostCall(L, e, d, args, total);
     /* a small function is inlined: no call at all. Parameters never change, so they can be the arguments' own
      * registers; a return becomes a jump to the end. Not into itself (recursion stays a call). */
     bool inside = false;
@@ -1322,15 +1369,20 @@ bool qkLower(Program* p, IrProgram* out, bool fuelOn) {
     L.prog = p;
     L.out = out;
     L.fnIndex = regList(p->count);
+    L.externIndex = regList(p->count);
+    out->mainIndex = -1;
     int n = 0;
-    for (int i = 0; i < p->count; i++)
-        if (p->decls[i]->kind == D_FN) L.fnIndex[i] = n++;
+    for (int i = 0; i < p->count; i++) {
+        L.externIndex[i] = -1;
+        if (p->decls[i]->kind == D_FN && !p->decls[i]->isExtern) L.fnIndex[i] = n++;
+    }
     out->fns = qkNew(sizeof(IrFn) * (size_t)(n ? n : 1));
     out->count = n;
+    out->externs = qkNew(sizeof(IrExtern) * (size_t)(p->count ? p->count : 1));
     qkBufAdd(&out->data, "", 0);
     for (int i = 0; i < p->count; i++) {
         Decl* d = p->decls[i];
-        if (d->kind != D_FN) continue;
+        if (d->kind != D_FN || d->isExtern) continue;
         lowerFn(&L, d, &out->fns[L.fnIndex[i]]);
         if (!strcmp(d->name, "main")) out->mainIndex = L.fnIndex[i];
     }
@@ -1342,7 +1394,7 @@ bool qkLower(Program* p, IrProgram* out, bool fuelOn) {
 void qkIrDump(const IrProgram* p, QkBuf* out) {
     static const char* const names[] = {"const", "mov", "add", "sub", "mul", "div", "mod", "neg", "fadd", "fsub", "fmul",
                                         "fdiv", "fneg", "sqrt", "fmin", "fmax", "cmp", "fcmp", "not", "i2f", "f2i", "round",
-                                        "load", "store", "bounds", "label", "jmp", "jz", "jnz", "call", "rtcall", "ret", "fuel"};
+                                        "load", "store", "bounds", "label", "jmp", "jz", "jnz", "call", "rtcall", "ret", "fuel", "hostcall", "nop"};
     static const char* const conds[] = {"==", "!=", "<", "<=", ">", ">="};
     for (int i = 0; i < p->count; i++) {
         const IrFn* f = &p->fns[i];
@@ -1361,7 +1413,7 @@ void qkIrDump(const IrProgram* p, QkBuf* out) {
                 if (ins->b >= 0) qkBufPrintf(out, " %c%d", f->kinds[ins->b] == 'F' ? 'f' : 'r', ins->b);
             }
             if (ins->op == IR_CONST || ins->op == IR_JMP || ins->op == IR_JZ || ins->op == IR_JNZ || ins->op == IR_LOAD ||
-                ins->op == IR_STORE || ins->op == IR_CALL || ins->op == IR_RTCALL || ins->op == IR_ROUND)
+                ins->op == IR_STORE || ins->op == IR_CALL || ins->op == IR_RTCALL || ins->op == IR_ROUND || ins->op == IR_HOSTCALL)
                 qkBufPrintf(out, " #%lld", (long long)ins->imm);
             if ((ins->op == IR_LOAD || ins->op == IR_STORE) && ins->c) qkBufPrintf(out, " +%d", ins->c);
             if (ins->op == IR_CONST && ins->c == 1) qkBufPuts(out, " (data)");

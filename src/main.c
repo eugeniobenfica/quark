@@ -11,7 +11,8 @@
  *
  * An executable made by `quark build` is this same program with the machine code appended: when it starts
  * and finds code at its own end, it runs that code instead of the command line. */
-#include "quark.h"
+#include "qk.h"
+#include "../include/quark.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +28,8 @@
 typedef struct Trailer {
     char magic[8];
     uint64_t codeLen, dataLen, relocCount;
-    int64_t entry;
+    int64_t entry; /* main's offset */
+    int64_t enter, escape;
     int64_t fuel;
     int64_t features; /* 1: AVX */
     uint64_t payloadSize;
@@ -52,7 +54,7 @@ static char* selfPath(void) {
     DWORD n = GetModuleFileNameW(NULL, w, 32768);
     if (!n || n >= 32768) return NULL;
     int len = WideCharToMultiByte(CP_UTF8, 0, w, (int)n, NULL, 0, NULL, NULL);
-    char* s = qkNew((size_t)len + 1);
+    char* s = calloc(1, (size_t)len + 1); /* not the compiler's memory: a compile frees that */
     WideCharToMultiByte(CP_UTF8, 0, w, (int)n, s, len, NULL, NULL);
     return s;
 #else
@@ -81,14 +83,47 @@ static int runPayload(const char* self) {
         fputs("this program was built for processors with AVX, and this one has none\n", stderr);
         return 1;
     }
-    void (*entry)(void) = qkLoad(code, t.codeLen, data, t.dataLen, relocs, (int)t.relocCount, (int32_t)t.entry);
-    if (!entry) return 1;
-    entry();
+    Loaded l;
+    if (!qkLoad(code, t.codeLen, data, t.dataLen, relocs, (int)t.relocCount, (int32_t)t.enter, (int32_t)t.escape, NULL, &l)) return 1;
+    bool ok = qkRunEntry(&l, l.code + t.entry, NULL, 0, NULL, 0);
     fflush(stdout);
+    if (!ok) {
+        fprintf(stderr, "%s\n", qkPanicText);
+        return 1;
+    }
+    return 0;
+}
+
+/* Runs main; a panic prints its message. */
+static int runMain(const MachineCode* mc, const IrProgram* ir, bool timed) {
+    if (ir->mainIndex < 0) {
+        fputs("quark: a program starts at fn main() { ... }\n", stderr);
+        return 1;
+    }
+    if (ir->externCount) {
+        fprintf(stderr, "quark: this program calls the host (extern fn %s): run it from a host that gives it\n", ir->externs[0].name);
+        return 1;
+    }
+    Loaded l;
+    if (!qkLoad((const uint8_t*)mc->code.data, mc->code.len, (const uint8_t*)ir->data.data, ir->data.len, mc->relocs,
+                mc->relocCount, mc->enter, mc->escape, NULL, &l)) {
+        fputs("quark: cannot load the machine code\n", stderr);
+        return 1;
+    }
+    double t0 = nowSeconds();
+    bool ok = qkRunEntry(&l, l.code + mc->fnAt[ir->mainIndex], NULL, 0, NULL, 0);
+    fflush(stdout);
+    if (!ok) {
+        fprintf(stderr, "%s\n", qkPanicText);
+        return 1;
+    }
+    if (timed) fprintf(stderr, "quark: ran in %.2f ms\n", (nowSeconds() - t0) * 1000);
     return 0;
 }
 
 /* ---- compiling ----------------------------------------------------------------------------------- */
+
+static const char* preludePath; /* --prelude: the host's declarations */
 
 static bool loadProgram(const char* path, Program* prog) {
     size_t len;
@@ -98,13 +133,26 @@ static bool loadProgram(const char* path, Program* prog) {
         return false;
     }
     QkSource src = {path, text, len};
-    return qkParse(&src, prog);
+    if (!qkParse(&src, prog)) return false;
+    if (preludePath) {
+        char* ptext = qkReadFile(preludePath, &len);
+        if (!ptext) {
+            fprintf(stderr, "quark: cannot read %s\n", preludePath);
+            return false;
+        }
+        QkSource* psrc = qkNew(sizeof *psrc);
+        *psrc = (QkSource){preludePath, ptext, len};
+        Program prelude;
+        if (!qkParse(psrc, &prelude)) return false;
+        qkAddPrelude(prog, &prelude);
+    }
+    return true;
 }
 
 static bool compile(const char* path, int64_t fuel, MachineCode* mc, IrProgram* ir, bool* timed) {
     double t0 = nowSeconds();
     Program prog;
-    if (!loadProgram(path, &prog) || !qkCheck(&prog)) return false;
+    if (!loadProgram(path, &prog) || !qkCheck(&prog, true)) return false;
     double t1 = nowSeconds();
     qkLower(&prog, ir, fuel > 0);
     qkOptimize(ir);
@@ -124,7 +172,10 @@ static int usage(void) {
           "  quark fmt   file.qk [--write]             print (or rewrite) the canonical text\n"
           "  quark graph file.qk                       print the node graph (JSON)\n"
           "  quark text  file.json                     turn a node graph back into Quark\n"
-          "  quark ir    file.qk                       print the intermediate code\n",
+          "  quark ir    file.qk                       print the intermediate code\n"
+          "  quark catalog file.qk | -                 every node an editor can offer (JSON)\n\n"
+          "  --prelude host.qk   the host's declarations (extern fn, extern type) for run, check, graph, catalog\n"
+          "  --layout pos.json   graph: node positions by key, written into the nodes as \"pos\"\n",
           stderr);
     return 2;
 }
@@ -136,12 +187,15 @@ static int realMain(int argc, char** argv) {
     int64_t fuel = 0;
     bool timed = false, write = false, noAvx = false;
     const char* outPath = NULL;
+    const char* layoutPath = NULL;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--fuel") && i + 1 < argc) fuel = strtoll(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--time")) timed = true;
         else if (!strcmp(argv[i], "--write")) write = true;
         else if (!strcmp(argv[i], "--no-avx")) noAvx = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outPath = argv[++i];
+        else if (!strcmp(argv[i], "--prelude") && i + 1 < argc) preludePath = argv[++i];
+        else if (!strcmp(argv[i], "--layout") && i + 1 < argc) layoutPath = argv[++i];
         else {
             fprintf(stderr, "quark: unknown option %s\n", argv[i]);
             return 2;
@@ -155,17 +209,7 @@ static int realMain(int argc, char** argv) {
         IrProgram ir;
         if (!compile(path, fuel, &mc, &ir, &timed)) return 1;
         if (fuel > 0) qkFuel = fuel;
-        void (*entry)(void) = qkLoad((const uint8_t*)mc.code.data, mc.code.len, (const uint8_t*)ir.data.data, ir.data.len,
-                                     mc.relocs, mc.relocCount, mc.entry);
-        if (!entry) {
-            fputs("quark: cannot load the machine code\n", stderr);
-            return 1;
-        }
-        double t0 = nowSeconds();
-        entry();
-        fflush(stdout);
-        if (timed) fprintf(stderr, "quark: ran in %.2f ms\n", (nowSeconds() - t0) * 1000);
-        return 0;
+        return runMain(&mc, &ir, timed);
     }
     if (!strcmp(cmd, "build")) {
         MachineCode mc;
@@ -195,7 +239,13 @@ static int realMain(int argc, char** argv) {
         t.codeLen = mc.code.len;
         t.dataLen = ir.data.len;
         t.relocCount = (uint64_t)mc.relocCount;
-        t.entry = mc.entry;
+        if (ir.mainIndex < 0 || ir.externCount) {
+            fputs("quark: an executable starts at fn main() and calls no host function\n", stderr);
+            return 1;
+        }
+        t.entry = mc.fnAt[ir.mainIndex];
+        t.enter = mc.enter;
+        t.escape = mc.escape;
         t.fuel = fuel;
         t.features = qkUseAvx ? 1 : 0;
         t.payloadSize = out.len - start;
@@ -224,14 +274,14 @@ static int realMain(int argc, char** argv) {
     }
     if (!strcmp(cmd, "check")) {
         Program prog;
-        if (!loadProgram(path, &prog) || !qkCheck(&prog)) return 1;
+        if (!loadProgram(path, &prog) || !qkCheck(&prog, false)) return 1;
         fputs("ok\n", stderr);
         return 0;
     }
     if (!strcmp(cmd, "ir")) {
         Program prog;
         IrProgram ir;
-        if (!loadProgram(path, &prog) || !qkCheck(&prog)) return 1;
+        if (!loadProgram(path, &prog) || !qkCheck(&prog, false)) return 1;
         qkLower(&prog, &ir, fuel > 0);
         qkOptimize(&ir);
         QkBuf out = {0};
@@ -256,9 +306,18 @@ static int realMain(int argc, char** argv) {
     }
     if (!strcmp(cmd, "graph")) {
         Program prog;
-        if (!loadProgram(path, &prog) || !qkCheck(&prog)) return 1;
+        if (!loadProgram(path, &prog) || !qkCheck(&prog, false)) return 1;
+        char* layout = NULL;
+        if (layoutPath) {
+            size_t layoutLen;
+            layout = qkReadFile(layoutPath, &layoutLen);
+            if (!layout) {
+                fprintf(stderr, "quark: cannot read %s\n", layoutPath);
+                return 1;
+            }
+        }
         QkBuf out = {0};
-        qkGraphExport(&prog, &out);
+        qkGraphExportWith(&prog, &out, layout);
         fwrite(out.data, 1, out.len, stdout);
         return 0;
     }
@@ -274,6 +333,25 @@ static int realMain(int argc, char** argv) {
         QkBuf out = {0};
         qkFormat(&prog, &out);
         fwrite(out.data, 1, out.len, stdout);
+        return 0;
+    }
+    if (!strcmp(cmd, "catalog")) { /* path: a program, or - for the built-ins and the prelude only */
+        QkVm* vm = qkVmNew();
+        if (preludePath) {
+            size_t len;
+            char* text = qkReadFile(preludePath, &len);
+            if (!text || !qkVmPrelude(vm, text)) {
+                fprintf(stderr, "quark: the prelude %s does not read\n", preludePath);
+                return 1;
+            }
+        }
+        size_t len = 0;
+        char* text = strcmp(path, "-") ? qkReadFile(path, &len) : NULL;
+        char* json = qkCatalog(vm, text, len);
+        if (!json) return 1;
+        fputs(json, stdout);
+        qkFree(json);
+        qkVmFree(vm);
         return 0;
     }
     return usage();
@@ -293,10 +371,10 @@ int main(int argc, char** argv) {
     int wargc;
     wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     if (wargv) {
-        char** u = qkNew(sizeof(char*) * (size_t)(wargc + 1));
+        char** u = calloc((size_t)wargc + 1, sizeof(char*)); /* the arguments outlive compiles */
         for (int i = 0; i < wargc; i++) {
             int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
-            u[i] = qkNew((size_t)n);
+            u[i] = malloc((size_t)n);
             WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, u[i], n, NULL, NULL);
         }
         argc = wargc;

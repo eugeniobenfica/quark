@@ -1,6 +1,6 @@
 /* Quark — the parser: tokens to a syntax tree. Comments stay attached to the declarations and statements
  * they sit above (or beside), so the formatter and the node graph keep them. */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +11,7 @@ typedef struct Parser {
     int i;
     int comment;  /* the next comment not yet attached */
     bool failed;
+    bool externNext; /* the fn being parsed is an extern one */
 } Parser;
 
 Expr* qkNewExpr(ExprKind kind, int line, int col) {
@@ -597,6 +598,8 @@ static Decl* parseFn(Parser* p) {
     Token* t = next(p); /* fn */
     Decl* d = qkNew(sizeof *d);
     d->kind = D_FN;
+    d->isExtern = p->externNext;
+    p->externNext = false;
     d->line = t->line;
     d->col = t->col;
     Token* name = expect(p, T_NAME, "after fn (a camelCase name)");
@@ -611,11 +614,32 @@ static Decl* parseFn(Parser* p) {
     }
     expect(p, T_RPAREN, "after the parameters");
     if (accept(p, T_ARROW)) d->ret = parseType(p);
+    if (d->isExtern) return d; /* the host's: no body */
     if (accept(p, T_ASSIGN)) {
         d->body = parseExpr(p);
     } else {
         d->body = blockExpr(p);
     }
+    return d;
+}
+
+/* extern fn name(params) -> Result   |   extern type Name */
+static Decl* parseExtern(Parser* p) {
+    Token* t = next(p); /* extern */
+    if (at(p, T_FN)) {
+        p->externNext = true;
+        Decl* d = parseFn(p);
+        d->line = t->line;
+        d->col = t->col;
+        return d;
+    }
+    expect(p, T_TYPE, "after extern (extern fn or extern type)");
+    Decl* d = qkNew(sizeof *d);
+    d->kind = D_TYPE;
+    d->isExtern = true;
+    d->line = t->line;
+    d->col = t->col;
+    d->name = tokText(expect(p, T_TYPENAME, "after extern type (a PascalCase name)"));
     return d;
 }
 
@@ -651,7 +675,7 @@ static Decl* parseTypeDecl(Parser* p) {
 bool qkParse(const QkSource* src, Program* out) {
     memset(out, 0, sizeof *out);
     out->src = *src;
-    Parser p = {src, {0}, 0, 0, false};
+    Parser p = {src, {0}, 0, 0, false, false};
     int errorsBefore = qkErrorCount;
     qkLex(src, &p.lx);
     if (qkErrorCount > errorsBefore) return false;
@@ -662,8 +686,9 @@ bool qkParse(const QkSource* src, Program* out) {
         Decl* d = NULL;
         if (at(&p, T_FN)) d = parseFn(&p);
         else if (at(&p, T_TYPE) || at(&p, T_ENUM)) d = parseTypeDecl(&p);
+        else if (at(&p, T_EXTERN)) d = parseExtern(&p);
         else {
-            fail(&p, t, "%s", "expected fn, type or enum at the top of the file");
+            fail(&p, t, "%s", "expected fn, type, enum or extern at the top of the file");
             break;
         }
         d->leading = leading;

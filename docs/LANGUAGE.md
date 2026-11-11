@@ -35,11 +35,11 @@ fn main() {
 
 ## Words
 
-**Keywords (19):**
+**Keywords (20):**
 
 | | |
 | --- | --- |
-| Declarations | `fn` `type` `enum` |
+| Declarations | `fn` `type` `enum` `extern` |
 | Bindings | `let` (never changes) · `var` (can change) |
 | Choices | `if` `else` `match` |
 | Loops | `for` `in` `while` `break` `continue` |
@@ -47,9 +47,8 @@ fn main() {
 | Logic | `and` `or` `not` |
 | Values | `true` `false` |
 
-**Kept for later:** `use` (modules), `pub` (exports), `extern` (functions from the host),
-`effect` (declared effects) and `self`. Using them as names is an error today, so adding them later
-breaks no program.
+**Kept for later:** `use` (modules), `pub` (exports) and `effect` (declared effects). Using them as
+names is an error today, so adding them later breaks no program.
 
 **Names:** `camelCase` for values, functions, fields and parameters, and `PascalCase` for types and
 enum cases. Underscores are not allowed. The compiler suggests the right spelling:
@@ -111,10 +110,32 @@ fn name(param: Type, ...) -> Result { statements; last expression is the result 
 fn name(param: Type, ...) -> Result = expression        // one expression: inlined where it is called
 type Name { field: Type, ... }
 enum Name { CaseA, CaseB }
+extern fn name(param: Type, ...) -> Result              // the host's: a C function, no body
+extern type Name                                         // the host's handle (an object, a layer...)
 ```
 
 `-> Result` may be left out when the body says it, except when the function calls itself or returns
-early. A program starts at `fn main()`.
+early.
+
+A program run from the command line starts at `fn main()`. A program for a host (an engine, an app)
+has the functions the host calls, such as `start` and `update`. `fn main` is not needed there.
+
+**Host declarations.** `extern fn` is a function the host provides, and `extern type` is a value
+only the host makes (`Object`, `Layer`). A script can pass it on and compare it, but never build it.
+A host usually gives these as its **prelude**, which every program it compiles sees. See
+[EMBEDDING.md](EMBEDDING.md).
+
+```quark
+extern type Object
+extern fn position(o: Object) -> Vec2
+extern fn moveBy(o: Object, dx: Float, dy: Float)
+
+fn update(self: Object, dt: Float) {
+    if position(self).x < 300 {
+        moveBy(self, 120 * dt, 0)
+    }
+}
+```
 
 ## Statements
 
@@ -232,16 +253,20 @@ back.
 | `if`, `match`, `for`, `while` | nodes holding the blocks they run |
 | comments and blank lines | notes on the node they belong to |
 
-Named nodes carry a `key` (`function/name`). An editor keeps node positions in a side file under
-that key, so moving nodes never touches the program. Graph → text always gives the canonical text,
-so a graph edited in a node editor and a program edited as text can live in one repository.
+Every node carries a `key`, a `line` in the canonical text, and its `type`:
+- a named node is keyed `function/name`;
+- another statement is keyed by its place (`update/@3`, and `update/@3/@0` inside it);
+- an input is keyed by its order (`update/at.0`).
+
+An editor keeps node positions in a side file under those keys (`quark graph --layout pos.json` puts
+them back in as `"pos"`), so moving nodes never touches the program. Graph → text always gives the
+canonical text, so a graph edited in a node editor and a program edited as text can live in one
+repository. `quark catalog` lists every node an editor can offer.
 
 ## Not yet
 
 These are planned and their words are reserved:
 
-- `extern` / host functions and an embedding API in C. The core is ready for it: values are flat slots
-  and the backend already calls C functions (the runtime).
 - `use` / modules, `pub`.
 - `effect`, declared effects: capabilities such as `doc` or `g` passed in by the host. This is how a
   plugin is kept from touching what it was not given.

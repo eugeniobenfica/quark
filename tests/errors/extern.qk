@@ -1,0 +1,7 @@
+// error: is a let
+extern fn tick(n: Int) -> Int
+
+fn main() {
+    let n = tick(1)
+    n = 2
+}

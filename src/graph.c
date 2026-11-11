@@ -15,367 +15,10 @@
  * Inputs: {"node": id} | {"value": "12", "of": "Int"} | {"case": "Mode.Parade"} | {"fn": "luma"}.
  * Blocks: {"stmts": [ids], "closing": "comment"}. A node's "key" (fn/name, for named nodes) is stable while
  * the name is: an editor keeps positions in a side file under it. */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
-
-/* ---- writing ------------------------------------------------------------------------------------- */
-
-typedef struct Out {
-    QkBuf nodes; /* this function's nodes, written as they are met */
-    int nextId;
-    const char* fn;
-    int nodeCount;
-} Out;
-
-static void jsonString(QkBuf* b, const char* s) {
-    qkBufByte(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"') qkBufPuts(b, "\\\"");
-        else if (c == '\\') qkBufPuts(b, "\\\\");
-        else if (c == '\n') qkBufPuts(b, "\\n");
-        else if (c == '\t') qkBufPuts(b, "\\t");
-        else if (c < 0x20) qkBufPrintf(b, "\\u%04x", c);
-        else qkBufByte(b, c);
-    }
-    qkBufByte(b, '"');
-}
-
-static void typeString(const TypeExpr* t, QkBuf* b) {
-    QkBuf s = {0};
-    qkFormatTypeExpr(t, &s);
-    jsonString(b, s.data);
-    qkBufFree(&s);
-}
-
-static const Expr* visible(const Expr* e) {
-    while (e->kind == E_CALL && e->implicit) e = e->args[0];
-    return e;
-}
-
-static void writeInput(Out* o, const Expr* e, QkBuf* b);
-static void writeBlock(Out* o, const Block* bl, QkBuf* b);
-static int writeStmt(Out* o, const Stmt* s);
-
-static void startNode(Out* o, int id, const char* kind) {
-    if (o->nodeCount++) qkBufPuts(&o->nodes, ",\n");
-    qkBufPrintf(&o->nodes, "    {\"id\": %d, \"kind\": ", id);
-    jsonString(&o->nodes, kind);
-}
-
-static void typeField(Out* o, const Type* t) {
-    if (!t || t->kind == TY_ERROR || t->kind == TY_VOID) return;
-    QkBuf s = {0};
-    qkTypeName(t, &s);
-    qkBufPuts(&o->nodes, ", \"type\": ");
-    jsonString(&o->nodes, s.data);
-    qkBufFree(&s);
-}
-
-static void notes(QkBuf* b, const char* leading, const char* trailing, bool blank) {
-    if (leading) {
-        qkBufPuts(b, ", \"comment\": ");
-        jsonString(b, leading);
-    }
-    if (trailing) {
-        qkBufPuts(b, ", \"trailing\": ");
-        jsonString(b, trailing);
-    }
-    if (blank) qkBufPuts(b, ", \"blank\": true");
-}
-
-static void inputs(Out* o, QkBuf* node, Expr* const* list, int n) {
-    QkBuf in = {0};
-    for (int i = 0; i < n; i++) {
-        if (i) qkBufPuts(&in, ", ");
-        writeInput(o, list[i], &in);
-    }
-    qkBufPuts(node, ", \"inputs\": [");
-    qkBufAdd(node, in.data ? in.data : "", in.len);
-    qkBufPuts(node, "]");
-    qkBufFree(&in);
-}
-
-/* An expression as a node; returns its id. Its inputs are written (and numbered) first. */
-static int writeNode(Out* o, const Expr* e) {
-    e = visible(e);
-    int id = o->nextId++;
-    QkBuf node = {0};
-    Expr* pair[2];
-    switch (e->kind) {
-    case E_CALL:
-        qkBufPuts(&node, ", \"fn\": ");
-        jsonString(&node, e->name);
-        if (e->method) qkBufPuts(&node, ", \"method\": true");
-        if (e->argCount && e->argNames && e->argNames[0]) {
-            qkBufPuts(&node, ", \"names\": [");
-            for (int i = 0; i < e->argCount; i++) {
-                if (i) qkBufPuts(&node, ", ");
-                jsonString(&node, e->argNames[i] ? e->argNames[i] : "");
-            }
-            qkBufPuts(&node, "]");
-        }
-        inputs(o, &node, e->args, e->argCount);
-        break;
-    case E_BINARY: case E_RANGE: case E_UNARY:
-        qkBufPuts(&node, ", \"op\": ");
-        jsonString(&node, e->kind == E_UNARY ? (e->op == T_NOT ? "not" : "neg") : qkTokName((TokKind)e->op));
-        pair[0] = e->a;
-        pair[1] = e->b;
-        inputs(o, &node, pair, e->kind == E_UNARY ? 1 : 2);
-        break;
-    case E_FIELD:
-        qkBufPuts(&node, ", \"field\": ");
-        jsonString(&node, e->name);
-        inputs(o, &node, &e->a, 1);
-        break;
-    case E_INDEX:
-        pair[0] = e->a;
-        pair[1] = e->b;
-        inputs(o, &node, pair, 2);
-        break;
-    case E_ARRAY: inputs(o, &node, e->args, e->argCount); break;
-    case E_LAMBDA: {
-        qkBufPuts(&node, ", \"params\": [");
-        for (int i = 0; i < e->paramCount; i++) {
-            int pid = o->nextId++;
-            e->params[i].binding->nodeId = pid;
-            qkBufPrintf(&node, "%s{\"id\": %d, \"name\": ", i ? ", " : "", pid);
-            jsonString(&node, e->params[i].name);
-            qkBufPuts(&node, "}");
-        }
-        qkBufPuts(&node, "]");
-        inputs(o, &node, &e->body, 1);
-        break;
-    }
-    case E_IF:
-        inputs(o, &node, &e->a, 1);
-        qkBufPuts(&node, ", \"then\": ");
-        writeBlock(o, e->thenBlock, &node);
-        if (e->elseExpr && e->elseExpr->kind == E_IF) {
-            qkBufPrintf(&node, ", \"elseIf\": %d", writeNode(o, e->elseExpr));
-        } else if (e->elseExpr) {
-            qkBufPuts(&node, ", \"else\": ");
-            writeBlock(o, e->elseExpr->block, &node);
-        }
-        break;
-    case E_MATCH:
-        inputs(o, &node, &e->a, 1);
-        qkBufPuts(&node, ", \"arms\": [");
-        for (int i = 0; i < e->armCount; i++) {
-            const Arm* a = &e->arms[i];
-            qkBufPuts(&node, i ? ", {\"pattern\": " : "{\"pattern\": ");
-            jsonString(&node, a->pattern ? a->pattern : a->intPattern ? a->intPattern->raw : "_");
-            if (a->comment) {
-                qkBufPuts(&node, ", \"comment\": ");
-                jsonString(&node, a->comment);
-            }
-            if (a->body->kind == E_BLOCK) {
-                qkBufPuts(&node, ", \"block\": ");
-                writeBlock(o, a->body->block, &node);
-            } else {
-                qkBufPuts(&node, ", \"value\": ");
-                writeInput(o, a->body, &node);
-            }
-            qkBufPuts(&node, "}");
-        }
-        qkBufPuts(&node, "]");
-        break;
-    case E_BLOCK:
-        qkBufPuts(&node, ", \"block\": ");
-        writeBlock(o, e->block, &node);
-        break;
-    default: break;
-    }
-    static const char* const kinds[] = {"value", "value", "value", "value", "name", "call", "field", "index", "op",
-                                        "op", "op", "if", "match", "lambda", "array", "block", "case"};
-    startNode(o, id, kinds[e->kind]);
-    typeField(o, e->type);
-    qkBufAdd(&o->nodes, node.data ? node.data : "", node.len);
-    qkBufPuts(&o->nodes, "}");
-    qkBufFree(&node);
-    return id;
-}
-
-static void writeInput(Out* o, const Expr* e, QkBuf* b) {
-    e = visible(e);
-    if (e->kind == E_LAMBDA && e->sugar) e = e->sugar;
-    switch (e->kind) {
-    case E_INT: case E_FLOAT: case E_TEXT: case E_BOOL: {
-        static const char* const of[] = {"Int", "Float", "Text", "Bool"};
-        qkBufPuts(b, "{\"value\": ");
-        jsonString(b, e->kind == E_BOOL ? (e->i ? "true" : "false") : e->raw);
-        qkBufPuts(b, ", \"of\": ");
-        jsonString(b, of[e->kind]);
-        qkBufPuts(b, "}");
-        return;
-    }
-    case E_CASE:
-        qkBufPrintf(b, "{\"case\": \"%s.%s\"}", e->decl->name, e->name);
-        return;
-    case E_NAME:
-        if (e->binding) {
-            qkBufPrintf(b, "{\"node\": %d}", e->binding->nodeId);
-        } else { /* a function given where a lambda goes */
-            qkBufPuts(b, "{\"fn\": ");
-            jsonString(b, e->name);
-            qkBufPuts(b, "}");
-        }
-        return;
-    default:
-        qkBufPrintf(b, "{\"node\": %d}", writeNode(o, e));
-    }
-}
-
-static void writeBlock(Out* o, const Block* bl, QkBuf* b) {
-    int* ids = qkNew(sizeof(int) * (size_t)(bl->count ? bl->count : 1));
-    for (int i = 0; i < bl->count; i++) ids[i] = writeStmt(o, bl->stmts[i]);
-    qkBufPuts(b, "{\"stmts\": [");
-    for (int i = 0; i < bl->count; i++) qkBufPrintf(b, "%s%d", i ? ", " : "", ids[i]);
-    qkBufPuts(b, "]");
-    if (bl->closingComment) {
-        qkBufPuts(b, ", \"closing\": ");
-        jsonString(b, bl->closingComment);
-    }
-    qkBufPuts(b, "}");
-}
-
-static int writeStmt(Out* o, const Stmt* s) {
-    QkBuf node = {0};
-    int id = o->nextId++;
-    const char* kind;
-    switch (s->kind) {
-    case S_EXPR: /* a "do" node holds the statement's place in the order; the expression is its input */
-        kind = "do";
-        inputs(o, &node, &((Stmt*)s)->value, 1);
-        break;
-    case S_LET: case S_VAR:
-        s->binding->nodeId = id;
-        kind = s->kind == S_LET ? "let" : "var";
-        qkBufPuts(&node, ", \"name\": ");
-        jsonString(&node, s->name);
-        qkBufPrintf(&node, ", \"key\": \"%s/%s\"", o->fn, s->name);
-        if (s->typeAnn) {
-            qkBufPuts(&node, ", \"annotation\": ");
-            typeString(s->typeAnn, &node);
-        }
-        inputs(o, &node, &((Stmt*)s)->value, 1);
-        break;
-    case S_ASSIGN: {
-        kind = "set";
-        qkBufPuts(&node, ", \"op\": ");
-        jsonString(&node, qkTokName((TokKind)s->op));
-        Expr* two[2] = {s->target, s->value};
-        inputs(o, &node, two, 2);
-        break;
-    }
-    case S_FOR:
-        kind = "for";
-        s->binding->nodeId = id;
-        qkBufPuts(&node, ", \"name\": ");
-        jsonString(&node, s->name);
-        qkBufPrintf(&node, ", \"key\": \"%s/%s\"", o->fn, s->name);
-        if (s->indexName) {
-            int ix = o->nextId++;
-            s->indexBinding->nodeId = ix;
-            qkBufPrintf(&node, ", \"index\": {\"id\": %d, \"name\": ", ix);
-            jsonString(&node, s->indexName);
-            qkBufPuts(&node, "}");
-        }
-        inputs(o, &node, &((Stmt*)s)->iter, 1);
-        qkBufPuts(&node, ", \"body\": ");
-        writeBlock(o, s->body, &node);
-        break;
-    case S_WHILE:
-        kind = "while";
-        inputs(o, &node, &((Stmt*)s)->value, 1);
-        qkBufPuts(&node, ", \"body\": ");
-        writeBlock(o, s->body, &node);
-        break;
-    case S_RETURN:
-        kind = "return";
-        if (s->value) inputs(o, &node, &((Stmt*)s)->value, 1);
-        break;
-    default: kind = s->kind == S_BREAK ? "break" : "continue";
-    }
-    notes(&node, s->leading, s->trailing, s->blankBefore);
-    startNode(o, id, kind);
-    qkBufAdd(&o->nodes, node.data ? node.data : "", node.len);
-    qkBufPuts(&o->nodes, "}");
-    qkBufFree(&node);
-    return id;
-}
-
-void qkGraphExport(const Program* p, QkBuf* out) {
-    qkBufPuts(out, "{\"quark\": 1, \"decls\": [\n");
-    for (int i = 0; i < p->count; i++) {
-        const Decl* d = p->decls[i];
-        qkBufPuts(out, i ? ",\n  {\"kind\": " : "  {\"kind\": ");
-        jsonString(out, d->kind == D_FN ? "fn" : d->kind == D_TYPE ? "type" : "enum");
-        qkBufPuts(out, ", \"name\": ");
-        jsonString(out, d->name);
-        notes(out, d->leading, d->trailing, false);
-        if (d->kind == D_ENUM) {
-            qkBufPuts(out, ", \"cases\": [");
-            for (int k = 0; k < d->caseCount; k++) {
-                if (k) qkBufPuts(out, ", ");
-                jsonString(out, d->cases[k]);
-            }
-            qkBufPuts(out, "]}");
-            continue;
-        }
-        if (d->kind == D_TYPE) {
-            qkBufPuts(out, ", \"fields\": [");
-            for (int k = 0; k < d->paramCount; k++) {
-                qkBufPuts(out, k ? ", {\"name\": " : "{\"name\": ");
-                jsonString(out, d->params[k].name);
-                qkBufPuts(out, ", \"type\": ");
-                typeString(d->params[k].type, out);
-                qkBufPuts(out, "}");
-            }
-            qkBufPuts(out, "]}");
-            continue;
-        }
-        Out o = {{0}, 1, d->name, 0};
-        qkBufPuts(out, ", \"params\": [");
-        for (int k = 0; k < d->paramCount; k++) {
-            int pid = o.nextId++;
-            d->params[k].binding->nodeId = pid;
-            qkBufPrintf(out, "%s{\"id\": %d, \"name\": ", k ? ", " : "", pid);
-            jsonString(out, d->params[k].name);
-            qkBufPuts(out, ", \"type\": ");
-            typeString(d->params[k].type, out);
-            qkBufPrintf(out, ", \"key\": \"%s/%s\"}", d->name, d->params[k].name);
-        }
-        qkBufPuts(out, "]");
-        if (d->ret) {
-            qkBufPuts(out, ", \"returns\": ");
-            typeString(d->ret, out);
-        }
-        QkBuf body = {0};
-        if (d->body->kind == E_BLOCK) {
-            qkBufPuts(&body, ", \"form\": \"block\", \"body\": ");
-            writeBlock(&o, d->body->block, &body);
-        } else {
-            qkBufPuts(&body, ", \"form\": \"expr\", \"result\": ");
-            writeInput(&o, d->body, &body);
-        }
-        qkBufAdd(out, body.data, body.len);
-        qkBufFree(&body);
-        qkBufPuts(out, ",\n   \"nodes\": [\n");
-        qkBufAdd(out, o.nodes.data ? o.nodes.data : "", o.nodes.len);
-        qkBufPuts(out, "]}");
-        qkBufFree(&o.nodes);
-    }
-    qkBufPuts(out, "]");
-    if (p->closingComment) {
-        qkBufPuts(out, ",\n \"closing\": ");
-        jsonString(out, p->closingComment);
-    }
-    qkBufPuts(out, "}\n");
-}
 
 /* ---- reading JSON -------------------------------------------------------------------------------- */
 
@@ -529,6 +172,453 @@ static const char* jstr(const J* o, const char* key) {
 static int jint(const J* o, const char* key, int fallback) {
     J* v = jget(o, key);
     return v && v->kind == J_NUM ? (int)v->num : fallback;
+}
+
+/* ---- writing ------------------------------------------------------------------------------------- */
+
+typedef struct Out {
+    QkBuf nodes;      /* this function's nodes, written as they are met */
+    int nextId;
+    const char* fn;
+    int nodeCount;
+    const J* layout;  /* {"key": [x, y]} or NULL */
+} Out;
+
+static void jsonString(QkBuf* b, const char* s) {
+    qkBufByte(b, '"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"') qkBufPuts(b, "\\\"");
+        else if (c == '\\') qkBufPuts(b, "\\\\");
+        else if (c == '\n') qkBufPuts(b, "\\n");
+        else if (c == '\t') qkBufPuts(b, "\\t");
+        else if (c < 0x20) qkBufPrintf(b, "\\u%04x", c);
+        else qkBufByte(b, c);
+    }
+    qkBufByte(b, '"');
+}
+
+static void typeString(const TypeExpr* t, QkBuf* b) {
+    QkBuf s = {0};
+    qkFormatTypeExpr(t, &s);
+    jsonString(b, s.data);
+    qkBufFree(&s);
+}
+
+static const Expr* visible(const Expr* e) {
+    while (e->kind == E_CALL && e->implicit) e = e->args[0];
+    return e;
+}
+
+static char* keyJoin(const char* a, const char* sep, const char* b) {
+    QkBuf k = {0};
+    qkBufPrintf(&k, "%s%s%s", a, sep, b);
+    char* s = qkDup(k.data, k.len);
+    qkBufFree(&k);
+    return s;
+}
+
+static char* keyIndex(const char* a, const char* sep, int i) {
+    char n[16];
+    snprintf(n, sizeof n, "%d", i);
+    return keyJoin(a, sep, n);
+}
+
+static void writeInput(Out* o, const Expr* e, QkBuf* b, const char* key);
+static void writeBlock(Out* o, const Block* bl, QkBuf* b, const char* prefix);
+static int writeStmt(Out* o, const Stmt* s, const char* key);
+
+/* Every node: its id, kind, key (stable while the code around it keeps its shape), line and, from the
+ * layout, its position. */
+static void startNode(Out* o, int id, const char* kind, const char* key, int line) {
+    if (o->nodeCount++) qkBufPuts(&o->nodes, ",\n");
+    qkBufPrintf(&o->nodes, "    {\"id\": %d, \"kind\": ", id);
+    jsonString(&o->nodes, kind);
+    qkBufPuts(&o->nodes, ", \"key\": ");
+    jsonString(&o->nodes, key);
+    if (line > 0) qkBufPrintf(&o->nodes, ", \"line\": %d", line);
+    const J* pos = jget(o->layout, key);
+    if (pos && pos->kind == J_ARR && pos->count == 2 && pos->items[0]->kind == J_NUM && pos->items[1]->kind == J_NUM)
+        qkBufPrintf(&o->nodes, ", \"pos\": [%g, %g]", pos->items[0]->num, pos->items[1]->num);
+}
+
+static void typeField(Out* o, const Type* t) {
+    if (!t || t->kind == TY_ERROR || t->kind == TY_VOID) return;
+    QkBuf s = {0};
+    qkTypeName(t, &s);
+    qkBufPuts(&o->nodes, ", \"type\": ");
+    jsonString(&o->nodes, s.data);
+    qkBufFree(&s);
+}
+
+static void notes(QkBuf* b, const char* leading, const char* trailing, bool blank) {
+    if (leading) {
+        qkBufPuts(b, ", \"comment\": ");
+        jsonString(b, leading);
+    }
+    if (trailing) {
+        qkBufPuts(b, ", \"trailing\": ");
+        jsonString(b, trailing);
+    }
+    if (blank) qkBufPuts(b, ", \"blank\": true");
+}
+
+/* inputs: the i-th one's key is key.i */
+static void inputs(Out* o, QkBuf* node, Expr* const* list, int n, const char* key) {
+    QkBuf in = {0};
+    for (int i = 0; i < n; i++) {
+        if (i) qkBufPuts(&in, ", ");
+        writeInput(o, list[i], &in, keyIndex(key, ".", i));
+    }
+    qkBufPuts(node, ", \"inputs\": [");
+    qkBufAdd(node, in.data ? in.data : "", in.len);
+    qkBufPuts(node, "]");
+    qkBufFree(&in);
+}
+
+/* An expression as a node; returns its id. Its inputs are written (and numbered) first. */
+static int writeNode(Out* o, const Expr* e, const char* key) {
+    e = visible(e);
+    int id = o->nextId++;
+    QkBuf node = {0};
+    Expr* pair[2];
+    switch (e->kind) {
+    case E_CALL:
+        qkBufPuts(&node, ", \"fn\": ");
+        jsonString(&node, e->name);
+        if (e->method) qkBufPuts(&node, ", \"method\": true");
+        if (e->argCount && e->argNames && e->argNames[0]) {
+            qkBufPuts(&node, ", \"names\": [");
+            for (int i = 0; i < e->argCount; i++) {
+                if (i) qkBufPuts(&node, ", ");
+                jsonString(&node, e->argNames[i] ? e->argNames[i] : "");
+            }
+            qkBufPuts(&node, "]");
+        }
+        inputs(o, &node, e->args, e->argCount, key);
+        break;
+    case E_BINARY: case E_RANGE: case E_UNARY:
+        qkBufPuts(&node, ", \"op\": ");
+        jsonString(&node, e->kind == E_UNARY ? (e->op == T_NOT ? "not" : "neg") : qkTokName((TokKind)e->op));
+        pair[0] = e->a;
+        pair[1] = e->b;
+        inputs(o, &node, pair, e->kind == E_UNARY ? 1 : 2, key);
+        break;
+    case E_FIELD:
+        qkBufPuts(&node, ", \"field\": ");
+        jsonString(&node, e->name);
+        inputs(o, &node, &((Expr*)e)->a, 1, key);
+        break;
+    case E_INDEX:
+        pair[0] = e->a;
+        pair[1] = e->b;
+        inputs(o, &node, pair, 2, key);
+        break;
+    case E_ARRAY: inputs(o, &node, e->args, e->argCount, key); break;
+    case E_LAMBDA: {
+        qkBufPuts(&node, ", \"params\": [");
+        for (int i = 0; i < e->paramCount; i++) {
+            int pid = o->nextId++;
+            e->params[i].binding->nodeId = pid;
+            qkBufPrintf(&node, "%s{\"id\": %d, \"name\": ", i ? ", " : "", pid);
+            jsonString(&node, e->params[i].name);
+            qkBufPuts(&node, "}");
+        }
+        qkBufPuts(&node, "]");
+        inputs(o, &node, &((Expr*)e)->body, 1, key);
+        break;
+    }
+    case E_IF:
+        inputs(o, &node, &((Expr*)e)->a, 1, key);
+        qkBufPuts(&node, ", \"then\": ");
+        writeBlock(o, e->thenBlock, &node, keyJoin(key, "", "/then"));
+        if (e->elseExpr && e->elseExpr->kind == E_IF) {
+            qkBufPrintf(&node, ", \"elseIf\": %d", writeNode(o, e->elseExpr, keyJoin(key, "", "/else")));
+        } else if (e->elseExpr) {
+            qkBufPuts(&node, ", \"else\": ");
+            writeBlock(o, e->elseExpr->block, &node, keyJoin(key, "", "/else"));
+        }
+        break;
+    case E_MATCH:
+        inputs(o, &node, &((Expr*)e)->a, 1, key);
+        qkBufPuts(&node, ", \"arms\": [");
+        for (int i = 0; i < e->armCount; i++) {
+            const Arm* a = &e->arms[i];
+            char* armKey = keyIndex(key, "/arm", i);
+            qkBufPuts(&node, i ? ", {\"pattern\": " : "{\"pattern\": ");
+            jsonString(&node, a->pattern ? a->pattern : a->intPattern ? a->intPattern->raw : "_");
+            if (a->comment) {
+                qkBufPuts(&node, ", \"comment\": ");
+                jsonString(&node, a->comment);
+            }
+            if (a->body->kind == E_BLOCK) {
+                qkBufPuts(&node, ", \"block\": ");
+                writeBlock(o, a->body->block, &node, armKey);
+            } else {
+                qkBufPuts(&node, ", \"value\": ");
+                writeInput(o, a->body, &node, armKey);
+            }
+            qkBufPuts(&node, "}");
+        }
+        qkBufPuts(&node, "]");
+        break;
+    case E_BLOCK:
+        qkBufPuts(&node, ", \"block\": ");
+        writeBlock(o, e->block, &node, keyJoin(key, "", "/block"));
+        break;
+    default: break;
+    }
+    static const char* const kinds[] = {"value", "value", "value", "value", "name", "call", "field", "index", "op",
+                                        "op", "op", "if", "match", "lambda", "array", "block", "case"};
+    startNode(o, id, kinds[e->kind], key, e->line);
+    typeField(o, e->type);
+    qkBufAdd(&o->nodes, node.data ? node.data : "", node.len);
+    qkBufPuts(&o->nodes, "}");
+    qkBufFree(&node);
+    return id;
+}
+
+static void writeInput(Out* o, const Expr* e, QkBuf* b, const char* key) {
+    e = visible(e);
+    if (e->kind == E_LAMBDA && e->sugar) e = e->sugar;
+    switch (e->kind) {
+    case E_INT: case E_FLOAT: case E_TEXT: case E_BOOL: {
+        static const char* const of[] = {"Int", "Float", "Text", "Bool"};
+        qkBufPuts(b, "{\"value\": ");
+        jsonString(b, e->kind == E_BOOL ? (e->i ? "true" : "false") : e->raw);
+        qkBufPuts(b, ", \"of\": ");
+        jsonString(b, of[e->kind]);
+        qkBufPuts(b, "}");
+        return;
+    }
+    case E_CASE:
+        qkBufPrintf(b, "{\"case\": \"%s.%s\"}", e->decl->name, e->name);
+        return;
+    case E_NAME:
+        if (e->binding) {
+            qkBufPrintf(b, "{\"node\": %d}", e->binding->nodeId);
+        } else { /* a function given where a lambda goes */
+            qkBufPuts(b, "{\"fn\": ");
+            jsonString(b, e->name);
+            qkBufPuts(b, "}");
+        }
+        return;
+    default:
+        qkBufPrintf(b, "{\"node\": %d}", writeNode(o, e, key));
+    }
+}
+
+/* A statement's key: fn/name for the named ones (let, var, for), else its place: prefix/@index. */
+static const char* stmtKey(Out* o, const Stmt* s, const char* prefix, int i) {
+    if (s->kind == S_LET || s->kind == S_VAR || s->kind == S_FOR) return keyJoin(o->fn, "/", s->name);
+    return keyIndex(prefix, "/@", i);
+}
+
+static void writeBlock(Out* o, const Block* bl, QkBuf* b, const char* prefix) {
+    int* ids = qkNew(sizeof(int) * (size_t)(bl->count ? bl->count : 1));
+    for (int i = 0; i < bl->count; i++) ids[i] = writeStmt(o, bl->stmts[i], stmtKey(o, bl->stmts[i], prefix, i));
+    qkBufPuts(b, "{\"stmts\": [");
+    for (int i = 0; i < bl->count; i++) qkBufPrintf(b, "%s%d", i ? ", " : "", ids[i]);
+    qkBufPuts(b, "]");
+    if (bl->closingComment) {
+        qkBufPuts(b, ", \"closing\": ");
+        jsonString(b, bl->closingComment);
+    }
+    qkBufPuts(b, "}");
+}
+
+static int writeStmt(Out* o, const Stmt* s, const char* key) {
+    QkBuf node = {0};
+    int id = o->nextId++;
+    const char* kind;
+    const char* in = key; /* inputs: key.0, key.1... */
+    switch (s->kind) {
+    case S_EXPR: /* a "do" node holds the statement's place in the order; the expression is its input */
+        kind = "do";
+        inputs(o, &node, &((Stmt*)s)->value, 1, in);
+        break;
+    case S_LET: case S_VAR:
+        s->binding->nodeId = id;
+        kind = s->kind == S_LET ? "let" : "var";
+        qkBufPuts(&node, ", \"name\": ");
+        jsonString(&node, s->name);
+        if (s->typeAnn) {
+            qkBufPuts(&node, ", \"annotation\": ");
+            typeString(s->typeAnn, &node);
+        }
+        inputs(o, &node, &((Stmt*)s)->value, 1, in);
+        break;
+    case S_ASSIGN: {
+        kind = "set";
+        qkBufPuts(&node, ", \"op\": ");
+        jsonString(&node, qkTokName((TokKind)s->op));
+        Expr* two[2] = {s->target, s->value};
+        inputs(o, &node, two, 2, in);
+        break;
+    }
+    case S_FOR:
+        kind = "for";
+        s->binding->nodeId = id;
+        qkBufPuts(&node, ", \"name\": ");
+        jsonString(&node, s->name);
+        if (s->indexName) {
+            int ix = o->nextId++;
+            s->indexBinding->nodeId = ix;
+            qkBufPrintf(&node, ", \"index\": {\"id\": %d, \"name\": ", ix);
+            jsonString(&node, s->indexName);
+            qkBufPuts(&node, "}");
+        }
+        inputs(o, &node, &((Stmt*)s)->iter, 1, in);
+        qkBufPuts(&node, ", \"body\": ");
+        writeBlock(o, s->body, &node, key);
+        break;
+    case S_WHILE:
+        kind = "while";
+        inputs(o, &node, &((Stmt*)s)->value, 1, in);
+        qkBufPuts(&node, ", \"body\": ");
+        writeBlock(o, s->body, &node, key);
+        break;
+    case S_RETURN:
+        kind = "return";
+        if (s->value) inputs(o, &node, &((Stmt*)s)->value, 1, in);
+        break;
+    default: kind = s->kind == S_BREAK ? "break" : "continue";
+    }
+    notes(&node, s->leading, s->trailing, s->blankBefore);
+    startNode(o, id, kind, key, s->line);
+    qkBufAdd(&o->nodes, node.data ? node.data : "", node.len);
+    qkBufPuts(&o->nodes, "}");
+    qkBufFree(&node);
+    return id;
+}
+
+static void writeParams(QkBuf* out, const Decl* d, Out* o) {
+    qkBufPuts(out, ", \"params\": [");
+    for (int k = 0; k < d->paramCount; k++) {
+        int pid = o ? o->nextId++ : k + 1;
+        if (d->params[k].binding) d->params[k].binding->nodeId = pid;
+        qkBufPrintf(out, "%s{\"id\": %d, \"name\": ", k ? ", " : "", pid);
+        jsonString(out, d->params[k].name);
+        qkBufPuts(out, ", \"type\": ");
+        typeString(d->params[k].type, out);
+        qkBufPuts(out, ", \"key\": ");
+        jsonString(out, keyJoin(d->name, "/", d->params[k].name));
+        qkBufPuts(out, "}");
+    }
+    qkBufPuts(out, "]");
+    if (d->ret) {
+        qkBufPuts(out, ", \"returns\": ");
+        typeString(d->ret, out);
+    }
+}
+
+void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
+    const J* layout = NULL;
+    if (layoutJson) {
+        JParser jp = {layoutJson, layoutJson + strlen(layoutJson), false};
+        layout = jvalue(&jp);
+        if (jp.failed || layout->kind != J_OBJ) layout = NULL;
+    }
+    qkBufPuts(out, "{\"quark\": 1, \"decls\": [\n");
+    int written = 0;
+    for (int i = 0; i < p->count; i++) {
+        const Decl* d = p->decls[i];
+        if (d->fromPrelude) continue; /* the host's: in the catalog, not in the program */
+        qkBufPuts(out, written++ ? ",\n  {\"kind\": " : "  {\"kind\": ");
+        const char* kind = d->kind == D_FN ? (d->isExtern ? "extern fn" : "fn")
+                           : d->kind == D_TYPE ? (d->isExtern ? "extern type" : "type") : "enum";
+        jsonString(out, kind);
+        qkBufPuts(out, ", \"name\": ");
+        jsonString(out, d->name);
+        notes(out, d->leading, d->trailing, false);
+        if (d->kind == D_ENUM) {
+            qkBufPuts(out, ", \"cases\": [");
+            for (int k = 0; k < d->caseCount; k++) {
+                if (k) qkBufPuts(out, ", ");
+                jsonString(out, d->cases[k]);
+            }
+            qkBufPuts(out, "]}");
+            continue;
+        }
+        if (d->kind == D_TYPE) {
+            if (!d->isExtern) {
+                qkBufPuts(out, ", \"fields\": [");
+                for (int k = 0; k < d->paramCount; k++) {
+                    qkBufPuts(out, k ? ", {\"name\": " : "{\"name\": ");
+                    jsonString(out, d->params[k].name);
+                    qkBufPuts(out, ", \"type\": ");
+                    typeString(d->params[k].type, out);
+                    qkBufPuts(out, "}");
+                }
+                qkBufPuts(out, "]");
+            }
+            qkBufPuts(out, "}");
+            continue;
+        }
+        if (d->isExtern) {
+            writeParams(out, d, NULL);
+            qkBufPuts(out, "}");
+            continue;
+        }
+        Out o = {{0}, 1, d->name, 0, layout};
+        writeParams(out, d, &o);
+        QkBuf body = {0};
+        if (d->body->kind == E_BLOCK) {
+            qkBufPuts(&body, ", \"form\": \"block\", \"body\": ");
+            writeBlock(&o, d->body->block, &body, d->name);
+        } else {
+            qkBufPuts(&body, ", \"form\": \"expr\", \"result\": ");
+            writeInput(&o, d->body, &body, keyJoin(d->name, "", "/="));
+        }
+        qkBufAdd(out, body.data, body.len);
+        qkBufFree(&body);
+        qkBufPuts(out, ",\n   \"nodes\": [\n");
+        qkBufAdd(out, o.nodes.data ? o.nodes.data : "", o.nodes.len);
+        qkBufPuts(out, "]}");
+        qkBufFree(&o.nodes);
+    }
+    qkBufPuts(out, "]");
+    if (p->closingComment) {
+        qkBufPuts(out, ",\n \"closing\": ");
+        jsonString(out, p->closingComment);
+    }
+    qkBufPuts(out, "}\n");
+}
+
+void qkGraphExport(const Program* p, QkBuf* out) { qkGraphExportWith(p, out, NULL); }
+
+/* The key of the statement a line belongs to (the last one starting at or before it, in the function that
+ * holds it): how an error in a graph's text points at a node. */
+static void keyInBlock(Out* o, const Block* bl, const char* prefix, int line, const char** best, int* bestLine) {
+    for (int i = 0; i < bl->count; i++) {
+        const Stmt* s = bl->stmts[i];
+        const char* key = stmtKey(o, s, prefix, i);
+        if (s->line <= line && s->line >= *bestLine) {
+            *best = key;
+            *bestLine = s->line;
+        }
+        if (s->body) keyInBlock(o, s->body, key, line, best, bestLine);
+    }
+}
+
+bool qkKeyAtLine(const Program* p, int line, char* out, size_t size) {
+    const char* best = NULL;
+    int bestLine = 0;
+    for (int i = 0; i < p->count; i++) {
+        const Decl* d = p->decls[i];
+        if (d->fromPrelude || d->line > line) continue;
+        if (d->line >= bestLine) {
+            best = d->name;
+            bestLine = d->line;
+        }
+        if (d->kind == D_FN && d->body && d->body->kind == E_BLOCK) {
+            Out o = {{0}, 1, d->name, 0, NULL};
+            keyInBlock(&o, d->body->block, d->name, line, &best, &bestLine);
+        }
+    }
+    if (!best) return false;
+    snprintf(out, size, "%s", best);
+    return true;
 }
 
 /* ---- graph to syntax tree ------------------------------------------------------------------------ */
@@ -891,6 +981,18 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
             J* cases = jget(dj, "cases");
             for (int k = 0; cases && k < cases->count; k++)
                 if (cases->items[k]->kind == J_STR) QK_PUSH(d->cases, d->caseCount, d->caseCap, cases->items[k]->str);
+        } else if (!strcmp(kind, "extern type")) {
+            d->kind = D_TYPE;
+            d->isExtern = true;
+        } else if (!strcmp(kind, "extern fn")) {
+            d->kind = D_FN;
+            d->isExtern = true;
+            J* params = jget(dj, "params");
+            for (int k = 0; params && k < params->count; k++) {
+                Param prm = {jstr(params->items[k], "name"), parseTypeText(jstr(params->items[k], "type")), 0, 0, NULL};
+                QK_PUSH(d->params, d->paramCount, d->paramCap, prm);
+            }
+            if (jstr(dj, "returns")) d->ret = parseTypeText(jstr(dj, "returns"));
         } else if (!strcmp(kind, "type")) {
             d->kind = D_TYPE;
             J* fields = jget(dj, "fields");

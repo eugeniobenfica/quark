@@ -34,6 +34,16 @@ for f in examples/*.qk; do
 done
 # a standalone executable runs without the compiler's command line
 if "$Q" build tests/run/loops.qk -o "$tmp/loops.exe" 2> /dev/null && "$tmp/loops.exe" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/run/loops.out; then ok; else bad "quark build"; fi
+# embedding: the engine example (host functions, events, hot reload, panics, budget, graphs, catalog)
+H=$(dirname "$Q")/host.exe
+if "$H" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" examples/host/host.out; then ok; else bad "host example"; diff examples/host/host.out "$tmp/out" | head -10; fi
+P="--prelude examples/host/engine.qk"
+"$Q" fmt examples/host/ship.qk > "$tmp/a.qk"
+if cmp -s examples/host/ship.qk "$tmp/a.qk"; then ok; else bad "ship.qk is not in canonical form"; fi
+if "$Q" graph examples/host/ship.qk $P > "$tmp/g.json" && "$Q" text "$tmp/g.json" > "$tmp/b.qk" && cmp -s "$tmp/a.qk" "$tmp/b.qk"; then ok; else bad "ship.qk graph round trip"; fi
+if "$Q" catalog - $P | grep -q '"name": "moveBy", "kind": "extern fn", "host": true'; then ok; else bad "catalog"; fi
+"$Q" fmt examples/host/engine.qk > "$tmp/a.qk"
+if cmp -s examples/host/engine.qk "$tmp/a.qk"; then ok; else bad "engine.qk is not in canonical form"; fi
 rm -rf "$tmp"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

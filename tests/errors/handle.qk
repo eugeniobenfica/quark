@@ -1,0 +1,6 @@
+// error: comes from the host: it is given to the program, never made by it
+extern type Object
+
+fn main() {
+    let o = Object()
+}

@@ -1,7 +1,7 @@
 /* Quark — the formatter: one canonical text for every program. Four spaces, parentheses only where
  * precedence needs them, comments where they were, a method chain with several lambdas one call per line.
  * Node graphs print through it too, so text -> graph -> text gives the same text. */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdio.h>
 
@@ -314,8 +314,14 @@ static void block(const Block* b, QkBuf* out, int indent) {
 
 static void decl(const Decl* d, QkBuf* out) {
     comments(out, d->leading, 0);
+    if (d->kind == D_TYPE && d->isExtern) {
+        qkBufPrintf(out, "extern type %s", d->name);
+        if (d->trailing) qkBufPrintf(out, " // %s", d->trailing);
+        qkBufPuts(out, "\n");
+        return;
+    }
     if (d->kind == D_FN) {
-        qkBufPrintf(out, "fn %s(", d->name);
+        qkBufPrintf(out, "%sfn %s(", d->isExtern ? "extern " : "", d->name);
         for (int i = 0; i < d->paramCount; i++) {
             qkBufPrintf(out, "%s%s: ", i ? ", " : "", d->params[i].name);
             qkFormatTypeExpr(d->params[i].type, out);
@@ -325,7 +331,9 @@ static void decl(const Decl* d, QkBuf* out) {
             qkBufPuts(out, " -> ");
             qkFormatTypeExpr(d->ret, out);
         }
-        if (d->body->kind == E_BLOCK) {
+        if (d->isExtern) {
+            /* the host's: no body */
+        } else if (d->body->kind == E_BLOCK) {
             qkBufPuts(out, " ");
             block(d->body->block, out, 0);
         } else {
@@ -383,22 +391,28 @@ static void decl(const Decl* d, QkBuf* out) {
     qkBufPuts(out, "\n");
 }
 
-static bool oneLine(const Decl* d) {
+static bool oneLine(const Decl* d) { /* its comments aside */
+    Decl bare = *d;
+    bare.leading = NULL;
     QkBuf b = {0};
-    decl(d, &b);
+    decl(&bare, &b);
     bool one = b.len && !memchr(b.data, '\n', b.len - 1);
     qkBufFree(&b);
     return one;
 }
 
+static bool listLike(const Decl* d) { return (d->kind != D_FN || d->isExtern) && oneLine(d); }
+
 void qkFormat(const Program* p, QkBuf* out) {
+    const Decl* before = NULL;
     for (int i = 0; i < p->count; i++) {
-        /* a blank line between declarations, except between one-line types and enums */
+        /* a blank line between declarations, except between one-line ones (types, enums, externs) */
         const Decl* d = p->decls[i];
-        const Decl* before = i ? p->decls[i - 1] : NULL;
-        bool together = before && d->kind != D_FN && before->kind != D_FN && !d->leading && oneLine(before) && oneLine(d);
-        if (i && !together) qkBufPuts(out, "\n");
+        if (d->fromPrelude) continue; /* the host's */
+        bool together = before && !d->leading && listLike(before) && listLike(d);
+        if (before && !together) qkBufPuts(out, "\n");
         decl(d, out);
+        before = d;
     }
     if (p->closingComment) {
         if (p->count) qkBufPuts(out, "\n");

@@ -3,11 +3,11 @@
  *  - code whose result nobody reads is dropped (a loop's index nobody asked for, say);
  *  - an int register set once by a constant becomes an immediate (no register, no instruction);
  *  - a float constant is computed once, at the start, and keeps a register if it is used in loops. */
-#include "quark.h"
+#include "qk.h"
 
 static bool defines(const IrIns* ins) {
     switch (ins->op) {
-    case IR_STORE: case IR_BOUNDS: case IR_LABEL: case IR_JMP: case IR_JZ: case IR_JNZ: case IR_CALL: case IR_RTCALL:
+    case IR_STORE: case IR_BOUNDS: case IR_LABEL: case IR_JMP: case IR_JZ: case IR_JNZ: case IR_CALL: case IR_RTCALL: case IR_HOSTCALL:
     case IR_RET: case IR_FUEL: case IR_NOP:
         return false;
     default:
@@ -230,7 +230,7 @@ static void commonSubexpressions(IrFn* f) {
             else if (ins->a >= 0 && isK[ins->a] && kv[ins->a] == bits) ins->a = ins->b, ins->op = IR_FADD;
         }
         switch (ins->op) {
-        case IR_LABEL: case IR_JMP: case IR_JZ: case IR_JNZ: case IR_CALL: case IR_RTCALL: case IR_RET:
+        case IR_LABEL: case IR_JMP: case IR_JZ: case IR_JNZ: case IR_CALL: case IR_RTCALL: case IR_HOSTCALL: case IR_RET:
             seen = 0; /* a new straight run */
             break;
         default: break;

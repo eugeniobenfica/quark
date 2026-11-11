@@ -1,5 +1,5 @@
 /* Quark — buffers, memory, files and error messages. */
-#include "quark.h"
+#include "qk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,7 +66,11 @@ void qkBufFree(QkBuf* b) {
     b->len = b->cap = 0;
 }
 
-/* A bump allocator: the compiler runs once and exits. */
+/* A bump allocator: everything a compile makes goes at once (qkNewReset), when the machine code is out. */
+typedef struct Chunk {
+    struct Chunk* next;
+} Chunk;
+static Chunk* chunks;
 static char* chunk;
 static size_t chunkLeft;
 
@@ -74,17 +78,30 @@ void* qkNew(size_t bytes) {
     bytes = (bytes + 15) & ~(size_t)15;
     if (bytes > chunkLeft) {
         size_t size = bytes > (1u << 20) ? bytes : (1u << 20);
-        chunk = calloc(1, size);
-        if (!chunk) {
+        Chunk* c = calloc(1, sizeof(Chunk) + 16 + size);
+        if (!c) {
             fputs("quark: out of memory\n", stderr);
             exit(2);
         }
+        c->next = chunks;
+        chunks = c;
+        chunk = (char*)(((uintptr_t)((char*)c + sizeof(Chunk)) + 15) & ~(uintptr_t)15);
         chunkLeft = size;
     }
     void* p = chunk;
     chunk += bytes;
     chunkLeft -= bytes;
     return p;
+}
+
+void qkNewReset(void) {
+    while (chunks) {
+        Chunk* next = chunks->next;
+        free(chunks);
+        chunks = next;
+    }
+    chunk = NULL;
+    chunkLeft = 0;
 }
 
 char* qkDup(const char* s, size_t n) {
@@ -119,9 +136,19 @@ bool qkWriteFile(const char* path, const void* data, size_t len) {
 }
 
 int qkErrorCount;
+void (*qkErrorSink)(const char* path, int line, int col, const char* message);
 
 void qkError(const QkSource* src, int line, int col, const char* fmt, ...) {
     qkErrorCount++;
+    if (qkErrorSink) {
+        char message[320];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(message, sizeof message, fmt, args);
+        va_end(args);
+        qkErrorSink(src && src->path ? src->path : "quark", line, col, message);
+        return;
+    }
     fprintf(stderr, "%s:%d:%d: ", src && src->path ? src->path : "quark", line, col);
     va_list args;
     va_start(args, fmt);

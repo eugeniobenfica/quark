@@ -1,7 +1,7 @@
 /* Quark — the runtime compiled code calls: printing, memory, time, the math library, and stopping with a
  * message. Memory comes from an arena: a program allocates by bumping a pointer and frees everything when it
  * ends (a host would reset the arena after each call). Also the loader that puts machine code in memory. */
-#include "quark.h"
+#include "qk.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -33,21 +33,27 @@ bool qkCpuHasAvx(void) { return false; }
 #endif
 const char* qkRunPath = "program";
 
+char qkPanicText[512];
+void* qkEscapeRsp;
+void (*qkEscapeStub)(void);
+
+/* The message, then: back to the host's call (the trampoline returns 1), or the end of the process. */
 static void rtPanic(int64_t code, int64_t line, int64_t a, int64_t b) {
-    fflush(stdout);
+    char* m = qkPanicText;
+    size_t n = sizeof qkPanicText;
+    long long L = (long long)line, A = (long long)a, B = (long long)b;
     switch (code) {
-    case PANIC_INDEX:
-        fprintf(stderr, "%s:%lld: index %lld is outside the array (its length is %lld)\n", qkRunPath, (long long)line, (long long)a, (long long)b);
-        break;
-    case PANIC_DIVIDE: fprintf(stderr, "%s:%lld: division by zero\n", qkRunPath, (long long)line); break;
-    case PANIC_FUEL: fprintf(stderr, "%s:%lld: the program ran too long (its budget ran out)\n", qkRunPath, (long long)line); break;
-    case PANIC_HISTOGRAM:
-        fprintf(stderr, "%s:%lld: histogram: bin %lld is outside 0..%lld\n", qkRunPath, (long long)line, (long long)a, (long long)b);
-        break;
-    case PANIC_EMPTY: fprintf(stderr, "%s:%lld: min / max of nothing (the list is empty)\n", qkRunPath, (long long)line); break;
-    case PANIC_SIZE: fprintf(stderr, "%s:%lld: an array of %lld elements cannot be made\n", qkRunPath, (long long)line, (long long)a); break;
-    default: fprintf(stderr, "%s:%lld: stopped (%lld)\n", qkRunPath, (long long)line, (long long)code);
+    case PANIC_INDEX: snprintf(m, n, "%s:%lld: index %lld is outside the array (its length is %lld)", qkRunPath, L, A, B); break;
+    case PANIC_DIVIDE: snprintf(m, n, "%s:%lld: division by zero", qkRunPath, L); break;
+    case PANIC_FUEL: snprintf(m, n, "%s:%lld: the program ran too long (its budget ran out)", qkRunPath, L); break;
+    case PANIC_HISTOGRAM: snprintf(m, n, "%s:%lld: histogram: bin %lld is outside 0..%lld", qkRunPath, L, A, B); break;
+    case PANIC_EMPTY: snprintf(m, n, "%s:%lld: min / max of nothing (the list is empty)", qkRunPath, L); break;
+    case PANIC_SIZE: snprintf(m, n, "%s:%lld: an array of %lld elements cannot be made", qkRunPath, L, A); break;
+    default: snprintf(m, n, "%s:%lld: stopped (%lld)", qkRunPath, L, (long long)code);
     }
+    if (qkEscapeRsp && qkEscapeStub) qkEscapeStub(); /* never returns */
+    fflush(stdout);
+    fprintf(stderr, "%s\n", m);
     exit(1);
 }
 
@@ -85,26 +91,51 @@ static void rtPrintEnd(void) { fputc('\n', stdout); }
 
 /* ---- the arena ----------------------------------------------------------------------------------- */
 
-static char* arena;
-static size_t arenaLeft;
+typedef struct ArenaBlock {
+    struct ArenaBlock* next;
+    size_t size, used;
+    char* data; /* 16-aligned */
+} ArenaBlock;
+static ArenaBlock* blocks;  /* the first */
+static ArenaBlock* current; /* where allocation is */
 
 static void* rtAlloc(int64_t count, int64_t bytesEach) {
     if (count < 0 || (count && bytesEach > (INT64_C(1) << 40) / count)) rtPanic(PANIC_SIZE, 0, count, 0);
     size_t bytes = ((size_t)(count * bytesEach) + 15) & ~(size_t)15;
     if (bytes == 0) bytes = 16;
-    if (bytes > arenaLeft) {
-        size_t size = bytes > ((size_t)64 << 20) ? bytes : ((size_t)64 << 20);
-        arena = calloc(1, size);
-        if (!arena) {
-            fprintf(stderr, "%s: out of memory\n", qkRunPath);
-            exit(1);
-        }
-        arenaLeft = size;
+    while (current && current->used + bytes > current->size) {
+        if (!current->next || current->next->size < bytes) break;
+        current = current->next; /* blocks after the current one are empty and zeroed */
     }
-    void* p = arena;
-    arena += bytes;
-    arenaLeft -= bytes;
+    if (!current || current->used + bytes > current->size) {
+        size_t size = bytes > ((size_t)16 << 20) ? bytes : ((size_t)16 << 20);
+        ArenaBlock* blk = calloc(1, sizeof(ArenaBlock) + size + 16);
+        if (!blk) {
+            snprintf(qkPanicText, sizeof qkPanicText, "%s: out of memory", qkRunPath);
+            rtPanic(PANIC_SIZE, 0, count, 0);
+        }
+        blk->size = size;
+        blk->data = (char*)(((uintptr_t)(blk + 1) + 15) & ~(uintptr_t)15);
+        if (current) { /* in after the current block */
+            blk->next = current->next;
+            current->next = blk;
+        } else {
+            blocks = blk;
+        }
+        current = blk;
+    }
+    void* p = current->data + current->used;
+    current->used += bytes;
     return p;
+}
+
+/* Everything the last call allocated goes; the memory stays, zeroed again (allocations are zeroed). */
+void qkArenaReset(void) {
+    for (ArenaBlock* blk = blocks; blk; blk = blk->next) {
+        memset(blk->data, 0, blk->used);
+        blk->used = 0;
+    }
+    current = blocks;
 }
 
 static void* rtGrow(void* ptr, int64_t oldCount, int64_t newCount, int64_t bytesEach) {
@@ -144,6 +175,7 @@ static double rtExp(double x) { return exp(x); }
 static double rtLog(double x) { return log(x); }
 static double rtPow(double x, double y) { return pow(x, y); }
 static void rtFuelOut(int64_t line) { rtPanic(PANIC_FUEL, line, 0, 0); }
+static void rtPrintHandle(const char* name, int64_t len, int64_t v) { printf("%.*s#%lld", (int)len, name, (long long)v); }
 
 const RtFn qkRuntime[RT_COUNT] = {
     [RT_PANIC] = {"panic", (void*)rtPanic, "IIII", 'V'},
@@ -168,27 +200,37 @@ const RtFn qkRuntime[RT_COUNT] = {
     [RT_LOG] = {"log", (void*)rtLog, "F", 'F'},
     [RT_POW] = {"pow", (void*)rtPow, "FF", 'F'},
     [RT_FUEL_OUT] = {"fuelOut", (void*)rtFuelOut, "I", 'V'},
+    [RT_PRINT_HANDLE] = {"printHandle", (void*)rtPrintHandle, "III", 'V'},
 };
 
 /* ---- loading machine code ------------------------------------------------------------------------ */
 
-void (*qkLoad(const uint8_t* code, size_t codeLen, const uint8_t* data, size_t dataLen, const Reloc* relocs,
-              int relocCount, int32_t entry))(void) {
+bool qkLoad(const uint8_t* code, size_t codeLen, const uint8_t* data, size_t dataLen, const Reloc* relocs, int relocCount,
+            int32_t enter, int32_t escape, void* const* hosts, Loaded* out) {
+    memset(out, 0, sizeof *out);
     uint8_t* dataCopy = malloc(dataLen + 16);
-    if (!dataCopy) return NULL;
+    if (!dataCopy) return false;
     memcpy(dataCopy, data, dataLen);
 #ifdef _WIN32
     uint8_t* mem = VirtualAlloc(NULL, codeLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
     uint8_t* mem = mmap(NULL, codeLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) mem = NULL;
 #endif
-    if (!mem) return NULL;
+    if (!mem) {
+        free(dataCopy);
+        return false;
+    }
     memcpy(mem, code, codeLen);
     for (int i = 0; i < relocCount; i++) {
         uint64_t address = 0;
-        if (relocs[i].kind == 0) address = (uint64_t)(uintptr_t)qkRuntime[relocs[i].target].addr;
-        else if (relocs[i].kind == 1) address = (uint64_t)(uintptr_t)(dataCopy + relocs[i].target);
-        else address = (uint64_t)(uintptr_t)&qkFuel;
+        switch (relocs[i].kind) {
+        case RELOC_RUNTIME: address = (uint64_t)(uintptr_t)qkRuntime[relocs[i].target].addr; break;
+        case RELOC_DATA: address = (uint64_t)(uintptr_t)(dataCopy + relocs[i].target); break;
+        case RELOC_FUEL: address = (uint64_t)(uintptr_t)&qkFuel; break;
+        case RELOC_HOST: address = (uint64_t)(uintptr_t)(hosts ? hosts[relocs[i].target] : NULL); break;
+        case RELOC_ESCAPE: address = (uint64_t)(uintptr_t)&qkEscapeRsp; break;
+        }
         memcpy(mem + relocs[i].at, &address, 8);
     }
 #ifdef _WIN32
@@ -198,8 +240,35 @@ void (*qkLoad(const uint8_t* code, size_t codeLen, const uint8_t* data, size_t d
 #else
     mprotect(mem, codeLen, PROT_READ | PROT_EXEC);
 #endif
-    void (*fn)(void);
-    void* at = mem + entry;
-    memcpy(&fn, &at, sizeof fn);
-    return fn;
+    out->code = mem;
+    out->codeLen = codeLen;
+    out->data = dataCopy;
+    void* at = mem + enter;
+    memcpy(&out->enter, &at, sizeof at);
+    at = mem + escape;
+    memcpy(&out->escape, &at, sizeof at);
+    return true;
+}
+
+void qkUnload(Loaded* l) {
+    if (l->code) {
+#ifdef _WIN32
+        VirtualFree(l->code, 0, MEM_RELEASE);
+#else
+        munmap(l->code, l->codeLen);
+#endif
+    }
+    free(l->data);
+    memset(l, 0, sizeof *l);
+}
+
+bool qkRunEntry(const Loaded* l, void* fn, const uint64_t* args, int argCount, uint64_t* results, int resultCount) {
+    if (!qkEscapeRsp) qkArenaReset(); /* the outermost call: what the last one allocated goes */
+    void (*savedStub)(void) = qkEscapeStub;
+    qkEscapeStub = l->escape;
+    qkPanicText[0] = '\0';
+    QkEnter e = {fn, args, argCount, results, resultCount};
+    int64_t stopped = l->enter(&e);
+    qkEscapeStub = savedStub;
+    return stopped == 0;
 }

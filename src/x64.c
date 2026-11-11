@@ -46,6 +46,8 @@ typedef struct Gen {
     int coldCount, coldCap;
     int* fnAt;        /* each function's offset */
     int* uses;        /* how often each virtual register is read */
+    char* loopTop;    /* labels a jump goes back to */
+    bool afterJump;   /* the last instruction was an unconditional jump */
     Fixup* callFixups;
     int callCount, callCap;
 } Gen;
@@ -255,6 +257,21 @@ static void sseWith(Gen* g, int prefix, int op, int xmm, int v) {
     else sseRM(g, prefix, false, op, xmm, RBP, slotDisp(g, v));
 }
 
+/* AVX, scalar double (VEX.F2.0F op): d = a op v, v from its register or its slot. Three-byte VEX. */
+static void vexF2(Gen* g, int op, int d, int a, int v) {
+    int rmReg = inReg(g, v) ? xmmOf(g, v) : RBP;
+    byte(g, 0xC4);
+    byte(g, (((d >> 3) & 1) ^ 1) << 7 | 1 << 6 | (((rmReg >> 3) & 1) ^ 1) << 5 | 0x01); /* R X B, map 0F */
+    byte(g, ((~a) & 15) << 3 | 0x03);                                                  /* W0, vvvv, L0, pp F2 */
+    byte(g, op);
+    if (inReg(g, v)) {
+        byte(g, 0xC0 | (d & 7) << 3 | (rmReg & 7));
+    } else {
+        byte(g, 0x80 | (d & 7) << 3 | RBP);
+        i32(g, slotDisp(g, v));
+    }
+}
+
 /* ---- calls --------------------------------------------------------------------------------------- */
 
 static void callRuntime(Gen* g, RtId id) {
@@ -345,6 +362,160 @@ static Mem memOf(Gen* g, const IrIns* ins) {
     return m;
 }
 
+/* The magic multiplier and shift that divide by d (d >= 2) without a division (Hacker's Delight, 10-1). */
+static void magic(int64_t d, int64_t* m, int* shift) {
+    const uint64_t two63 = UINT64_C(1) << 63;
+    uint64_t ad = (uint64_t)d;
+    uint64_t anc = two63 - 1 - two63 % ad;
+    int p = 63;
+    uint64_t q1 = two63 / anc, r1 = two63 - q1 * anc;
+    uint64_t q2 = two63 / ad, r2 = two63 - q2 * ad;
+    uint64_t delta;
+    do {
+        p++;
+        q1 *= 2;
+        r1 *= 2;
+        if (r1 >= anc) {
+            q1++;
+            r1 -= anc;
+        }
+        q2 *= 2;
+        r2 *= 2;
+        if (r2 >= ad) {
+            q2++;
+            r2 -= ad;
+        }
+        delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+    *m = (int64_t)(q2 + 1);
+    *shift = p - 64;
+}
+
+static void shiftImm(Gen* g, int reg, int digit, int n) { /* shl /4, shr /5, sar /7 */
+    rex(g, true, 0, 0, reg, false);
+    byte(g, 0xC1);
+    byte(g, 0xC0 | digit << 3 | (reg & 7));
+    byte(g, n);
+}
+
+/* x / d and x % d by a positive constant, floored like every Int division: a multiplication by d's magic
+ * number (or a shift and a mask for a power of two) instead of a division that takes 40 cycles or more. */
+static void divideByConstant(Gen* g, const IrIns* ins) {
+    int64_t d = kOf(g, ins->b);
+    bool quotient = ins->op == IR_DIV;
+    loadBits(g, R8, ins->a); /* n */
+    if (d == 1) {
+        if (quotient) movRR(g, RDX, R8);
+        else rr(g, false, OP_XOR, 1, RDX, RDX);
+        storeBits(g, ins->dst, RDX);
+        return;
+    }
+    if ((d & (d - 1)) == 0) {
+        int k = 0;
+        while ((INT64_C(1) << k) < d) k++;
+        movRR(g, RDX, R8);
+        if (quotient) {
+            shiftImm(g, RDX, 7, k); /* sar: rounds down */
+        } else if (fits32(d - 1)) { /* and rdx, d - 1 */
+            rex(g, true, 0, 0, RDX, false);
+            byte(g, 0x81);
+            byte(g, 0xE0 | (RDX & 7));
+            i32(g, (int32_t)(d - 1));
+        } else {
+            movImm(g, R11, d - 1);
+            rr(g, true, (const uint8_t[]){0x23}, 1, RDX, R11);
+        }
+        storeBits(g, ins->dst, RDX);
+        return;
+    }
+    int64_t m;
+    int shift;
+    magic(d, &m, &shift);
+    movImm(g, RAX, m);
+    rex(g, true, 0, 0, R8, false); /* imul r8: rdx:rax = rax * r8 */
+    byte(g, 0xF7);
+    byte(g, 0xE8 | (R8 & 7));
+    if (m < 0) rr(g, true, OP_ADD, 1, RDX, R8);
+    if (shift > 0) shiftImm(g, RDX, 7, shift);
+    movRR(g, RAX, R8); /* + 1 when n < 0: truncated toward zero */
+    shiftImm(g, RAX, 5, 63);
+    rr(g, true, OP_ADD, 1, RDX, RAX);
+    /* r = n - q * d; when r < 0, q - 1 and r + d: rounded down */
+    movRR(g, RCX, RDX);
+    if (fits32(d)) {
+        rex(g, true, RCX, 0, RCX, false);
+        byte(g, 0x69);
+        byte(g, 0xC0 | (RCX & 7) << 3 | (RCX & 7));
+        i32(g, (int32_t)d);
+    } else {
+        movImm(g, R11, d);
+        rr(g, true, OP_IMUL, 2, RCX, R11);
+    }
+    movRR(g, RAX, R8);
+    rr(g, true, OP_SUB, 1, RAX, RCX);
+    movRR(g, RCX, RAX);
+    rr(g, true, OP_TEST, 1, RCX, RCX);
+    int fine = jccShort(g, CC_NS);
+    rex(g, true, 0, 0, RDX, false); /* dec rdx */
+    byte(g, 0xFF);
+    byte(g, 0xC8 | (RDX & 7));
+    if (fits32(d)) {
+        rex(g, true, 0, 0, RCX, false); /* add rcx, d */
+        byte(g, 0x81);
+        byte(g, 0xC0 | (RCX & 7));
+        i32(g, (int32_t)d);
+    } else {
+        movImm(g, R11, d);
+        rr(g, true, OP_ADD, 1, RCX, R11);
+    }
+    land(g, fine);
+    storeBits(g, ins->dst, quotient ? RDX : RCX);
+}
+
+/* x + k, x * 2^n, x * 3, 5, 9 into another register: one lea or shift, no copy first. */
+static bool leaFor(Gen* g, const IrIns* ins) {
+    if (!inReg(g, ins->a) || !isK(g, ins->b) || !inReg(g, ins->dst)) return false;
+    int64_t k = kOf(g, ins->b);
+    int a = gprOf(g, ins->a), d = gprOf(g, ins->dst);
+    static const uint8_t LEA[] = {0x8D};
+    if ((ins->op == IR_ADD || ins->op == IR_SUB) && fits32(k) && fits32(-k)) {
+        Mem m = {a, -1, 1, (int32_t)(ins->op == IR_ADD ? k : -k)};
+        memOp(g, 0, true, LEA, 1, d, m);
+        return true;
+    }
+    if (ins->op != IR_MUL) return false;
+    if (k == 3 || k == 5 || k == 9) {
+        Mem m = {a, a, (int)k - 1, 0};
+        memOp(g, 0, true, LEA, 1, d, m);
+        return true;
+    }
+    if (k > 1 && k < (INT64_C(1) << 31) && (k & (k - 1)) == 0) {
+        int n = 0;
+        while ((INT64_C(1) << n) < k) n++;
+        movRR(g, d, a);
+        rex(g, true, 0, 0, d, false); /* shl d, n */
+        byte(g, 0xC1);
+        byte(g, 0xE0 | (d & 7));
+        byte(g, n);
+        return true;
+    }
+    return false;
+}
+
+/* x = [m]; x = x + k; [m] = x, with x read nowhere else: add qword [m], k */
+static bool addToMemory(Gen* g, const IrIns* ld, const IrIns* add, const IrIns* st) {
+    if (ld->op != IR_LOAD || add->op != IR_ADD || st->op != IR_STORE) return false;
+    int v = ld->dst;
+    if (isFloat(g, v) || add->dst != v || add->a != v || st->dst != v || g->uses[v] != 2) return false;
+    if (!isK(g, add->b) || kOf(g, add->b) < -128 || kOf(g, add->b) > 127) return false;
+    if (st->a != ld->a || st->b != ld->b || st->imm != ld->imm || st->c != ld->c) return false;
+    Mem m = memOf(g, ld);
+    static const uint8_t ADD_IMM8[] = {0x83};
+    memOp(g, 0, true, ADD_IMM8, 1, 0, m); /* /0 */
+    byte(g, (int)(int8_t)kOf(g, add->b));
+    return true;
+}
+
 static void genIns(Gen* g, const IrIns* ins) {
     switch (ins->op) {
     case IR_CONST:
@@ -370,6 +541,7 @@ static void genIns(Gen* g, const IrIns* ins) {
         }
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: {
+        if (leaFor(g, ins)) break;
         const uint8_t* op = ins->op == IR_ADD ? OP_ADD : ins->op == IR_SUB ? OP_SUB : OP_IMUL;
         int opLen = ins->op == IR_MUL ? 2 : 1;
         int d = inReg(g, ins->dst) && (!inReg(g, ins->b) || gprOf(g, ins->b) != gprOf(g, ins->dst)) ? gprOf(g, ins->dst) : RAX;
@@ -379,6 +551,10 @@ static void genIns(Gen* g, const IrIns* ins) {
         break;
     }
     case IR_DIV: case IR_MOD: {
+        if (isK(g, ins->b) && kOf(g, ins->b) >= 1) {
+            divideByConstant(g, ins);
+            break;
+        }
         /* floored: the quotient rounds down, the remainder takes the divisor's sign */
         loadBits(g, RAX, ins->a);
         loadBits(g, RCX, ins->b);
@@ -434,6 +610,14 @@ static void genIns(Gen* g, const IrIns* ins) {
     case IR_FADD: case IR_FSUB: case IR_FMUL: case IR_FDIV: case IR_FMIN: case IR_FMAX: {
         static const int ops[] = {0x58, 0x5C, 0x59, 0x5E};
         int op = ins->op == IR_FMIN ? 0x5D : ins->op == IR_FMAX ? 0x5F : ops[ins->op - IR_FADD];
+        if (qkUseAvx) { /* three operands: no copy of the first one */
+            int x = inReg(g, ins->a) ? xmmOf(g, ins->a) : 0;
+            if (x == 0) loadF(g, 0, ins->a);
+            int d = inReg(g, ins->dst) ? xmmOf(g, ins->dst) : 0;
+            vexF2(g, op, d, x, ins->b);
+            if (d == 0) storeF(g, ins->dst, 0);
+            break;
+        }
         int d = inReg(g, ins->dst) && (!inReg(g, ins->b) || xmmOf(g, ins->b) != xmmOf(g, ins->dst)) ? xmmOf(g, ins->dst) : 0;
         loadF(g, d, ins->a);
         sseWith(g, 0xF2, op, d, ins->b);
@@ -496,29 +680,36 @@ static void genIns(Gen* g, const IrIns* ins) {
         movzxEaxAl(g);
         storeBits(g, ins->dst, RAX);
         break;
-    case IR_I2F:
-        loadBits(g, RAX, ins->a);
-        byte(g, 0x0F); /* xorps xmm0, xmm0: cvtsi2sd keeps the upper half, a false dependency on the last value */
-        byte(g, 0x57);
-        byte(g, 0xC0);
-        sseRR(g, 0xF2, true, 0x2A, 0, RAX); /* cvtsi2sd xmm0, rax */
-        storeF(g, ins->dst, 0);
+    case IR_I2F: { /* straight into the destination register when it has one */
+        int src = inReg(g, ins->a) ? gprOf(g, ins->a) : RAX;
+        if (src == RAX) loadBits(g, RAX, ins->a);
+        int x = inReg(g, ins->dst) ? xmmOf(g, ins->dst) : 0;
+        sseRR(g, 0, false, 0x57, x, x); /* xorps x, x: cvtsi2sd keeps the upper half, a false dependency */
+        sseRR(g, 0xF2, true, 0x2A, x, src); /* cvtsi2sd x, src */
+        if (x == 0) storeF(g, ins->dst, 0);
         break;
-    case IR_F2I:
-        loadF(g, 0, ins->a);
-        sseRR(g, 0xF2, true, 0x2C, RAX, 0); /* cvttsd2si rax, xmm0 */
-        storeBits(g, ins->dst, RAX);
+    }
+    case IR_F2I: {
+        int x = inReg(g, ins->a) ? xmmOf(g, ins->a) : 0;
+        if (x == 0) loadF(g, 0, ins->a);
+        int d = inReg(g, ins->dst) ? gprOf(g, ins->dst) : RAX;
+        sseRR(g, 0xF2, true, 0x2C, d, x); /* cvttsd2si d, x */
+        if (d == RAX) storeBits(g, ins->dst, RAX);
         break;
+    }
     case IR_ROUND: {
-        loadF(g, 0, ins->a);
+        int x = inReg(g, ins->a) ? xmmOf(g, ins->a) : 0;
+        if (x == 0) loadF(g, 0, ins->a);
+        int d = inReg(g, ins->dst) ? xmmOf(g, ins->dst) : 0;
         int mode = ins->imm == 1 ? 9 : ins->imm == 2 ? 10 : 8; /* floor, ceil, nearest; no precision exception */
-        byte(g, 0x66); /* roundsd xmm0, xmm0, mode */
+        byte(g, 0x66); /* roundsd d, x, mode */
+        rex(g, false, d, 0, x, false);
         byte(g, 0x0F);
         byte(g, 0x3A);
         byte(g, 0x0B);
-        byte(g, 0xC0);
+        byte(g, 0xC0 | (d & 7) << 3 | (x & 7));
         byte(g, mode);
-        storeF(g, ins->dst, 0);
+        if (d == 0) storeF(g, ins->dst, 0);
         break;
     }
     case IR_LOAD: case IR_STORE: {
@@ -545,7 +736,12 @@ static void genIns(Gen* g, const IrIns* ins) {
         coldJump(g, CC_AE, (int)ins->imm, ins->line, ins->a, ins->b);
         break;
     }
-    case IR_LABEL: g->labelAt[ins->imm] = here(g); break;
+    case IR_LABEL:
+        /* a loop's top, reached only by jumps: pad it to 16 bytes (the padding is never run) */
+        if (g->loopTop[ins->imm] && g->afterJump)
+            while (g->b->len % 16) byte(g, 0xCC);
+        g->labelAt[ins->imm] = here(g);
+        break;
     case IR_JMP: jmpLabel(g, (int)ins->imm); break;
     case IR_JZ: case IR_JNZ:
         if (inReg(g, ins->a) && !isFloat(g, ins->a)) {
@@ -715,35 +911,49 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut, int* gprUsed, int* xm
         }
         order[j + 1] = v;
     }
-    static const int gprs[] = {RBX, RSI, RDI, R12, R13, R14, R15};
-    int owner[2][10];
+    /* a value no call crosses takes a volatile register first (nothing to save), the others a callee-saved one */
+    static const int regList[2][15] = {{R10, RBX, RSI, RDI, R12, R13, R14, R15},
+                                       {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
+    static const int volatileCount[2] = {1, 5};
+    static const int poolSize[2] = {8, 15};
+    bool* crosses = qkNew((size_t)n);
+    for (int k = 0; k < f->count; k++) {
+        if (f->code[k].op != IR_CALL && f->code[k].op != IR_RTCALL) continue;
+        for (int v = 0; v < f->vregCount; v++)
+            if (first[v] < k && last[v] >= k) crosses[v] = true;
+    }
+    int owner[2][15];
     for (int c = 0; c < 2; c++)
-        for (int r = 0; r < 10; r++) owner[c][r] = -1;
-    int pool[2] = {7, 10};
+        for (int r = 0; r < 15; r++) owner[c][r] = -1;
     *gprUsed = *xmmUsed = 0;
     for (int i = 0; i < count; i++) {
         int v = order[i];
         int c = f->kinds[v] == 'F' ? 1 : 0;
+        int from = crosses[v] ? volatileCount[c] : 0;
         int pick = -1;
-        for (int r = 0; r < pool[c]; r++) {
+        for (int r = 0; r < poolSize[c]; r++) {
             int o = owner[c][r];
             if (o >= 0 && last[o] < first[v]) owner[c][r] = o = -1; /* expired */
-            if (o < 0 && pick < 0) pick = r;
+            if (o < 0 && pick < 0 && r >= from) pick = r;
         }
         if (pick < 0) { /* all taken: the lightest gives way, if lighter than this one */
             int lightest = -1;
-            for (int r = 0; r < pool[c]; r++)
+            for (int r = from; r < poolSize[c]; r++)
                 if (lightest < 0 || f->weight[owner[c][r]] < f->weight[owner[c][lightest]]) lightest = r;
-            if (f->weight[owner[c][lightest]] < f->weight[v]) {
+            if (lightest >= 0 && f->weight[owner[c][lightest]] < f->weight[v]) {
                 g->home[owner[c][lightest]] = INT32_MIN;
                 pick = lightest;
             }
         }
         if (pick < 0) continue;
         owner[c][pick] = v;
-        g->home[v] = c ? 16 + 6 + pick : gprs[pick];
-        if (c && pick + 1 > *xmmUsed) *xmmUsed = pick + 1;
-        if (!c && pick + 1 > *gprUsed) *gprUsed = pick + 1;
+        int reg = regList[c][pick];
+        g->home[v] = c ? 16 + reg : reg;
+        if (pick >= volatileCount[c]) {
+            int saved = c ? reg - 6 + 1 : pick - volatileCount[c] + 1;
+            if (c && saved > *xmmUsed) *xmmUsed = saved;
+            if (!c && saved > *gprUsed) *gprUsed = saved;
+        }
     }
     int slots = 0;
     for (int v = 0; v < f->vregCount; v++)
@@ -795,6 +1005,15 @@ static void genFn(Gen* g, const IrFn* f) {
         storeBits(g, f->params[i], RAX);
     }
     g->uses = qkNew(sizeof(int) * (size_t)(f->vregCount ? f->vregCount : 1));
+    g->loopTop = qkNew((size_t)f->labelCount + 1);
+    {
+        int* placed = qkNew(sizeof(int) * (size_t)(f->labelCount + 1));
+        for (int k = 0; k < f->count; k++) {
+            const IrIns* ins = &f->code[k];
+            if (ins->op == IR_LABEL) placed[ins->imm] = k + 1;
+            else if ((ins->op == IR_JMP || ins->op == IR_JZ || ins->op == IR_JNZ) && placed[ins->imm]) g->loopTop[ins->imm] = 1;
+        }
+    }
     for (int k = 0; k < f->count; k++) {
         const IrIns* ins = &f->code[k];
         if (ins->op == IR_LABEL || ins->op == IR_JMP) continue;
@@ -805,12 +1024,21 @@ static void genFn(Gen* g, const IrFn* f) {
         }
         for (int i = 0; i < ins->argCount; i++) g->uses[ins->args[i]]++;
     }
+    g->afterJump = false;
     for (int k = 0; k < f->count; k++) {
         if (k + 1 < f->count && fusedBranch(g, &f->code[k], &f->code[k + 1])) {
             k++;
+            g->afterJump = false;
+            continue;
+        }
+        if (k + 2 < f->count && addToMemory(g, &f->code[k], &f->code[k + 1], &f->code[k + 2])) {
+            k += 2;
+            g->afterJump = false;
             continue;
         }
         genIns(g, &f->code[k]);
+        int op = f->code[k].op;
+        if (op != IR_LABEL) g->afterJump = op == IR_JMP || op == IR_RET;
     }
 
     /* epilogue */

@@ -370,6 +370,8 @@ typedef enum RtId {
 
 extern const RtFn qkRuntime[RT_COUNT];
 extern int64_t qkFuel;
+extern bool qkUseAvx;      /* the code generator may use AVX (three-operand float instructions) */
+bool qkCpuHasAvx(void);
 extern const char* qkRunPath; /* for messages */
 
 enum { PANIC_INDEX = 1, PANIC_DIVIDE = 2, PANIC_FUEL = 3, PANIC_HISTOGRAM = 4, PANIC_EMPTY = 5, PANIC_SIZE = 6 };

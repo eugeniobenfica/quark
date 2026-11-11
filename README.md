@@ -40,26 +40,46 @@ connected to Montage, Depict or Artifice.
 ## Speed
 
 Each benchmark runs the same work in Quark, in C compiled with `gcc -O2`, and in Lua 5.4 (the version
-Montage embeds). Measured on Windows x64, best of three:
+Montage embeds). Measured on Windows x64, best of five:
 
 | | C (gcc -O2) | **Quark** | Lua 5.4 |
 | --- | --- | --- | --- |
-| Scopes: four histograms of a 384 × 216 frame, 200 times ([scopes.qk](bench/scopes.qk)) | 29 ms | **39 ms** | 915 ms |
-| Mandelbrot, 1000 × 1000, 100 steps ([mandelbrot.qk](bench/mandelbrot.qk)) | 32 ms | **38 ms** | 256 ms |
+| Scopes: four histograms of a 384 × 216 frame, 200 times ([scopes.qk](bench/scopes.qk)) | 28.6 ms | **29.6 ms** | 915 ms |
+| Mandelbrot, 1000 × 1000, 100 steps ([mandelbrot.qk](bench/mandelbrot.qk)) | 32.3 ms | **35 ms** | 256 ms |
 
-Quark is 1.2–1.4× the time of optimized C and 7–23× faster than Lua 5.4. It also checks every
-array index, which the C code does not. Compiling a program takes about 0.2 ms.
+Quark is within 3–8% of optimized C and 7–30× faster than Lua 5.4. It also checks every array
+index and rounds integer division down, which the C code does not. Compiling a program takes
+about 0.2 ms.
 
 Where the speed comes from:
 
-- Loops are fused, and lambdas and one-line functions are inlined.
-- A linear-scan register allocator weighs loops more.
-- Integer constants become immediates and float constants are hoisted.
-- A comparison followed by a jump becomes one compare-and-branch.
-- Error paths (bounds, division by zero, budget) sit out of line.
+- **Loops fuse.** `map` / `filter` / `histogram` / `fold` become one machine loop with the test at
+  the bottom, and loop tops are aligned.
+- **Small functions are inlined**, block bodies with `return`s included. Lambdas always are.
+- **Registers.** A linear-scan allocator weighs loops more. Values that no call crosses go to
+  volatile registers, so nothing is saved for them. Records and vectors live in registers.
+- **The optimizer:**
+  - constants are folded;
+  - common subexpressions are computed once (`p * 3` for the three loads of a pixel);
+  - copies are folded into the instruction that computes them;
+  - unused code is dropped;
+  - float constants are hoisted and int constants become immediates.
+- **Instruction choice:**
+  - division by a constant becomes a multiplication by a magic number;
+  - `x / d` and `x % d` share one;
+  - `x * 3` becomes one `lea`, and `x * 2.0` becomes `x + x`;
+  - `counts[k] += 1` becomes one `add [mem], 1`;
+  - a compare and its branch become one instruction pair;
+  - conversions go straight to their register, without the false dependency of `cvtsi2sd`;
+  - three-operand AVX is used when the processor has it (`--no-avx` for one that does not).
+- **Error paths** (bounds, division by zero, budget) sit out of line, so loops fall through.
 
-Next steps for speed: a smarter allocator (splitting), unboxed small element types, SIMD, and threads
-for `map` and `histogram`.
+Next steps for speed:
+
+- range analysis, to drop bounds checks and sign fixes proven unneeded;
+- unboxed small element types (`[Byte]`, `[Float32]`);
+- SIMD for `map`;
+- threads for `map` and `histogram`.
 
 ## Build
 
@@ -79,14 +99,14 @@ tests/run.sh          # programs, errors, panics, canonical text, graph round tr
 | `src/parser.c` | tokens → syntax tree, comments attached |
 | `src/check.c` | types (inferred), conversions, which loops fuse |
 | `src/lower.c` | tree → register IR: fused loops, inlining, values as 8-byte slots |
-| `src/opt.c` | copies folded, dead code dropped, constants as immediates |
-| `src/x64.c` | IR → x86-64 bytes: linear scan, instruction encoding, no assembler |
+| `src/opt.c` | constants folded, common subexpressions, shared divisions, copies folded, dead code dropped |
+| `src/x64.c` | IR → x86-64 bytes: linear scan, SSE / AVX encoding, magic division, no assembler |
 | `src/runtime.c` | what compiled code calls: print, arena memory, math, panics; the loader |
 | `src/format.c` | the canonical text |
 | `src/graph.c` | node graph (JSON) out and in |
 | `src/main.c` | the command line; executables carry their machine code at their end |
 
-About 6,900 lines. Today the backend targets x86-64 Windows. System V (Linux, macOS) and ARM64
+About 7,400 lines. Today the backend targets x86-64 Windows. System V (Linux, macOS) and ARM64
 backends come next. The IR is shared, so only `x64.c`'s calling convention and a second encoder
 differ.
 

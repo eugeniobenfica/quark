@@ -1,0 +1,22 @@
+// Division by a constant becomes a multiplication: it must agree with a real division everywhere.
+fn main() {
+    var divisor = 0
+    for d in [7] {
+        divisor = d
+    }
+    var wrong = 0
+    for n in -100_000..100_000 {
+        let big = n * 92_233_720_368_547
+        if n / 7 != n / divisor or n % 7 != n % divisor or big / 7 != big / divisor or big % 7 != big % divisor {
+            wrong += 1
+        }
+        if n / 1000 * 1000 + n % 1000 != n or n % 1000 < 0 {
+            wrong += 1
+        }
+        if n / 256 != n / (divisor * 0 + 256) or n % 256 != n % (divisor * 0 + 256) {
+            wrong += 1
+        }
+    }
+    print("wrong", wrong)
+    print(-7 / 7, -8 / 7, 13 % 7, -13 % 7, -13 / 4, -13 % 4, 9223372036854775807 / 10, -9223372036854775807 / 10)
+}

@@ -30,10 +30,15 @@ struct Lower {
     int preA, preB;
     Expr* preArray;   /* an array already in registers */
     Val preArrayVal;
-    Decl* inlining[8]; /* functions being inlined, innermost last */
+    struct InlineFrame {
+        Decl* d;
+        int end;    /* where its returns jump */
+        Val result; /* where they leave their value */
+    } inlining[8];  /* functions being inlined, innermost last */
     Decl* current;     /* the function being lowered */
     int inlineDepth;
 };
+typedef struct InlineFrame InlineFrame;
 
 /* ---- emitting ------------------------------------------------------------------------------------ */
 
@@ -848,6 +853,26 @@ static Val lowerBuiltin(Lower* L, Expr* e) {
     return (Val){0, NULL};
 }
 
+/* How big a function's body is, in nodes: small ones are inlined. */
+static int blockSize(const Block* b);
+static int exprSize(const Expr* e) {
+    if (!e) return 0;
+    int n = 1 + exprSize(e->a) + exprSize(e->b) + exprSize(e->body) + exprSize(e->elseExpr);
+    for (int i = 0; i < e->argCount; i++) n += exprSize(e->args[i]);
+    for (int i = 0; i < e->armCount; i++) n += exprSize(e->arms[i].body);
+    if (e->thenBlock) n += blockSize(e->thenBlock);
+    if (e->block) n += blockSize(e->block);
+    return n;
+}
+static int blockSize(const Block* b) {
+    int n = 0;
+    for (int i = 0; i < b->count; i++) {
+        const Stmt* s = b->stmts[i];
+        n += 1 + exprSize(s->value) + exprSize(s->target) + exprSize(s->iter) + (s->body ? blockSize(s->body) : 0);
+    }
+    return n;
+}
+
 static Val lowerCall(Lower* L, Expr* e) {
     if (e->builtin) return lowerBuiltin(L, e);
     Decl* d = e->decl;
@@ -876,18 +901,27 @@ static Val lowerCall(Lower* L, Expr* e) {
         args[i] = lowerExpr(L, e->args[i]);
         total += args[i].n;
     }
-    /* a function written as one expression (fn f(x: T) = ...) is inlined: no call at all. Parameters never
-     * change, so they can be the arguments' own registers. Not into itself (recursion stays a call). */
+    /* a small function is inlined: no call at all. Parameters never change, so they can be the arguments' own
+     * registers; a return becomes a jump to the end. Not into itself (recursion stays a call). */
     bool inside = false;
-    for (int i = 0; i < L->inlineDepth; i++) inside |= L->inlining[i] == d;
-    if (d->body->kind != E_BLOCK && !inside && L->inlineDepth < 8 && d != L->current) {
+    for (int i = 0; i < L->inlineDepth; i++) inside |= L->inlining[i].d == d;
+    if (!inside && L->inlineDepth < 8 && d != L->current && exprSize(d->body) <= 120) {
         int** saved = qkNew(sizeof(int*) * (size_t)(d->paramCount ? d->paramCount : 1));
         for (int i = 0; i < d->paramCount; i++) {
             saved[i] = d->params[i].binding->regs;
             d->params[i].binding->regs = args[i].r;
         }
-        L->inlining[L->inlineDepth++] = d;
-        Val r = lowerStored(L, d->body);
+        InlineFrame* fr = &L->inlining[L->inlineDepth++];
+        fr->d = d;
+        fr->end = label(L);
+        fr->result = valOf(L, d->retType);
+        int savedBreak = L->userBreak, savedContinue = L->userContinue;
+        Val v = d->body->kind == E_BLOCK ? lowerBlock(L, d->body->block, d->retType) : lowerStored(L, d->body);
+        if (v.n) movVal(L, fr->result, v);
+        place(L, fr->end);
+        Val r = fr->result;
+        L->userBreak = savedBreak;
+        L->userContinue = savedContinue;
         L->inlineDepth--;
         for (int i = 0; i < d->paramCount; i++) d->params[i].binding->regs = saved[i];
         return r;
@@ -1211,25 +1245,32 @@ static void lowerStmt(Lower* L, Stmt* s) {
         forEach(L, s->iter, forSink, &f);
         break;
     }
-    case S_WHILE: {
-        int top = label(L), done = label(L);
+    case S_WHILE: { /* the test at the bottom: one jump per turn */
+        int top = label(L), test = label(L), done = label(L);
         L->depth++;
+        jmp(L, test);
         place(L, top);
         fuel(L, s->line);
-        jz(L, lowerExpr(L, s->value).r[0], done);
         int savedBreak = L->userBreak, savedContinue = L->userContinue;
         L->userBreak = done;
-        L->userContinue = top;
+        L->userContinue = test;
         lowerBlock(L, s->body, &qkTypeVoid);
         L->userBreak = savedBreak;
         L->userContinue = savedContinue;
-        jmp(L, top);
+        place(L, test);
+        jnz(L, lowerExpr(L, s->value).r[0], top);
         L->depth--;
         place(L, done);
         break;
     }
     case S_RETURN: {
         Val v = s->value ? lowerStored(L, s->value) : (Val){0, NULL};
+        if (L->inlineDepth) { /* inside an inlined function: to its end */
+            InlineFrame* fr = &L->inlining[L->inlineDepth - 1];
+            if (v.n) movVal(L, fr->result, v);
+            jmp(L, fr->end);
+            break;
+        }
         IrIns* ins = emit(L, IR_RET, -1, -1, -1);
         ins->args = v.r;
         ins->argCount = v.n;

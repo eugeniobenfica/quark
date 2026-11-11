@@ -13,6 +13,9 @@ bad() { fail=$((fail + 1)); echo "FAIL $1"; }
 for f in tests/run/*.qk; do
     if "$Q" run "$f" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" "${f%.qk}.out"; then ok; else bad "$f"; diff "${f%.qk}.out" "$tmp/out" | head -5; fi
 done
+for f in tests/run/*.qk; do # the same programs without AVX (SSE2 only)
+    if "$Q" run "$f" --no-avx > "$tmp/out" 2>&1 && cmp -s "$tmp/out" "${f%.qk}.out"; then ok; else bad "$f --no-avx"; fi
+done
 for f in tests/errors/*.qk; do
     want=$(head -1 "$f" | sed 's|^// error: ||')
     if "$Q" check "$f" > "$tmp/out" 2>&1; then bad "$f (no error)"; elif grep -qF -- "$want" "$tmp/out"; then ok; else bad "$f"; cat "$tmp/out"; fi

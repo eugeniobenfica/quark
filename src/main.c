@@ -1,7 +1,8 @@
 /* Quark — the command line.
  *
  *   quark run   file.qk [--fuel N] [--time]   compile to machine code in memory and run it
- *   quark build file.qk [-o file.exe]         a standalone executable (this program + the machine code)
+ *   quark build file.qk [-o file.exe]         a standalone executable (this program + the machine code);
+ *                                             --no-avx for processors without AVX
  *   quark check file.qk                       only the errors
  *   quark fmt   file.qk [--write]             the canonical text
  *   quark graph file.qk                       the node graph, as JSON
@@ -28,6 +29,7 @@ typedef struct Trailer {
     uint64_t codeLen, dataLen, relocCount;
     int64_t entry;
     int64_t fuel;
+    int64_t features; /* 1: AVX */
     uint64_t payloadSize;
 } Trailer;
 
@@ -75,6 +77,10 @@ static int runPayload(const char* self) {
     const uint8_t* data = code + t.codeLen;
     const Reloc* relocs = (const Reloc*)(data + t.dataLen);
     if (t.fuel > 0) qkFuel = t.fuel;
+    if ((t.features & 1) && !qkCpuHasAvx()) {
+        fputs("this program was built for processors with AVX, and this one has none\n", stderr);
+        return 1;
+    }
     void (*entry)(void) = qkLoad(code, t.codeLen, data, t.dataLen, relocs, (int)t.relocCount, (int32_t)t.entry);
     if (!entry) return 1;
     entry();
@@ -128,12 +134,13 @@ static int realMain(int argc, char** argv) {
     const char* cmd = argv[1];
     const char* path = argv[2];
     int64_t fuel = 0;
-    bool timed = false, write = false;
+    bool timed = false, write = false, noAvx = false;
     const char* outPath = NULL;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--fuel") && i + 1 < argc) fuel = strtoll(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--time")) timed = true;
         else if (!strcmp(argv[i], "--write")) write = true;
+        else if (!strcmp(argv[i], "--no-avx")) noAvx = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outPath = argv[++i];
         else {
             fprintf(stderr, "quark: unknown option %s\n", argv[i]);
@@ -141,6 +148,7 @@ static int realMain(int argc, char** argv) {
         }
     }
     qkRunPath = path;
+    qkUseAvx = !noAvx && qkCpuHasAvx();
 
     if (!strcmp(cmd, "run")) {
         MachineCode mc;
@@ -189,6 +197,7 @@ static int realMain(int argc, char** argv) {
         t.relocCount = (uint64_t)mc.relocCount;
         t.entry = mc.entry;
         t.fuel = fuel;
+        t.features = qkUseAvx ? 1 : 0;
         t.payloadSize = out.len - start;
         qkBufAdd(&out, &t, sizeof t);
         char defaultOut[1024];

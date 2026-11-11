@@ -16,6 +16,21 @@
 #endif
 
 int64_t qkFuel = INT64_MAX;
+bool qkUseAvx;
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(_M_X64))
+#include <cpuid.h>
+bool qkCpuHasAvx(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return false;
+    if (!(c & (1u << 27)) || !(c & (1u << 28))) return false; /* OSXSAVE and AVX */
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6; /* the system saves the AVX registers */
+}
+#else
+bool qkCpuHasAvx(void) { return false; }
+#endif
 const char* qkRunPath = "program";
 
 static void rtPanic(int64_t code, int64_t line, int64_t a, int64_t b) {

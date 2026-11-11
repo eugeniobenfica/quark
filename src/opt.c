@@ -58,7 +58,237 @@ static void recount(IrFn* f, Counts* c) {
     for (int k = 0; k < f->count; k++) countIns(c, &f->code[k], 1);
 }
 
+/* ---- common subexpressions ----------------------------------------------------------------------- */
+
+typedef struct Seen {
+    uint8_t op, cond, kind;
+    int64_t a, b;   /* an operand: a register's number and version, or a constant's value */
+    bool aK, bK;
+    int va, vb;
+    int64_t imm;
+    int c;
+    int dst;
+} Seen;
+
+static bool commutative(int op) {
+    return op == IR_ADD || op == IR_MUL || op == IR_FADD || op == IR_FMUL || op == IR_FMIN || op == IR_FMAX;
+}
+
+static int resolve(const int* rename, int v) {
+    while (v >= 0 && rename[v] >= 0) v = rename[v];
+    return v;
+}
+
+static void renameOperands(IrIns* ins, const int* rename) {
+    if (ins->op == IR_STORE) ins->dst = resolve(rename, ins->dst);
+    if (ins->op != IR_CONST) {
+        ins->a = resolve(rename, ins->a);
+        ins->b = resolve(rename, ins->b);
+    }
+    for (int i = 0; i < ins->argCount; i++) ins->args[i] = resolve(rename, ins->args[i]);
+}
+
+/* In a straight run of code, the same pure computation on the same values is done once (p * 3 for three
+ * loads of one pixel, say). Constants count by value, and a float constant is one register for the whole
+ * function. Only registers set once are merged. */
+static int addReg(IrFn* f, char kind) {
+    if (f->vregCount == f->vregCap) {
+        int cap = f->vregCap ? f->vregCap * 2 : 64;
+        char* kinds = qkNew((size_t)cap);
+        double* weight = qkNew(sizeof(double) * (size_t)cap);
+        memcpy(kinds, f->kinds, (size_t)f->vregCount);
+        memcpy(weight, f->weight, sizeof(double) * (size_t)f->vregCount);
+        f->kinds = kinds;
+        f->weight = weight;
+        f->vregCap = cap;
+    }
+    f->kinds[f->vregCount] = kind;
+    return f->vregCount++;
+}
+
+/* x % d by a constant (not a power of two) is x - x / d * d: then x / d nearby is shared, one multiplication
+ * by d's magic number for both, as pixel % width and pixel / width are. */
+static void remainderFromQuotient(IrFn* f) {
+    int n = f->vregCount ? f->vregCount : 1;
+    int* defs = qkNew(sizeof(int) * (size_t)n);
+    int64_t* kv = qkNew(sizeof(int64_t) * (size_t)n);
+    for (int k = 0; k < f->count; k++) {
+        const IrIns* ins = &f->code[k];
+        if (defines(ins)) defs[ins->dst]++;
+        for (int i = 0; i < ins->retCount; i++) defs[ins->rets[i]]++;
+    }
+    for (int k = 0; k < f->paramCount; k++) defs[f->params[k]]++;
+    int found = 0;
+    for (int k = 0; k < f->count; k++) {
+        const IrIns* ins = &f->code[k];
+        if (ins->op == IR_CONST && ins->c != 1 && f->kinds[ins->dst] == 'I' && defs[ins->dst] == 1) kv[ins->dst] = ins->imm;
+        else if (ins->op == IR_MOV && defs[ins->dst] == 1 && f->kinds[ins->dst] == 'I') kv[ins->dst] = kv[ins->a]; /* let d = 1000 */
+        else if (ins->op == IR_MOD && ins->b >= 0 && kv[ins->b] > 1 && (kv[ins->b] & (kv[ins->b] - 1))) found++;
+    }
+    if (!found) return;
+    IrIns* code = qkNew(sizeof(IrIns) * (size_t)(f->count + 2 * found + 1));
+    int m = 0;
+    for (int k = 0; k < f->count; k++) {
+        IrIns ins = f->code[k];
+        if (ins.op == IR_MOD && ins.b >= 0 && kv[ins.b] > 1 && (kv[ins.b] & (kv[ins.b] - 1))) {
+            int q = addReg(f, 'I'), p = addReg(f, 'I');
+            f->weight[q] = f->weight[p] = f->weight[ins.dst];
+            IrIns div = ins, mul = ins, sub = ins;
+            div.op = IR_DIV;
+            div.dst = q;
+            mul.op = IR_MUL;
+            mul.dst = p;
+            mul.a = q;
+            sub.op = IR_SUB;
+            sub.b = p;
+            code[m++] = div;
+            code[m++] = mul;
+            code[m++] = sub;
+            continue;
+        }
+        code[m++] = ins;
+    }
+    f->code = code;
+    f->count = m;
+    f->cap = m;
+}
+
+static void commonSubexpressions(IrFn* f) {
+    int n = f->vregCount ? f->vregCount : 1;
+    int* defs = qkNew(sizeof(int) * (size_t)n);
+    int* version = qkNew(sizeof(int) * (size_t)n);
+    int* rename = qkNew(sizeof(int) * (size_t)n);
+    char* isK = qkNew((size_t)n);
+    int64_t* kv = qkNew(sizeof(int64_t) * (size_t)n);
+    for (int v = 0; v < f->vregCount; v++) rename[v] = -1;
+    for (int k = 0; k < f->paramCount; k++) defs[f->params[k]]++;
+    for (int k = 0; k < f->count; k++) {
+        const IrIns* ins = &f->code[k];
+        if (defines(ins)) defs[ins->dst]++;
+        for (int i = 0; i < ins->retCount; i++) defs[ins->rets[i]]++;
+    }
+    for (int k = 0; k < f->count; k++) {
+        const IrIns* ins = &f->code[k];
+        if (ins->op == IR_CONST && ins->c != 1 && defs[ins->dst] == 1) {
+            isK[ins->dst] = 1;
+            kv[ins->dst] = ins->imm;
+        }
+    }
+    /* float constants: one register per value (they are all hoisted to the start afterwards) */
+    for (int k = 0; k < f->count; k++) {
+        IrIns* ins = &f->code[k];
+        if (ins->op != IR_CONST || !isK[ins->dst] || f->kinds[ins->dst] != 'F') continue;
+        for (int j = 0; j < k; j++) {
+            IrIns* first = &f->code[j];
+            if (first->op == IR_CONST && isK[first->dst] && f->kinds[first->dst] == 'F' && first->imm == ins->imm) {
+                rename[ins->dst] = first->dst;
+                ins->op = IR_NOP;
+                break;
+            }
+        }
+    }
+    Seen* table = qkNew(sizeof(Seen) * (size_t)(f->count ? f->count : 1));
+    int seen = 0;
+    for (int k = 0; k < f->count; k++) {
+        IrIns* ins = &f->code[k];
+        if (ins->op == IR_NOP) continue;
+        renameOperands(ins, rename);
+        /* constants fold: a copy of one, an Int made Float, arithmetic on two (registers set once only) */
+        if (defines(ins) && defs[ins->dst] == 1 && ins->op != IR_CONST) {
+            bool aK = ins->a >= 0 && isK[ins->a], bK = ins->b >= 0 && isK[ins->b];
+            int64_t x = aK ? kv[ins->a] : 0, y = bK ? kv[ins->b] : 0, r = 0;
+            bool fold = true;
+            switch (ins->op) {
+            case IR_MOV: fold = aK; r = x; break;
+            case IR_I2F: {
+                double v = (double)x;
+                fold = aK;
+                memcpy(&r, &v, 8);
+                break;
+            }
+            case IR_ADD: fold = aK && bK; r = (int64_t)((uint64_t)x + (uint64_t)y); break;
+            case IR_SUB: fold = aK && bK; r = (int64_t)((uint64_t)x - (uint64_t)y); break;
+            case IR_MUL: fold = aK && bK; r = (int64_t)((uint64_t)x * (uint64_t)y); break;
+            case IR_NEG: fold = aK; r = (int64_t)(0 - (uint64_t)x); break;
+            default: fold = false;
+            }
+            if (fold) {
+                ins->op = IR_CONST;
+                ins->a = ins->b = -1;
+                ins->c = 0;
+                ins->imm = r;
+                isK[ins->dst] = 1;
+                kv[ins->dst] = r;
+            }
+        }
+        /* x * 2.0 is x + x: the same result, a cheaper instruction */
+        if (ins->op == IR_FMUL) {
+            double two = 2.0;
+            int64_t bits;
+            memcpy(&bits, &two, 8);
+            if (ins->b >= 0 && isK[ins->b] && kv[ins->b] == bits) ins->b = ins->a, ins->op = IR_FADD;
+            else if (ins->a >= 0 && isK[ins->a] && kv[ins->a] == bits) ins->a = ins->b, ins->op = IR_FADD;
+        }
+        switch (ins->op) {
+        case IR_LABEL: case IR_JMP: case IR_JZ: case IR_JNZ: case IR_CALL: case IR_RTCALL: case IR_RET:
+            seen = 0; /* a new straight run */
+            break;
+        default: break;
+        }
+        bool safeDivide = (ins->op == IR_DIV || ins->op == IR_MOD) && ins->b >= 0 && isK[ins->b] && kv[ins->b] != 0;
+        bool candidate = (pure(ins) || safeDivide) && ins->op != IR_LOAD && ins->op != IR_MOV && ins->op != IR_CONST &&
+                         defines(ins) && defs[ins->dst] == 1;
+        if (candidate) {
+            Seen s = {0};
+            s.op = ins->op;
+            s.cond = ins->cond;
+            s.kind = (uint8_t)f->kinds[ins->dst];
+            s.imm = ins->imm;
+            s.c = ins->c;
+            s.dst = ins->dst;
+            if (ins->a >= 0) {
+                s.aK = isK[ins->a];
+                s.a = s.aK ? kv[ins->a] : ins->a;
+                s.va = s.aK ? 0 : version[ins->a];
+            } else {
+                s.a = -1;
+            }
+            if (ins->b >= 0) {
+                s.bK = isK[ins->b];
+                s.b = s.bK ? kv[ins->b] : ins->b;
+                s.vb = s.bK ? 0 : version[ins->b];
+            } else {
+                s.b = -1;
+            }
+            if (commutative(ins->op) && (s.aK > s.bK || (s.aK == s.bK && s.a > s.b))) {
+                Seen t = s;
+                s.a = t.b, s.aK = t.bK, s.va = t.vb;
+                s.b = t.a, s.bK = t.aK, s.vb = t.va;
+            }
+            int found = -1;
+            for (int i = 0; i < seen && found < 0; i++) {
+                const Seen* o = &table[i];
+                if (o->op == s.op && o->cond == s.cond && o->kind == s.kind && o->imm == s.imm && o->c == s.c && o->a == s.a &&
+                    o->aK == s.aK && o->va == s.va && o->b == s.b && o->bK == s.bK && o->vb == s.vb)
+                    found = o->dst;
+            }
+            if (found >= 0) {
+                rename[ins->dst] = found;
+                ins->op = IR_NOP;
+                continue;
+            }
+            table[seen++] = s;
+        }
+        if (defines(ins)) version[ins->dst]++;
+        for (int i = 0; i < ins->retCount; i++) version[ins->rets[i]]++;
+    }
+    for (int k = 0; k < f->count; k++)
+        if (f->code[k].op != IR_NOP) renameOperands(&f->code[k], rename);
+}
+
 static void optimizeFn(IrFn* f) {
+    remainderFromQuotient(f); /* adds registers: before the counts are sized */
+    commonSubexpressions(f);
     int n = f->vregCount ? f->vregCount : 1;
     Counts c = {qkNew(sizeof(int) * (size_t)n), qkNew(sizeof(int) * (size_t)n), qkNew(sizeof(int) * (size_t)n)};
     recount(f, &c);

@@ -1,0 +1,6 @@
+// error: write its result type
+fn f(n: Int) = if n > 0 { f(n - 1) } else { 0 }
+
+fn main() {
+    print(f(3))
+}

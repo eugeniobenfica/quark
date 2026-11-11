@@ -1,0 +1,4 @@
+// error: arithmetic needs numbers, not Int and Bool
+fn main() {
+    print(1 + true)
+}

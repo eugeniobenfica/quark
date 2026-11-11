@@ -1,0 +1,37 @@
+// What a Scopes panel computes: a waveform (one column of counts per column of the frame) and the
+// histograms, from a frame of red, green and blue values.
+type Frame { width: Int, height: Int, rgb: [Int] }
+
+fn luma(r: Int, g: Int, b: Int) -> Int = round(0.2126 * r + 0.7152 * g + 0.0722 * b)
+
+fn testFrame(width: Int, height: Int) -> Frame {
+    // a gradient from left to right, warmer at the top
+    let rgb = (0..width * height * 3).map(i => {
+        let pixel = i / 3
+        let x = pixel % width
+        let y = pixel / width
+        match i % 3 {
+            0 => 255 * x / width
+            1 => 128 + 127 * y / height
+            _ => 255 - 255 * x / width
+        }
+    })
+    Frame(width, height, rgb)
+}
+
+fn lightAt(f: Frame, pixel: Int) -> Int =
+    luma(f.rgb[pixel * 3], f.rgb[pixel * 3 + 1], f.rgb[pixel * 3 + 2])
+
+// counts[(255 - light) * width + x]: the waveform's trace, light at the top
+fn waveform(f: Frame) -> [Int] =
+    (0..f.width * f.height).histogram(256 * f.width, p => (255 - lightAt(f, p)) * f.width + p % f.width)
+
+fn main() {
+    let frame = testFrame(384, 216)
+    let light = (0..frame.width * frame.height).histogram(256, p => lightAt(frame, p))
+    let trace = waveform(frame)
+    let busiest = (0..256).fold(0, (best, v) => if light[v] > light[best] { v } else { best })
+    print("pixels", frame.width * frame.height, "light levels used", light.filter(c => c > 0).len())
+    print("most common light", busiest, "with", light[busiest], "pixels")
+    print("waveform cells lit", trace.filter(c => c > 0).len(), "of", len(trace))
+}

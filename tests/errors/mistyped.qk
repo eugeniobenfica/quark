@@ -1,0 +1,5 @@
+// error: did you mean "total"?
+fn main() {
+    let total = 1
+    print(totl)
+}

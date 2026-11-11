@@ -1,0 +1,25 @@
+// How many points of a 1000 x 1000 grid stay inside the Mandelbrot set (100 steps).
+fn inside(cx: Float, cy: Float) -> Bool {
+    var x = 0.0
+    var y = 0.0
+    var i = 0
+    while i < 100 {
+        let xx = x * x
+        let yy = y * y
+        if xx + yy > 4.0 {
+            return false
+        }
+        y = 2.0 * x * y + cy
+        x = xx - yy + cx
+        i += 1
+    }
+    true
+}
+
+fn main() {
+    let start = now()
+    let size = 1000
+    let count = (0..size * size).filter(k => inside(k % size * 3.0 / size - 2.0, k / size * 3.0 / size - 1.5)).len()
+    print("inside", count)
+    print("ms", (now() - start) * 1000)
+}

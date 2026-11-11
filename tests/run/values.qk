@@ -1,0 +1,23 @@
+// Values never change behind your back: storing an array from a var copies it.
+type Box { items: [Int], scale: Float }
+
+fn grow(items: [Int]) -> [Int] = items
+
+fn main() {
+    var a = [1, 2, 3]
+    let b = a
+    let c = grow(a)
+    a[0] = 100
+    print(a, b, c)
+    var box = Box([7, 8], 2)
+    box.scale *= 1.5
+    print(box)
+    print(-7 / 2, -7 % 2, 7 / -2, 7 % -2, 7 / 2, 7 % 2)
+    print(0.1 + 0.2, 1.0 / 3, 2.0 * 0.5, 1e20, 1.5e-7)
+    print("tab\there", "quote \"q\"", true and not false, 3 < 2 or 2 <= 2)
+    print(match 3 {
+        1 => "one"
+        3 => "three"
+        _ => "many"
+    })
+}

@@ -1,0 +1,38 @@
+// A bar chart's layout, the way the Charts plugin draws one: each bar grows in, one after another.
+type Row { label: Text, value: Float }
+
+type Bar { x: Float, y: Float, width: Float, height: Float }
+enum Easing { Linear, EaseOut, BackOut }
+
+fn ease(kind: Easing, t: Float) -> Float = match kind {
+    Linear => t
+    EaseOut => 1 - (1 - t) * (1 - t) * (1 - t)
+    BackOut => 1 + 2.70158 * pow(t - 1, 3) + 1.70158 * pow(t - 1, 2)
+}
+
+// How far item i of n has grown when the whole chart is at `progress` (0 to 1).
+fn grown(progress: Float, stagger: Float, i: Int, n: Int) -> Float {
+    let span = 1 / (1 + stagger * max(0, n - 1))
+    clamp((progress - i * stagger * span) / span, 0, 1)
+}
+
+fn bars(rows: [Row], size: Vec2, gap: Float, progress: Float) -> [Bar] {
+    let n = len(rows)
+    let tallest = rows.map(r => r.value).max()
+    let slot = size.x / n
+    let width = slot * (1 - gap)
+    rows.map((r, i) => {
+        let height = size.y * r.value / tallest * ease(Easing.BackOut, grown(progress, 0.45, i, n))
+        Bar(x: slot * i + (slot - width) / 2, y: size.y - height, width: width, height: height)
+    })
+}
+
+fn main() {
+    let rows = [Row("Jan", 42), Row("Feb", 58), Row("Mar", 51), Row("Apr", 76), Row("May", 93)]
+    for t in [0.25, 0.5, 1.0] {
+        print("progress", t)
+        for bar in bars(rows, Vec2(1000, 600), 0.35, t) {
+            print("  ", bar)
+        }
+    }
+}

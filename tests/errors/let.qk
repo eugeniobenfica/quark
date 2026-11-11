@@ -1,0 +1,5 @@
+// error: declare it with var to change it
+fn main() {
+    let x = 1
+    x = 2
+}

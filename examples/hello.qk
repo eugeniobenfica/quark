@@ -1,0 +1,15 @@
+// The first program.
+fn square(x: Int) -> Int = x * x
+
+fn main() {
+    print("Hello from Quark")
+    let n = 10
+    var total = 0
+    for i in 0..n {
+        total += square(i)
+    }
+    print("sum of squares below", n, "is", total)
+    let evens = (0..20).filter(x => x % 2 == 0).map(x => x * 10)
+    print(evens.sum())
+    print(toFloat(total) / 3.0, sqrt(2.0), -7 / 2, -7 % 2)
+}

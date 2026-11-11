@@ -1,0 +1,10 @@
+// error: this match misses Mode.B
+enum Mode { A, B }
+
+fn f(m: Mode) -> Int = match m {
+    A => 1
+}
+
+fn main() {
+    print(f(Mode.A))
+}

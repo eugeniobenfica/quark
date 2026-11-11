@@ -1,0 +1,5 @@
+// panic: division by zero
+fn main() {
+    let zero = len([1]) - 1
+    print(10 / zero)
+}

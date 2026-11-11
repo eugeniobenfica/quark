@@ -1,0 +1,4 @@
+// error: write "fooBar"
+fn main() {
+    let foo_bar = 1
+}

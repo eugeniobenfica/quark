@@ -1,0 +1,7 @@
+// panic: the program ran too long
+fn main() {
+    var n = 0
+    while true {
+        n += 1
+    }
+}

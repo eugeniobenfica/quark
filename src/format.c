@@ -5,12 +5,13 @@
 
 #include <stdio.h>
 
-enum { P_LOWEST, P_OR, P_AND, P_NOT, P_COMPARE, P_RANGE, P_ADD, P_MUL, P_UNARY, P_POSTFIX, P_PRIMARY };
+enum { P_LOWEST, P_COALESCE, P_OR, P_AND, P_NOT, P_COMPARE, P_RANGE, P_ADD, P_MUL, P_UNARY, P_POSTFIX, P_PRIMARY };
 
 static int precedence(const Expr* e) {
     switch (e->kind) {
     case E_BINARY:
         switch (e->op) {
+        case T_QQ: return P_COALESCE;
         case T_OR: return P_OR;
         case T_AND: return P_AND;
         case T_PLUS: case T_MINUS: return P_ADD;
@@ -51,7 +52,10 @@ static void comments(QkBuf* out, const char* text, int indent) {
 }
 
 void qkFormatTypeExpr(const TypeExpr* t, QkBuf* out) {
-    if (!t->name) {
+    if (t->optional) {
+        qkFormatTypeExpr(t->elem, out);
+        qkBufPuts(out, "?");
+    } else if (!t->name) {
         qkBufPuts(out, "[");
         qkFormatTypeExpr(t->elem, out);
         qkBufPuts(out, "]");
@@ -117,6 +121,7 @@ static void call(const Expr* e, QkBuf* out, int indent, bool broken) {
         args(e, 1, out, indent + (broken ? 1 : 0));
         return;
     }
+    if (e->qualifier) qkBufPrintf(out, "%s.", e->qualifier);
     qkBufPuts(out, e->name);
     args(e, 0, out, indent);
 }
@@ -199,7 +204,11 @@ static void expr(const Expr* e, QkBuf* out, int indent, int minPrec) {
             const Arm* a = &e->arms[i];
             comments(out, a->comment, indent + 1);
             indentTo(out, indent + 1);
-            if (a->pattern) qkBufPuts(out, a->pattern);
+            if (a->pattern) {
+                qkBufPuts(out, a->pattern);
+                for (int k = 0; k < a->bindCount; k++) qkBufPrintf(out, "%s%s", k ? ", " : "(", a->binds[k]);
+                if (a->bindCount) qkBufPuts(out, ")");
+            }
             else if (a->intPattern) qkBufPuts(out, a->intPattern->raw);
             else qkBufPuts(out, "_");
             qkBufPuts(out, " => ");
@@ -229,6 +238,26 @@ static void expr(const Expr* e, QkBuf* out, int indent, int minPrec) {
         qkBufPuts(out, "]");
         break;
     case E_BLOCK: block(e->block, out, indent); break;
+    case E_WITH:
+        expr(e->a, out, indent, P_POSTFIX);
+        qkBufPuts(out, " with { ");
+        for (int i = 0; i < e->argCount; i++) {
+            qkBufPrintf(out, "%s%s: ", i ? ", " : "", e->argNames[i]);
+            expr(e->args[i], out, indent, P_LOWEST);
+        }
+        qkBufPuts(out, " }");
+        break;
+    case E_INTERP: /* the pieces as written, the values between braces */
+        qkBufPuts(out, "\"");
+        for (int i = 0; i <= e->argCount; i++) {
+            qkBufPuts(out, e->rawParts[i]);
+            if (i == e->argCount) break;
+            qkBufPuts(out, "{");
+            expr(e->args[i], out, indent, P_LOWEST);
+            qkBufPuts(out, "}");
+        }
+        qkBufPuts(out, "\"");
+        break;
     case E_CALL: {
         /* a chain of calls with lambdas goes one call per line when it is long */
         bool broken = false;
@@ -312,6 +341,17 @@ static void block(const Block* b, QkBuf* out, int indent) {
     qkBufPuts(out, "}");
 }
 
+/* Circle(radius: Float), or a plain case's name */
+static void caseText(const Decl* d, int k, QkBuf* out) {
+    qkBufPuts(out, d->cases[k]);
+    int n = d->caseFieldCount ? d->caseFieldCount[k] : 0;
+    for (int f = 0; f < n; f++) {
+        qkBufPrintf(out, "%s%s: ", f ? ", " : "(", d->caseFields[k][f].name);
+        qkFormatTypeExpr(d->caseFields[k][f].type, out);
+    }
+    if (n) qkBufPuts(out, ")");
+}
+
 static void decl(const Decl* d, QkBuf* out) {
     comments(out, d->leading, 0);
     if (d->kind == D_TYPE && d->isExtern) {
@@ -320,11 +360,27 @@ static void decl(const Decl* d, QkBuf* out) {
         qkBufPuts(out, "\n");
         return;
     }
+    if (d->kind == D_CONST) {
+        qkBufPrintf(out, "let %s", d->name);
+        if (d->ret) {
+            qkBufPuts(out, ": ");
+            qkFormatTypeExpr(d->ret, out);
+        }
+        qkBufPuts(out, " = ");
+        expr(d->body, out, 0, P_LOWEST);
+        if (d->trailing) qkBufPrintf(out, " // %s", d->trailing);
+        qkBufPuts(out, "\n");
+        return;
+    }
     if (d->kind == D_FN) {
-        qkBufPrintf(out, "%sfn %s(", d->isExtern ? "extern " : "", d->name);
+        qkBufPrintf(out, "%s%sfn %s(", d->isExtern ? "extern " : "", d->isEffect ? "effect " : "", d->name);
         for (int i = 0; i < d->paramCount; i++) {
             qkBufPrintf(out, "%s%s: ", i ? ", " : "", d->params[i].name);
             qkFormatTypeExpr(d->params[i].type, out);
+            if (d->params[i].fallback) {
+                qkBufPuts(out, " = ");
+                expr(d->params[i].fallback, out, 0, P_LOWEST);
+            }
         }
         qkBufPuts(out, ")");
         if (d->ret) {
@@ -365,7 +421,7 @@ static void decl(const Decl* d, QkBuf* out) {
                 qkBufPrintf(&line, "%s: ", d->params[i].name);
                 qkFormatTypeExpr(d->params[i].type, &line);
             } else {
-                qkBufPuts(&line, d->cases[i]);
+                caseText(d, i, &line);
             }
         }
         qkBufPuts(&line, " }");
@@ -379,7 +435,7 @@ static void decl(const Decl* d, QkBuf* out) {
                     qkBufPrintf(out, "%s: ", d->params[i].name);
                     qkFormatTypeExpr(d->params[i].type, out);
                 } else {
-                    qkBufPuts(out, d->cases[i]);
+                    caseText(d, i, out);
                 }
                 qkBufPuts(out, "\n");
             }
@@ -403,13 +459,16 @@ static bool oneLine(const Decl* d) { /* its comments aside */
 
 static bool listLike(const Decl* d) { return (d->kind != D_FN || d->isExtern) && oneLine(d); }
 
+/* one-liners of one family stay together: the host's (extern), constants, types and enums */
+static int family(const Decl* d) { return d->isExtern ? 1 : d->kind == D_CONST ? 2 : 3; }
+
 void qkFormat(const Program* p, QkBuf* out) {
     const Decl* before = NULL;
     for (int i = 0; i < p->count; i++) {
         /* a blank line between declarations, except between one-line ones (types, enums, externs) */
         const Decl* d = p->decls[i];
         if (d->fromPrelude) continue; /* the host's */
-        bool together = before && !d->leading && listLike(before) && listLike(d);
+        bool together = before && !d->leading && listLike(before) && listLike(d) && family(before) == family(d);
         if (before && !together) qkBufPuts(out, "\n");
         decl(d, out);
         before = d;

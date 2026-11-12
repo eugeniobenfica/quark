@@ -1,0 +1,9 @@
+// error: a lambda cannot have any
+effect fn shout(x: Int) -> Int {
+    print(x)
+    x
+}
+
+fn main() {
+    let xs = (0..3).map(shout)
+}

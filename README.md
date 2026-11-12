@@ -1,7 +1,7 @@
 # Quark
 
-A small compiled language whose programs are also node graphs. It is lean, as fast as C where it
-counts, and depends on nothing.
+A small, general-purpose compiled language whose programs are also node graphs. It is lean, as fast
+as C where it counts, and depends on nothing.
 
 ```quark
 fn luma(r: Int, g: Int, b: Int) -> Int = round(0.2126 * r + 0.7152 * g + 0.0722 * b)
@@ -28,10 +28,20 @@ Artifice yet.
 
 ## The idea
 
-- **Elegant.** 20 keywords. camelCase for values and PascalCase for types, enforced. One canonical
+- **Elegant.** 22 keywords. camelCase for values and PascalCase for types, enforced. One canonical
   layout. Values that never change behind your back. See [docs/LANGUAGE.md](docs/LANGUAGE.md).
+- **Whole.** Inferred static types, and:
+  - records with `with` copies;
+  - enums whose cases carry data, taken apart by `match`;
+  - optionals (`T?`, `Some`, `None`, `??`);
+  - text that joins, compares and interpolates (`"lap {n}"`);
+  - arrays that grow (`push`);
+  - constants, and named and default arguments.
+
+  Code that changes the world is marked `effect fn`, so everything else is pure and can be fused,
+  cached or, later, run in parallel. An editor can tell actions from data at a glance.
 - **Fast.** Quark compiles to machine code itself, with no C compiler, no LLVM and no interpreter. A
-  pipeline (`map`, `filter`, `histogram`...) becomes one fused loop. Lambdas and one-expression
+  pipeline (`map`, `filter`, `histogram`...) becomes one fused loop. Lambdas and small
   functions are inlined. Records and vectors live in registers.
 - **A node graph.** Every `let` is a named node and every call a node with input pins. The order of
   statements is the execution wire. Text → graph → text gives back the same text, comments included.
@@ -98,7 +108,7 @@ tests/run.sh          # programs, errors, panics, canonical text, graph round tr
 ```c
 QkVm* vm = qkVmNew();
 qkVmPrelude(vm, "extern type Object\n"
-                "extern fn moveBy(o: Object, dx: Float, dy: Float)\n");
+                "extern effect fn moveBy(o: Object, dx: Float, dy: Float)\n");
 qkVmHost(vm, "moveBy", (void*)moveBy);               // void moveBy(int64_t o, double dx, double dy)
 QkModule* m = qkCompile(vm, "ship.qk", text, len);   // NULL: qkDiagnosticAt says why
 QkValue args[2] = {{.i = id}, {.f = 1.0 / 60}};
@@ -134,7 +144,7 @@ it, and the tests check its output.
 | `src/main.c` | the command line; executables carry their machine code at their end |
 | `examples/host/` | an engine in Artifice's style: its prelude, a ship script, the C host |
 
-About 8,900 lines. Today the backend targets x86-64 Windows. System V (Linux, macOS) and ARM64
+About 9,800 lines. Today the backend targets x86-64 Windows. System V (Linux, macOS) and ARM64
 backends come next. The IR is shared, so only `x64.c`'s calling convention and a second encoder
 differ.
 
@@ -142,7 +152,9 @@ differ.
 
 Done:
 
-- the language core and a native compiler;
+- the language and a native compiler;
+- text, optionals, enums with data, `with`, constants, named and default arguments, `push`, and
+  effects;
 - the formatter, and node graphs both ways;
 - standalone executables;
 - the embedding API, with host functions, safe calls, hot reload, node keys and layout, and the
@@ -154,5 +166,6 @@ Next, in the order that leads to replacing Lua in Artifice, Montage and Depict:
 1. System V and ARM64 backends: Linux, macOS and Android exports.
 2. Artifice: its prelude (one `extern fn` per node) and its node editor reading Quark's graphs. See
    [docs/ARTIFICE.md](docs/ARTIFICE.md).
-3. Text operations (join, compare, format) and capabilities (`effect`) in place of the Lua sandbox.
-4. Montage's plugin API: the `draw(o, g)` of objects and panels, and commands with `doc`.
+3. Generic functions and functions as parameters (by specialization), maps, and modules (`use`).
+4. Montage's plugin API: the `draw(o, g)` of objects and panels, and commands with `doc`, given as
+   capabilities.

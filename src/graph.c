@@ -283,11 +283,41 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
     QkBuf node = {0};
     Expr* pair[2];
     switch (e->kind) {
+    case E_WITH:
+        qkBufPuts(&node, ", \"names\": [");
+        for (int i = 0; i < e->argCount; i++) {
+            if (i) qkBufPuts(&node, ", ");
+            jsonString(&node, e->argNames[i]);
+        }
+        qkBufPuts(&node, "]");
+        {
+            Expr** all = qkNew(sizeof(Expr*) * (size_t)(e->argCount + 1)); /* the base, then the new values */
+            all[0] = e->a;
+            for (int i = 0; i < e->argCount; i++) all[i + 1] = e->args[i];
+            inputs(o, &node, all, e->argCount + 1, key);
+        }
+        break;
+    case E_INTERP:
+        qkBufPuts(&node, ", \"parts\": [");
+        for (int i = 0; i <= e->argCount; i++) {
+            if (i) qkBufPuts(&node, ", ");
+            jsonString(&node, e->rawParts[i]);
+        }
+        qkBufPuts(&node, "]");
+        inputs(o, &node, e->args, e->argCount, key);
+        break;
     case E_CALL:
         qkBufPuts(&node, ", \"fn\": ");
         jsonString(&node, e->name);
+        if (e->qualifier) {
+            qkBufPuts(&node, ", \"qualifier\": ");
+            jsonString(&node, e->qualifier);
+        }
+        if (e->decl && e->decl->kind == D_FN && e->decl->isEffect) qkBufPuts(&node, ", \"effect\": true");
         if (e->method) qkBufPuts(&node, ", \"method\": true");
-        if (e->argCount && e->argNames && e->argNames[0]) {
+        bool anyNamed = false;
+        for (int i = 0; e->argNames && i < e->argCount; i++) anyNamed |= e->argNames[i] != NULL;
+        if (anyNamed) {
             qkBufPuts(&node, ", \"names\": [");
             for (int i = 0; i < e->argCount; i++) {
                 if (i) qkBufPuts(&node, ", ");
@@ -347,6 +377,17 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
             char* armKey = keyIndex(key, "/arm", i);
             qkBufPuts(&node, i ? ", {\"pattern\": " : "{\"pattern\": ");
             jsonString(&node, a->pattern ? a->pattern : a->intPattern ? a->intPattern->raw : "_");
+            if (a->bindCount) { /* Circle(r): the names, each a node the arm's wires come from */
+                qkBufPuts(&node, ", \"binds\": [");
+                for (int f = 0; f < a->bindCount; f++) {
+                    int bid = o->nextId++;
+                    if (a->bindings && a->bindings[f]) a->bindings[f]->nodeId = bid;
+                    qkBufPrintf(&node, "%s{\"id\": %d, \"name\": ", f ? ", " : "", bid);
+                    jsonString(&node, a->binds[f]);
+                    qkBufPuts(&node, "}");
+                }
+                qkBufPuts(&node, "]");
+            }
             if (a->comment) {
                 qkBufPuts(&node, ", \"comment\": ");
                 jsonString(&node, a->comment);
@@ -369,7 +410,7 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
     default: break;
     }
     static const char* const kinds[] = {"value", "value", "value", "value", "name", "call", "field", "index", "op",
-                                        "op", "op", "if", "match", "lambda", "array", "block", "case"};
+                                        "op", "op", "if", "match", "lambda", "array", "block", "case", "with", "text"};
     startNode(o, id, kinds[e->kind], key, e->line);
     typeField(o, e->type);
     qkBufAdd(&o->nodes, node.data ? node.data : "", node.len);
@@ -397,8 +438,12 @@ static void writeInput(Out* o, const Expr* e, QkBuf* b, const char* key) {
     case E_NAME:
         if (e->binding) {
             qkBufPrintf(b, "{\"node\": %d}", e->binding->nodeId);
-        } else { /* a function given where a lambda goes */
+        } else if (e->decl && e->decl->kind == D_FN) { /* a function given where a lambda goes */
             qkBufPuts(b, "{\"fn\": ");
+            jsonString(b, e->name);
+            qkBufPuts(b, "}");
+        } else { /* a constant, None */
+            qkBufPuts(b, "{\"name\": ");
             jsonString(b, e->name);
             qkBufPuts(b, "}");
         }
@@ -503,6 +548,10 @@ static void writeParams(QkBuf* out, const Decl* d, Out* o) {
         typeString(d->params[k].type, out);
         qkBufPuts(out, ", \"key\": ");
         jsonString(out, keyJoin(d->name, "/", d->params[k].name));
+        if (d->params[k].fallback && o) { /* its default: a value, or nodes of its own */
+            qkBufPuts(out, ", \"default\": ");
+            writeInput(o, d->params[k].fallback, out, keyJoin(d->name, "/", keyJoin(d->params[k].name, "", "=")));
+        }
         qkBufPuts(out, "}");
     }
     qkBufPuts(out, "]");
@@ -510,6 +559,7 @@ static void writeParams(QkBuf* out, const Decl* d, Out* o) {
         qkBufPuts(out, ", \"returns\": ");
         typeString(d->ret, out);
     }
+    if (d->isEffect) qkBufPuts(out, ", \"effect\": true");
 }
 
 void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
@@ -526,7 +576,7 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
         if (d->fromPrelude) continue; /* the host's: in the catalog, not in the program */
         qkBufPuts(out, written++ ? ",\n  {\"kind\": " : "  {\"kind\": ");
         const char* kind = d->kind == D_FN ? (d->isExtern ? "extern fn" : "fn")
-                           : d->kind == D_TYPE ? (d->isExtern ? "extern type" : "type") : "enum";
+                           : d->kind == D_TYPE ? (d->isExtern ? "extern type" : "type") : d->kind == D_CONST ? "let" : "enum";
         jsonString(out, kind);
         qkBufPuts(out, ", \"name\": ");
         jsonString(out, d->name);
@@ -535,9 +585,41 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
             qkBufPuts(out, ", \"cases\": [");
             for (int k = 0; k < d->caseCount; k++) {
                 if (k) qkBufPuts(out, ", ");
+                int n = d->caseFieldCount ? d->caseFieldCount[k] : 0;
+                if (!n) {
+                    jsonString(out, d->cases[k]);
+                    continue;
+                }
+                qkBufPuts(out, "{\"name\": "); /* a case with data: its fields */
                 jsonString(out, d->cases[k]);
+                qkBufPuts(out, ", \"fields\": [");
+                for (int f = 0; f < n; f++) {
+                    qkBufPuts(out, f ? ", {\"name\": " : "{\"name\": ");
+                    jsonString(out, d->caseFields[k][f].name);
+                    qkBufPuts(out, ", \"type\": ");
+                    typeString(d->caseFields[k][f].type, out);
+                    qkBufPuts(out, "}");
+                }
+                qkBufPuts(out, "]}");
             }
             qkBufPuts(out, "]}");
+            continue;
+        }
+        if (d->kind == D_CONST) { /* a constant: its value's nodes */
+            Out o = {{0}, 1, d->name, 0, layout};
+            if (d->ret) {
+                qkBufPuts(out, ", \"annotation\": ");
+                typeString(d->ret, out);
+            }
+            QkBuf value = {0};
+            qkBufPuts(&value, ", \"result\": ");
+            writeInput(&o, d->body, &value, keyJoin(d->name, "", "/="));
+            qkBufAdd(out, value.data, value.len);
+            qkBufFree(&value);
+            qkBufPuts(out, ",\n   \"nodes\": [\n");
+            qkBufAdd(out, o.nodes.data ? o.nodes.data : "", o.nodes.len);
+            qkBufPuts(out, "]}");
+            qkBufFree(&o.nodes);
             continue;
         }
         if (d->kind == D_TYPE) {
@@ -556,7 +638,14 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
             continue;
         }
         if (d->isExtern) {
-            writeParams(out, d, NULL);
+            Out o = {{0}, 1, d->name, 0, layout};
+            writeParams(out, d, &o);
+            if (o.nodeCount) { /* defaults with nodes */
+                qkBufPuts(out, ",\n   \"nodes\": [\n");
+                qkBufAdd(out, o.nodes.data, o.nodes.len);
+                qkBufPuts(out, "]");
+            }
+            qkBufFree(&o.nodes);
             qkBufPuts(out, "}");
             continue;
         }
@@ -639,6 +728,12 @@ static void inFail(In* in, const char* what, int id) {
 static TypeExpr* parseTypeText(const char* s) {
     TypeExpr* t = qkNew(sizeof *t);
     if (!s) s = "Int";
+    size_t len = strlen(s);
+    if (len > 1 && s[len - 1] == '?') { /* T? */
+        t->optional = true;
+        t->elem = parseTypeText(qkDup(s, len - 1));
+        return t;
+    }
     if (s[0] == '[') {
         size_t n = strlen(s);
         t->elem = parseTypeText(qkDup(s + 1, n >= 2 ? n - 2 : 0));
@@ -711,6 +806,7 @@ static Expr* buildInput(In* in, const J* input) {
         return f;
     }
     const char* fn = jstr(input, "fn");
+    if (!fn) fn = jstr(input, "name"); /* a constant, None */
     if (fn) {
         Expr* e = qkNewExpr(E_NAME, 0, 0);
         e->name = fn;
@@ -775,6 +871,38 @@ static Expr* buildNode(In* in, int id) {
         for (int i = 0; names && i < names->count && i < n; i++)
             if (names->items[i]->kind == J_STR && names->items[i]->str[0]) e->argNames[i] = names->items[i]->str;
         if (!e->name) inFail(in, "a call without a function", id);
+        e->qualifier = jstr(node, "qualifier");
+        return e;
+    }
+    if (!strcmp(kind, "with")) { /* inputs: the base, then the new values, named */
+        Expr* e = qkNewExpr(E_WITH, 0, 0);
+        e->a = n > 0 ? args[0] : zero();
+        e->args = args + (n > 0 ? 1 : 0);
+        e->argCount = e->argCap = n > 0 ? n - 1 : 0;
+        e->argNames = qkNew(sizeof(char*) * (size_t)(n ? n : 1));
+        J* names = jget(node, "names");
+        for (int i = 0; i < e->argCount; i++)
+            e->argNames[i] = names && i < names->count && names->items[i]->kind == J_STR ? names->items[i]->str : "x";
+        return e;
+    }
+    if (!strcmp(kind, "text")) { /* "lap {n}": the pieces as written, a value between each two */
+        Expr* e = qkNewExpr(E_INTERP, 0, 0);
+        J* parts = jget(node, "parts");
+        e->args = args;
+        e->argCount = e->argCap = n;
+        e->argNames = qkNew(sizeof(char*) * (size_t)(n ? n : 1));
+        e->parts = qkNew(sizeof(char*) * (size_t)(n + 1));
+        e->rawParts = qkNew(sizeof(char*) * (size_t)(n + 1));
+        for (int i = 0; i <= n; i++) {
+            const char* raw = parts && i < parts->count && parts->items[i]->kind == J_STR ? parts->items[i]->str : "";
+            e->rawParts[i] = raw;
+            Expr* lit = literal(qkDup("\"", 1), "Text");
+            QkBuf quoted = {0};
+            qkBufPrintf(&quoted, "\"%s\"", raw);
+            lit = literal(qkDup(quoted.data, quoted.len), "Text");
+            qkBufFree(&quoted);
+            e->parts[i] = lit->text;
+        }
         return e;
     }
     if (!strcmp(kind, "op")) {
@@ -788,7 +916,7 @@ static Expr* buildNode(In* in, int id) {
         }
         Expr* e = qkNewExpr(!strcmp(op, "..") ? E_RANGE : E_BINARY, 0, 0);
         e->op = -1;
-        for (int k = T_AND; k <= T_GE; k++)
+        for (int k = T_AND; k <= T_QQ; k++)
             if (!strcmp(qkTokName((TokKind)k), op)) e->op = k;
         if (e->op < 0) inFail(in, "an unknown operator", id);
         e->a = n > 0 ? args[0] : zero();
@@ -840,6 +968,16 @@ static Expr* buildNode(In* in, int id) {
                 else arm.pattern = pat;
             }
             arm.comment = jstr(a, "comment");
+            J* binds = jget(a, "binds");
+            if (binds && binds->count) { /* Circle(r): r names a node the arm's wires come from */
+                arm.bindCount = binds->count;
+                arm.binds = qkNew(sizeof(char*) * (size_t)binds->count);
+                for (int f = 0; f < binds->count; f++) {
+                    arm.binds[f] = jstr(binds->items[f], "name") ? jstr(binds->items[f], "name") : "_";
+                    int bid = jint(binds->items[f], "id", -1);
+                    if (bid >= 0 && bid <= in->maxId) in->names[bid] = arm.binds[f];
+                }
+            }
             if (jget(a, "block")) {
                 arm.body = qkNewExpr(E_BLOCK, 0, 0);
                 arm.body->block = buildBlock(in, jget(a, "block"));
@@ -947,6 +1085,12 @@ static int maxIdOf(const J* dj) {
         J* ps = jget(nd, "params");
         for (int q = 0; ps && q < ps->count; q++)
             if (jint(ps->items[q], "id", 0) > maxId) maxId = jint(ps->items[q], "id", 0);
+        J* arms = jget(nd, "arms");
+        for (int q = 0; arms && q < arms->count; q++) {
+            J* binds = jget(arms->items[q], "binds");
+            for (int f = 0; binds && f < binds->count; f++)
+                if (jint(binds->items[f], "id", 0) > maxId) maxId = jint(binds->items[f], "id", 0);
+        }
     }
     return maxId;
 }
@@ -979,20 +1123,27 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
         if (!strcmp(kind, "enum")) {
             d->kind = D_ENUM;
             J* cases = jget(dj, "cases");
-            for (int k = 0; cases && k < cases->count; k++)
-                if (cases->items[k]->kind == J_STR) QK_PUSH(d->cases, d->caseCount, d->caseCap, cases->items[k]->str);
+            d->caseFields = qkNew(sizeof(Param*) * 64);
+            d->caseFieldCount = qkNew(sizeof(int) * 64);
+            for (int k = 0; cases && k < cases->count && k < 64; k++) {
+                J* cj = cases->items[k];
+                if (cj->kind == J_STR) {
+                    QK_PUSH(d->cases, d->caseCount, d->caseCap, cj->str);
+                    continue;
+                }
+                const char* name = jstr(cj, "name"); /* a case with data */
+                int at = d->caseCount;
+                QK_PUSH(d->cases, d->caseCount, d->caseCap, name ? name : "Case");
+                J* fields = jget(cj, "fields");
+                int n = fields ? fields->count : 0;
+                d->caseFields[at] = qkNew(sizeof(Param) * (size_t)(n ? n : 1));
+                d->caseFieldCount[at] = n;
+                for (int f = 0; f < n; f++)
+                    d->caseFields[at][f] = (Param){jstr(fields->items[f], "name"), parseTypeText(jstr(fields->items[f], "type")), 0, 0, NULL, NULL};
+            }
         } else if (!strcmp(kind, "extern type")) {
             d->kind = D_TYPE;
             d->isExtern = true;
-        } else if (!strcmp(kind, "extern fn")) {
-            d->kind = D_FN;
-            d->isExtern = true;
-            J* params = jget(dj, "params");
-            for (int k = 0; params && k < params->count; k++) {
-                Param prm = {jstr(params->items[k], "name"), parseTypeText(jstr(params->items[k], "type")), 0, 0, NULL};
-                QK_PUSH(d->params, d->paramCount, d->paramCap, prm);
-            }
-            if (jstr(dj, "returns")) d->ret = parseTypeText(jstr(dj, "returns"));
         } else if (!strcmp(kind, "type")) {
             d->kind = D_TYPE;
             J* fields = jget(dj, "fields");
@@ -1000,27 +1151,35 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
                 Param f = {jstr(fields->items[k], "name"), parseTypeText(jstr(fields->items[k], "type")), 0, 0, NULL};
                 QK_PUSH(d->params, d->paramCount, d->paramCap, f);
             }
-        } else {
-            d->kind = D_FN;
+        } else { /* fn, extern fn, let: nodes of their own */
+            bool isConst = !strcmp(kind, "let");
+            d->kind = isConst ? D_CONST : D_FN;
+            d->isExtern = !strcmp(kind, "extern fn");
+            J* effect = jget(dj, "effect");
+            d->isEffect = effect && effect->kind == J_BOOL && effect->b;
             In in = {src, NULL, NULL, maxIdOf(dj), false};
             in.byId = qkNew(sizeof(J*) * (size_t)(in.maxId + 1));
             in.names = qkNew(sizeof(char*) * (size_t)(in.maxId + 1));
             J* nodes = jget(dj, "nodes");
             for (int k = 0; nodes && k < nodes->count; k++) {
                 int nid = jint(nodes->items[k], "id", -1);
-                if (nid >= 0) in.byId[nid] = nodes->items[k];
+                if (nid >= 0 && nid <= in.maxId) in.byId[nid] = nodes->items[k];
             }
             J* params = jget(dj, "params");
             for (int k = 0; params && k < params->count; k++) {
                 J* pj = params->items[k];
                 Param prm = {jstr(pj, "name"), parseTypeText(jstr(pj, "type")), 0, 0, NULL};
-                QK_PUSH(d->params, d->paramCount, d->paramCap, prm);
                 int pid = jint(pj, "id", -1);
-                if (pid >= 0) in.names[pid] = prm.name;
+                if (pid >= 0 && pid <= in.maxId) in.names[pid] = prm.name;
+                if (jget(pj, "default")) prm.fallback = buildInput(&in, jget(pj, "default"));
+                QK_PUSH(d->params, d->paramCount, d->paramCap, prm);
             }
             if (jstr(dj, "returns")) d->ret = parseTypeText(jstr(dj, "returns"));
+            if (jstr(dj, "annotation")) d->ret = parseTypeText(jstr(dj, "annotation"));
             const char* form = jstr(dj, "form");
-            if (form && !strcmp(form, "expr")) {
+            if (d->isExtern) {
+                /* the host's: no body */
+            } else if (isConst || (form && !strcmp(form, "expr"))) {
                 d->body = buildInput(&in, jget(dj, "result"));
             } else {
                 d->body = qkNewExpr(E_BLOCK, 0, 0);

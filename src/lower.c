@@ -564,6 +564,115 @@ static void forEach(Lower* L, Expr* src, Sink sink, void* ctx) {
     place(L, done);
 }
 
+/* ---- enums with data ----------------------------------------------------------------------------- */
+
+/* An enum's slots: its case, then each case's data side by side. Where case k's data starts. */
+static int caseOffset(const Decl* d, int k) {
+    int at = 1;
+    for (int i = 0; i < k; i++)
+        for (int f = 0; d->caseFieldCount && f < d->caseFieldCount[i]; f++) at += qkTypeSlots(d->caseFields[i][f].binding->type);
+    return at;
+}
+
+static int fieldOffset(const Decl* d, int k, int field) {
+    int at = caseOffset(d, k);
+    for (int f = 0; f < field; f++) at += qkTypeSlots(d->caseFields[k][f].binding->type);
+    return at;
+}
+
+/* Case k of enum t, with its data (fields: one value per field, or NULL). The other cases' slots are left
+ * as they come: nothing reads them. */
+static Val caseValue(Lower* L, Type* t, int k, Val* fields) {
+    Val v = valOf(L, t);
+    mov(L, v.r[0], iconst(L, k));
+    const Decl* d = t->decl;
+    for (int f = 0; fields && d->caseFieldCount && f < d->caseFieldCount[k]; f++) {
+        Val part = {fields[f].n, v.r + fieldOffset(d, k, f)};
+        movVal(L, part, fields[f]);
+    }
+    return v;
+}
+
+/* ---- text ---------------------------------------------------------------------------------------- */
+
+static Val literalText(Lower* L, const char* s, int n) {
+    Val v = {2, regList(2)};
+    v.r[0] = dataAddress(L, dataText(L, s, n));
+    v.r[1] = iconst(L, n);
+    return v;
+}
+
+/* What the runtime makes: [length][bytes] at p, as (bytes, length). */
+static Val unpackText(Lower* L, int p) {
+    Val v = {2, regList(2)};
+    v.r[0] = op2(L, IR_ADD, p, iconst(L, 8), 'I');
+    v.r[1] = newReg(L, 'I');
+    IrIns* ld = emit(L, IR_LOAD, v.r[1], p, iconst(L, 0));
+    ld->imm = 8;
+    ld->c = 0;
+    return v;
+}
+
+static Val joinText(Lower* L, Val a, Val b) {
+    int args[4] = {a.r[0], a.r[1], b.r[0], b.r[1]};
+    return unpackText(L, rtcall(L, RT_TEXT_JOIN, args, 4, 'I', 0));
+}
+
+/* The names of an enum's cases, as a table of (offset, length) in the data block; returns its offset. */
+static int caseNameTable(Lower* L, const Decl* d) {
+    int64_t* table = qkNew(sizeof(int64_t) * 2 * (size_t)d->caseCount);
+    for (int k = 0; k < d->caseCount; k++) {
+        table[2 * k] = dataText(L, d->cases[k], (int)strlen(d->cases[k]));
+        table[2 * k + 1] = (int64_t)strlen(d->cases[k]);
+    }
+    int at = (int)L->out->data.len;
+    qkBufAdd(&L->out->data, table, sizeof(int64_t) * 2 * (size_t)d->caseCount);
+    return at;
+}
+
+/* Case tag's name as text. */
+static Val caseName(Lower* L, const Decl* d, int tag) {
+    int tableAt = dataAddress(L, caseNameTable(L, d));
+    int base = dataAddress(L, 0);
+    int off = newReg(L, 'I');
+    IrIns* ld = emit(L, IR_LOAD, off, tableAt, tag);
+    ld->imm = 16;
+    ld->c = 0;
+    Val v = {2, regList(2)};
+    v.r[1] = newReg(L, 'I');
+    ld = emit(L, IR_LOAD, v.r[1], tableAt, tag);
+    ld->imm = 16;
+    ld->c = 8;
+    v.r[0] = op2(L, IR_ADD, base, off, 'I');
+    return v;
+}
+
+/* Any value toText takes, as text. */
+static Val textOf(Lower* L, Expr* e) {
+    Val v = lowerExpr(L, e);
+    switch (e->type->kind) {
+    case TY_TEXT: return v;
+    case TY_INT: return unpackText(L, rtcall(L, RT_TEXT_OF_INT, v.r, 1, 'I', e->line));
+    case TY_FLOAT: return unpackText(L, rtcall(L, RT_TEXT_OF_FLOAT, v.r, 1, 'I', e->line));
+    case TY_BOOL: {
+        Val r = {2, regList(2)};
+        r.r[0] = newReg(L, 'I');
+        r.r[1] = newReg(L, 'I');
+        Val yes = literalText(L, "true", 4), no = literalText(L, "false", 5);
+        int other = label(L), done = label(L);
+        jz(L, v.r[0], other);
+        movVal(L, r, yes);
+        jmp(L, done);
+        place(L, other);
+        movVal(L, r, no);
+        place(L, done);
+        return r;
+    }
+    case TY_ENUM: return caseName(L, e->type->decl, v.r[0]);
+    default: return literalText(L, "", 0);
+    }
+}
+
 /* ---- printing ------------------------------------------------------------------------------------ */
 
 static void printVal(Lower* L, Val v, const Type* t);
@@ -595,32 +704,42 @@ static void printVal(Lower* L, Val v, const Type* t) {
         break;
     }
     case TY_ENUM: {
-        /* a table of (offset, length) per case in the data block */
         Decl* d = t->decl;
-        int64_t* table = qkNew(sizeof(int64_t) * 2 * (size_t)d->caseCount);
-        for (int k = 0; k < d->caseCount; k++) {
-            table[2 * k] = dataText(L, d->cases[k], (int)strlen(d->cases[k]));
-            table[2 * k + 1] = (int64_t)strlen(d->cases[k]);
+        if (d->optionOf) { /* None, or Some(the value) */
+            int some = label(L), done = label(L);
+            jnz(L, v.r[0], some);
+            printLiteral(L, "None");
+            jmp(L, done);
+            place(L, some);
+            printLiteral(L, "Some(");
+            Val inner = {qkTypeSlots(d->optionOf), v.r + caseOffset(d, 1)};
+            printVal(L, inner, d->optionOf);
+            printLiteral(L, ")");
+            place(L, done);
+            break;
         }
-        int at = (int)L->out->data.len;
-        qkBufAdd(&L->out->data, table, sizeof(int64_t) * 2 * (size_t)d->caseCount);
-        qkBufPrintf(&L->out->data, "%s.", d->name);
-        int prefix = at + (int)(sizeof(int64_t) * 2 * (size_t)d->caseCount);
-        while (L->out->data.len % 8) qkBufByte(&L->out->data, 0);
-        int args[2] = {dataAddress(L, prefix), iconst(L, (int64_t)strlen(d->name) + 1)};
-        rtcall(L, RT_PRINT_TEXT, args, 2, 'V', 0);
-        int base = dataAddress(L, 0);
-        int tableAt = dataAddress(L, at);
-        int off = newReg(L, 'I');
-        IrIns* ld = emit(L, IR_LOAD, off, tableAt, v.r[0]);
-        ld->imm = 16;
-        ld->c = 0;
-        int len = newReg(L, 'I');
-        ld = emit(L, IR_LOAD, len, tableAt, v.r[0]);
-        ld->imm = 16;
-        ld->c = 8;
-        int args2[2] = {op2(L, IR_ADD, base, off, 'I'), len};
-        rtcall(L, RT_PRINT_TEXT, args2, 2, 'V', 0);
+        QkBuf head = {0};
+        qkBufPrintf(&head, "%s.", d->name);
+        printLiteral(L, head.data);
+        qkBufFree(&head);
+        Val name = caseName(L, d, v.r[0]);
+        rtcall(L, RT_PRINT_TEXT, name.r, 2, 'V', 0);
+        for (int k = 0; qkHasData(t) && k < d->caseCount; k++) { /* the case's data: (radius: 2.0) */
+            if (!d->caseFieldCount[k]) continue;
+            int skip = label(L);
+            jz(L, cmp(L, C_EQ, v.r[0], iconst(L, k)), skip);
+            for (int f = 0; f < d->caseFieldCount[k]; f++) {
+                Type* ft = d->caseFields[k][f].binding->type;
+                QkBuf field = {0};
+                qkBufPrintf(&field, "%s%s: ", f ? ", " : "(", d->caseFields[k][f].name);
+                printLiteral(L, field.data);
+                qkBufFree(&field);
+                Val part = {qkTypeSlots(ft), v.r + fieldOffset(d, k, f)};
+                printVal(L, part, ft);
+            }
+            printLiteral(L, ")");
+            place(L, skip);
+        }
         break;
     }
     case TY_VEC: {
@@ -772,6 +891,7 @@ static Val lowerBuiltin(Lower* L, Expr* e) {
     }
     case B_LEN: {
         Expr* src = stripImplicit(a[0]);
+        if (src->type->kind == TY_TEXT) return one(lowerExpr(L, src).r[1]);
         if (src->type->kind == TY_ARRAY && !(src->kind == E_NAME && src->binding && src->binding->lazy))
             return one(lowerExpr(L, src).r[1]);
         Acc acc = {0};
@@ -848,6 +968,23 @@ static Val lowerBuiltin(Lower* L, Expr* e) {
         rtcall(L, RT_PRINT_END, NULL, 0, 'V', 0);
         return (Val){0, NULL};
     case B_NOW: return one(rtcall(L, RT_NOW, NULL, 0, 'F', e->line));
+    case B_SOME: {
+        Val v = lowerStored(L, a[0]);
+        return caseValue(L, e->type, 1, &v);
+    }
+    case B_TOTEXT: return textOf(L, a[0]);
+    case B_PUSH: { /* xs.push(v): room for one more, v at the end, one longer */
+        Binding* b = a[0]->binding;
+        Val v = lowerStored(L, a[1]);
+        Val arr = {2, b->regs};
+        int bytes = qkTypeSlots(a[0]->type->elem) * 8;
+        int args[3] = {arr.r[0], arr.r[1], iconst(L, bytes)};
+        int ptr = rtcall(L, RT_PUSH, args, 3, 'I', e->line);
+        mov(L, arr.r[0], ptr);
+        storeSlots(L, arr.r[0], arr.r[1], bytes, 0, v);
+        emit(L, IR_ADD, arr.r[1], arr.r[1], iconst(L, 1));
+        return (Val){0, NULL};
+    }
     case B_VEC2: case B_VEC3: case B_VEC4: {
         Val r = {e->argCount, regList(e->argCount)};
         for (int i = 0; i < e->argCount; i++) {
@@ -881,7 +1018,7 @@ static int blockSize(const Block* b) {
 }
 
 /* A call to the host: its C function, one argument per slot. */
-static Val hostCall(Lower* L, Expr* e, Decl* d, Val* args, int total) {
+static Val hostCall(Lower* L, Expr* e, Decl* d, Val* args, int count, int total) {
     int index = L->externIndex[d->index];
     if (index < 0) { /* the first call: the host function joins the program's list */
         index = L->externIndex[d->index] = L->out->externCount++;
@@ -903,7 +1040,7 @@ static Val hostCall(Lower* L, Expr* e, Decl* d, Val* args, int total) {
     ins->line = e->line;
     ins->args = regList(total);
     ins->argCount = total;
-    for (int i = 0, k = 0; i < e->argCount; i++)
+    for (int i = 0, k = 0; i < count; i++)
         for (int j = 0; j < args[i].n; j++) ins->args[k++] = args[i].r[j];
     Val r = valOf(L, d->retType);
     ins = &L->fn->code[L->fn->count - 1];
@@ -929,25 +1066,29 @@ static Val lowerCall(Lower* L, Expr* e) {
             fieldAt[f] = at;
             at += qkTypeSlots(d->params[f].binding->type);
         }
-        for (int i = 0; i < e->argCount; i++) {
-            int f = i;
-            if (e->argNames[i])
-                for (int k = 0; k < d->paramCount; k++)
-                    if (!strcmp(d->params[k].name, e->argNames[i])) f = k;
-            Val v = lowerStored(L, e->args[i]);
+        for (int f = 0; f < d->paramCount; f++) { /* the fields in order (bound by the checker) */
+            Val v = lowerStored(L, e->ordered[f]);
             Val part = {v.n, r.r + fieldAt[f]};
             movVal(L, part, v);
         }
         return r;
     }
-    /* a function: arguments as a flat list of slots */
+    if (d->kind == D_ENUM) { /* Shape.Circle(2): a case with its data */
+        int n = d->caseFieldCount[e->caseIndex];
+        Val* fields = qkNew(sizeof(Val) * (size_t)(n ? n : 1));
+        for (int i = 0; i < n; i++) fields[i] = lowerStored(L, e->ordered[i]);
+        return caseValue(L, d->type, e->caseIndex, fields);
+    }
+    /* a function: arguments as a flat list of slots, one value per parameter (defaults filled in) */
     int total = 0;
-    Val* args = qkNew(sizeof(Val) * (size_t)(e->argCount ? e->argCount : 1));
-    for (int i = 0; i < e->argCount; i++) {
-        args[i] = lowerExpr(L, e->args[i]);
+    int count = e->ordered ? e->orderedCount : e->argCount;
+    Expr** values = e->ordered ? e->ordered : e->args;
+    Val* args = qkNew(sizeof(Val) * (size_t)(count ? count : 1));
+    for (int i = 0; i < count; i++) {
+        args[i] = lowerExpr(L, values[i]);
         total += args[i].n;
     }
-    if (d->isExtern) return hostCall(L, e, d, args, total);
+    if (d->isExtern) return hostCall(L, e, d, args, count, total);
     /* a small function is inlined: no call at all. Parameters never change, so they can be the arguments' own
      * registers; a return becomes a jump to the end. Not into itself (recursion stays a call). */
     bool inside = false;
@@ -978,7 +1119,7 @@ static Val lowerCall(Lower* L, Expr* e) {
     ins->line = e->line;
     ins->args = regList(total);
     ins->argCount = total;
-    for (int i = 0, k = 0; i < e->argCount; i++)
+    for (int i = 0, k = 0; i < count; i++)
         for (int j = 0; j < args[i].n; j++) ins->args[k++] = args[i].r[j];
     Val r = valOf(L, d->retType);
     ins = &L->fn->code[L->fn->count - 1];
@@ -1002,10 +1143,34 @@ static Val lowerBinary(Lower* L, Expr* e) {
         place(L, done);
         return one(r);
     }
+    if (e->op == T_QQ) { /* what the optional holds, or the right side (worked out only then) */
+        Val opt = copyVal(L, lowerExpr(L, e->a));
+        Decl* d = e->a->type->decl;
+        Val r = valOf(L, e->type);
+        int none = label(L), done = label(L);
+        jz(L, opt.r[0], none);
+        if (e->type == e->a->type) movVal(L, r, opt); /* a ?? b with b optional too */
+        else {
+            Val inner = {qkTypeSlots(d->optionOf), opt.r + caseOffset(d, 1)};
+            movVal(L, r, inner);
+        }
+        jmp(L, done);
+        place(L, none);
+        movVal(L, r, lowerStored(L, e->b));
+        place(L, done);
+        return r;
+    }
     Val a = lowerExpr(L, e->a);
     Val b = lowerExpr(L, e->b);
     Type* ta = e->a->type;
     Type* tb = e->b->type;
+    if (ta->kind == TY_TEXT) { /* joined, or compared byte by byte */
+        if (e->op == T_PLUS) return joinText(L, a, b);
+        static const int conds[] = {C_EQ, C_NE, C_LT, C_LE, C_GT, C_GE};
+        int args[4] = {a.r[0], a.r[1], b.r[0], b.r[1]};
+        int order = rtcall(L, RT_TEXT_COMPARE, args, 4, 'I', e->line);
+        return one(cmp(L, conds[e->op - T_EQ], order, iconst(L, 0)));
+    }
     switch (e->op) {
     case T_PLUS: case T_MINUS: case T_STAR: case T_SLASH: case T_PERCENT: {
         if (e->type->kind == TY_VEC) {
@@ -1065,8 +1230,9 @@ static Val lowerIf(Lower* L, Expr* e) {
 static Val lowerMatch(Lower* L, Expr* e) {
     bool value = e->type->kind != TY_VOID && e->type->kind != TY_ERROR;
     Val r = value ? valOf(L, e->type) : (Val){0, NULL};
-    int subject = newReg(L, 'I');
-    mov(L, subject, lowerExpr(L, e->a).r[0]);
+    Val whole = copyVal(L, lowerExpr(L, e->a)); /* its case, and its data for the arms' names */
+    int subject = whole.r[0];
+    const Decl* ed = e->a->type->kind == TY_ENUM ? e->a->type->decl : NULL;
     int done = label(L);
     for (int i = 0; i < e->armCount; i++) {
         Arm* a = &e->arms[i];
@@ -1079,6 +1245,8 @@ static Val lowerMatch(Lower* L, Expr* e) {
                 jz(L, cmp(L, C_EQ, subject, iconst(L, k)), next);
             }
         }
+        for (int f = 0; ed && a->pattern && f < a->bindCount; f++) /* Circle(r): r is the data's own slots */
+            if (a->bindings && a->bindings[f]) a->bindings[f]->regs = whole.r + fieldOffset(ed, a->caseIndex, f);
         Expr* body = a->body;
         Val v = body->kind == E_BLOCK ? lowerBlock(L, body->block, value ? e->type : &qkTypeVoid) : lowerExpr(L, body);
         if (value) movVal(L, r, v);
@@ -1094,7 +1262,36 @@ static Val lowerExpr(Lower* L, Expr* e) {
     case E_INT: return one(iconst(L, e->i));
     case E_FLOAT: return one(fconst(L, e->f));
     case E_BOOL: return one(iconst(L, e->i));
-    case E_CASE: return one(iconst(L, e->caseIndex));
+    case E_CASE: return qkHasData(e->type) ? caseValue(L, e->type, e->caseIndex, NULL) : one(iconst(L, e->caseIndex));
+    case E_WITH: { /* a copy, some fields changed */
+        Val base = lowerExpr(L, e->a);
+        Val r = copyVal(L, base);
+        Type* t = e->a->type;
+        for (int i = 0; i < e->argCount; i++) {
+            Val v = lowerStored(L, e->args[i]);
+            int at = 0;
+            if (t->kind == TY_VEC) {
+                at = (int)(strchr("xyzw", e->argNames[i][0]) - "xyzw");
+            } else {
+                for (int f = 0; f < t->decl->paramCount && strcmp(t->decl->params[f].name, e->argNames[i]); f++)
+                    at += qkTypeSlots(t->decl->params[f].binding->type);
+            }
+            Val part = {v.n, r.r + at};
+            movVal(L, part, v);
+        }
+        return r;
+    }
+    case E_INTERP: { /* the pieces and the values as text, joined */
+        Val acc = literalText(L, e->parts[0], (int)strlen(e->parts[0]));
+        bool empty = !e->parts[0][0];
+        for (int i = 0; i < e->argCount; i++) {
+            Val t = textOf(L, e->args[i]);
+            acc = empty ? t : joinText(L, acc, t);
+            empty = false;
+            if (e->parts[i + 1][0]) acc = joinText(L, acc, literalText(L, e->parts[i + 1], (int)strlen(e->parts[i + 1])));
+        }
+        return acc;
+    }
     case E_TEXT: {
         Val v = {2, regList(2)};
         v.r[0] = dataAddress(L, dataText(L, e->text, e->textLen));
@@ -1103,6 +1300,10 @@ static Val lowerExpr(Lower* L, Expr* e) {
     }
     case E_NAME: {
         Binding* b = e->binding;
+        if (!b) {
+            if (e->decl && e->decl->kind == D_CONST) return lowerExpr(L, e->decl->body); /* a constant: its value */
+            return caseValue(L, e->type, 0, NULL);                                        /* None */
+        }
         if (b->lazy) return materialize(L, b->init, b->type->elem, e->line);
         Val v = {qkTypeSlots(b->type), b->regs};
         return v;
@@ -1119,7 +1320,10 @@ static Val lowerExpr(Lower* L, Expr* e) {
     case E_INDEX: {
         Val arr = lowerExpr(L, e->a);
         int i = lowerExpr(L, e->b).r[0];
-        bounds(L, i, arr.r[1], PANIC_INDEX, e->line);
+        /* for i in 0..len(xs) { xs[i] }: i is in range, xs never changes */
+        bool proven = e->a->kind == E_NAME && e->b->kind == E_NAME && e->b->binding && e->a->binding &&
+                      e->b->binding->safeIn == e->a->binding;
+        if (!proven) bounds(L, i, arr.r[1], PANIC_INDEX, e->line);
         return loadElem(L, arr, i, e->type);
     }
     case E_UNARY: {

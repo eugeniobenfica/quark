@@ -426,8 +426,12 @@ static const BuiltinNode kBuiltins[] = {
     {"len", "Loops", "source: Loop<T>", "Int", "how many values"},
     {"toArray", "Loops", "source: Loop<T>", "[T]", "the values, kept in an array"},
     {"fill", "Arrays", "count: Int, value: T", "[T]", "an array of count copies"},
-    {"print", "Out", "values: Any...", "", "shows the values, separated by spaces"},
-    {"now", "Out", "", "Float", "seconds, for timing"},
+    {"push", "Arrays", "list: [T] (a var), value: T", "", "adds value at the end of a var array"},
+    {"Some", "Optionals", "value: T", "T?", "a value that is there (None: none)"},
+    {"toText", "Text", "value: Int | Float | Bool | Text | a case", "Text", "the value as text (\"{x}\" in a text does it too)"},
+    {"len", "Text", "text: Text", "Int", "how many bytes"},
+    {"print", "Out", "values: Any...", "", "effect: shows the values, separated by spaces"},
+    {"now", "Out", "", "Float", "effect: seconds, for timing"},
 };
 
 static void jsonText(QkBuf* b, const char* s) {
@@ -464,6 +468,7 @@ static void declEntry(QkBuf* out, const Decl* d, bool checked, bool* first) {
     qkBufPuts(out, ", \"kind\": ");
     jsonText(out, kind);
     qkBufPrintf(out, ", \"host\": %s", d->fromPrelude ? "true" : "false");
+    if (d->isEffect) qkBufPuts(out, ", \"effect\": true"); /* an action node: on the execution wire */
     if (d->leading) {
         qkBufPuts(out, ", \"doc\": ");
         jsonText(out, d->leading);
@@ -520,9 +525,9 @@ char* qkCatalog(QkVm* vm, const char* text, size_t len) {
         jsonText(&out, n->doc);
         qkBufPuts(&out, "}");
     }
-    qkBufPuts(&out, "],\n \"types\": [\"Int\", \"Float\", \"Bool\", \"Text\", \"Vec2\", \"Vec3\", \"Vec4\", \"[T]\"],\n"
+    qkBufPuts(&out, "],\n \"types\": [\"Int\", \"Float\", \"Bool\", \"Text\", \"Vec2\", \"Vec3\", \"Vec4\", \"[T]\", \"T?\"],\n"
                     " \"operators\": [\"+\", \"-\", \"*\", \"/\", \"%\", \"==\", \"!=\", \"<\", \"<=\", \">\", \">=\", \"and\", \"or\","
-                    " \"not\", \"neg\", \"..\"],\n"
+                    " \"not\", \"neg\", \"..\", \"??\", \"with\"],\n"
                     " \"statements\": [\"let\", \"var\", \"set\", \"do\", \"if\", \"match\", \"for\", \"while\", \"return\", \"break\","
                     " \"continue\"],\n"
                     " \"events\": [\"start(self)\", \"update(self, dt)\", \"hit(self, other)\", \"click(self)\"],\n"

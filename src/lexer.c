@@ -7,16 +7,16 @@
 #include <stdlib.h>
 
 const char* const qkKeywords[] = {"fn",  "let",   "var",   "type",     "enum", "if",  "else", "match", "for",  "in",
-                                  "while", "return", "break", "continue", "and", "or", "not",  "true",  "false", "extern"};
+                                  "while", "return", "break", "continue", "and", "or", "not",  "true",  "false", "extern", "with", "effect"};
 const int qkKeywordCount = (int)(sizeof qkKeywords / sizeof qkKeywords[0]);
 
 const char* qkTokName(TokKind k) {
     static const char* const names[] = {
         "end of file", "end of line", "name", "type name", "number", "number", "text",
         "fn", "let", "var", "type", "enum", "if", "else", "match", "for", "in", "while", "return", "break", "continue",
-        "and", "or", "not", "true", "false", "extern",
+        "and", "or", "not", "true", "false", "extern", "with", "effect",
         "(", ")", "{", "}", "[", "]", ",", ".", "..", ":", "->", "=>", "=", "+=", "-=", "*=", "/=", "+", "-", "*",
-        "/", "%", "==", "!=", "<", "<=", ">", ">=", "_"};
+        "/", "%", "==", "!=", "<", "<=", ">", ">=", "_", "??", "?"};
     return names[k];
 }
 
@@ -27,6 +27,7 @@ static bool endsStatement(TokKind k) {
     switch (k) {
     case T_NAME: case T_TYPENAME: case T_INT: case T_FLOAT: case T_TEXT: case T_TRUE: case T_FALSE:
     case T_RPAREN: case T_RBRACKET: case T_RBRACE: case T_RETURN: case T_BREAK: case T_CONTINUE: case T_UNDERSCORE:
+    case T_QUESTION:
         return true;
     default:
         return false;
@@ -145,7 +146,7 @@ void qkLex(const QkSource* src, Lexed* out) {
             TokKind kind = (c >= 'A' && c <= 'Z') ? T_TYPENAME : T_NAME;
             for (int k = 0; k < qkKeywordCount; k++)
                 if ((int)strlen(qkKeywords[k]) == len && memcmp(qkKeywords[k], start, (size_t)len) == 0) kind = (TokKind)(T_FN + k);
-            static const char* const reserved[] = {"use", "pub", "effect"};
+            static const char* const reserved[] = {"use", "pub"};
             for (size_t k = 0; k < sizeof reserved / sizeof reserved[0]; k++)
                 if ((int)strlen(reserved[k]) == len && memcmp(reserved[k], start, (size_t)len) == 0)
                     qkError(src, lx.line, (int)(start - lx.lineStart) + 1, "\"%s\" is kept for a later version of Quark: pick another name", reserved[k]);
@@ -176,10 +177,24 @@ void qkLex(const QkSource* src, Lexed* out) {
             add(&lx, isFloat ? T_FLOAT : T_INT, start, (int)(lx.p - start));
             continue;
         }
-        if (c == '"') {
+        if (c == '"') { /* text, with {expressions} inside (which may hold texts of their own) */
             lx.p++;
-            while (lx.p < lx.end && *lx.p != '"' && *lx.p != '\n') {
-                if (*lx.p == '\\' && lx.p + 1 < lx.end) lx.p++;
+            int depth = 0;
+            while (lx.p < lx.end && *lx.p != '\n' && (depth > 0 || *lx.p != '"')) {
+                char k = *lx.p;
+                if (k == '\\' && lx.p + 1 < lx.end) {
+                    lx.p += 2;
+                    continue;
+                }
+                if (k == '{') depth++;
+                else if (k == '}' && depth > 0) depth--;
+                else if (k == '"') { /* a text inside an expression */
+                    lx.p++;
+                    while (lx.p < lx.end && *lx.p != '"' && *lx.p != '\n') {
+                        if (*lx.p == '\\' && lx.p + 1 < lx.end) lx.p++;
+                        lx.p++;
+                    }
+                }
                 lx.p++;
             }
             if (lx.p >= lx.end || *lx.p != '"') {
@@ -192,7 +207,7 @@ void qkLex(const QkSource* src, Lexed* out) {
         }
         /* punctuation: the longest first */
         static const struct { const char* s; TokKind k; } punct[] = {
-            {"..", T_DOTDOT}, {"->", T_ARROW}, {"=>", T_FATARROW}, {"==", T_EQ}, {"!=", T_NE}, {"<=", T_LE}, {">=", T_GE},
+            {"??", T_QQ}, {"?", T_QUESTION}, {"..", T_DOTDOT}, {"->", T_ARROW}, {"=>", T_FATARROW}, {"==", T_EQ}, {"!=", T_NE}, {"<=", T_LE}, {">=", T_GE},
             {"+=", T_PLUSEQ}, {"-=", T_MINUSEQ}, {"*=", T_STAREQ}, {"/=", T_SLASHEQ},
             {"(", T_LPAREN}, {")", T_RPAREN}, {"{", T_LBRACE}, {"}", T_RBRACE}, {"[", T_LBRACKET}, {"]", T_RBRACKET},
             {",", T_COMMA}, {".", T_DOT}, {":", T_COLON}, {"=", T_ASSIGN}, {"+", T_PLUS}, {"-", T_MINUS}, {"*", T_STAR},

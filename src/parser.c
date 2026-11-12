@@ -100,15 +100,23 @@ static TypeExpr* parseType(Parser* p) {
     if (accept(p, T_LBRACKET)) {
         te->elem = parseType(p);
         expect(p, T_RBRACKET, "after an array's element type");
-        return te;
-    }
-    if (t->kind != T_TYPENAME) {
-        fail(p, t, "%s", "expected a type (Int, Float, Bool, Text, Vec2, a type's name, or [Type])");
+    } else if (t->kind != T_TYPENAME) {
+        fail(p, t, "%s", "expected a type (Int, Float, Bool, Text, Vec2, a type's name, [Type] or Type?)");
         te->name = "Int";
         return te;
+    } else {
+        next(p);
+        te->name = tokText(t);
     }
-    next(p);
-    te->name = tokText(t);
+    if (accept(p, T_QUESTION)) { /* T?: a T, or None */
+        TypeExpr* opt = qkNew(sizeof *opt);
+        *opt = *te;
+        te = qkNew(sizeof *te);
+        te->line = opt->line;
+        te->col = opt->col;
+        te->elem = opt;
+        te->optional = true;
+    }
     return te;
 }
 
@@ -207,10 +215,9 @@ static double parseFloatText(Token* t) {
     return strtod(buf, NULL);
 }
 
-static void decodeText(Parser* p, Token* t, Expr* e) {
+/* The text between s and end, escapes decoded. */
+static const char* decodePiece(Parser* p, Token* t, const char* s, const char* end, int* len) {
     QkBuf b = {0};
-    const char* s = t->start + 1;
-    const char* end = t->start + t->len - (t->len > 1 && t->start[t->len - 1] == '"' ? 1 : 0);
     while (s < end) {
         char c = *s++;
         if (c == '\\' && s < end) {
@@ -220,14 +227,105 @@ static void decodeText(Parser* p, Token* t, Expr* e) {
             case 't': c = '\t'; break;
             case '"': c = '"'; break;
             case '\\': c = '\\'; break;
-            default: fail(p, t, "%s", "unknown escape in text (\\n, \\t, \\\" and \\\\ are known)"); c = k;
+            case '{': c = '{'; break;
+            case '}': c = '}'; break;
+            default: fail(p, t, "%s", "unknown escape in text (\\n, \\t, \\\", \\\\, \\{ and \\} are known)"); c = k;
             }
         }
         qkBufByte(&b, (uint8_t)c);
     }
-    e->text = qkDup(b.data ? b.data : "", b.len);
-    e->textLen = (int)b.len;
+    const char* r = qkDup(b.data ? b.data : "", b.len);
+    *len = (int)b.len;
     qkBufFree(&b);
+    return r;
+}
+
+static Expr* parseExpr(Parser* p);
+static void addArg(Expr* e, Expr* arg, const char* name);
+
+/* A text; with {expressions} inside, an E_INTERP: the pieces around them, and each expression parsed. */
+static Expr* parseText(Parser* p, Token* t) {
+    const char* s = t->start + 1;
+    const char* end = t->start + t->len - (t->len > 1 && t->start[t->len - 1] == '"' ? 1 : 0);
+    const char* open = NULL;
+    for (const char* q = s; q < end; q++) {
+        if (*q == '\\') {
+            q++;
+            continue;
+        }
+        if (*q == '{') {
+            open = q;
+            break;
+        }
+    }
+    if (!open) {
+        Expr* e = qkNewExpr(E_TEXT, t->line, t->col);
+        e->text = decodePiece(p, t, s, end, &e->textLen);
+        e->raw = tokText(t);
+        return e;
+    }
+    Expr* e = qkNewExpr(E_INTERP, t->line, t->col);
+    const char* parts[64];
+    const char* raws[64];
+    int count = 0;
+    const char* piece = s;
+    const char* q = s;
+    while (q < end && count < 63) {
+        if (*q == '\\') {
+            q += 2;
+            continue;
+        }
+        if (*q != '{') {
+            q++;
+            continue;
+        }
+        int len;
+        parts[count] = decodePiece(p, t, piece, q, &len);
+        raws[count] = qkDup(piece, (size_t)(q - piece));
+        count++;
+        /* the expression: to the matching brace, texts inside it skipped */
+        const char* from = ++q;
+        int depth = 1;
+        while (q < end && depth) {
+            if (*q == '"') {
+                for (q++; q < end && *q != '"'; q++)
+                    if (*q == '\\') q++;
+            } else if (*q == '{') {
+                depth++;
+            } else if (*q == '}') {
+                depth--;
+                if (!depth) break;
+            }
+            q++;
+        }
+        if (q >= end) {
+            fail(p, t, "%s", "a { in a text needs its } (write \\{ for the character)");
+            return e;
+        }
+        QkSource* sub = qkNew(sizeof *sub);
+        *sub = (QkSource){p->src->path, qkDup(from, (size_t)(q - from)), (size_t)(q - from)};
+        Parser inner = {sub, {0}, 0, 0, false, false};
+        qkLex(sub, &inner.lx);
+        for (int k = 0; k < inner.lx.count; k++) { /* point errors at the text's line */
+            inner.lx.tokens[k].line = t->line;
+            inner.lx.tokens[k].col += t->col + (int)(from - t->start) - 1;
+        }
+        Expr* x = parseExpr(&inner);
+        if (inner.lx.tokens[inner.i].kind != T_EOF && inner.lx.tokens[inner.i].kind != T_NEWLINE)
+            fail(&inner, &inner.lx.tokens[inner.i], "%s", "one expression goes between { and }");
+        if (inner.failed) p->failed = true;
+        addArg(e, x, NULL);
+        piece = ++q;
+    }
+    int len;
+    parts[count] = decodePiece(p, t, piece, end, &len);
+    raws[count] = qkDup(piece, (size_t)(end - piece));
+    count++;
+    e->parts = qkNew(sizeof(char*) * (size_t)count);
+    e->rawParts = qkNew(sizeof(char*) * (size_t)count);
+    memcpy(e->parts, parts, sizeof(char*) * (size_t)count);
+    memcpy(e->rawParts, raws, sizeof(char*) * (size_t)count);
+    return e;
 }
 
 static Expr* parseIf(Parser* p) {
@@ -257,6 +355,22 @@ static Expr* parseMatch(Parser* p) {
             Token* name = next(p);
             if (accept(p, T_DOT)) name = expect(p, T_TYPENAME, "after the enum's name");
             arm.pattern = tokText(name);
+            if (accept(p, T_LPAREN)) { /* Circle(r, _): names for the case's data */
+                const char* binds[32];
+                while (!at(p, T_RPAREN) && !at(p, T_EOF) && arm.bindCount < 32) {
+                    Token* b = peek(p);
+                    if (b->kind != T_NAME && b->kind != T_UNDERSCORE) {
+                        fail(p, b, "%s", "expected a name (or _) for the case's data");
+                        break;
+                    }
+                    next(p);
+                    binds[arm.bindCount++] = b->kind == T_UNDERSCORE ? "_" : tokText(b);
+                    if (!accept(p, T_COMMA)) break;
+                }
+                expect(p, T_RPAREN, "after the names");
+                arm.binds = qkNew(sizeof(char*) * (size_t)(arm.bindCount ? arm.bindCount : 1));
+                memcpy(arm.binds, binds, sizeof(char*) * (size_t)arm.bindCount);
+            }
         } else if (at(p, T_INT) || (at(p, T_MINUS) && peekAt(p, 1)->kind == T_INT)) {
             bool negative = accept(p, T_MINUS);
             Token* num = next(p);
@@ -300,13 +414,9 @@ static Expr* parsePrimary(Parser* p) {
         e->raw = tokText(t);
         return e;
     }
-    case T_TEXT: {
+    case T_TEXT:
         next(p);
-        Expr* e = qkNewExpr(E_TEXT, t->line, t->col);
-        decodeText(p, t, e);
-        e->raw = tokText(t);
-        return e;
-    }
+        return parseText(p, t);
     case T_TRUE: case T_FALSE: {
         next(p);
         Expr* e = qkNewExpr(E_BOOL, t->line, t->col);
@@ -369,8 +479,11 @@ static Expr* parsePostfix(Parser* p) {
             Expr* call = qkNewExpr(E_CALL, e->line, e->col);
             if (e->kind == E_NAME) {
                 call->name = e->name;
+            } else if (e->kind == E_FIELD && e->a->kind == E_NAME && e->name[0] >= 'A' && e->name[0] <= 'Z') {
+                call->name = e->name; /* Shape.Circle(2): a case with data */
+                call->qualifier = e->a->name;
             } else {
-                fail(p, t, "%s", "only a function or a type can be called");
+                fail(p, t, "%s", "only a function, a type or an enum case can be called");
             }
             parseArgs(p, call);
             e = call;
@@ -389,7 +502,14 @@ static Expr* parsePostfix(Parser* p) {
                 return e;
             }
             next(p);
-            if (at(p, T_LPAREN)) { /* a.f(b) is f(a, b) */
+            if (at(p, T_LPAREN) && name->kind == T_TYPENAME && e->kind == E_NAME) { /* Shape.Circle(2): a case with data */
+                next(p);
+                Expr* call = qkNewExpr(E_CALL, e->line, e->col);
+                call->name = tokText(name);
+                call->qualifier = e->name;
+                parseArgs(p, call);
+                e = call;
+            } else if (at(p, T_LPAREN)) { /* a.f(b) is f(a, b) */
                 next(p);
                 Expr* call = qkNewExpr(E_CALL, name->line, name->col);
                 call->name = tokText(name);
@@ -403,6 +523,24 @@ static Expr* parsePostfix(Parser* p) {
                 f->name = tokText(name);
                 e = f;
             }
+        } else if (t->kind == T_WITH) { /* ship with { laps: ship.laps + 1 } */
+            next(p);
+            Expr* w = qkNewExpr(E_WITH, t->line, t->col);
+            w->a = e;
+            expect(p, T_LBRACE, "after with (the fields that change)");
+            skipNewlines(p);
+            while (!at(p, T_RBRACE) && !at(p, T_EOF) && !p->failed) {
+                Token* field = expect(p, T_NAME, "for a field (a camelCase name)");
+                expect(p, T_COLON, "after the field's name");
+                addArg(w, parseExpr(p), tokText(field));
+                if (!accept(p, T_COMMA) && !at(p, T_NEWLINE) && !at(p, T_RBRACE)) {
+                    fail(p, peek(p), "%s", "separate the fields with commas or new lines");
+                    break;
+                }
+                skipNewlines(p);
+            }
+            expect(p, T_RBRACE, "to close the fields");
+            e = w;
         } else {
             return e;
         }
@@ -508,11 +646,21 @@ static Expr* parseAnd(Parser* p) {
     return e;
 }
 
-static Expr* parseExpr(Parser* p) {
+static Expr* parseOr(Parser* p) {
     Expr* e = parseAnd(p);
     while (at(p, T_OR)) {
         Token* t = next(p);
         e = binary(t, e, parseAnd(p));
+    }
+    return e;
+}
+
+/* a ?? b: the value inside an optional, or b */
+static Expr* parseExpr(Parser* p) {
+    Expr* e = parseOr(p);
+    while (at(p, T_QQ)) {
+        Token* t = next(p);
+        e = binary(t, e, parseOr(p));
     }
     return e;
 }
@@ -608,7 +756,8 @@ static Decl* parseFn(Parser* p) {
     while (!at(p, T_RPAREN) && !at(p, T_EOF)) {
         Token* pn = expect(p, T_NAME, "for a parameter (a camelCase name)");
         expect(p, T_COLON, "after a parameter's name (every parameter has a type)");
-        Param prm = {tokText(pn), parseType(p), pn->line, pn->col, NULL};
+        Param prm = {tokText(pn), parseType(p), pn->line, pn->col, NULL, NULL};
+        if (accept(p, T_ASSIGN)) prm.fallback = parseExpr(p); /* a default value */
         QK_PUSH(d->params, d->paramCount, d->paramCap, prm);
         if (!accept(p, T_COMMA)) break;
     }
@@ -623,9 +772,46 @@ static Decl* parseFn(Parser* p) {
     return d;
 }
 
-/* extern fn name(params) -> Result   |   extern type Name */
+/* effect fn ... (a function with effects) */
+static Decl* parseEffect(Parser* p, bool external) {
+    Token* t = next(p); /* effect */
+    if (!at(p, T_FN)) {
+        fail(p, peek(p), "%s", "expected fn after effect");
+        Decl* d = qkNew(sizeof *d);
+        d->name = "";
+        return d;
+    }
+    p->externNext = external;
+    Decl* d = parseFn(p);
+    d->isEffect = true;
+    d->line = t->line;
+    d->col = t->col;
+    return d;
+}
+
+/* let name = value, at the top: a constant */
+static Decl* parseConst(Parser* p) {
+    Token* t = next(p); /* let */
+    Decl* d = qkNew(sizeof *d);
+    d->kind = D_CONST;
+    d->line = t->line;
+    d->col = t->col;
+    d->name = tokText(expect(p, T_NAME, "after let (a camelCase name)"));
+    if (accept(p, T_COLON)) d->ret = parseType(p);
+    expect(p, T_ASSIGN, "after the constant's name");
+    d->body = parseExpr(p);
+    return d;
+}
+
+/* extern fn name(params) -> Result   |   extern effect fn ...   |   extern type Name */
 static Decl* parseExtern(Parser* p) {
     Token* t = next(p); /* extern */
+    if (at(p, T_EFFECT)) {
+        Decl* d = parseEffect(p, true);
+        d->line = t->line;
+        d->col = t->col;
+        return d;
+    }
     if (at(p, T_FN)) {
         p->externNext = true;
         Decl* d = parseFn(p);
@@ -660,7 +846,30 @@ static Decl* parseTypeDecl(Parser* p) {
             QK_PUSH(d->params, d->paramCount, d->paramCap, f);
         } else {
             const char* c = tokText(expect(p, T_TYPENAME, "for a case (a PascalCase name)"));
+            int k = d->caseCount;
             QK_PUSH(d->cases, d->caseCount, d->caseCap, c);
+            if (d->caseCount > 64) {
+                fail(p, peek(p), "%s", "an enum has at most 64 cases");
+                break;
+            }
+            if (!d->caseFields) {
+                d->caseFields = qkNew(sizeof(Param*) * 64);
+                d->caseFieldCount = qkNew(sizeof(int) * 64);
+            }
+            if (accept(p, T_LPAREN)) { /* Circle(radius: Float): the case carries data */
+                Param fields[32];
+                int n = 0;
+                while (!at(p, T_RPAREN) && !at(p, T_EOF) && n < 32) {
+                    Token* fn = expect(p, T_NAME, "for the case's data (a camelCase name)");
+                    expect(p, T_COLON, "after its name");
+                    fields[n++] = (Param){tokText(fn), parseType(p), fn->line, fn->col, NULL, NULL};
+                    if (!accept(p, T_COMMA)) break;
+                }
+                expect(p, T_RPAREN, "after the case's data");
+                d->caseFields[k] = qkNew(sizeof(Param) * (size_t)(n ? n : 1));
+                memcpy(d->caseFields[k], fields, sizeof(Param) * (size_t)n);
+                d->caseFieldCount[k] = n;
+            }
         }
         if (!accept(p, T_COMMA) && !at(p, T_NEWLINE) && !at(p, T_RBRACE)) {
             fail(p, peek(p), "%s", "separate them with commas or new lines");
@@ -687,8 +896,10 @@ bool qkParse(const QkSource* src, Program* out) {
         if (at(&p, T_FN)) d = parseFn(&p);
         else if (at(&p, T_TYPE) || at(&p, T_ENUM)) d = parseTypeDecl(&p);
         else if (at(&p, T_EXTERN)) d = parseExtern(&p);
+        else if (at(&p, T_EFFECT)) d = parseEffect(&p, false);
+        else if (at(&p, T_LET)) d = parseConst(&p);
         else {
-            fail(&p, t, "%s", "expected fn, type, enum or extern at the top of the file");
+            fail(&p, t, "%s", "expected fn, effect fn, let, type, enum or extern at the top of the file");
             break;
         }
         d->leading = leading;

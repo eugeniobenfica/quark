@@ -1,10 +1,11 @@
 // What a game engine gives its scripts (the host's prelude): Artifice's object API as Quark sees it.
 // Every program the engine compiles sees these; the engine registers a C function for each extern fn.
+// An effect fn changes the world (an action node, on the execution wire); the others only read it.
 extern type Object
 extern fn position(o: Object) -> Vec2
-extern fn moveBy(o: Object, dx: Float, dy: Float)
-extern fn moveTo(o: Object, p: Vec2)
-extern fn setColor(o: Object, r: Float, g: Float, b: Float, a: Float)
-extern fn say(o: Object, message: Text)
-extern fn destroy(o: Object)
+extern effect fn moveBy(o: Object, dx: Float, dy: Float)
+extern effect fn moveTo(o: Object, p: Vec2)
+extern effect fn setColor(o: Object, r: Float, g: Float, b: Float, a: Float)
+extern effect fn say(o: Object, message: Text)
+extern effect fn destroy(o: Object)
 extern fn keyDown(key: Text) -> Bool

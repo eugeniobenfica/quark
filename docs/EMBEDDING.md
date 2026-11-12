@@ -23,11 +23,15 @@ describes its API, in the language itself:
 ```quark
 extern type Object                                  // a handle: the host's, never made by a script
 extern fn position(o: Object) -> Vec2
-extern fn moveBy(o: Object, dx: Float, dy: Float)
-extern fn setColor(o: Object, r: Float, g: Float, b: Float, a: Float)
-extern fn say(o: Object, message: Text)
+extern effect fn moveBy(o: Object, dx: Float, dy: Float)   // effect: it changes the world
+extern effect fn setColor(o: Object, r: Float, g: Float, b: Float, a: Float)
+extern effect fn say(o: Object, message: Text)
 extern fn keyDown(key: Text) -> Bool
 ```
+
+Mark `effect` every host function that changes something (moves, draws, plays a sound). Only an
+`effect fn` can call one, and a node editor shows it as an action on the execution wire. Functions
+that only read (`position`, `keyDown`) stay pure.
 
 A prelude can also hold records, enums and ordinary functions that the host wants to share with
 every script. Its declarations are never printed or put in graphs, because they belong to the host,

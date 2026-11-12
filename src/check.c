@@ -8,6 +8,7 @@
 
 Type qkTypeError = {TY_ERROR}, qkTypeVoid = {TY_VOID}, qkTypeInt = {TY_INT}, qkTypeFloat = {TY_FLOAT},
      qkTypeBool = {TY_BOOL}, qkTypeText = {TY_TEXT}, qkTypeRange = {TY_RANGE, 0, &qkTypeInt};
+Type qkTypeNone = {TY_ENUM}, qkTypeEmpty = {TY_ARRAY};
 
 static Type vecTypes[3] = {{TY_VEC, 2}, {TY_VEC, 3}, {TY_VEC, 4}};
 
@@ -17,6 +18,7 @@ typedef struct Interned {
     Type* elem;
     Type* array;
     Type* iter;
+    Type* option;
     struct Interned* next;
 } Interned;
 static Interned* interned;
@@ -41,6 +43,44 @@ Type* qkTypeArray(Type* elem) { return internFor(elem)->array; }
 void qkTypesReset(void) { interned = NULL; }
 Type* qkTypeIter(Type* elem) { return internFor(elem)->iter; }
 
+/* T? is an enum of its own: None, Some(value: T). */
+Type* qkTypeOption(Type* elem) {
+    Interned* in = internFor(elem);
+    if (in->option) return in->option;
+    Decl* d = qkNew(sizeof *d);
+    d->kind = D_ENUM;
+    QkBuf name = {0};
+    qkTypeName(elem, &name);
+    qkBufPuts(&name, "?");
+    d->name = qkDup(name.data, name.len);
+    qkBufFree(&name);
+    d->cases = qkNew(sizeof(char*) * 2);
+    d->cases[0] = "None";
+    d->cases[1] = "Some";
+    d->caseCount = d->caseCap = 2;
+    d->caseFields = qkNew(sizeof(Param*) * 2);
+    d->caseFieldCount = qkNew(sizeof(int) * 2);
+    d->caseFields[1] = qkNew(sizeof(Param));
+    d->caseFields[1][0].name = "value";
+    d->caseFields[1][0].binding = qkNew(sizeof(Binding));
+    d->caseFields[1][0].binding->name = "value";
+    d->caseFields[1][0].binding->type = elem;
+    d->caseFieldCount[1] = 1;
+    d->state = 2;
+    d->type = qkNew(sizeof(Type));
+    *d->type = (Type){TY_ENUM, 0, elem, d};
+    d->optionOf = elem;
+    in->option = d->type;
+    return d->type;
+}
+
+bool qkHasData(const Type* t) {
+    if (t->kind != TY_ENUM || !t->decl || !t->decl->caseFieldCount) return false;
+    for (int k = 0; k < t->decl->caseCount; k++)
+        if (t->decl->caseFieldCount[k]) return true;
+    return false;
+}
+
 bool qkTypeSame(const Type* a, const Type* b) { return a == b || a->kind == TY_ERROR || b->kind == TY_ERROR; }
 
 void qkTypeName(const Type* t, QkBuf* out) {
@@ -52,16 +92,36 @@ void qkTypeName(const Type* t, QkBuf* out) {
     case TY_BOOL: qkBufPuts(out, "Bool"); break;
     case TY_TEXT: qkBufPuts(out, "Text"); break;
     case TY_VEC: qkBufPrintf(out, "Vec%d", t->n); break;
-    case TY_ARRAY: qkBufPuts(out, "["); qkTypeName(t->elem, out); qkBufPuts(out, "]"); break;
-    case TY_RECORD: case TY_ENUM: case TY_HANDLE: qkBufPuts(out, t->decl->name); break;
+    case TY_ARRAY:
+        if (!t->elem) qkBufPuts(out, "[] (of no type yet)");
+        else {
+            qkBufPuts(out, "[");
+            qkTypeName(t->elem, out);
+            qkBufPuts(out, "]");
+        }
+        break;
+    case TY_RECORD: case TY_ENUM: case TY_HANDLE:
+        if (t == &qkTypeNone) qkBufPuts(out, "None (of no type yet)");
+        else qkBufPuts(out, t->decl->name);
+        break;
     case TY_RANGE: qkBufPuts(out, "a range of Int"); break;
     case TY_ITER: qkBufPuts(out, "a loop of "); qkTypeName(t->elem, out); break;
     }
 }
 
+/* An enum: its case (1 slot), then every case's data, side by side (a slot never changes its kind). */
+static int enumSlots(const Decl* d) {
+    int n = 1;
+    if (d && d->caseFieldCount)
+        for (int k = 0; k < d->caseCount; k++)
+            for (int f = 0; f < d->caseFieldCount[k]; f++) n += qkTypeSlots(d->caseFields[k][f].binding->type);
+    return n;
+}
+
 int qkTypeSlots(const Type* t) {
     switch (t->kind) {
-    case TY_INT: case TY_FLOAT: case TY_BOOL: case TY_ENUM: case TY_HANDLE: return 1;
+    case TY_ENUM: return enumSlots(t->decl);
+    case TY_INT: case TY_FLOAT: case TY_BOOL: case TY_HANDLE: return 1;
     case TY_TEXT: case TY_ARRAY: return 2;
     case TY_VEC: return t->n;
     case TY_RECORD: {
@@ -86,6 +146,19 @@ void qkTypeSlotKinds(const Type* t, char* out) {
         }
         break;
     }
+    case TY_ENUM: {
+        out[0] = 'I';
+        int at = 1;
+        const Decl* d = t->decl;
+        if (d && d->caseFieldCount)
+            for (int k = 0; k < d->caseCount; k++)
+                for (int f = 0; f < d->caseFieldCount[k]; f++) {
+                    Type* ft = d->caseFields[k][f].binding->type;
+                    qkTypeSlotKinds(ft, out + at);
+                    at += qkTypeSlots(ft);
+                }
+        break;
+    }
     default:
         for (int i = 0; i < qkTypeSlots(t); i++) out[i] = 'I';
     }
@@ -97,7 +170,7 @@ Type* qkElemType(const Type* t) { return t->elem ? t->elem : &qkTypeError; }
 const char* const qkBuiltinNames[B_COUNT] = {
     NULL, "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow", "abs", "floor", "ceil",
     "round", "toFloat", "toInt", "min", "max", "clamp", "lerp", "length", "dot", "len", "fill", "map", "filter", "fold",
-    "sum", "histogram", "any", "all", "toArray", "print", "now", "Vec2", "Vec3", "Vec4"};
+    "sum", "histogram", "any", "all", "toArray", "print", "now", "Vec2", "Vec3", "Vec4", "Some", "toText", "push"};
 
 /* ---- the checker --------------------------------------------------------------------------------- */
 
@@ -113,6 +186,7 @@ typedef struct Checker {
     int varReads;
     Binding** lets;  /* this function's lets, to decide which are fused */
     int letCount, letCap;
+    bool inConst;    /* checking a constant or a default value: no names, no effects */
 } Checker;
 
 static Type* checkExpr(Checker* c, Expr* e, bool wantValue);
@@ -128,6 +202,14 @@ static void typeError(Checker* c, const Expr* e, const char* fmt, const Type* a,
 }
 
 static Type* resolveType(Checker* c, TypeExpr* te) {
+    if (te->optional) {
+        Type* inner = resolveType(c, te->elem);
+        if (inner->kind == TY_ENUM && inner->decl && inner->decl->optionOf) {
+            qkError(c->src, te->line, te->col, "an optional of an optional: one ? is enough");
+            return inner;
+        }
+        return inner->kind == TY_ERROR ? inner : qkTypeOption(inner);
+    }
     if (!te->name) return qkTypeArray(resolveType(c, te->elem));
     if (!strcmp(te->name, "Int")) return &qkTypeInt;
     if (!strcmp(te->name, "Float")) return &qkTypeFloat;
@@ -201,6 +283,23 @@ static void wrapImplicit(Expr** slot, int builtin, Type* type) {
 static bool coerce(Checker* c, Expr** slot, Type* want, const char* where) {
     Type* have = (*slot)->type;
     if (qkTypeSame(have, want)) return true;
+    if (have == &qkTypeNone && want->kind == TY_ENUM && want->decl && want->decl->optionOf) { /* None takes the type */
+        Expr* e = *slot;
+        e->type = want;
+        e->decl = want->decl;
+        return true;
+    }
+    if (have == &qkTypeEmpty && want->kind == TY_ARRAY) { /* [] takes the type */
+        (*slot)->type = want;
+        return true;
+    }
+    bool haveOption = have->kind == TY_ENUM && have->decl && have->decl->optionOf;
+    if (want->kind == TY_ENUM && want->decl && want->decl->optionOf && !haveOption && have != &qkTypeNone) {
+        /* a T (or an Int for a Float?) where a T? goes: Some(it) */
+        if (!coerce(c, slot, want->decl->optionOf, where)) return false;
+        wrapImplicit(slot, B_SOME, want);
+        return true;
+    }
     if (have->kind == TY_INT && want->kind == TY_FLOAT) {
         wrapImplicit(slot, B_TOFLOAT, &qkTypeFloat);
         return true;
@@ -238,6 +337,20 @@ static Type* unifyNumeric(Checker* c, Expr** a, Expr** b) {
         return &qkTypeFloat;
     }
     return NULL;
+}
+
+/* ---- effects ------------------------------------------------------------------------------------- */
+
+/* A call that changes the world (the host's effect fns, print, now) is allowed only in an effect fn (or main),
+ * never in a lambda or a constant: everything else is pure, so it can be fused, reordered, cached. */
+static void needEffect(Checker* c, const Expr* e, const char* what) {
+    if (c->lambdaDepth) {
+        qkError(c->src, e->line, e->col, "%s has effects: a lambda cannot have any (map, filter... are pure)", what);
+    } else if (c->inConst || !c->fn) {
+        qkError(c->src, e->line, e->col, "%s has effects: a constant cannot have any", what);
+    } else if (!c->fn->isEffect && strcmp(c->fn->name, "main")) {
+        qkError(c->src, e->line, e->col, "%s has effects (it changes the world): write effect fn %s", what, c->fn->name);
+    }
 }
 
 /* ---- lambdas ------------------------------------------------------------------------------------- */
@@ -338,6 +451,12 @@ static Type* checkSource(Checker* c, Expr* e, int i) {
     }
     markIterUse(e->args[i]);
     return t->elem;
+}
+
+/* what toText and "{x}" take */
+static bool textable(const Type* t) {
+    return t->kind == TY_INT || t->kind == TY_FLOAT || t->kind == TY_BOOL || t->kind == TY_TEXT || t->kind == TY_ERROR ||
+           (t->kind == TY_ENUM && t != &qkTypeNone && !(t->decl && t->decl->optionOf)); /* a case: its name */
 }
 
 static bool printable(const Type* t) {
@@ -444,7 +563,13 @@ static Type* checkBuiltin(Checker* c, Expr* e, int b) {
     }
     case B_LEN: {
         if (!argCount(c, e, 1, 1)) return &qkTypeError;
-        checkSource(c, e, 0);
+        Type* t = checkExpr(c, e->args[0], true);
+        if (t->kind == TY_TEXT) return &qkTypeInt; /* bytes */
+        if (!qkIsIterable(t)) {
+            if (t->kind != TY_ERROR) typeError(c, e->args[0], "len: expected a text, an array, a range or a loop, found %s", t, NULL);
+            return &qkTypeInt;
+        }
+        markIterUse(e->args[0]);
         return &qkTypeInt;
     }
     case B_FILL: {
@@ -511,6 +636,7 @@ static Type* checkBuiltin(Checker* c, Expr* e, int b) {
         return qkTypeArray(checkSource(c, e, 0));
     }
     case B_PRINT:
+        needEffect(c, e, "print");
         for (int i = 0; i < e->argCount; i++) {
             Type* t = checkExpr(c, e->args[i], true);
             if (t->kind == TY_RANGE || t->kind == TY_ITER) {
@@ -522,8 +648,51 @@ static Type* checkBuiltin(Checker* c, Expr* e, int b) {
         }
         return &qkTypeVoid;
     case B_NOW:
+        needEffect(c, e, "now");
         argCount(c, e, 0, 0);
         return &qkTypeFloat;
+    case B_SOME: {
+        if (!argCount(c, e, 1, 1)) return &qkTypeError;
+        Type* t = checkExpr(c, e->args[0], true);
+        if (t->kind == TY_RANGE || t->kind == TY_ITER) {
+            markIterUse(e->args[0]);
+            coerce(c, &e->args[0], qkTypeArray(t->elem), "Some");
+            t = e->args[0]->type;
+        }
+        if (t->kind == TY_VOID || t == &qkTypeNone || t == &qkTypeEmpty) {
+            typeError(c, e->args[0], "Some needs a value of a known type, not %s", t, NULL);
+            return &qkTypeError;
+        }
+        if (t->kind == TY_ERROR) return t;
+        if (t->kind == TY_ENUM && t->decl && t->decl->optionOf) {
+            typeError(c, e->args[0], "Some of %s: it is optional already", t, NULL);
+            return &qkTypeError;
+        }
+        return qkTypeOption(t);
+    }
+    case B_TOTEXT: {
+        if (!argCount(c, e, 1, 1)) return &qkTypeError;
+        Type* t = checkExpr(c, e->args[0], true);
+        if (!textable(t)) typeError(c, e->args[0], "toText: %s has no text form (Int, Float, Bool, Text and enum cases do)", t, NULL);
+        return &qkTypeText;
+    }
+    case B_PUSH: { /* xs.push(value): xs a var array, one longer */
+        if (!argCount(c, e, 2, 2)) return &qkTypeError;
+        Type* t = checkExpr(c, e->args[0], true);
+        Expr* target = e->args[0];
+        if (target->kind != E_NAME || !target->binding || !target->binding->mutable) {
+            qkError(c->src, target->line, target->col, "push adds to a var array: var xs: [Int] = [] ... xs.push(1)");
+            return &qkTypeError;
+        }
+        if (t->kind != TY_ARRAY) {
+            if (t->kind != TY_ERROR) typeError(c, target, "push adds to an array, not %s", t, NULL);
+            return &qkTypeError;
+        }
+        Type* v = checkExpr(c, e->args[1], true);
+        if (v->kind == TY_RANGE || v->kind == TY_ITER) markIterUse(e->args[1]);
+        coerce(c, &e->args[1], t->elem, "push");
+        return &qkTypeVoid;
+    }
     case B_VEC2: case B_VEC3: case B_VEC4: {
         int n = b - B_VEC2 + 2;
         if (!argCount(c, e, n, n)) return &qkTypeError;
@@ -539,67 +708,151 @@ static Type* checkBuiltin(Checker* c, Expr* e, int b) {
 
 static Type* fnReturnType(Checker* c, Decl* d, const Expr* at);
 
+/* A constant's type, its value checked once, where no local name is in reach and nothing has effects. Its
+ * value is computed where it is used (it is pure). */
+static Type* checkPure(Checker* c, Expr** slot, TypeExpr* written, Type* want, const char* name) {
+    Checker inner = {0};
+    inner.prog = c->prog;
+    inner.src = c->src;
+    inner.inConst = true;
+    Type* t = checkExpr(&inner, *slot, true);
+    if (written) want = resolveType(&inner, written);
+    if (want) {
+        coerce(&inner, slot, want, name);
+        t = want;
+    }
+    if (t->kind == TY_RANGE || t->kind == TY_ITER) {
+        markIterUse(*slot);
+        coerce(&inner, slot, qkTypeArray(t->elem), name);
+        t = (*slot)->type;
+    }
+    if (t == &qkTypeNone || t == &qkTypeEmpty) {
+        qkError(c->src, (*slot)->line, (*slot)->col, "%s needs its type written: let %s: T = ...", name, name);
+        t = &qkTypeError;
+    }
+    if (t->kind == TY_VOID) {
+        qkError(c->src, (*slot)->line, (*slot)->col, "%s is given nothing", name);
+        t = &qkTypeError;
+    }
+    return t;
+}
+
+static Type* constType(Checker* c, Decl* d, const Expr* at) {
+    if (d->state == 2) return d->retType ? d->retType : &qkTypeError;
+    if (d->state == 1) {
+        qkError(c->src, at->line, at->col, "the constant %s needs itself", d->name);
+        return &qkTypeError;
+    }
+    d->state = 1;
+    d->retType = checkPure(c, &d->body, d->ret, NULL, d->name);
+    d->state = 2;
+    return d->retType;
+}
+
+/* A call's arguments onto the parameters: by position, then by name (f(1, size: 2)), the rest from their
+ * defaults. e->ordered gets one value per parameter, converted to its type; e->args keep what was written. */
+static bool bindArgs(Checker* c, Expr* e, Param* params, int count, const char* what) {
+    Expr** ordered = qkNew(sizeof(Expr*) * (size_t)(count ? count : 1));
+    bool ok = true, named = false;
+    for (int i = 0; i < e->argCount; i++) {
+        Type* t = checkExpr(c, e->args[i], true);
+        if (t->kind == TY_RANGE || t->kind == TY_ITER) markIterUse(e->args[i]);
+        int p = i;
+        if (e->argNames && e->argNames[i]) {
+            named = true;
+            p = -1;
+            for (int k = 0; k < count; k++)
+                if (!strcmp(params[k].name, e->argNames[i])) p = k;
+            if (p < 0) {
+                const char* names[64];
+                int n = 0;
+                for (int k = 0; k < count && n < 64; k++) names[n++] = params[k].name;
+                const char* close = qkClosest(e->argNames[i], names, n);
+                qkError(c->src, e->args[i]->line, e->args[i]->col, "%s has no parameter \"%s\"%s%s%s", what, e->argNames[i],
+                        close ? ": did you mean \"" : "", close ? close : "", close ? "\"?" : "");
+                ok = false;
+                continue;
+            }
+        } else if (named) {
+            qkError(c->src, e->args[i]->line, e->args[i]->col, "after a named value, every value is named");
+            ok = false;
+            continue;
+        }
+        if (p >= count) {
+            qkError(c->src, e->line, e->col, "%s takes %d value%s, given %d", what, count, count == 1 ? "" : "s", e->argCount);
+            return false;
+        }
+        if (ordered[p]) {
+            qkError(c->src, e->args[i]->line, e->args[i]->col, "\"%s\" is given twice", params[p].name);
+            ok = false;
+            continue;
+        }
+        ordered[p] = e->args[i];
+        coerce(c, &ordered[p], params[p].binding->type, params[p].name);
+    }
+    for (int p = 0; p < count; p++)
+        if (!ordered[p]) {
+            if (params[p].fallback) ordered[p] = params[p].fallback;
+            else {
+                qkError(c->src, e->line, e->col, "%s needs \"%s\" (%d value%s, given %d)", what, params[p].name, count, count == 1 ? "" : "s",
+                        e->argCount);
+                ok = false;
+            }
+        }
+    e->ordered = ordered;
+    e->orderedCount = count;
+    return ok;
+}
+
 static Type* checkCall(Checker* c, Expr* e) {
     Decl* d = qkFindDecl(c->prog, e->name);
+    if (e->qualifier) d = NULL; /* a case: below */
     if (d && d->kind == D_TYPE && d->isExtern) {
         qkError(c->src, e->line, e->col, "%s comes from the host: it is given to the program, never made by it", d->name);
         return &qkTypeError;
     }
-    if (d && d->kind == D_TYPE) { /* a record */
+    if (d && d->kind == D_TYPE) { /* a record: its fields by position, then by name */
         e->decl = d;
-        if (e->argCount != d->paramCount) {
-            qkError(c->src, e->line, e->col, "%s has %d field%s, given %d", d->name, d->paramCount, d->paramCount == 1 ? "" : "s", e->argCount);
+        if (!bindArgs(c, e, d->params, d->paramCount, d->name)) return &qkTypeError;
+        return d->type;
+    }
+    if (e->qualifier) { /* Shape.Circle(2): a case with data */
+        Decl* en = qkFindDecl(c->prog, e->qualifier);
+        if (!en || en->kind != D_ENUM) {
+            qkError(c->src, e->line, e->col, "%s is not an enum", e->qualifier);
             return &qkTypeError;
         }
-        bool named = e->argCount > 0 && e->argNames[0];
-        Expr** ordered = qkNew(sizeof(Expr*) * (size_t)(e->argCount ? e->argCount : 1));
-        for (int i = 0; i < e->argCount; i++) {
-            int field = i;
-            if (named != (e->argNames[i] != NULL)) {
-                qkError(c->src, e->args[i]->line, e->args[i]->col, "name every field or none");
-                return &qkTypeError;
-            }
-            if (named) {
-                field = -1;
-                for (int f = 0; f < d->paramCount; f++)
-                    if (!strcmp(d->params[f].name, e->argNames[i])) field = f;
-                if (field < 0) {
-                    qkError(c->src, e->args[i]->line, e->args[i]->col, "%s has no field \"%s\"", d->name, e->argNames[i]);
-                    return &qkTypeError;
-                }
-                if (ordered[field]) {
-                    qkError(c->src, e->args[i]->line, e->args[i]->col, "\"%s\" is given twice", e->argNames[i]);
-                    return &qkTypeError;
-                }
-            }
-            checkExpr(c, e->args[i], true);
-            ordered[field] = e->args[i];
-            coerce(c, &ordered[field], d->params[field].binding->type, d->params[field].name);
+        int k = -1;
+        for (int i = 0; i < en->caseCount; i++)
+            if (!strcmp(en->cases[i], e->name)) k = i;
+        if (k < 0) {
+            const char* close = qkClosest(e->name, en->cases, en->caseCount);
+            qkError(c->src, e->line, e->col, "%s has no case %s%s%s%s", en->name, e->name, close ? ": did you mean " : "", close ? close : "",
+                    close ? "?" : "");
+            return &qkTypeError;
         }
-        /* keep the written order for printing; lowering reads `ordered` through argNames */
-        if (!named)
-            for (int i = 0; i < e->argCount; i++) e->args[i] = ordered[i];
-        else
-            for (int i = 0; i < e->argCount; i++)
-                for (int f = 0; f < d->paramCount; f++)
-                    if (!strcmp(d->params[f].name, e->argNames[i])) e->args[i] = ordered[f];
-        return d->type;
+        int n = en->caseFieldCount ? en->caseFieldCount[k] : 0;
+        if (!n) {
+            qkError(c->src, e->line, e->col, "%s.%s carries no data: write %s.%s", en->name, e->name, en->name, e->name);
+            return &qkTypeError;
+        }
+        e->decl = en;
+        e->caseIndex = k;
+        if (!bindArgs(c, e, en->caseFields[k], n, e->name)) return &qkTypeError;
+        return en->type;
     }
     if (d && d->kind == D_FN && !lookup(c, e->name)) {
         e->decl = d;
-        if (!argCount(c, e, d->paramCount, d->paramCount)) {
-            for (int i = 0; i < e->argCount; i++) checkExpr(c, e->args[i], true);
-            return fnReturnType(c, d, e);
-        }
-        for (int i = 0; i < e->argCount; i++) {
-            Type* t = checkExpr(c, e->args[i], true);
-            if (t->kind == TY_RANGE || t->kind == TY_ITER) markIterUse(e->args[i]);
-            coerce(c, &e->args[i], d->params[i].binding->type, d->params[i].name);
-        }
+        if (d->isEffect) needEffect(c, e, d->name);
+        bindArgs(c, e, d->params, d->paramCount, d->name);
         return fnReturnType(c, d, e);
     }
     if (d && d->kind == D_ENUM) {
         qkError(c->src, e->line, e->col, "%s is an enum: pick a case, %s.%s", d->name, d->name, d->caseCount ? d->cases[0] : "Case");
+        return &qkTypeError;
+    }
+    if (d && d->kind == D_CONST) {
+        qkError(c->src, e->line, e->col, "%s is a constant, not a function", d->name);
         return &qkTypeError;
     }
     int b = builtinNamed(e->name);
@@ -657,6 +910,33 @@ static Type* unifyBranches(Checker* c, Expr*** slots, int n, Expr* at) {
         for (int i = 0; i < n; i++) coerce(c, slots[i], &qkTypeFloat, "this branch");
         return &qkTypeFloat;
     }
+    /* an optional among the branches (or a typed array among []): every branch becomes one */
+    Type* target = NULL;
+    for (int i = 0; i < n && !target; i++) {
+        Type* bt = slots[i] ? (*slots[i])->type : &qkTypeVoid;
+        if (bt->kind == TY_ENUM && bt->decl && bt->decl->optionOf) target = bt;
+    }
+    for (int i = 0; i < n && !target; i++) {
+        Type* bt = slots[i] ? (*slots[i])->type : &qkTypeVoid;
+        if (bt->kind == TY_ARRAY && bt != &qkTypeEmpty) target = bt;
+    }
+    bool anyNone = false, anyEmpty = false;
+    for (int i = 0; i < n; i++) {
+        Type* bt = slots[i] ? (*slots[i])->type : &qkTypeVoid;
+        anyNone |= bt == &qkTypeNone;
+        anyEmpty |= bt == &qkTypeEmpty;
+    }
+    if (anyNone && !target) { /* None and a T: a T? */
+        for (int i = 0; i < n && !target; i++) {
+            Type* bt = slots[i] ? (*slots[i])->type : &qkTypeVoid;
+            if (bt != &qkTypeNone && bt->kind != TY_VOID) target = qkTypeOption(bt);
+        }
+    }
+    if (target && (anyNone || anyEmpty || target->kind == TY_ENUM)) {
+        for (int i = 0; i < n; i++)
+            if (slots[i] && !coerce(c, slots[i], target, "this branch")) return &qkTypeError;
+        return target;
+    }
     for (int i = 0; i < n; i++) {
         Type* bt = slots[i] ? (*slots[i])->type : &qkTypeVoid;
         if (!qkTypeSame(bt, t)) {
@@ -705,8 +985,8 @@ static Type* checkIf(Checker* c, Expr* e, bool wantValue) {
 
 static Type* checkMatch(Checker* c, Expr* e, bool wantValue) {
     Type* t = checkExpr(c, e->a, true);
-    if (t->kind != TY_ENUM && t->kind != TY_INT) {
-        if (t->kind != TY_ERROR) typeError(c, e->a, "match works on an enum or an Int, not %s", t, NULL);
+    if ((t->kind != TY_ENUM && t->kind != TY_INT) || t == &qkTypeNone) {
+        if (t->kind != TY_ERROR) typeError(c, e->a, "match works on an enum, an optional or an Int, not %s", t, NULL);
         return &qkTypeError;
     }
     bool wildcard = false;
@@ -733,6 +1013,22 @@ static Type* checkMatch(Checker* c, Expr* e, bool wantValue) {
             }
             if (a->caseIndex < 256 && seen[a->caseIndex]) qkError(c->src, a->body->line, a->body->col, "%s is matched twice", a->pattern);
             if (a->caseIndex < 256) seen[a->caseIndex] = true;
+            /* Circle(r): names for the case's data, in scope for the arm */
+            int fields = d->caseFieldCount ? d->caseFieldCount[a->caseIndex] : 0;
+            if (a->bindCount && a->bindCount != fields) {
+                qkError(c->src, a->body->line, a->body->col, "%s.%s carries %d value%s: name each (or _)", d->name, a->pattern, fields,
+                        fields == 1 ? "" : "s");
+                continue;
+            }
+            int mark = c->scopeCount;
+            a->bindings = qkNew(sizeof(Binding*) * (size_t)(a->bindCount ? a->bindCount : 1));
+            for (int f = 0; f < a->bindCount; f++) {
+                if (!strcmp(a->binds[f], "_")) continue;
+                a->bindings[f] = declare(c, a->binds[f], d->caseFields[a->caseIndex][f].binding->type, false, a->body->line, a->body->col);
+            }
+            checkExpr(c, a->body, wantValue);
+            c->scopeCount = mark;
+            continue;
         } else if (t->kind != TY_INT) {
             qkError(c->src, a->intPattern->line, a->intPattern->col, "an Int pattern, but the match is on %s", t->decl->name);
         }
@@ -790,6 +1086,11 @@ static void checkStmt(Checker* c, Stmt* s) {
         }
         if (t->kind == TY_VOID) {
             qkError(c->src, s->value->line, s->value->col, "this gives nothing to keep in \"%s\"", s->name);
+            t = &qkTypeError;
+        }
+        if (t == &qkTypeNone || t == &qkTypeEmpty) {
+            qkError(c->src, s->value->line, s->value->col, "%s needs its type written: %s %s: %s = ...", t == &qkTypeNone ? "None" : "[]",
+                    s->kind == S_LET ? "let" : "var", s->name, t == &qkTypeNone ? "Int?" : "[Int]");
             t = &qkTypeError;
         }
         bool loop = t->kind == TY_RANGE || t->kind == TY_ITER;
@@ -850,6 +1151,14 @@ static void checkStmt(Checker* c, Stmt* s) {
         int mark = c->scopeCount;
         c->loopDepth++;
         s->binding = declare(c, s->name, t->kind == TY_ERROR ? t : t->elem, false, s->line, s->col);
+        /* for i in 0..len(xs), xs a let or a parameter: xs[i] needs no bounds check */
+        Expr* it = s->iter;
+        if (it->kind == E_RANGE && it->a->kind == E_INT && it->a->i >= 0 && it->b->kind == E_CALL && it->b->builtin == B_LEN &&
+            it->b->argCount == 1) {
+            Expr* arr = it->b->args[0];
+            if (arr->kind == E_NAME && arr->binding && !arr->binding->mutable && arr->binding->type->kind == TY_ARRAY)
+                s->binding->safeIn = arr->binding;
+        }
         if (s->indexName) s->indexBinding = declare(c, s->indexName, &qkTypeInt, false, s->line, s->col);
         checkBlock(c, s->body, false);
         c->loopDepth--;
@@ -897,6 +1206,29 @@ static Type* checkBinary(Checker* c, Expr* e) {
     Type* a = checkExpr(c, e->a, true);
     Type* b = checkExpr(c, e->b, true);
     if (a->kind == TY_ERROR || b->kind == TY_ERROR) return &qkTypeError;
+    if (e->op == T_QQ) { /* a ?? b: what is in a, or b */
+        if (a->kind != TY_ENUM || !a->decl || !a->decl->optionOf) {
+            typeError(c, e->a, "?? takes an optional (T?) on its left, not %s", a, NULL);
+            return &qkTypeError;
+        }
+        Type* inner = a->decl->optionOf;
+        if (b == &qkTypeNone || (b->kind == TY_ENUM && b->decl && b->decl->optionOf)) { /* a ?? b ?? c: still optional */
+            coerce(c, &e->b, a, "??");
+            return a;
+        }
+        coerce(c, &e->b, inner, "??");
+        return inner;
+    }
+    if (a->kind == TY_TEXT && b->kind == TY_TEXT) { /* joined, compared byte by byte */
+        if (e->op == T_PLUS) return &qkTypeText;
+        if (e->op >= T_EQ && e->op <= T_GE) return &qkTypeBool;
+        typeError(c, e, "texts are joined with + and compared, not %s and %s", a, b);
+        return &qkTypeError;
+    }
+    if ((a->kind == TY_TEXT) != (b->kind == TY_TEXT) && e->op == T_PLUS) {
+        typeError(c, e, "+ joins two texts: make the other one text with \"{x}\" or toText(x) (%s and %s)", a, b);
+        return &qkTypeError;
+    }
     switch (e->op) {
     case T_AND: case T_OR:
         if (a->kind != TY_BOOL || b->kind != TY_BOOL) {
@@ -932,8 +1264,13 @@ static Type* checkBinary(Checker* c, Expr* e) {
             unifyNumeric(c, &e->a, &e->b);
             return &qkTypeBool;
         }
-        if (a == b && (a->kind == TY_BOOL || a->kind == TY_ENUM || a->kind == TY_VEC || a->kind == TY_HANDLE)) return &qkTypeBool;
-        typeError(c, e, "== compares numbers, Bools, enum cases or vectors of one kind, not %s and %s", a, b);
+        if (a == b && (a->kind == TY_BOOL || (a->kind == TY_ENUM && !qkHasData(a)) || a->kind == TY_VEC || a->kind == TY_HANDLE))
+            return &qkTypeBool;
+        if (a == b && qkHasData(a)) {
+            typeError(c, e, "%s carries data: compare it with match", a, NULL);
+            return &qkTypeError;
+        }
+        typeError(c, e, "== compares numbers, texts, Bools, enum cases or vectors of one kind, not %s and %s", a, b);
         return &qkTypeError;
     default: /* < <= > >= */
         if (isNumeric(a) && isNumeric(b)) {
@@ -962,17 +1299,64 @@ static Type* checkExprInner(Checker* c, Expr* e, bool wantValue) {
             return b->type;
         }
         Decl* d = qkFindDecl(c->prog, e->name);
+        if (d && d->kind == D_CONST) { /* a constant: its value, wherever it is used */
+            e->decl = d;
+            return constType(c, d, e);
+        }
+        if (!d && !strcmp(e->name, "None")) return &qkTypeNone; /* takes the T? it goes into */
         if (d && d->kind == D_FN) qkError(c->src, e->line, e->col, "%s is a function: call it, %s(...)", e->name, e->name);
         else if (d) qkError(c->src, e->line, e->col, "%s is a type, not a value", e->name);
+        else if (!strcmp(e->name, "Some")) qkError(c->src, e->line, e->col, "Some holds a value: Some(x)");
         else unknownName(c, e);
         return &qkTypeError;
     }
+    case E_WITH: { /* a copy with some fields changed */
+        Type* t = checkExpr(c, e->a, true);
+        if (t->kind != TY_RECORD && t->kind != TY_VEC) {
+            if (t->kind != TY_ERROR) typeError(c, e->a, "with changes fields of a record or a vector, not %s", t, NULL);
+            return &qkTypeError;
+        }
+        for (int i = 0; i < e->argCount; i++) {
+            checkExpr(c, e->args[i], true);
+            const char* f = e->argNames[i];
+            Type* ft = NULL;
+            if (t->kind == TY_VEC) {
+                static const char* const comps = "xyzw";
+                if (strlen(f) == 1 && strchr(comps, f[0]) && strchr(comps, f[0]) - comps < t->n) ft = &qkTypeFloat;
+            } else {
+                for (int k = 0; k < t->decl->paramCount; k++)
+                    if (!strcmp(t->decl->params[k].name, f)) ft = t->decl->params[k].binding->type;
+            }
+            if (!ft) {
+                QkBuf n = {0};
+                qkTypeName(t, &n);
+                qkError(c->src, e->args[i]->line, e->args[i]->col, "%s has no field \"%s\"", n.data, f);
+                qkBufFree(&n);
+                return &qkTypeError;
+            }
+            for (int j = 0; j < i; j++)
+                if (!strcmp(e->argNames[j], f)) qkError(c->src, e->args[i]->line, e->args[i]->col, "\"%s\" is given twice", f);
+            if (e->args[i]->type->kind == TY_RANGE || e->args[i]->type->kind == TY_ITER) markIterUse(e->args[i]);
+            coerce(c, &e->args[i], ft, f);
+        }
+        return t;
+    }
+    case E_INTERP: /* "lap {n}": each value as text */
+        for (int i = 0; i < e->argCount; i++) {
+            Type* t = checkExpr(c, e->args[i], true);
+            if (!textable(t)) typeError(c, e->args[i], "%s has no text form (Int, Float, Bool, Text and enum cases do)", t, NULL);
+        }
+        return &qkTypeText;
     case E_FIELD: {
         if (e->a->kind == E_NAME && e->a->name[0] >= 'A' && e->a->name[0] <= 'Z') {
             Decl* d = qkFindDecl(c->prog, e->a->name);
             if (d && d->kind == D_ENUM) {
                 for (int k = 0; k < d->caseCount; k++)
                     if (!strcmp(d->cases[k], e->name)) {
+                        if (d->caseFieldCount && d->caseFieldCount[k]) {
+                            qkError(c->src, e->line, e->col, "%s.%s carries data: %s.%s(...)", d->name, e->name, d->name, e->name);
+                            return &qkTypeError;
+                        }
                         e->kind = E_CASE;
                         e->decl = d;
                         e->caseIndex = k;
@@ -1051,10 +1435,7 @@ static Type* checkExprInner(Checker* c, Expr* e, bool wantValue) {
     case E_MATCH: return checkMatch(c, e, wantValue);
     case E_BLOCK: return checkBlock(c, e->block, wantValue);
     case E_ARRAY: {
-        if (!e->argCount) {
-            qkError(c->src, e->line, e->col, "an empty array needs its type: let xs: [Int] = fill(0, 0)");
-            return &qkTypeError;
-        }
+        if (!e->argCount) return &qkTypeEmpty; /* takes the array type it goes into */
         Type* t = NULL;
         bool anyFloat = false;
         for (int i = 0; i < e->argCount; i++) {
@@ -1190,21 +1571,33 @@ bool qkCheck(Program* p, bool needMain) {
         for (int j = 0; j < i; j++)
             if (!strcmp(p->decls[j]->name, d->name)) qkError(c.src, d->line, d->col, "\"%s\" is declared twice", d->name);
         if (builtinNamed(d->name)) qkError(c.src, d->line, d->col, "\"%s\" is a built-in name", d->name);
-        if (d->kind != D_FN) {
+        if (d->kind == D_TYPE || d->kind == D_ENUM) {
             d->type = qkNew(sizeof(Type));
             d->type->kind = d->kind == D_ENUM ? TY_ENUM : d->isExtern ? TY_HANDLE : TY_RECORD;
             d->type->decl = d;
         }
+        if ((d->kind == D_TYPE || d->kind == D_ENUM) && (!strcmp(d->name, "Some") || !strcmp(d->name, "None")))
+            qkError(c.src, d->line, d->col, "%s is the built-in optional's case: pick another name", d->name);
     }
-    /* record fields and function parameters */
+    /* record fields, enum cases' data and function parameters */
     for (int i = 0; i < p->count; i++) {
         Decl* d = p->decls[i];
         if (d->kind == D_ENUM) {
-            for (int k = 0; k < d->caseCount; k++)
+            for (int k = 0; k < d->caseCount; k++) {
                 for (int j = 0; j < k; j++)
                     if (!strcmp(d->cases[j], d->cases[k])) qkError(c.src, d->line, d->col, "%s.%s is listed twice", d->name, d->cases[k]);
+                for (int f = 0; d->caseFieldCount && f < d->caseFieldCount[k]; f++) {
+                    Param* prm = &d->caseFields[k][f];
+                    Binding* b = qkNew(sizeof *b);
+                    b->name = prm->name;
+                    b->type = resolveType(&c, prm->type);
+                    prm->binding = b;
+                    if (b->type == d->type) qkError(c.src, prm->line, prm->col, "%s cannot hold itself", d->name);
+                }
+            }
             continue;
         }
+        if (d->kind == D_CONST) continue;
         for (int f = 0; f < d->paramCount; f++) {
             Param* prm = &d->params[f];
             for (int j = 0; j < f; j++)
@@ -1222,6 +1615,16 @@ bool qkCheck(Program* p, bool needMain) {
             d->retType = d->ret ? resolveType(&c, d->ret) : &qkTypeVoid;
             d->state = 2;
         }
+    }
+    if (qkErrorCount > errorsBefore) return false;
+    /* constants and default values: pure, checked once */
+    for (int i = 0; i < p->count; i++) {
+        Decl* d = p->decls[i];
+        if (d->kind == D_CONST) constType(&c, d, d->body);
+        if (d->kind != D_FN) continue;
+        for (int f = 0; f < d->paramCount; f++)
+            if (d->params[f].fallback)
+                checkPure(&c, &d->params[f].fallback, NULL, d->params[f].binding->type, d->params[f].name);
     }
     if (qkErrorCount > errorsBefore) return false;
     for (int i = 0; i < p->count; i++)

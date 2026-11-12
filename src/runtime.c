@@ -130,12 +130,96 @@ static void* rtAlloc(int64_t count, int64_t bytesEach) {
 }
 
 /* Everything the last call allocated goes; the memory stays, zeroed again (allocations are zeroed). */
+/* Arrays that grow (push): each one's room, so the next push writes in place. */
+typedef struct Growing {
+    char* ptr;
+    int64_t capBytes;
+} Growing;
+static Growing growing[64];
+static int growingNext;
+
 void qkArenaReset(void) {
     for (ArenaBlock* blk = blocks; blk; blk = blk->next) {
         memset(blk->data, 0, blk->used);
         blk->used = 0;
     }
     current = blocks;
+    memset(growing, 0, sizeof growing);
+}
+
+/* xs.push(v): the array's address, with room for one more (in place when it has room, else moved to twice
+ * the room). The caller stores v at index len and adds 1 to len. */
+static void* rtPush(char* ptr, int64_t len, int64_t bytesEach) {
+    int64_t need = (len + 1) * bytesEach;
+    for (int i = 0; ptr && i < 64; i++)
+        if (growing[i].ptr == ptr) {
+            if (need <= growing[i].capBytes) return ptr;
+            int64_t cap = len * 2 > 8 ? len * 2 : 8;
+            char* p = rtAlloc(cap, bytesEach);
+            memcpy(p, ptr, (size_t)(len * bytesEach));
+            growing[i].ptr = p;
+            growing[i].capBytes = cap * bytesEach;
+            return p;
+        }
+    int64_t cap = len * 2 > 8 ? len * 2 : 8;
+    char* p = rtAlloc(cap, bytesEach);
+    if (len) memcpy(p, ptr, (size_t)(len * bytesEach));
+    growing[growingNext].ptr = p;
+    growing[growingNext].capBytes = cap * bytesEach;
+    growingNext = (growingNext + 1) % 64;
+    return p;
+}
+
+/* ---- text: made in the arena as [length: 8 bytes][bytes]; the code reads both ---------------------- */
+
+static char* rtText(const char* bytes, int64_t len) {
+    char* p = rtAlloc(len + 8, 1);
+    memcpy(p, &len, 8);
+    if (len) memcpy(p + 8, bytes, (size_t)len);
+    return p;
+}
+
+static char* rtTextJoin(const char* a, int64_t la, const char* b, int64_t lb) {
+    char* p = rtAlloc(la + lb + 8, 1);
+    int64_t n = la + lb;
+    memcpy(p, &n, 8);
+    if (la) memcpy(p + 8, a, (size_t)la);
+    if (lb) memcpy(p + 8 + la, b, (size_t)lb);
+    return p;
+}
+
+static int64_t rtTextCompare(const char* a, int64_t la, const char* b, int64_t lb) {
+    int c = memcmp(a, b, (size_t)(la < lb ? la : lb));
+    if (c) return c < 0 ? -1 : 1;
+    return la < lb ? -1 : la > lb ? 1 : 0;
+}
+
+static char* rtTextOfInt(int64_t v) {
+    char s[32];
+    int n = snprintf(s, sizeof s, "%lld", (long long)v);
+    return rtText(s, n);
+}
+
+static char* rtTextOfFloat(double v) {
+    char s[48];
+    int n;
+    if (v != v) n = snprintf(s, sizeof s, "nan");
+    else if (v == INFINITY || v == -INFINITY) n = snprintf(s, sizeof s, "%s", v > 0 ? "inf" : "-inf");
+    else {
+        n = 0;
+        for (int digits = 1; digits <= 17; digits++) { /* the shortest that reads back, like print */
+            n = snprintf(s, sizeof s, "%.*g", digits, v);
+            if (strtod(s, NULL) != v) continue;
+            double size = fabs(v);
+            if (strchr(s, 'e') && size >= 1e-4 && size < 1e16) {
+                int decimals = digits - 1 - (int)floor(log10(size));
+                n = snprintf(s, sizeof s, "%.*f", decimals > 0 ? decimals : 0, v);
+            }
+            break;
+        }
+        if (!strpbrk(s, ".eEn")) n += snprintf(s + n, sizeof s - (size_t)n, ".0");
+    }
+    return rtText(s, n);
 }
 
 static void* rtGrow(void* ptr, int64_t oldCount, int64_t newCount, int64_t bytesEach) {
@@ -201,6 +285,11 @@ const RtFn qkRuntime[RT_COUNT] = {
     [RT_POW] = {"pow", (void*)rtPow, "FF", 'F'},
     [RT_FUEL_OUT] = {"fuelOut", (void*)rtFuelOut, "I", 'V'},
     [RT_PRINT_HANDLE] = {"printHandle", (void*)rtPrintHandle, "III", 'V'},
+    [RT_TEXT_JOIN] = {"textJoin", (void*)rtTextJoin, "IIII", 'I'},
+    [RT_TEXT_COMPARE] = {"textCompare", (void*)rtTextCompare, "IIII", 'I'},
+    [RT_TEXT_OF_INT] = {"textOfInt", (void*)rtTextOfInt, "I", 'I'},
+    [RT_TEXT_OF_FLOAT] = {"textOfFloat", (void*)rtTextOfFloat, "F", 'I'},
+    [RT_PUSH] = {"push", (void*)rtPush, "III", 'I'},
 };
 
 /* ---- loading machine code ------------------------------------------------------------------------ */

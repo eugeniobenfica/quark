@@ -1,0 +1,6 @@
+// error: carries data: compare it with match
+enum Shape { Circle(radius: Float), Empty }
+
+fn main() {
+    print(Shape.Circle(1) == Shape.Empty)
+}

@@ -63,11 +63,11 @@ typedef enum TokKind {
     T_EOF, T_NEWLINE, T_NAME, T_TYPENAME, T_INT, T_FLOAT, T_TEXT,
     /* keywords */
     T_FN, T_LET, T_VAR, T_TYPE, T_ENUM, T_IF, T_ELSE, T_MATCH, T_FOR, T_IN, T_WHILE, T_RETURN, T_BREAK, T_CONTINUE,
-    T_AND, T_OR, T_NOT, T_TRUE, T_FALSE, T_EXTERN,
+    T_AND, T_OR, T_NOT, T_TRUE, T_FALSE, T_EXTERN, T_WITH, T_EFFECT,
     /* punctuation */
     T_LPAREN, T_RPAREN, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET, T_COMMA, T_DOT, T_DOTDOT, T_COLON, T_ARROW,
     T_FATARROW, T_ASSIGN, T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
-    T_EQ, T_NE, T_LT, T_LE, T_GT, T_GE, T_UNDERSCORE
+    T_EQ, T_NE, T_LT, T_LE, T_GT, T_GE, T_UNDERSCORE, T_QQ, T_QUESTION
 } TokKind;
 
 typedef struct Token {
@@ -108,6 +108,7 @@ typedef struct TypeExpr {
     const char* name; /* NULL for an array: [elem] */
     struct TypeExpr* elem;
     int line, col;
+    bool optional; /* T? */
 } TypeExpr;
 
 typedef struct Param {
@@ -115,6 +116,7 @@ typedef struct Param {
     TypeExpr* type; /* NULL in a lambda: inferred */
     int line, col;
     Binding* binding;
+    Expr* fallback; /* a parameter's default value (fn f(x: Int = 1)) */
 } Param;
 
 typedef struct Block {
@@ -129,11 +131,16 @@ typedef struct Arm {
     Expr* body;
     int caseIndex;       /* resolved */
     const char* comment;
+    const char** binds;  /* Circle(r) => ...: names for the case's data, in field order ("_": skipped) */
+    int bindCount;
+    Binding** bindings;
 } Arm;
 
 typedef enum ExprKind {
     E_INT, E_FLOAT, E_TEXT, E_BOOL, E_NAME, E_CALL, E_FIELD, E_INDEX, E_UNARY, E_BINARY, E_RANGE, E_IF, E_MATCH,
-    E_LAMBDA, E_ARRAY, E_BLOCK, E_CASE /* Mode.Waveform, resolved from E_FIELD */
+    E_LAMBDA, E_ARRAY, E_BLOCK, E_CASE, /* Mode.Waveform, resolved from E_FIELD */
+    E_WITH,   /* a with { field: value }: a copy of a record or vector with fields changed */
+    E_INTERP  /* "text {expr} text": parts around args */
 } ExprKind;
 
 struct Expr {
@@ -164,11 +171,16 @@ struct Expr {
     int paramCount;
     Expr* body;
     Expr* sugar;      /* a function name given where a lambda goes: what was written */
+    const char* qualifier; /* E_CALL of a case with data: Shape.Circle(2) keeps "Shape" */
+    const char** parts;    /* E_INTERP: the text around each of args (argCount + 1 pieces, decoded) */
+    const char** rawParts; /* ... as written */
     /* resolved */
     Binding* binding;
     int builtin;
-    Decl* decl;       /* a called function, a constructed record, an enum */
+    Decl* decl;       /* a called function, a constructed record, an enum, a constant */
     int caseIndex;
+    Expr** ordered;   /* E_CALL of a function or a case: every parameter's value, defaults filled in */
+    int orderedCount;
 };
 
 typedef enum StmtKind { S_LET, S_VAR, S_ASSIGN, S_EXPR, S_FOR, S_WHILE, S_RETURN, S_BREAK, S_CONTINUE } StmtKind;
@@ -191,7 +203,7 @@ struct Stmt {
     bool blankBefore;
 };
 
-typedef enum DeclKind { D_FN, D_TYPE, D_ENUM } DeclKind;
+typedef enum DeclKind { D_FN, D_TYPE, D_ENUM, D_CONST } DeclKind;
 
 struct Decl {
     DeclKind kind;
@@ -212,6 +224,10 @@ struct Decl {
     int index;
     bool isExtern;    /* extern fn (no body: the host's) or extern type (a host handle) */
     bool fromPrelude; /* the host's declarations: not printed, not in graphs */
+    bool isEffect;    /* effect fn: it changes the world (the host's, or prints); pure otherwise */
+    Param** caseFields; /* D_ENUM: the data each case carries (NULL: none) */
+    int* caseFieldCount;
+    Type* optionOf;     /* the built-in T? (cases None and Some(value: T)) */
 };
 
 typedef struct Program {
@@ -250,6 +266,7 @@ struct Binding {
     int depth;       /* loop depth where it lives */
     int* regs;       /* lowering: its slots */
     int nodeId;      /* graph: the node that carries it */
+    Binding* safeIn; /* a loop variable over 0..len(xs): an index of xs that needs no check */
 };
 
 typedef enum Builtin {
@@ -259,12 +276,17 @@ typedef enum Builtin {
     B_LEN, B_FILL, B_MAP, B_FILTER, B_FOLD, B_SUM, B_HISTOGRAM, B_ANY, B_ALL, B_TOARRAY,
     B_PRINT, B_NOW,
     B_VEC2, B_VEC3, B_VEC4,
+    B_SOME, B_TOTEXT, B_PUSH,
     B_COUNT
 } Builtin;
 
 extern const char* const qkBuiltinNames[B_COUNT];
 
 extern Type qkTypeError, qkTypeVoid, qkTypeInt, qkTypeFloat, qkTypeBool, qkTypeText, qkTypeRange;
+/* None and [] before they meet a type: they take the optional / array type they go into */
+extern Type qkTypeNone, qkTypeEmpty;
+Type* qkTypeOption(Type* elem); /* T? */
+bool qkHasData(const Type* t);  /* an enum with a case carrying data */
 Type* qkTypeVec(int n);
 Type* qkTypeArray(Type* elem);
 Type* qkTypeIter(Type* elem);
@@ -389,7 +411,7 @@ typedef struct RtFn {
 typedef enum RtId {
     RT_PANIC, RT_PRINT_INT, RT_PRINT_FLOAT, RT_PRINT_BOOL, RT_PRINT_TEXT, RT_PRINT_SEP, RT_PRINT_END, RT_ALLOC,
     RT_GROW, RT_COPY, RT_NOW, RT_SIN, RT_COS, RT_TAN, RT_ASIN, RT_ACOS, RT_ATAN, RT_ATAN2, RT_EXP, RT_LOG, RT_POW, RT_FUEL_OUT,
-    RT_PRINT_HANDLE,
+    RT_PRINT_HANDLE, RT_TEXT_JOIN, RT_TEXT_COMPARE, RT_TEXT_OF_INT, RT_TEXT_OF_FLOAT, RT_PUSH,
     RT_COUNT
 } RtId;
 

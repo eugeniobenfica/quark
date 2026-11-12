@@ -1,0 +1,8 @@
+// error: print has effects (it changes the world): write effect fn greet
+fn greet() {
+    print("hi")
+}
+
+fn main() {
+    greet()
+}

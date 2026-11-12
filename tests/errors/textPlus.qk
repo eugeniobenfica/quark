@@ -1,0 +1,4 @@
+// error: + joins two texts
+fn main() {
+    print("lap " + 3)
+}

@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
     qkModuleFree(bad);
 
     printf("a script that never stops\n");
-    const char* forever = "fn update(self: Object, ship: Ship, dt: Float) -> Ship {\n"
+    const char* forever = "effect fn update(self: Object, ship: Ship, dt: Float) -> Ship {\n"
                           "    while true {\n"
                           "        moveBy(self, 0, 0)\n"
                           "    }\n"

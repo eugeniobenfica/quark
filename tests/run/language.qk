@@ -1,0 +1,59 @@
+// The second layer of the language: constants, with, text, effects, defaults, enums with data, optionals.
+let gravity = Vec2(0, 300)
+let palette = [rgb(232, 185, 49), rgb(79, 142, 247)]
+
+type Ship { name: Text, speed: Float, laps: Int }
+enum Shape { Circle(radius: Float), Box(width: Float, height: Float), Empty }
+
+fn rgb(r: Int, g: Int, b: Int, a: Float = 1.0) -> Vec4 = Vec4(r / 255.0, g / 255.0, b / 255.0, a)
+
+fn area(s: Shape) -> Float = match s {
+    Circle(r) => 3.0 * r * r
+    Box(w, h) => w * h
+    Empty => 0
+}
+
+fn find(names: [Text], wanted: Text) -> Int? {
+    for name, i in names {
+        if name == wanted {
+            return i
+        }
+    }
+    None
+}
+
+fn lap(ship: Ship) -> Ship = ship with { speed: ship.speed * 1.5, laps: ship.laps + 1 }
+
+effect fn report(ship: Ship, label: Text = "ship") {
+    print("{label} {ship.name}: {ship.laps} laps at {ship.speed}")
+}
+
+fn main() {
+    var ship = Ship("Arrow", speed: 100, laps: 0)
+    for i in 0..3 {
+        ship = lap(ship)
+    }
+    report(ship)
+    report(ship, label: "boat")
+    print(gravity, palette[1], len(palette))
+    let shapes = [Shape.Circle(2), Shape.Box(width: 3, height: 4), Shape.Empty]
+    print(shapes.map(area).sum(), shapes[1])
+    let names = ["ana", "bia", "carla"]
+    print(find(names, "bia"), find(names, "zé"), find(names, "zé") ?? -1, find(names, "carla") ?? -1)
+    match find(names, "ana") {
+        Some(i) => print("found at", i)
+        None => print("missing")
+    }
+    let joined = names[0] + " & " + names[2]
+    print(joined, len(joined), "abc" < "abd", "b" == "b", toText(2.5) + "!", "{true} {Shape.Empty}")
+    var squares: [Int] = []
+    for i in 0..10 {
+        squares.push(i * i)
+    }
+    print(squares, len(squares))
+    var total = 0
+    for i in 0..len(names) {
+        total += len(names[i])
+    }
+    print(total, "escapes: \{braces\} {"inner {1 + 1}"}")
+}

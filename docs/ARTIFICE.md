@@ -20,11 +20,11 @@ side, listed at the end.
 
 | Artifice node | Quark function | The engine calls |
 | --- | --- | --- |
-| On Start | `fn start(self: Object) -> State` | once; keeps the State it returns |
-| On Update (gives `dt`) | `fn update(self: Object, state: State, dt: Float) -> State` | every frame, with the last State |
-| On Hit (`with`) | `fn hit(self: Object, other: Object)` | when hitboxes start to touch |
-| On Click | `fn click(self: Object)` | when its button is clicked |
-| On Key Pressed / Released | `fn keyPressed(self: Object, key: Text)` ... | on the key |
+| On Start | `effect fn start(self: Object) -> State` | once; keeps the State it returns |
+| On Update (gives `dt`) | `effect fn update(self: Object, state: State, dt: Float) -> State` | every frame, with the last State |
+| On Hit (`with`) | `effect fn hit(self: Object, other: Object)` | when hitboxes start to touch |
+| On Click | `effect fn click(self: Object)` | when its button is clicked |
+| On Key Pressed / Released | `effect fn keyPressed(self: Object, key: Text)` ... | on the key |
 
 `State` is any record the program declares, such as `type Ship { speed: Float, laps: Int }`. A
 program without variables leaves it out (`fn update(self: Object, dt: Float)`). The engine reads
@@ -39,8 +39,8 @@ the signatures from `qkFunctionSignature` and `qkSlotKinds`, so it knows which f
 | Sine, Random... | built-in calls (`sin`); Random would be a host function (`extern fn random() -> Float`) |
 | Branch | `if` (a node holding its two blocks) |
 | Sequence | the order of a block's statements: the execution wire |
-| Set Variable / Get Variable | a field of the State record (`ship.speed`), or a `var` for one event's own use |
-| Move By, Set Position, Rotate By, Set Visible, Set Color, Camera Follow, Print, Go To Scene, Quit Game, Burst Particles, Set Emitting | `extern fn`s in the engine's prelude: one C function each |
+| Set Variable / Get Variable | a field of the State record: read `ship.speed`, set `ship with { speed: 200 }`; or a `var` for one event's own use |
+| Move By, Set Position, Rotate By, Set Visible, Set Color, Camera Follow, Print, Go To Scene, Quit Game, Burst Particles, Set Emitting | `extern effect fn`s in the engine's prelude (action nodes, on the execution wire): one C function each |
 | Get Position, Get Rotation, Is Key Down, Input Axis, Delta Time, Time, Is Touching | `extern fn`s that return a value (`position(self) -> Vec2`), or a parameter (`dt`) |
 | Move By 3D... (the 3D category) | the same, with `Vec3` |
 

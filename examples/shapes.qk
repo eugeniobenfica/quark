@@ -1,0 +1,42 @@
+// Shapes, their areas, and a report.
+let unit = 10.0
+
+enum Shape { Circle(radius: Float), Box(width: Float, height: Float), Empty }
+type Item { name: Text, shape: Shape, count: Int }
+
+fn area(s: Shape) -> Float = match s {
+    Circle(r) => 3.14159 * r * r
+    Box(w, h) => w * h
+    Empty => 0
+}
+
+fn biggest(items: [Item]) -> Item? {
+    var best: Item? = None
+    var most = -1.0
+    for item in items {
+        let size = area(item.shape)
+        if size > most {
+            best = item
+            most = size
+        }
+    }
+    best
+}
+
+effect fn report(items: [Item], title: Text = "Stock") {
+    print("{title}: {len(items)} items, {items.map(i => area(i.shape) * i.count).sum()} square units")
+    match biggest(items) {
+        Some(item) => print("biggest: {item.name}")
+        None => print("nothing")
+    }
+}
+
+fn main() {
+    var items: [Item] = []
+    items.push(Item("plate", Shape.Circle(radius: unit), count: 4))
+    items.push(Item("tile", Shape.Box(2, 2), count: 50))
+    let more = items[0] with { name: "big plate", count: 1 }
+    items.push(more)
+    report(items)
+    report(items, title: "Today")
+}

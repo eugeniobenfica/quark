@@ -1,0 +1,4 @@
+// error: None needs its type written
+fn main() {
+    let nothing = None
+}

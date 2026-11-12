@@ -1,0 +1,6 @@
+// error: f has no parameter "size"
+fn f(width: Int, height: Int = 2) -> Int = width * height
+
+fn main() {
+    print(f(1, size: 3))
+}

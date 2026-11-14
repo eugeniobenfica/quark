@@ -466,6 +466,15 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson);
 bool qkKeyAtLine(const Program* p, int line, char* out, size_t size);
 bool qkGraphImport(const char* json, size_t len, const char* path, Program* out);
 
+/* ---- graphs side by side (collab.c) -------------------------------------------------------------- */
+
+/* The changes from graph a to graph b, by node key (text, or JSON): how many, or -1 when one is not a graph. */
+int qkGraphDiff(const char* a, size_t aLen, const char* b, size_t bLen, bool json, QkBuf* out);
+/* A three-way merge by node key: the merged graph (JSON) into merged, the conflicts (lines of text, or a JSON
+ * array) into conflicts; how many conflicts (where the merge keeps ours), or -1 when one is not a graph. */
+int qkGraphMerge(const char* base, size_t baseLen, const char* ours, size_t oursLen, const char* theirs, size_t theirsLen,
+                 QkBuf* merged, bool json, QkBuf* conflicts);
+
 /* ---- intermediate code (lower.c) ----------------------------------------------------------------- */
 
 typedef enum IrOp {

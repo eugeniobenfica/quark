@@ -115,6 +115,34 @@ if "$Q" graph examples/host/item.qk $P > "$tmp/g.json" && "$Q" text "$tmp/g.json
 if "$Q" catalog - $P | grep -q '"name": "moveBy", "kind": "extern fn", "host": true'; then ok; else bad "catalog"; fi
 "$Q" fmt examples/host/app.qk > "$tmp/a.qk"
 if cmp -s examples/host/app.qk "$tmp/a.qk"; then ok; else bad "app.qk is not in canonical form"; fi
+# versions side by side: diffs by node key (text, JSON), three-way merges, conflicts by key (tests/collab)
+C=tests/collab
+for v in ours theirs moved; do
+    "$Q" diff $C/base.qk $C/$v.qk > "$tmp/out"
+    if [ $? -eq 1 ] && cmp -s "$tmp/out" $C/$v.diff; then ok; else bad "quark diff $v"; diff $C/$v.diff "$tmp/out" | head -5; fi
+done
+if "$Q" diff $C/base.qk $C/theirs.qk --json > "$tmp/out"; [ $? -eq 1 ] && cmp -s "$tmp/out" $C/theirs.json; then ok; else bad "quark diff --json"; fi
+if "$Q" diff $C/base.qk $C/base.qk > "$tmp/out" && [ ! -s "$tmp/out" ]; then ok; else bad "quark diff (no changes)"; fi
+if "$Q" merge $C/base.qk $C/ours.qk $C/theirs.qk -o "$tmp/m.qk" && cmp -s "$tmp/m.qk" $C/merged.qk; then ok; else bad "quark merge"; fi
+if "$Q" merge $C/base.qk $C/moved.qk $C/theirs.qk -o "$tmp/m.qk" && cmp -s "$tmp/m.qk" $C/merged-moved.qk; then ok; else bad "quark merge (moved)"; fi
+for v in base ours theirs; do "$Q" graph $C/$v.qk > "$tmp/$v.json"; done # graphs in, a graph out
+if "$Q" merge "$tmp/base.json" "$tmp/ours.json" "$tmp/theirs.json" -o "$tmp/m.json" && "$Q" text "$tmp/m.json" | cmp -s - $C/merged.qk; then ok; else bad "quark merge (graphs)"; fi
+for v in conflict removed; do
+    "$Q" merge $C/base.qk $C/ours.qk $C/$v.qk -o "$tmp/m.qk" 2> "$tmp/err"
+    if [ $? -eq 1 ] && cmp -s "$tmp/err" $C/$v.out && cmp -s "$tmp/m.qk" $C/$v-merged.qk; then ok; else bad "quark merge ($v)"; cat "$tmp/err"; fi
+done
+"$Q" merge $C/base.qk $C/ours.qk $C/conflict.qk --json -o "$tmp/m.qk" 2> "$tmp/err"
+if cmp -s "$tmp/err" $C/conflict.json; then ok; else bad "quark merge --json"; fi
+if command -v "$CCX" > /dev/null 2>&1; then # the embedding API's qkDiff and qkMerge
+    if "$CCX" -Iinclude $C/api.c "$(dirname "$Q")/libquark.a" -lm -o "$tmp/collab" && "$tmp/collab" $C | tr -d '\r' | cmp -s - $C/api.out; then ok; else bad "qkDiff, qkMerge"; fi
+fi
+# the catalog's pins as data: a built-in's generic loop, a program's generic record
+if "$Q" catalog - | grep -qF '"pins": [{"name": "source", "shape": {"kind": "loop", "element": {"kind": "param", "name": "T"}}}, {"name": "f", "shape": {"kind": "fn", "params": [{"kind": "param", "name": "T"}, {"kind": "int"}], "returns": {"kind": "param", "name": "U"}}}], "result": {"kind": "loop", "element": {"kind": "param", "name": "U"}}'; then ok; else bad "catalog pins"; fi
+printf 'type Pair<A, B> { first: A, second: B }
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> = Pair(p.second, p.first)
+' > "$tmp/pair.qk"
+if "$Q" catalog "$tmp/pair.qk" | grep -qF '"returns": "Pair<B, A>", "result": {"kind": "named", "name": "Pair", "args": [{"kind": "param", "name": "B"}, {"kind": "param", "name": "A"}]}'; then ok; else bad "catalog pins (a program's)"; fi
 rm -rf "$tmp"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -40,6 +40,8 @@ quark debug hello.qk        breakpoints, stepping, the names' values
 quark run hello.qk --trace  the last value of every node, for node editors
 quark graph hello.qk        the same program as a node graph (JSON)
 quark text hello.json       ... and back, to the same text
+quark diff a.qk b.qk        what changed, by node key (added, removed, changed inputs, moved)
+quark merge base a b        a three-way merge by node key; conflicts named by key
 ```
 
 **Ready to embed.** A C program links `build/libquark.a`, gives Quark its API as `extern fn`s, and
@@ -194,6 +196,7 @@ all of it, and the tests check its output.
 | `src/runtime.c` | what compiled code calls: print, text, maps, the arena and its loop collections, files, panics with their calls; the loader |
 | `src/format.c` | the canonical text |
 | `src/graph.c` | node graph (JSON) out and in |
+| `src/collab.c` | versions side by side: diffs and three-way merges by node key |
 | `src/api.c` | the embedding API (`include/quark.h`): machines, preludes, host functions, calls, catalog |
 | `src/lsp.c` | the language server |
 | `src/module.c` | `use`: the files a program names, read and joined to it |
@@ -246,4 +249,4 @@ Next:
 4. `fold` across threads, SIMD for `map`, small element types (`[Byte]`, `[Float32]`).
 
 Node editors are tools of their own, outside the language: they read and write the files quark gives them
-(`quark graph`, `quark text`, `quark catalog`, `--layout`, `--trace`).
+(`quark graph`, `quark text`, `quark catalog`, `quark diff`, `quark merge`, `--layout`, `--trace`).

@@ -1,0 +1,15 @@
+// Totals of a few numbers.
+fn square(x: Int) -> Int = x * x + 0
+
+fn cube(x: Int) -> Int = x * x * x
+
+fn main() {
+    print("start")
+    let n = 12
+    var total = 0
+    for i in 0..n {
+        total += square(i) + cube(i)
+    }
+    print("total", total)
+    print("all done")
+}

@@ -1,0 +1,28 @@
+diff:
+changed  main/n: input 0: 10 -> 12
+added    main/@0: call print
+the same: {"changes": []}
+merged (conflicts []
+):
+// Totals of a few numbers.
+fn square(x: Int) -> Int = x * x + 0
+
+fn cube(x: Int) -> Int = x * x * x
+
+fn main() {
+    print("start")
+    let n = 12
+    var total = 0
+    for i in 0..n {
+        total += square(i) + cube(i)
+    }
+    print("total", total)
+    print("all done")
+}
+as a graph: the same program
+conflicts: [
+ {"key": "main/n", "what": "changed on both sides"},
+ {"key": "main/@0.0", "what": "added on both sides, differently"}
+]
+kept ours: yes
+not a program: NULL (1 diagnostics)

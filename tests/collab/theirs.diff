@@ -1,0 +1,7 @@
+changed  square/=: op: "*" -> "+"; input 0: square/x -> square/=.0; input 1: square/x -> 0
+added    square/=.0: op *
+changed  main/i/@0.1: kind: "call" -> "op"; fn: "square" -> nothing; input 0: main/i -> main/i/@0.1.0; input 1: nothing -> main/i/@0.1.1; op: nothing -> "+"
+added    main/i/@0.1.0: call square
+added    main/i/@0.1.1: call cube
+changed  main/@4.0: input 0: "done" -> "all done"
+added    fn cube

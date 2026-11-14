@@ -146,6 +146,19 @@ char* qkGraphToText(QkVm* vm, const char* json, size_t len);
 /* Every node an editor can offer: built-in functions with their pins, the prelude's externs and types,
  * a program's own functions and types (text may be NULL). */
 char* qkCatalog(QkVm* vm, const char* text, size_t len);
+
+/* ---- versions side by side (each a program's text, or its graph: JSON starting with '{') ----------- */
+
+/* What changed from a to b, by node key: lines like "changed main/n: input 0: 10 -> 12" ("added", "removed",
+ * "changed", "moved"), or with json {"changes": [{"change", "key", "kind", "in", "line", "fields": [{"field",
+ * "was", "now"}]...}]}. "" when they are the same. */
+char* qkDiff(QkVm* vm, const char* a, size_t aLen, const char* b, size_t bLen, bool json);
+/* A three-way merge by node key: what each side changed apart is taken; where both changed the same node or
+ * added statements at the same place, ours is kept and *conflicts (may be NULL; free it) lists it:
+ * [{"key": "main/n", "what": "changed on both sides"}], "[]" when none. Returns the merged program's canonical
+ * text, or with graph its graph (NULL when the merged program has errors: the diagnostics say which). */
+char* qkMerge(QkVm* vm, const char* base, size_t baseLen, const char* ours, size_t oursLen, const char* theirs,
+              size_t theirsLen, bool graph, char** conflicts);
 void qkFree(void* p);
 
 #ifdef __cplusplus

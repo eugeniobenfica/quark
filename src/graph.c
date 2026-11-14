@@ -963,6 +963,17 @@ static Expr* buildInput(In* in, const J* input) {
         e->name = in->names[id];
         return e;
     }
+    const J* target = in->byId[id];
+    const char* kind = target ? jstr(target, "kind") : NULL;
+    if (kind && (!strcmp(kind, "let") || !strcmp(kind, "var") || !strcmp(kind, "for")) && jstr(target, "name")) {
+        if (in->building[id]) {
+            inFail(in, "a node wired into itself (its value uses it)", id);
+            return zero();
+        }
+        Expr* e = qkNewExpr(E_NAME, 0, 0); /* a wire from a let further on (a merge can make one): its name, which */
+        e->name = jstr(target, "name");     /* the checker finds is not known there yet */
+        return e;
+    }
     return buildNode(in, id);
 }
 
@@ -1242,7 +1253,9 @@ static Stmt* buildStmt(In* in, int id) {
         s->kind = kind[0] == 'l' ? S_LET : S_VAR;
         s->name = jstr(node, "name");
         if (jstr(node, "annotation")) s->typeAnn = parseTypeText(jstr(node, "annotation"));
+        in->building[id] = 1;
         s->value = buildInput(in, first);
+        in->building[id] = 0;
         in->names[id] = s->name; /* from here on, wires from it are its name */
     } else if (!strcmp(kind, "set")) {
         s->kind = S_ASSIGN;

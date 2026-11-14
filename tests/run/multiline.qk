@@ -1,0 +1,19 @@
+// Texts on lines of their own: """ ... """, each line without the closing quotes' indentation, values put in.
+fn poem(name: Text) -> Text {
+    let n = 3
+    """
+        Dear {name},
+          indented "quoted" line
+
+        {n} lines, a brace \{ and a tab\tend
+        """
+}
+
+fn main() {
+    let plain = """
+        just text
+        two lines
+        """
+    print(poem("ana"))
+    print(plain, len(plain))
+}

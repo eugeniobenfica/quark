@@ -1,0 +1,11 @@
+// error: a defer's block cannot leave its function: no return in it
+fn f() -> Int {
+    defer {
+        return 1
+    }
+    2
+}
+
+fn main() {
+    print(f())
+}

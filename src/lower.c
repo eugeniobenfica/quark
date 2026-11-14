@@ -24,6 +24,13 @@ struct Lower {
     int depth;        /* loop depth, for weights */
     int loopBreak;    /* the innermost loop the code is in */
     int loopContinue;
+    struct DeferAt {  /* the defers of the blocks being lowered, in the order written */
+        Block* body;
+        int inlineDepth; /* the function they belong to (inlined ones too) */
+        int loopLevel;   /* the loops they are inside */
+    } * defers;
+    int deferCount, deferCap;
+    int loopLevel;    /* how many of the source's loops the code is in */
     int userBreak;    /* where break / continue in the source go */
     int userContinue;
     Expr* preRange;   /* a range whose bounds are already in registers */
@@ -488,6 +495,37 @@ static void countBySink(Lower* L, Val elem, int index, void* ctx) {
     place(L, done);
 }
 
+static void toSetSink(Lower* L, Val elem, int index, void* ctx) {
+    (void)index;
+    Acc* a = ctx;
+    mapSet(L, a->acc, copyVal(L, elem), (Val){0, NULL}, a->line);
+}
+
+/* a | b, a & b, a - b on sets: a new set */
+typedef struct SetOp {
+    Val out;
+    Val other;
+    int op;
+    int line;
+} SetOp;
+
+static void setOpEntry(Lower* L, Val key, Val value, void* ctx) {
+    (void)value;
+    SetOp* s = ctx;
+    if (s->op == T_PIPE) {
+        mapSet(L, s->out, key, (Val){0, NULL}, s->line);
+        return;
+    }
+    int args[3] = {s->other.r[0], 0, 0};
+    keyArgs(L, key, args + 1);
+    int p = rtcall(L, RT_MAP_GET, args, 3, 'I', s->line);
+    int skip = label(L);
+    if (s->op == T_AMP) jz(L, p, skip); /* in both */
+    else jnz(L, p, skip);               /* in the first only */
+    mapSet(L, s->out, key, (Val){0, NULL}, s->line);
+    place(L, skip);
+}
+
 static void sumSink(Lower* L, Val elem, int index, void* ctx) {
     (void)index;
     Acc* a = ctx;
@@ -897,6 +935,7 @@ static void printEntry(Lower* L, Val key, Val value, void* ctx) {
     place(L, skip);
     mov(L, pm->first, iconst(L, 0));
     printVal(L, key, pm->t->key);
+    if (qkIsSet(pm->t)) return;
     printLiteral(L, ": ");
     printVal(L, value, pm->t->elem);
 }
@@ -953,15 +992,16 @@ static void printValInline(Lower* L, Val v, const Type* t) {
     }
     case TY_MAP: {
         int empty = label(L), done = label(L);
+        bool set = qkIsSet(t);
         jz(L, rtcall(L, RT_MAP_LEN, v.r, 1, 'I', 0), empty);
-        printLiteral(L, "[");
+        printLiteral(L, set ? "Set(" : "[");
         PrintMap pm = {t, newReg(L, 'I')};
         mov(L, pm.first, iconst(L, 1));
         forEachEntry(L, v, t, printEntry, &pm, 0);
-        printLiteral(L, "]");
+        printLiteral(L, set ? ")" : "]");
         jmp(L, done);
         place(L, empty);
-        printLiteral(L, "[:]");
+        printLiteral(L, set ? "Set()" : "[:]");
         place(L, done);
         break;
     }
@@ -1551,6 +1591,18 @@ static Val lowerBuiltin(Lower* L, Expr* e) {
     case B_KEYS: case B_VALUES: {
         Val m = lowerExpr(L, a[0]);
         return unpackArray(L, rtcall(L, e->builtin == B_KEYS ? RT_MAP_KEYS : RT_MAP_VALUES, m.r, 1, 'I', e->line));
+    }
+    case B_ADD: { /* s.add(v): in place, s is the var's own */
+        Binding* b = a[0]->binding;
+        mapSet(L, one(b->regs[0]), lowerExpr(L, a[1]), (Val){0, NULL}, e->line);
+        return (Val){0, NULL};
+    }
+    case B_TOSET: {
+        Acc acc = {0};
+        acc.acc = newMap(L, e->type, e->line);
+        acc.line = e->line;
+        forEach(L, a[0], toSetSink, &acc);
+        return acc.acc;
     }
     case B_REMOVE: {
         Binding* b = a[0]->binding;
@@ -2163,6 +2215,11 @@ static Val lowerBinary(Lower* L, Expr* e) {
         int order = rtcall(L, RT_TEXT_COMPARE, args, 4, 'I', e->line);
         return one(cmp(L, conds[e->op - T_EQ], order, iconst(L, 0)));
     }
+    if (qkIsSet(ta)) { /* union: a's values then b's; intersection and difference: a's, kept or not */
+        SetOp so = {e->op == T_PIPE ? copyMap(L, a, e->line) : newMap(L, ta, e->line), b, e->op, e->line};
+        forEachEntry(L, e->op == T_PIPE ? b : a, ta, setOpEntry, &so, e->line);
+        return so.out;
+    }
     switch (e->op) {
     case T_AMP: case T_PIPE: case T_CARET: case T_SHL: case T_SHR: {
         IrOp op = e->op == T_AMP ? IR_AND : e->op == T_PIPE ? IR_OR : e->op == T_CARET ? IR_XOR : e->op == T_SHL ? IR_SHL : IR_SAR;
@@ -2469,16 +2526,43 @@ static Val lowerExpr(Lower* L, Expr* e) {
 
 static void debugLine(Lower* L, int line);
 
+/* defer { ... }: kept while the block it is in is lowered; its code goes wherever that block is left: at its end, at a
+ * return (this function's defers), at a break or continue (the loop's). The last one written runs first. A panic
+ * runs none: it stops the call. */
+static void runDefers(Lower* L, int from, int loopLevel) {
+    for (int i = L->deferCount - 1; i >= from; i--) {
+        if (L->defers[i].inlineDepth != L->inlineDepth || L->defers[i].loopLevel < loopLevel) continue;
+        int saved = L->deferCount;
+        L->deferCount = i; /* while its own code is lowered, only the ones before it are open */
+        lowerBlock(L, L->defers[i].body, &qkTypeVoid);
+        L->deferCount = saved;
+    }
+}
+
 static Val lowerBlock(Lower* L, Block* b, Type* t) {
     bool value = t && t->kind != TY_VOID && t->kind != TY_ERROR;
+    int mark = L->deferCount;
     for (int i = 0; i < b->count; i++) {
         Stmt* s = b->stmts[i];
         if (value && i == b->count - 1 && s->kind == S_EXPR) { /* the block's value: a line of its own too */
             debugLine(L, s->line);
-            return lowerStored(L, s->value);
+            Val v = lowerStored(L, s->value);
+            if (L->deferCount > mark) {
+                v = copyVal(L, v); /* the value as it is now, before the defers run */
+                runDefers(L, mark, 0);
+                L->deferCount = mark;
+            }
+            return v;
+        }
+        if (s->kind == S_DEFER) {
+            struct DeferAt at = {s->body, L->inlineDepth, L->loopLevel};
+            QK_PUSH(L->defers, L->deferCount, L->deferCap, at);
+            continue;
         }
         lowerStmt(L, s);
     }
+    runDefers(L, mark, 0);
+    L->deferCount = mark;
     return (Val){0, NULL};
 }
 
@@ -2784,6 +2868,10 @@ static void debugLine(Lower* L, int line) {
 }
 
 static void lowerReturn(Lower* L, Val v) {
+    if (L->deferCount) { /* this function's defers, the value kept as it is */
+        v = copyVal(L, v);
+        runDefers(L, 0, 0);
+    }
     if (L->inlineDepth) { /* inside an inlined function: to its end */
         InlineFrame* fr = &L->inlining[L->inlineDepth - 1];
         if (v.n) movVal(L, fr->result, v);
@@ -2805,7 +2893,9 @@ static void entrySink(Lower* L, Val key, Val value, void* ctx) {
     int turnEnd = label(L);
     L->userBreak = L->loopBreak;
     L->userContinue = turnEnd;
+    L->loopLevel++;
     lowerBlock(L, f->s->body, &qkTypeVoid);
+    L->loopLevel--;
     place(L, turnEnd);
     loopTurnEnd(L, f->memory, f->s->line);
     L->userBreak = savedBreak;
@@ -2822,7 +2912,9 @@ static void forSink(Lower* L, Val elem, int index, void* ctx) {
     int turnEnd = label(L);
     L->userBreak = L->loopBreak;
     L->userContinue = turnEnd;
+    L->loopLevel++;
     lowerBlock(L, f->s->body, &qkTypeVoid);
+    L->loopLevel--;
     place(L, turnEnd);
     loopTurnEnd(L, f->memory, f->s->line);
     L->userBreak = savedBreak;
@@ -2996,7 +3088,9 @@ static void lowerStmtInner(Lower* L, Stmt* s) {
         int savedBreak = L->userBreak, savedContinue = L->userContinue;
         L->userBreak = done;
         L->userContinue = turnEnd;
+        L->loopLevel++;
         lowerBlock(L, s->body, &qkTypeVoid);
+        L->loopLevel--;
         place(L, turnEnd);
         loopTurnEnd(L, &memory, s->line);
         L->userBreak = savedBreak;
@@ -3007,9 +3101,16 @@ static void lowerStmtInner(Lower* L, Stmt* s) {
         place(L, done);
         break;
     }
+    case S_DEFER: break; /* kept by lowerBlock, lowered where its block is left */
     case S_RETURN: lowerReturn(L, s->value ? lowerStored(L, s->value) : (Val){0, NULL}); break;
-    case S_BREAK: jmp(L, L->userBreak); break;
-    case S_CONTINUE: jmp(L, L->userContinue); break;
+    case S_BREAK:
+        runDefers(L, 0, L->loopLevel); /* the defers inside the loop */
+        jmp(L, L->userBreak);
+        break;
+    case S_CONTINUE:
+        runDefers(L, 0, L->loopLevel);
+        jmp(L, L->userContinue);
+        break;
     }
 }
 

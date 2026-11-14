@@ -1,0 +1,12 @@
+// error: twice needs its T to fit Speaker: Rock has no fn speak() -> Text
+type Speaker { fn speak() -> Text }
+type Dog { name: Text }
+type Rock { weight: Int }
+
+fn Dog.speak(self) -> Text = "woof, I am {self.name}"
+
+fn twice<T: Speaker>(x: T) -> Text = x.speak() + " " + x.speak()
+
+fn main() {
+    print(twice(Rock(3)))
+}

@@ -63,7 +63,7 @@ typedef enum TokKind {
     T_EOF, T_NEWLINE, T_NAME, T_TYPENAME, T_INT, T_FLOAT, T_TEXT,
     /* keywords */
     T_FN, T_LET, T_VAR, T_TYPE, T_ENUM, T_IF, T_ELSE, T_MATCH, T_FOR, T_IN, T_WHILE, T_RETURN, T_BREAK, T_CONTINUE,
-    T_AND, T_OR, T_NOT, T_TRUE, T_FALSE, T_EXTERN, T_WITH, T_EFFECT, T_USE, T_PUB, T_CONST,
+    T_AND, T_OR, T_NOT, T_TRUE, T_FALSE, T_EXTERN, T_WITH, T_EFFECT, T_USE, T_PUB, T_CONST, T_DEFER,
     /* punctuation */
     T_LPAREN, T_RPAREN, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET, T_COMMA, T_DOT, T_DOTDOT, T_COLON, T_ARROW,
     T_FATARROW, T_ASSIGN, T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
@@ -195,6 +195,7 @@ struct Expr {
     Expr* body;
     Expr* sugar;      /* a function name given where a lambda goes: what was written */
     bool typed;       /* checked already (a method call's receiver, checked to find its type's function) */
+    bool multiline;   /* E_TEXT, E_INTERP: written """ ... """ on lines of its own */
     const char* qualifier; /* E_CALL of a case with data: Shape.Circle(2) keeps "Shape" */
     const char** parts;    /* E_INTERP: the text around each of args (argCount + 1 pieces, decoded) */
     const char** rawParts; /* ... as written */
@@ -209,7 +210,7 @@ struct Expr {
     int orderedCount;
 };
 
-typedef enum StmtKind { S_LET, S_VAR, S_ASSIGN, S_EXPR, S_FOR, S_WHILE, S_RETURN, S_BREAK, S_CONTINUE } StmtKind;
+typedef enum StmtKind { S_LET, S_VAR, S_ASSIGN, S_EXPR, S_FOR, S_WHILE, S_RETURN, S_BREAK, S_CONTINUE, S_DEFER } StmtKind;
 
 struct Stmt {
     StmtKind kind;
@@ -263,6 +264,7 @@ struct Decl {
     Type* resultOf;     /* the built-in T! (cases Err(message: Text) and Ok(value: T)) */
     Type* errorOf;      /* ... and what its Err holds: Text, or the error type written (T!ParseError) */
     const char** typeParams; /* fn first<T>(...): its type parameters */
+    const char** typeBounds; /* fn talk<T: Speaker>(...): the interface each must fit (NULL entries: none) */
     int typeParamCount;
     bool isTest;        /* test "name" { ... }: run by quark test */
     const char* testName;
@@ -388,7 +390,7 @@ typedef enum Builtin {
     B_PARALLELMAP,
     B_RANDOM, B_RANDOMINT, B_SEEDRANDOM,
     B_SPAWN, B_STEP, B_YIELD, B_WAIT,
-    B_TAKE, B_SKIP, B_COUNTBY, B_MEAN, B_PANIC, B_GET,
+    B_TAKE, B_SKIP, B_COUNTBY, B_MEAN, B_PANIC, B_GET, B_ADD, B_TOSET,
     B_INTERFACE, /* implicit: a value made an interface (a record of functions), its functions closures over it */
     B_NEVER,     /* implicit: an expression that never gives a value (exit, panic) where a value goes */
     B_ENTRIES,   /* implicit: a map as a loop source, its entries (key, value) tuples */
@@ -414,6 +416,7 @@ int qkTypeSlots(const Type* t);
 int qkFieldSlots(const Param* p); /* a record's or a case's field: its type's slots, or 1 when it is boxed */
 void qkTypeSlotKinds(const Type* t, char* out); /* 'I' or 'F' per slot */
 bool qkIsIterable(const Type* t);
+bool qkIsSet(const Type* t); /* Set<K>: a map whose values are nothing */
 Type* qkElemType(const Type* t);
 
 /* What a program may call that reaches outside it: NULL, everything; else a list of names and groups, by spaces

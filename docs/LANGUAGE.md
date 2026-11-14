@@ -85,7 +85,7 @@ fn main() {
 
 ## Words
 
-**Keywords (25):**
+**Keywords (26):**
 
 | | |
 | --- | --- |
@@ -93,7 +93,7 @@ fn main() {
 | Bindings | `let` (never changes) · `var` (can change), inside functions |
 | Choices | `if` `else` `match` |
 | Loops | `for` `in` `while` `break` `continue` |
-| Leaving | `return` |
+| Leaving | `return` · `defer` (runs when its block is left) |
 | Logic | `and` `or` `not` |
 | Values | `true` `false` |
 | Copies | `with` |
@@ -113,7 +113,9 @@ let my_value = 3     error: names are camelCase or PascalCase, without underscor
 
 **Literals:**
 - numbers: `42`, `1_000_000` (underscores between digits), `3.14`, `1e-6`;
-- text: `"text"`, with `{expressions}` inside (below) and the escapes `\n \t \r \" \\ \{ \}`;
+- text: `"text"`, with `{expressions}` inside (below) and the escapes `\n \t \r \" \\ \{ \}`; and on lines of its
+  own between `"""` and `"""`: the closing quotes' indentation is taken off every line, values and escapes
+  work as in any text, and `quark fmt` puts the lines one level in from where the text starts;
 - `true`, `false`;
 - arrays: `[1, 2, 3]` and `[]` (the empty one takes the type it goes into);
 - maps: `["ana": 31, "bia": 27]` and `[:]` (the empty one takes the type it goes into).
@@ -249,6 +251,11 @@ fn newest(texts: [Text]) -> Version! {
     best
 }
 ```
+
+**Sets.** `Set<K>` holds each value once, in the order they came (K as for a map's key). A list where a
+set goes makes one (`let seen: Set<Text> = ["a", "b"]`, `[]`), and `xs.toSet()` does from any loop. A `var`
+set changes in place with `s.add(v)` and `s.remove(v)`; `contains(s, v)`, `len(s)`, `for v in s` and every
+loop function read it; `a | b`, `a & b` and `a - b` are the union, the intersection and the difference.
 
 **Maps.** `[K: V]` holds a V for each key, and keeps the keys in the order they came. `m[key]` is an
 optional (`None` when the key is not there). A `var` map changes in place:
@@ -426,7 +433,10 @@ fn pairs<T>(xs: [T]) -> [[T]] {
 print(pairs([1, 2, 3, 4, 5]), pairs(["a", "b"]))   // [[1, 2], [3, 4], [5]] [[a, b]]
 ```
 
-The types come from the values given (`pairs([1, 2])`: T is Int). A type parameter is PascalCase.
+The types come from the values given (`pairs([1, 2])`: T is Int). A type parameter is PascalCase. It may
+name an interface its type must fit, `fn twice<T: Speaker>(x: T) -> Text = x.speak() + x.speak()`: a call
+with a type that lacks one of the interface's functions is an error where it is called, naming what is
+missing, and each instance is still compiled for its own type (no indirect calls).
 
 ### Functions that take functions
 
@@ -616,6 +626,7 @@ ok    gcd of two numbers (0.0 ms)
 | `let Case(a, b) = value else { ... }` | the data of one case, or the else block, which must leave (`return`, `break`, `continue`, `exit`, `panic`) |
 | `for x in source { }` | over an array, a range `a..b` (b not included) or a loop; `for x, i in ...` gives the index too; over a map, `for key, value in m` |
 | `while condition { }` | |
+| `defer { ... }` | runs when the block it is in is left: at its end, at a `return` or a `?` (all of the function's), at a `break` or `continue` (the loop's); the last one written runs first. It is placed where the program is compiled, so it costs what its code does. Its block cannot leave (`return`, `?`); a panic runs none |
 | `break`, `continue` | |
 | `return value` | |
 | an expression | a call, an `if`, a `match` or an `a?` whose value is not kept |

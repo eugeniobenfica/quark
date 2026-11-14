@@ -149,6 +149,34 @@ void qkFormatPattern(const Arm* a, QkBuf* out) {
     }
 }
 
+static void indentTo(QkBuf* out, int indent);
+
+/* """ text """: each line one level in from where the text is, the closing quotes too */
+static void multilinePiece(const char* s, int n, QkBuf* out, int indent, bool decoded) {
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\n') {
+            qkBufByte(out, '\n');
+            if (i + 1 >= n || s[i + 1] != '\n') indentTo(out, indent + 1); /* an empty line stays empty */
+        } else if (decoded && c == '\\') qkBufPuts(out, "\\\\");
+        else if (decoded && c == '{') qkBufPuts(out, "\\{");
+        else if (decoded && c == '}') qkBufPuts(out, "\\}");
+        else if (decoded && c == '\t') qkBufPuts(out, "\\t");
+        else qkBufByte(out, (uint8_t)c);
+    }
+}
+
+static void multilineOpen(QkBuf* out, int indent) {
+    qkBufPuts(out, "\"\"\"\n");
+    indentTo(out, indent + 1);
+}
+
+static void multilineClose(QkBuf* out, int indent) {
+    qkBufByte(out, '\n');
+    indentTo(out, indent + 1);
+    qkBufPuts(out, "\"\"\"");
+}
+
 static void textLiteral(const Expr* e, QkBuf* out) {
     qkBufPuts(out, "\"");
     for (int i = 0; i < e->textLen; i++) {
@@ -265,7 +293,15 @@ static void expr(const Expr* e, QkBuf* out, int indent, int minPrec) {
         else if (e->kind == E_INT) qkBufPrintf(out, "%lld", (long long)e->i);
         else qkBufPrintf(out, "%.17g", e->f);
         break;
-    case E_TEXT: textLiteral(e, out); break;
+    case E_TEXT:
+        if (e->multiline) {
+            multilineOpen(out, indent);
+            multilinePiece(e->text, e->textLen, out, indent, true);
+            multilineClose(out, indent);
+        } else {
+            textLiteral(e, out);
+        }
+        break;
     case E_BOOL: qkBufPuts(out, e->i ? "true" : "false"); break;
     case E_NAME: qkBufPuts(out, e->name); break;
     case E_CASE: qkBufPrintf(out, "%s.%s", e->decl->templateOf ? e->decl->templateOf->name : e->decl->name, e->name); break;
@@ -367,16 +403,19 @@ static void expr(const Expr* e, QkBuf* out, int indent, int minPrec) {
         qkBufPuts(out, " }");
         break;
     case E_INTERP: /* the pieces as written, the values between braces */
-        qkBufPuts(out, "\"");
+        if (e->multiline) multilineOpen(out, indent);
+        else qkBufPuts(out, "\"");
         for (int i = 0; i <= e->argCount; i++) {
-            qkBufPuts(out, e->rawParts[i]);
+            if (e->multiline) multilinePiece(e->rawParts[i], (int)strlen(e->rawParts[i]), out, indent, false);
+            else qkBufPuts(out, e->rawParts[i]);
             if (i == e->argCount) break;
             qkBufPuts(out, "{");
             expr(e->args[i], out, indent, P_LOWEST);
             if (e->formats && e->formats[i]) qkBufPrintf(out, ":%s", e->formats[i]);
             qkBufPuts(out, "}");
         }
-        qkBufPuts(out, "\"");
+        if (e->multiline) multilineClose(out, indent);
+        else qkBufPuts(out, "\"");
         break;
     case E_CALL: {
         /* a chain of calls with lambdas goes one call per line when it is long */
@@ -435,6 +474,10 @@ static void stmt(const Stmt* s, QkBuf* out, int indent) {
         qkBufPuts(out, " in ");
         expr(s->iter, out, indent, P_LOWEST);
         qkBufPuts(out, " ");
+        block(s->body, out, indent);
+        break;
+    case S_DEFER:
+        qkBufPuts(out, "defer ");
         block(s->body, out, indent);
         break;
     case S_WHILE:
@@ -517,7 +560,10 @@ static void decl(const Decl* d, QkBuf* out) {
     } else if (d->kind == D_FN) {
         qkBufPrintf(out, "%s%sfn %s", d->isExtern ? "extern " : "", d->isExtern && d->isEffect ? "effect " : "", d->name);
         int typeParams = d->impliedTypes ? 0 : d->typeParamCount;
-        for (int i = 0; i < typeParams; i++) qkBufPrintf(out, "%s%s", i ? ", " : "<", d->typeParams[i]);
+        for (int i = 0; i < typeParams; i++) {
+            qkBufPrintf(out, "%s%s", i ? ", " : "<", d->typeParams[i]);
+            if (d->typeBounds && d->typeBounds[i]) qkBufPrintf(out, ": %s", d->typeBounds[i]); /* T: Speaker */
+        }
         qkBufPuts(out, typeParams ? ">(" : "(");
         for (int i = 0; i < d->paramCount; i++) {
             if (!i && (!d->params[0].type || d->impliedSelf)) { /* fn Vec2.length(self) */

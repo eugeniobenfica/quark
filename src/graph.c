@@ -360,6 +360,7 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
         }
         break;
     case E_INTERP:
+        if (e->multiline) qkBufPuts(&node, ", \"multiline\": true");
         qkBufPuts(&node, ", \"parts\": [");
         for (int i = 0; i <= e->argCount; i++) {
             if (i) qkBufPuts(&node, ", ");
@@ -635,6 +636,11 @@ static int writeStmt(Out* o, const Stmt* s, const char* key) {
         qkBufPuts(&node, ", \"body\": ");
         writeBlock(o, s->body, &node, key);
         break;
+    case S_DEFER:
+        kind = "defer";
+        qkBufPuts(&node, ", \"body\": ");
+        writeBlock(o, s->body, &node, key);
+        break;
     case S_WHILE:
         kind = "while";
         inputs(o, &node, &((Stmt*)s)->value, 1, in);
@@ -684,7 +690,14 @@ static void writeParams(QkBuf* out, const Decl* d, Out* o) {
         qkBufPuts(out, ", \"typeParams\": [");
         for (int k = 0; k < d->typeParamCount; k++) {
             if (k) qkBufPuts(out, ", ");
-            jsonString(out, d->typeParams[k]);
+            if (d->typeBounds && d->typeBounds[k]) { /* "T: Speaker" */
+                QkBuf tb = {0};
+                qkBufPrintf(&tb, "%s: %s", d->typeParams[k], d->typeBounds[k]);
+                jsonString(out, tb.data);
+                qkBufFree(&tb);
+            } else {
+                jsonString(out, d->typeParams[k]);
+            }
         }
         qkBufPuts(out, "]");
     }
@@ -904,6 +917,11 @@ static Expr* literal(const char* raw, const char* of) {
         size_t n = strlen(raw);
         const char* s = raw + 1;
         const char* end = raw + (n > 1 ? n - 1 : n);
+        if (n >= 8 && !strncmp(raw, "\"\"\"\n", 4) && !strcmp(raw + n - 4, "\n\"\"\"")) { /* three quotes: lines */
+            e->multiline = true;
+            s = raw + 4;
+            end = raw + n - 4;
+        }
         while (s < end) {
             char c = *s++;
             if (c == '\\' && s < end) {
@@ -1083,6 +1101,8 @@ static Expr* buildNodeInner(In* in, int id) {
     if (!strcmp(kind, "text")) { /* "lap {n}": the pieces as written, a value between each two */
         Expr* e = qkNewExpr(E_INTERP, 0, 0);
         J* parts = jget(node, "parts");
+        J* multiline = jget(node, "multiline");
+        e->multiline = multiline && multiline->kind == J_BOOL && multiline->b;
         e->args = args;
         e->argCount = e->argCap = n;
         e->argNames = qkNew(sizeof(char*) * (size_t)(n ? n : 1));
@@ -1264,6 +1284,9 @@ static Stmt* buildStmt(In* in, int id) {
         }
         s->iter = buildInput(in, first);
         s->body = buildBlock(in, jget(node, "body"));
+    } else if (!strcmp(kind, "defer")) {
+        s->kind = S_DEFER;
+        s->body = buildBlock(in, jget(node, "body"));
     } else if (!strcmp(kind, "while")) {
         s->kind = S_WHILE;
         s->value = buildInput(in, first);
@@ -1351,7 +1374,15 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
         J* tps = jget(dj, "typeParams");
         if (tps && tps->kind == J_ARR && tps->count) {
             d->typeParams = qkNew(sizeof(char*) * (size_t)tps->count);
-            for (int k = 0; k < tps->count; k++) d->typeParams[k] = tps->items[k]->kind == J_STR ? tps->items[k]->str : "T";
+            for (int k = 0; k < tps->count; k++) {
+                const char* tp = tps->items[k]->kind == J_STR ? tps->items[k]->str : "T";
+                const char* colon = strstr(tp, ": ");
+                d->typeParams[k] = colon ? qkDup(tp, (size_t)(colon - tp)) : tp;
+                if (colon) { /* T: Speaker */
+                    if (!d->typeBounds) d->typeBounds = qkNew(sizeof(char*) * (size_t)tps->count);
+                    d->typeBounds[k] = colon + 2;
+                }
+            }
             d->typeParamCount = tps->count;
         }
         if (!strcmp(kind, "use")) {

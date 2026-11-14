@@ -369,9 +369,60 @@ static Expr* parseExpr(Parser* p);
 static void addArg(Expr* e, Expr* arg, const char* name);
 
 /* A text; with {expressions} inside, an E_INTERP: the pieces around them, and each expression parsed. */
+/* """ ... """: the lines between the quotes, each without the closing quotes' indentation, joined by line breaks
+ * (none after the last). The opening quotes end their line; the closing ones stand on a line of their own. */
+static bool multilineText(Parser* p, Token* t, const char** s, const char** end) {
+    const char* open = t->start + 3;
+    const char* close = t->start + t->len - 3;
+    const char* q = open;
+    while (q < close && (*q == ' ' || *q == '\t' || *q == '\r')) q++;
+    if (q >= close || *q != '\n') {
+        fail(p, t, "%s", "the text starts on the line after its \"\"\"");
+        return false;
+    }
+    const char* first = q + 1;
+    const char* lastBreak = close;
+    while (lastBreak > first && lastBreak[-1] != '\n') lastBreak--;
+    for (const char* r = lastBreak; r < close; r++)
+        if (*r != ' ' && *r != '\t') {
+            fail(p, t, "%s", "the closing \"\"\" stands on a line of its own");
+            return false;
+        }
+    int indent = (int)(close - lastBreak);
+    QkBuf b = {0};
+    for (const char* line = first; line < lastBreak;) {
+        const char* nl = memchr(line, '\n', (size_t)(lastBreak - line));
+        const char* stop = nl ? nl : lastBreak;
+        const char* text = line;
+        int strip = 0;
+        while (strip < indent && text < stop && (*text == ' ' || *text == '\t')) text++, strip++;
+        const char* tail = stop;
+        while (tail > text && tail[-1] == '\r') tail--;
+        if (strip < indent && text < tail) {
+            fail(p, t, "%s", "each line of the text starts at least as far in as the closing \"\"\"");
+            qkBufFree(&b);
+            return false;
+        }
+        if (line != first) qkBufByte(&b, '\n');
+        qkBufAdd(&b, text, (size_t)(tail - text));
+        line = stop + 1;
+    }
+    *s = qkDup(b.data ? b.data : "", b.len);
+    *end = *s + b.len;
+    qkBufFree(&b);
+    return true;
+}
+
 static Expr* parseText(Parser* p, Token* t) {
     const char* s = t->start + 1;
     const char* end = t->start + t->len - (t->len > 1 && t->start[t->len - 1] == '"' ? 1 : 0);
+    bool multiline = t->len >= 6 && !strncmp(t->start, "\"\"\"", 3);
+    if (multiline && !multilineText(p, t, &s, &end)) {
+        Expr* e = qkNewExpr(E_TEXT, t->line, t->col);
+        e->text = "";
+        e->raw = "\"\"";
+        return e;
+    }
     const char* open = NULL;
     for (const char* q = s; q < end; q++) {
         if (*q == '\\') {
@@ -386,10 +437,21 @@ static Expr* parseText(Parser* p, Token* t) {
     if (!open) {
         Expr* e = qkNewExpr(E_TEXT, t->line, t->col);
         e->text = decodePiece(p, t, s, end, &e->textLen);
-        e->raw = tokText(t);
+        e->multiline = multiline;
+        if (multiline) { /* as a graph keeps it: the lines, without indentation */
+            QkBuf r = {0};
+            qkBufPuts(&r, "\"\"\"\n");
+            qkBufAdd(&r, s, (size_t)(end - s));
+            qkBufPuts(&r, "\n\"\"\"");
+            e->raw = qkDup(r.data, r.len);
+            qkBufFree(&r);
+        } else {
+            e->raw = tokText(t);
+        }
         return e;
     }
     Expr* e = qkNewExpr(E_INTERP, t->line, t->col);
+    e->multiline = multiline;
     const char* parts[64];
     const char* raws[64];
     const char* formats[64];
@@ -990,6 +1052,9 @@ static Stmt* parseStmt(Parser* p) {
         s->kind = S_WHILE;
         s->value = parseExpr(p);
         s->body = parseBlock(p);
+    } else if (accept(p, T_DEFER)) { /* defer { ... }: runs when the block it is in is left, however it is left */
+        s->kind = S_DEFER;
+        s->body = parseBlock(p);
     } else if (accept(p, T_RETURN)) {
         s->kind = S_RETURN;
         if (!at(p, T_NEWLINE) && !at(p, T_RBRACE)) s->value = parseExpr(p);
@@ -1053,15 +1118,26 @@ static Decl* parseFn(Parser* p) {
     }
     if (accept(p, T_LT)) { /* fn first<T>(xs: [T]): type parameters */
         const char* names[16];
+        const char* bounds[16] = {0};
+        bool anyBound = false;
         int n = 0;
         while (!at(p, T_GT) && !at(p, T_EOF) && n < 16) {
-            names[n++] = tokText(expect(p, T_TYPENAME, "for a type parameter (a PascalCase name, like T)"));
+            names[n] = tokText(expect(p, T_TYPENAME, "for a type parameter (a PascalCase name, like T)"));
+            if (accept(p, T_COLON)) { /* T: Speaker: any type that fits the interface */
+                bounds[n] = tokText(expect(p, T_TYPENAME, "after the colon (an interface T must fit, like T: Speaker)"));
+                anyBound = true;
+            }
+            n++;
             if (!accept(p, T_COMMA)) break;
         }
         expect(p, T_GT, "after the type parameters");
         d->typeParams = qkNew(sizeof(char*) * (size_t)(n ? n : 1));
         memcpy(d->typeParams, names, sizeof(char*) * (size_t)n);
         d->typeParamCount = n;
+        if (anyBound) {
+            d->typeBounds = qkNew(sizeof(char*) * (size_t)n);
+            memcpy(d->typeBounds, bounds, sizeof(char*) * (size_t)n);
+        }
     }
     expect(p, T_LPAREN, "after the function's name");
     while (!at(p, T_RPAREN) && !at(p, T_EOF)) {

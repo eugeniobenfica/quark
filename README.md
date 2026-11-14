@@ -48,7 +48,7 @@ editor, a server, a tool or any other C program can use it as its scripting lang
 
 ## The idea
 
-- **Elegant.** 25 keywords. camelCase for values and PascalCase for types, enforced. One canonical
+- **Elegant.** 26 keywords. camelCase for values and PascalCase for types, enforced. One canonical
   layout. Values that never change behind your back. See [docs/LANGUAGE.md](docs/LANGUAGE.md).
 - **Whole.** Inferred static types, and:
   - records with `with` copies, compared with `==` field by field;

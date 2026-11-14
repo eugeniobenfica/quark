@@ -8,14 +8,14 @@
 
 const char* const qkKeywords[] = {"fn",  "let",   "var",   "type",     "enum", "if",  "else", "match", "for",  "in",
                                   "while", "return", "break", "continue", "and", "or", "not",  "true",  "false", "extern", "with", "effect",
-                                  "use",   "pub",    "const"};
+                                  "use",   "pub",    "const", "defer"};
 const int qkKeywordCount = (int)(sizeof qkKeywords / sizeof qkKeywords[0]);
 
 const char* qkTokName(TokKind k) {
     static const char* const names[] = {
         "end of file", "end of line", "name", "type name", "number", "number", "text",
         "fn", "let", "var", "type", "enum", "if", "else", "match", "for", "in", "while", "return", "break", "continue",
-        "and", "or", "not", "true", "false", "extern", "with", "effect", "use", "pub", "const",
+        "and", "or", "not", "true", "false", "extern", "with", "effect", "use", "pub", "const", "defer",
         "(", ")", "{", "}", "[", "]", ",", ".", "..", ":", "->", "=>", "=", "+=", "-=", "*=", "/=", "+", "-", "*",
         "/", "%", "==", "!=", "<", "<=", ">", ">=", "_", "??", "?", "!", "&", "|", "^", "~", "<<", ">>"};
     return names[k];
@@ -172,6 +172,29 @@ void qkLex(const QkSource* src, Lexed* out) {
                 while (lx.p < lx.end && isAlpha(*lx.p)) lx.p++;
             }
             add(&lx, isFloat ? T_FLOAT : T_INT, start, (int)(lx.p - start));
+            continue;
+        }
+        if (c == '"' && lx.p + 2 < lx.end && lx.p[1] == '"' && lx.p[2] == '"') { /* """ a text on lines of its own """ */
+            int line = lx.line;
+            int col = (int)(start - lx.lineStart) + 1;
+            lx.p += 3;
+            while (lx.p + 2 < lx.end && !(lx.p[0] == '"' && lx.p[1] == '"' && lx.p[2] == '"')) {
+                if (*lx.p == '\\' && lx.p + 1 < lx.end) lx.p++;
+                else if (*lx.p == '\n') {
+                    lx.line++;
+                    lx.lineStart = lx.p + 1;
+                }
+                lx.p++;
+            }
+            if (lx.p + 2 >= lx.end) {
+                qkError(src, line, col, "this text has no closing \"\"\"");
+                lx.p = lx.end;
+            } else {
+                lx.p += 3;
+            }
+            add(&lx, T_TEXT, start, (int)(lx.p - start));
+            lx.out->tokens[lx.out->count - 1].line = line;
+            lx.out->tokens[lx.out->count - 1].col = col;
             continue;
         }
         if (c == '"') { /* text, with {expressions} inside (which may hold texts of their own) */

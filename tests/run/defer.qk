@@ -1,0 +1,44 @@
+// defer: runs when its block is left (its end, return, ?, break, continue), the last one first; worked out when compiled.
+fn work(n: Int) -> Int {
+    print("open {n}")
+    defer {
+        print("close {n}")
+    }
+    if n > 1 {
+        defer {
+            print("  inner done")
+        }
+        return n * 10
+    }
+    n
+}
+
+fn parse(t: Text) -> Int? {
+    defer {
+        print("parsed {t}")
+    }
+    let v = parseInt(t)?
+    v + 1
+}
+
+fn main() {
+    print(work(1), work(2))
+    print(parse("4"), parse("x"))
+    for i in 0..4 {
+        defer {
+            print("turn {i} ends")
+        }
+        if i == 1 {
+            continue
+        }
+        if i == 2 {
+            break
+        }
+        print("turn {i}")
+    }
+    var count = 0
+    defer {
+        print("main ends with count {count}")
+    }
+    count = 3
+}

@@ -304,6 +304,12 @@ void qkTypeName(const Type* t, QkBuf* out) {
             qkBufPuts(out, "[:] (of no type yet)");
             break;
         }
+        if (qkIsSet(t)) { /* Set<K> */
+            qkBufPuts(out, "Set<");
+            qkTypeName(t->key, out);
+            qkBufPuts(out, ">");
+            break;
+        }
         qkBufPuts(out, "[");
         qkTypeName(t->key, out);
         qkBufPuts(out, ": ");
@@ -385,6 +391,8 @@ void qkTypeSlotKinds(const Type* t, char* out) {
     }
 }
 
+bool qkIsSet(const Type* t) { return t->kind == TY_MAP && t->key && t->elem && t->elem->kind == TY_VOID; }
+
 bool qkIsIterable(const Type* t) { return t->kind == TY_ARRAY || t->kind == TY_RANGE || t->kind == TY_ITER; }
 Type* qkElemType(const Type* t) { return t->elem ? t->elem : &qkTypeError; }
 
@@ -397,7 +405,7 @@ const char* const qkBuiltinNames[B_COUNT] = {
     "join", "repeat", "chars", "sort", "sortBy", "reverse", "first", "last", "count", "minBy", "maxBy",
     "keys", "values", "remove", "index", "printErr", "exit", "env", "fileExists", "listDir", "time", "assert",
     "parallelMap", "random", "randomInt", "seedRandom", "spawn", "step", "yield", "wait", "take", "skip", "countBy", "mean",
-    "panic", "get", "#interface", "#never", "#entries"};
+    "panic", "get", "add", "toSet", "#interface", "#never", "#entries"};
 
 /* ---- the checker --------------------------------------------------------------------------------- */
 
@@ -414,6 +422,7 @@ struct Checker {
     Binding** lets;  /* this function's lets, to decide which are fused */
     int letCount, letCap;
     bool inConst;    /* checking a constant or a default value: no names, no effects */
+    int deferDepth;  /* inside a defer's block: it cannot leave (return, break, continue, ?) */
     int module;      /* the file whose code it checks: what it sees is its own and the pub of the files it uses */
     Type* hint;      /* the type a value goes into, when it is written (let xs: [Speaker] = [...]) */
     struct Checker* outer; /* checking a lambda kept as a value: the function it is written in (its names are out of reach) */
@@ -535,6 +544,18 @@ static Type* resolveType(Checker* c, TypeExpr* te) {
     if (!strcmp(te->name, "Text")) return &qkTypeText;
     if (!strcmp(te->name, "Never")) return &qkTypeNever;
     Decl* d = findDecl(c, te->name);
+    if (!d && !strcmp(te->name, "Set") && te->argCount == 1) { /* Set<Text>: each value once, in the order they came */
+        Type* k = resolveType(c, te->args[0]);
+        if (k->kind == TY_ERROR) return k;
+        if (!keyable(k)) {
+            QkBuf n = {0};
+            qkTypeName(k, &n);
+            qkError(c->src, te->line, te->col, "a set holds Ints, Texts, Bools, enum cases or records of two Ints, not %s", n.data);
+            qkBufFree(&n);
+            return &qkTypeError;
+        }
+        return qkTypeMap(k, &qkTypeVoid);
+    }
     if (!d && !strcmp(te->name, "Entry") && te->argCount == 2) { /* a map's entry: Entry<Text, Int> */
         Type* k = resolveType(c, te->args[0]);
         Type* v = resolveType(c, te->args[1]);
@@ -851,6 +872,29 @@ static Type* fnReturnType(Checker* c, Decl* d, const Expr* at);
 
 static bool hasOperators(const Type* t);
 static bool effectOf(Checker* c, Decl* d);
+
+/* fn talk<T: Speaker>: does this type have each of the interface's functions, of its type? Said where it is called. */
+static bool fitsInterface(Checker* c, Type* have, Decl* w, const Expr* at, const char* fn, const char* param) {
+    for (int f = 0; f < w->paramCount; f++) {
+        Type* ft = w->params[f].binding->type;
+        Decl* m = typeFunction(c, have, w->params[f].name);
+        bool fits = m && m->paramCount == ft->paramCount + 1 && (!effectOf(c, m) || ft->effect);
+        for (int i = 0; fits && i < ft->paramCount; i++) fits = m->params[i + 1].binding->type == ft->params[i];
+        if (fits) fits = fnReturnType(c, m, at) == ft->elem;
+        if (!fits) {
+            QkBuf hn = {0}, sig = {0};
+            qkTypeName(have, &hn);
+            qkFormatMember(&w->params[f], &sig);
+            qkError(c->src, at->line, at->col, "%s needs its %s to fit %s: %s has no %s of its own (fn %s.%s(self, ...))", fn, param, w->name,
+                    hn.data, sig.data, hn.data, w->params[f].name);
+            qkBufFree(&hn);
+            qkBufFree(&sig);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool toInterface(Checker* c, Expr** slot, Type* have, Type* want) {
     Decl* w = want->decl;
     QkBuf hn = {0}, wn = {0};
@@ -949,6 +993,14 @@ static bool coerce(Checker* c, Expr** slot, Type* want, const char* where) {
     }
     if (have == &qkTypeEmpty && want->kind == TY_ARRAY) { /* [] takes the type */
         (*slot)->type = want;
+        return true;
+    }
+    if (qkIsSet(want) && (*slot)->kind == E_ARRAY && have->kind == TY_ARRAY) { /* let s: Set<Text> = ["a", "b"] */
+        Expr* arr = *slot;
+        for (int i = 0; i < arr->argCount; i++)
+            if (!coerce(c, &arr->args[i], want->key, where)) return false;
+        arr->type = qkTypeArray(want->key);
+        wrapImplicit(slot, B_TOSET, want);
         return true;
     }
     if (have == &qkTypeEmptyMap && want->kind == TY_MAP) { /* [:] takes the type */
@@ -1321,6 +1373,10 @@ static bool argCount(Checker* c, Expr* e, int lo, int hi) {
 
 static Type* checkSource(Checker* c, Expr* e, int i) {
     Type* t = checkExpr(c, e->args[i], true);
+    if (qkIsSet(t)) { /* a set: its values, in the order they came */
+        wrapImplicit(&e->args[i], B_ENTRIES, qkTypeIter(t->key));
+        return t->key;
+    }
     if (t->kind == TY_MAP && t->key) { /* a map: its entries, Entry(key, value), in the order the keys came */
         wrapImplicit(&e->args[i], B_ENTRIES, qkTypeIter(typeEntry(t->key, t->elem)));
         return e->args[i]->type->elem;
@@ -1342,7 +1398,7 @@ static bool textable(const Type* t) {
 static bool printable(const Type* t) {
     switch (t->kind) {
     case TY_ARRAY: return printable(t->elem);
-    case TY_MAP: return t->key && printable(t->key) && printable(t->elem);
+    case TY_MAP: return t->key && printable(t->key) && (qkIsSet(t) || printable(t->elem));
     case TY_RANGE: case TY_ITER: case TY_VOID: case TY_ERROR: case TY_FN: return false;
     default: return true;
     }
@@ -1424,6 +1480,28 @@ static Type* checkBuiltin(Checker* c, Expr* e, int b) {
         checkExpr(c, e->args[1], true);
         coerce(c, &e->args[1], &qkTypeInt, "get's index");
         return qkTypeOption(elem);
+    }
+    case B_TOSET: { /* xs.toSet(): each value once, in the order they came */
+        if (!argCount(c, e, 1, 1)) return &qkTypeError;
+        Type* elem = checkSource(c, e, 0);
+        if (elem->kind == TY_ERROR) return elem;
+        if (!keyable(elem)) {
+            typeError(c, e->args[0], "a set holds Ints, Texts, Bools, enum cases or records of two Ints, not %s", elem, NULL);
+            return &qkTypeError;
+        }
+        return qkTypeMap(elem, &qkTypeVoid);
+    }
+    case B_ADD: { /* s.add(v): s a var set, one value more */
+        if (!argCount(c, e, 2, 2)) return &qkTypeError;
+        Type* t = checkExpr(c, e->args[0], true);
+        Expr* target = e->args[0];
+        if (target->kind != E_NAME || !target->binding || !target->binding->mutable || !qkIsSet(t)) {
+            if (t->kind != TY_ERROR) qkError(c->src, target->line, target->col, "add puts a value into a var set: var s: Set<Text> = [] ... s.add(\"a\")");
+            return &qkTypeError;
+        }
+        checkExpr(c, e->args[1], true);
+        coerce(c, &e->args[1], t->key, "the value");
+        return &qkTypeVoid;
     }
     case B_PANIC: /* stops the program (or the host's call) with this message: it never gives a value */
         if (!argCount(c, e, 1, 1)) return &qkTypeError;
@@ -2223,6 +2301,15 @@ static Type* checkTemplateCall(Checker* c, Expr* e, Decl* d) {
             qkError(c->src, e->line, e->col, "%s: what %s is cannot be told from the values given", d->name, d->typeParams[i]);
             return &qkTypeError;
         }
+    for (int i = 0; d->typeBounds && i < d->typeParamCount; i++) { /* T: Speaker: the type given fits the interface */
+        if (!d->typeBounds[i]) continue;
+        Decl* w = findDecl(c, d->typeBounds[i]);
+        if (!w || w->kind != D_TYPE || !w->isInterface) {
+            qkError(c->src, e->line, e->col, "%s: %s is not an interface (T: Speaker, with type Speaker { fn ... })", d->name, d->typeBounds[i]);
+            return &qkTypeError;
+        }
+        if (!fitsInterface(c, bound[i], w, e, d->name, d->typeParams[i])) return &qkTypeError;
+    }
     if (instantiating > 24) {
         qkError(c->src, e->line, e->col, "%s keeps making new versions of itself (a function that takes a function, or new types, calling itself)", d->name);
         return &qkTypeError;
@@ -3207,6 +3294,19 @@ static void checkStmt(Checker* c, Stmt* s) {
         c->scopeCount = mark;
         break;
     }
+    case S_DEFER: {
+        if (c->lambdaDepth) {
+            qkError(c->src, s->line, s->col, "defer belongs in a function's block, not in a lambda");
+            break;
+        }
+        int loops = c->loopDepth;
+        c->loopDepth = 0; /* a break inside it would leave the defer, not a loop */
+        c->deferDepth++;
+        checkBlock(c, s->body, false);
+        c->deferDepth--;
+        c->loopDepth = loops;
+        break;
+    }
     case S_WHILE: {
         c->loopDepth++;
         Type* t = checkExpr(c, s->value, true);
@@ -3216,6 +3316,10 @@ static void checkStmt(Checker* c, Stmt* s) {
         break;
     }
     case S_RETURN: {
+        if (c->deferDepth) {
+            qkError(c->src, s->line, s->col, "a defer's block cannot leave its function: no return in it");
+            break;
+        }
         if (c->lambdaDepth) {
             qkError(c->src, s->line, s->col, "return inside a lambda: a lambda is one expression");
             break;
@@ -3292,6 +3396,13 @@ static Type* checkBinary(Checker* c, Expr* e) {
     if ((a->kind == TY_TEXT) != (b->kind == TY_TEXT) && e->op == T_PLUS) {
         typeError(c, e, "+ joins two texts: make the other one text with \"{x}\" or toText(x) (%s and %s)", a, b);
         return &qkTypeError;
+    }
+    if (qkIsSet(a) && (e->op == T_PIPE || e->op == T_AMP || e->op == T_MINUS)) { /* union, intersection, difference */
+        if (a != b) {
+            typeError(c, e, "| & - join sets of one type, not %s and %s", a, b);
+            return &qkTypeError;
+        }
+        return a;
     }
     if (e->op == T_AMP || e->op == T_PIPE || e->op == T_CARET || e->op == T_SHL || e->op == T_SHR) { /* an Int's bits */
         if ((a->kind != TY_INT && a->kind != TY_ERROR) || (b->kind != TY_INT && b->kind != TY_ERROR)) {
@@ -3451,6 +3562,10 @@ static Type* checkExprInner(Checker* c, Expr* e, bool wantValue) {
         }
         return &qkTypeText;
     case E_TRY: { /* a?: what it holds, or leave with its None / Err */
+        if (c->deferDepth) {
+            qkError(c->src, e->line, e->col, "a defer's block cannot leave its function: no ? in it");
+            return &qkTypeError;
+        }
         Type* t = checkExpr(c, e->a, true);
         if (t->kind == TY_ERROR) return t;
         Type* v = qkFallibleValue(t);
@@ -3566,6 +3681,10 @@ static Type* checkExprInner(Checker* c, Expr* e, bool wantValue) {
             return &qkTypeError;
         }
         Type* i = checkExpr(c, e->b, true);
+        if (qkIsSet(t)) {
+            qkError(c->src, e->line, e->col, "a set has no values to look up: contains(s, value) says if it holds one");
+            return &qkTypeError;
+        }
         if (t->kind == TY_MAP && t->key) { /* m[key]: the value, or None */
             coerce(c, &e->b, t->key, "the key");
             return qkTypeOption(t->elem);

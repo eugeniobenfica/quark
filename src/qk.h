@@ -580,9 +580,18 @@ typedef struct QkDebugger {
     int breakCount, breakCap;
     bool stepping;
     const char* tracePath; /* --trace: the last values, by graph key, written there at the end (JSON) */
+    /* a debugger that drives it (quark dap): called where the program stops (a breakpoint, or stepping), instead of
+     * reading commands from stdin; it sets stepping and the breakpoints before it returns and the program goes on */
+    void (*stopped)(int line);
 } QkDebugger;
 extern QkDebugger qkDebugger;
 void qkDebugFinish(void); /* writes the trace */
+/* What the debugger knows while the program is stopped: the calls it is in (0 the outermost), each one's line,
+ * and its names' last values, as print writes them. */
+int qkDebugDepth(void);
+const char* qkDebugFrame(int depth, int* line);
+int qkDebugVarCount(int depth);
+const char* qkDebugVar(int depth, int i, const char** text);
 void qkIrDump(const IrProgram* p, QkBuf* out);
 /* Folds copies into the instructions that compute them, drops unused code, turns constants into immediates
  * (ints) or hoists them to the start (floats). */
@@ -728,6 +737,10 @@ bool qkGenSysvAdapters(QkBuf* out, int32_t* at);
 /* ---- the language server (lsp.c) ----------------------------------------------------------------- */
 
 int qkLsp(const char* prelude); /* serves an editor over stdin / stdout until it says exit */
+/* A debug adapter (dap.c): serves a debugger client (the Debug Adapter Protocol) over stdin / stdout. */
+int qkDap(const char* prelude);
+/* Documentation (doc.c): the pub declarations of the program's files, with their comments, as Markdown or HTML. */
+void qkDoc(const Program* p, bool html, QkBuf* out);
 
 /* Code and data in executable memory, addresses patched (host functions from `hosts`, by extern index). */
 typedef struct Loaded {

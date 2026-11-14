@@ -1,7 +1,8 @@
 /* Quark — a language server: an editor talks to it over stdin and stdout (the Language Server Protocol). It
  * checks every open file as it changes and reports the errors where they are; formats a file into its one
  * canonical text; tells the type of the name under the cursor; goes to where a name was made; lists a file's
- * declarations; offers names to complete. Each request checks the text afresh (a check takes a fraction of a
+ * declarations; offers names to complete (after a dot: fields, cases, a type's functions; in a call: the names
+ * of its values); offers the fixes the errors' messages ask for. Each request checks the text afresh (a check takes a fraction of a
  * millisecond), so nothing is kept between requests but the files' texts. */
 #include "qk.h"
 
@@ -140,7 +141,7 @@ static int byteColumn(const char* text, int line, int units) { /* the editor's c
     return i + 1;
 }
 
-static bool isNameChar(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }
+static bool isNameChar(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
 
 /* {"start": {...}, "end": {...}}: the word at Quark's (line, col), at least one character */
 static void rangeAt(QkBuf* b, const char* text, int line, int col) {
@@ -777,35 +778,497 @@ static void formatting(const char* id, const Doc* d) {
     qkBufFree(&b);
 }
 
-static void completion(const char* id, const Doc* d) {
+/* ---- completion: names; after a dot, a record's fields, an enum's cases, a type's or a module's functions;
+ * inside a call, the names of the values it takes ---------------------------------------------------------- */
+
+typedef struct Items {
+    QkBuf b;
+    int n;
+} Items;
+
+static void item(Items* it, const char* label, int kind, const char* detail, const char* insert, const char* sort) {
+    qkBufPuts(&it->b, it->n++ ? ", {\"label\": " : "{\"label\": ");
+    qkJsonString(&it->b, label);
+    qkBufPrintf(&it->b, ", \"kind\": %d", kind);
+    if (detail) {
+        qkBufPuts(&it->b, ", \"detail\": ");
+        qkJsonString(&it->b, detail);
+    }
+    if (insert) {
+        qkBufPuts(&it->b, ", \"insertText\": ");
+        qkJsonString(&it->b, insert);
+    }
+    if (sort) {
+        qkBufPuts(&it->b, ", \"sortText\": ");
+        qkJsonString(&it->b, sort);
+    }
+    qkBufPuts(&it->b, "}");
+}
+
+/* a function's text, for an item's detail */
+static const char* detailOf(const Decl* d) {
+    QkBuf b = {0};
+    signature(&b, d);
+    const char* s = qkDup(b.data, b.len);
+    qkBufFree(&b);
+    return s;
+}
+
+static const char* typeExprText(const TypeExpr* t) {
+    if (!t) return NULL;
+    QkBuf b = {0};
+    qkFormatTypeExpr(t, &b);
+    const char* s = qkDup(b.data, b.len);
+    qkBufFree(&b);
+    return s;
+}
+
+/* a type's own functions (fn Vec2.length), named without the type: a value's (they take self), or the type's */
+static void ownFunctions(Items* it, const Program* p, const char* type, bool values) {
+    for (int i = 0; i < p->count; i++) {
+        const Decl* x = p->decls[i];
+        if (x->kind != D_FN || !x->owner || x->templateOf || x->lifted || strcmp(x->owner, type)) continue;
+        bool takesSelf = x->paramCount && !strcmp(x->params[0].name, "self");
+        if (values != takesSelf) continue;
+        item(it, x->name + strlen(type) + 1, 2, detailOf(x), NULL, "1");
+    }
+}
+
+static void membersOf(Items* it, const Program* p, const Type* t) {
+    if (!t) return;
+    const Decl* d = t->decl ? declOf(t->decl) : NULL;
+    if (t->kind == TY_RECORD && d && !d->isTuple)
+        for (int i = 0; i < d->paramCount; i++) item(it, d->params[i].name, d->isInterface ? 2 : 5, typeExprText(d->params[i].type), NULL, "0");
+    if ((t->kind == TY_RECORD || t->kind == TY_ENUM) && d) {
+        ownFunctions(it, p, d->name, true);
+        return;
+    }
+    if (t->kind == TY_ERROR || t->kind == TY_VOID) return;
+    for (int i = 1; i < B_INTERFACE; i++) item(it, qkBuiltinNames[i], 3, NULL, NULL, "2"); /* xs.map(f): a function after its first value */
+}
+
+/* the latest let, var, for, parameter or lambda's parameter named `name` at or before `line` */
+typedef struct Latest {
+    const char* name;
+    int line;
+    const Binding* found;
+    int foundLine;
+} Latest;
+
+static void latestBlock(Latest* l, const Block* b);
+
+static void latestExpr(Latest* l, const Expr* e) {
+    if (!e) return;
+    latestExpr(l, e->a);
+    latestExpr(l, e->b);
+    latestExpr(l, e->body);
+    latestExpr(l, e->elseExpr);
+    for (int i = 0; i < e->argCount; i++) latestExpr(l, e->args[i]);
+    for (int i = 0; i < e->armCount; i++) latestExpr(l, e->arms[i].body);
+    for (int i = 0; e->kind == E_LAMBDA && i < e->paramCount; i++)
+        if (e->params[i].binding && !strcmp(e->params[i].name, l->name) && e->line <= l->line && e->line >= l->foundLine) {
+            l->found = e->params[i].binding;
+            l->foundLine = e->line;
+        }
+    if (e->thenBlock) latestBlock(l, e->thenBlock);
+    if (e->block) latestBlock(l, e->block);
+}
+
+static void latestBlock(Latest* l, const Block* b) {
+    for (int i = 0; i < b->count; i++) {
+        const Stmt* s = b->stmts[i];
+        if (s->line > l->line) return;
+        if (s->binding && s->name && !strcmp(s->name, l->name) && s->line >= l->foundLine) {
+            l->found = s->binding;
+            l->foundLine = s->line;
+        }
+        latestExpr(l, s->value);
+        latestExpr(l, s->iter);
+        if (s->body) latestBlock(l, s->body);
+        if (s->elseBody) latestBlock(l, s->elseBody);
+    }
+}
+
+static const Type* typeOfName(const Program* p, const char* name, int line) {
+    const Decl* in = NULL; /* the function the line is in: the last one to start before it */
+    for (int i = 0; i < p->count; i++) {
+        const Decl* x = p->decls[i];
+        if (x->kind == D_FN && x->body && !x->module && !x->fromPrelude && !x->templateOf && !x->lifted && x->line <= line &&
+            (!in || x->line > in->line))
+            in = x;
+    }
+    if (!in) return NULL;
+    Latest l = {name, line, NULL, 0};
+    for (int i = 0; i < in->paramCount; i++)
+        if (!strcmp(in->params[i].name, name)) l.found = in->params[i].binding;
+    latestExpr(&l, in->body);
+    return l.found ? l.found->type : NULL;
+}
+
+/* The text with [from, to) of its bytes made spaces: what is being typed there taken out, so the rest parses. */
+static Doc blanked(const Doc* d, size_t from, size_t to) {
+    Doc t = {d->uri, copyOf(d->text, d->len), d->len};
+    for (size_t i = from; i < to && i < t.len; i++)
+        if (t.text[i] != '\n') t.text[i] = ' ';
+    return t;
+}
+
+static bool analyzeSome(Doc* t, Program* prog, int line) { /* the text, else the text without the cursor's line */
+    if (analyze(t, prog, true)) return true;
+    char* c = (char*)lineAt(t->text, line);
+    for (; *c && *c != '\n'; c++) *c = ' ';
+    return analyze(t, prog, true);
+}
+
+/* After a dot: what is before it, and what it offers. */
+static void memberCompletion(Items* it, const Doc* d, int line, size_t dot) {
+    size_t start = dot;
+    while (start > 0 && isNameChar(d->text[start - 1])) start--;
+    char* receiver = copyOf(d->text + start, dot - start);
+    int recvCol = (int)(start - (size_t)(lineAt(d->text, line) - d->text)) + 1;
+    size_t to = dot + 1;
+    while (to < d->len && isNameChar(d->text[to])) to++;
+    Doc t = blanked(d, dot, to);
     Program prog;
-    bool parsed = analyze(d, &prog, false);
+    bool ok = analyzeSome(&t, &prog, line);
+    if (ok && receiver[0] >= 'A' && receiver[0] <= 'Z') { /* a type: an enum's cases, the type's own functions */
+        for (int i = 0; i < prog.count; i++) {
+            const Decl* x = prog.decls[i];
+            if (x->kind != D_ENUM || strcmp(x->name, receiver)) continue;
+            for (int k = 0; k < x->caseCount; k++) {
+                const char* detail = NULL;
+                if (x->caseFieldCount && x->caseFieldCount[k]) {
+                    QkBuf b = {0};
+                    for (int f = 0; f < x->caseFieldCount[k]; f++) {
+                        qkBufPrintf(&b, "%s%s: ", f ? ", " : "(", x->caseFields[k][f].name);
+                        qkFormatTypeExpr(x->caseFields[k][f].type, &b);
+                    }
+                    qkBufPuts(&b, ")");
+                    detail = qkDup(b.data, b.len);
+                    qkBufFree(&b);
+                }
+                item(it, x->cases[k], 20, detail, NULL, "0");
+            }
+        }
+        ownFunctions(it, &prog, receiver, false);
+    } else if (ok && receiver[0]) {
+        int module = -1; /* use geometry as g: g. offers geometry's pub declarations */
+        for (int i = 0; prog.moduleCount && prog.modules[0].aliases && i < prog.modules[0].useCount; i++)
+            if (prog.modules[0].aliases[i] && !strcmp(prog.modules[0].aliases[i], receiver)) module = prog.modules[0].uses[i];
+        if (module > 0) {
+            for (int i = 0; i < prog.count; i++) {
+                const Decl* x = prog.decls[i];
+                if (x->module != module || !x->isPub || x->owner || x->templateOf || x->lifted || x->kind == D_USE) continue;
+                int kind = x->kind == D_FN ? 3 : x->kind == D_ENUM ? 13 : x->kind == D_CONST ? 21 : 22;
+                item(it, x->name, kind, x->kind == D_FN ? detailOf(x) : NULL, NULL, "0");
+            }
+        } else {
+            Found f = find(&prog, line, recvCol);
+            const Type* type = f.expr ? f.expr->type : f.stmt && f.stmt->binding ? f.stmt->binding->type
+                             : f.param && f.param->binding ? f.param->binding->type : NULL;
+            if (!type || type->kind == TY_ERROR) type = typeOfName(&prog, receiver, line);
+            membersOf(it, &prog, type);
+        }
+    }
+    free(t.text);
+    free(receiver);
+}
+
+/* Inside a call's parentheses, where a value starts: the names of the values it takes, not written yet. */
+static void argumentCompletion(Items* it, const Doc* d, size_t at) {
+    size_t i = at;
+    while (i > 0 && isNameChar(d->text[i - 1])) i--;
+    size_t word = i;
+    while (i > 0 && (d->text[i - 1] == ' ' || d->text[i - 1] == '\n' || d->text[i - 1] == '\r')) i--;
+    if (!i || (d->text[i - 1] != '(' && d->text[i - 1] != ',')) return;
+    int depth = 0; /* the call's ( */
+    size_t open = i;
+    bool found = false;
+    while (open > 0) {
+        char c = d->text[--open];
+        if (c == ')' || c == ']' || c == '}') depth++;
+        else if (c == '(' || c == '[' || c == '{') {
+            if (!depth) {
+                found = c == '(';
+                break;
+            }
+            depth--;
+        }
+    }
+    size_t nameStart = open;
+    while (found && nameStart > 0 && isNameChar(d->text[nameStart - 1])) nameStart--;
+    if (!found || nameStart == open) return;
+    char* callee = copyOf(d->text + nameStart, open - nameStart);
+    char* qualifier = NULL; /* Shape.Circle( or p.scale( */
+    if (nameStart > 0 && d->text[nameStart - 1] == '.') {
+        size_t q = nameStart - 1;
+        while (q > 0 && isNameChar(d->text[q - 1])) q--;
+        qualifier = copyOf(d->text + q, nameStart - 1 - q);
+    }
+    char* written = copyOf(d->text + open, at - open); /* the call so far: the names already given */
+    Doc t = blanked(d, word, at);
+    int line = 1;
+    for (size_t k = 0; k < at; k++) line += d->text[k] == '\n';
+    Program prog;
+    bool ok = analyzeSome(&t, &prog, line);
+    const Param* params = NULL;
+    int count = 0, skip = 0;
+    for (int k = 0; ok && k < prog.count && !params; k++) {
+        const Decl* x = prog.decls[k];
+        if (x->templateOf || x->lifted || x->isTest) continue;
+        if (x->kind == D_TYPE && !x->isInterface && !x->isExtern && !qualifier && !strcmp(x->name, callee)) {
+            params = x->params, count = x->paramCount;
+        } else if (x->kind == D_FN && !x->owner && !qualifier && !strcmp(x->name, callee)) {
+            params = x->params, count = x->paramCount;
+        } else if (x->kind == D_FN && x->owner && qualifier && !strcmp(x->name + strlen(x->owner) + 1, callee)) {
+            params = x->params, count = x->paramCount;
+            skip = x->paramCount && !strcmp(x->params[0].name, "self"); /* p.scale(k: ...): self is p */
+        } else if (x->kind == D_ENUM && qualifier && !strcmp(x->name, qualifier)) {
+            for (int c = 0; c < x->caseCount; c++)
+                if (!strcmp(x->cases[c], callee) && x->caseFieldCount) params = x->caseFields[c], count = x->caseFieldCount[c];
+        }
+    }
+    int level = 0; /* the values given before, in order (not by name): they take the first parameters */
+    bool named = false, started = false;
+    for (const char* w = written + 1; *w; w++) {
+        if (*w == '(' || *w == '[' || *w == '{') level++;
+        else if (*w == ')' || *w == ']' || *w == '}') level--;
+        else if (!level && *w == ',') {
+            if (started && !named) skip++;
+            named = started = false;
+        } else if (!level && !started && *w != ' ' && *w != '\n' && *w != '\r') {
+            started = true;
+            const char* e = w;
+            while (isNameChar(*e)) e++;
+            while (*e == ' ') e++;
+            named = e > w && *e == ':';
+        }
+    }
+    for (int k = skip; params && k < count; k++) {
+        size_t n = strlen(params[k].name);
+        bool given = false;
+        for (const char* w = written; (w = strstr(w, params[k].name)) != NULL; w += n) {
+            const char* after = w + n;
+            while (*after == ' ') after++;
+            if (*after == ':' && (w == written || !isNameChar(w[-1]))) given = true;
+        }
+        if (given) continue;
+        QkBuf label = {0}, insert = {0};
+        qkBufPrintf(&label, "%s:", params[k].name);
+        qkBufPrintf(&insert, "%s: ", params[k].name);
+        item(it, label.data, 5, typeExprText(params[k].type), insert.data, "0");
+        qkBufFree(&label);
+        qkBufFree(&insert);
+    }
+    free(t.text);
+    free(callee);
+    free(qualifier);
+    free(written);
+}
+
+static void completion(const char* id, const Doc* d, int line, int col) {
+    Items it = {{0}, 0};
+    qkBufPuts(&it.b, "[");
+    size_t at = (size_t)(lineAt(d->text, line) - d->text) + (size_t)(col - 1); /* the cursor, as a byte of the text */
+    if (at > d->len) at = d->len;
+    size_t word = at;
+    while (word > 0 && isNameChar(d->text[word - 1])) word--;
+    if (word > 0 && d->text[word - 1] == '.' && (word < 2 || d->text[word - 2] != '.')) { /* not a range's .. */
+        memberCompletion(&it, d, line, word - 1);
+    } else {
+        argumentCompletion(&it, d, at);
+        Program prog;
+        bool parsed = analyze(d, &prog, false);
+        for (int i = 0; i < qkKeywordCount; i++) item(&it, qkKeywords[i], 14, NULL, NULL, NULL);
+        for (int i = 1; i < B_INTERFACE; i++) item(&it, qkBuiltinNames[i], 3, NULL, NULL, NULL);
+        for (int i = 0; parsed && i < prog.count; i++) {
+            const Decl* x = prog.decls[i];
+            if (x->isTest || x->owner || strchr(x->name, '.') || x->kind == D_USE || x->templateOf || x->lifted || x->fromPrelude) continue;
+            int kind = x->kind == D_FN ? 3 : x->kind == D_ENUM ? 13 : x->kind == D_CONST ? 21 : 22;
+            item(&it, x->name, kind, NULL, NULL, NULL);
+        }
+    }
+    qkBufPuts(&it.b, "]");
+    respond(id, it.b.data);
+    qkBufFree(&it.b);
+}
+
+/* ---- quick fixes: the edits the errors' own messages ask for ------------------------------------------- */
+
+static size_t offsetOf(const char* text, int line, int col) { return (size_t)(lineAt(text, line) - text) + (size_t)(col - 1); }
+
+/* one edit: [from, to) of the text made `with` */
+typedef struct Edit {
+    size_t from, to;
+    const char* with;
+} Edit;
+
+static void editRange(QkBuf* b, const Doc* d, size_t from, size_t to) {
+    int l0 = 1, c0 = 1;
+    for (size_t i = 0; i < from; i++) {
+        if (d->text[i] == '\n') l0++, c0 = 1;
+        else c0++;
+    }
+    int l1 = l0, c1 = c0;
+    for (size_t i = from; i < to; i++) {
+        if (d->text[i] == '\n') l1++, c1 = 1;
+        else c1++;
+    }
+    qkBufPrintf(b, "{\"start\": {\"line\": %d, \"character\": %d}, \"end\": {\"line\": %d, \"character\": %d}}", l0 - 1,
+                utf16Column(d->text, l0, c0), l1 - 1, utf16Column(d->text, l1, c1));
+}
+
+static bool wordAt(const char* text, size_t len, size_t at, const char* word) {
+    size_t n = strlen(word);
+    return at + n <= len && !memcmp(text + at, word, n) && (at == 0 || !isNameChar(text[at - 1])) && !isNameChar(text[at + n]);
+}
+
+/* the name after `after` in the message, without its quotes ("unknown name \"x\": did you mean \"y\"?") */
+static char* quoted(const char* message, const char* after) {
+    const char* p = strstr(message, after);
+    if (!p) return NULL;
+    p += strlen(after);
+    if (*p == '"') p++;
+    const char* end = p;
+    while (isNameChar(*end)) end++;
+    return end > p ? copyOf(p, (size_t)(end - p)) : NULL;
+}
+
+/* where `word` is written nearest the place on its line (at it, then before, then after); -1 if nowhere */
+static long nearest(const Doc* d, int line, int col, const char* word) {
+    size_t start = offsetOf(d->text, line, 1), at = offsetOf(d->text, line, col);
+    size_t end = at;
+    while (end < d->len && d->text[end] != '\n') end++;
+    if (wordAt(d->text, d->len, at, word)) return (long)at;
+    for (size_t i = at; i-- > start;)
+        if (wordAt(d->text, d->len, i, word)) return (long)i;
+    for (size_t i = at; i < end; i++)
+        if (wordAt(d->text, d->len, i, word)) return (long)i;
+    return -1;
+}
+
+static bool inText(const Doc* d, size_t at) { /* inside a "text" on its line, or a comment: not code */
+    size_t i = at;
+    while (i > 0 && d->text[i - 1] != '\n') i--;
+    bool quote = false;
+    for (; i < at; i++) {
+        if (d->text[i] == '\\') i++;
+        else if (d->text[i] == '"') quote = !quote;
+        else if (!quote && d->text[i] == '/' && d->text[i + 1] == '/') return true;
+    }
+    return quote;
+}
+
+/* The fix a problem's message asks for: a title and its edits (false: none). */
+static bool quickFix(const Doc* d, const Problem* pr, QkBuf* title, Edit* edits, int* count, int cap) {
+    const char* m = pr->message;
+    size_t at = offsetOf(d->text, pr->line, pr->col);
+    *count = 0;
+    char* fixed = quoted(m, "without underscores: write ");
+    if (fixed) { /* every snake_case spelling of the name, in camelCase */
+        size_t s = at, e = at;
+        while (s > 0 && isNameChar(d->text[s - 1])) s--;
+        while (e < d->len && isNameChar(d->text[e])) e++;
+        char* old = copyOf(d->text + s, e - s);
+        for (size_t i = 0; i < d->len && *count < cap; i++)
+            if (wordAt(d->text, d->len, i, old) && !inText(d, i)) edits[(*count)++] = (Edit){i, i + strlen(old), fixed};
+        qkBufPrintf(title, "Rename %s to %s", old, fixed);
+        free(old);
+        return *count > 0;
+    }
+    if (strstr(m, "did you mean")) { /* the name written, made the one meant */
+        char* meant = quoted(m, "did you mean ");
+        char* wrong = quoted(m, "unknown name ");
+        if (!wrong) wrong = quoted(m, "has no field ");
+        if (!wrong) wrong = quoted(m, "has no parameter ");
+        if (!wrong) wrong = quoted(m, "has no case ");
+        long w = meant && wrong ? nearest(d, pr->line, pr->col, wrong) : -1;
+        if (w >= 0) {
+            edits[(*count)++] = (Edit){(size_t)w, (size_t)w + strlen(wrong), meant};
+            qkBufPrintf(title, "Change %s to %s", wrong, meant);
+        }
+        free(wrong);
+        return *count > 0;
+    }
+    if (strstr(m, "write not x") && at < d->len && d->text[at] == '!') { /* !x -> not x */
+        size_t e = at + 1;
+        while (e < d->len && d->text[e] == ' ') e++;
+        edits[(*count)++] = (Edit){at, e, "not "};
+        qkBufPuts(title, "Write not");
+        return true;
+    }
+    if (strstr(m, "a constant is written const") && (wordAt(d->text, d->len, at, "let") || wordAt(d->text, d->len, at, "var"))) {
+        edits[(*count)++] = (Edit){at, at + 3, "const"};
+        qkBufPuts(title, "Make it a const");
+        return true;
+    }
+    if (strstr(m, "effects are inferred") && wordAt(d->text, d->len, at, "effect")) { /* effect fn -> fn */
+        size_t e = at + 6;
+        while (e < d->len && d->text[e] == ' ') e++;
+        edits[(*count)++] = (Edit){at, e, ""};
+        qkBufPuts(title, "Remove effect (effects are inferred)");
+        return true;
+    }
+    char* name = strstr(m, "declare it with var") ? quoted(m, "") : NULL;
+    if (name) { /* "x" is a let: the let that makes it, a var */
+        size_t best = (size_t)-1;
+        for (size_t i = 0; i < at; i++)
+            if (wordAt(d->text, d->len, i, "let") && !inText(d, i)) {
+                size_t n = i + 3;
+                while (n < d->len && d->text[n] == ' ') n++;
+                if (wordAt(d->text, d->len, n, name)) best = i;
+            }
+        if (best != (size_t)-1) {
+            edits[(*count)++] = (Edit){best, best + 3, "var"};
+            qkBufPrintf(title, "Make %s a var", name);
+        }
+        free(name);
+        return *count > 0;
+    }
+    return false;
+}
+
+static void diagnostic(QkBuf* b, const Doc* d, const Problem* p) {
+    qkBufPuts(b, "{\"range\": ");
+    rangeAt(b, d->text, p->line > 0 ? p->line : 1, p->col > 0 ? p->col : 1);
+    qkBufPuts(b, ", \"severity\": 1, \"source\": \"quark\", \"message\": ");
+    qkJsonString(b, p->message);
+    qkBufPuts(b, "}");
+}
+
+/* the quick fixes for the problems on lines [fromLine, toLine] */
+static void codeActions(const char* id, const Doc* d, int fromLine, int toLine) {
+    Program prog;
+    analyze(d, &prog, true);
     QkBuf b = {0};
     qkBufPuts(&b, "[");
     int n = 0;
-    for (int i = 0; i < qkKeywordCount; i++) {
-        qkBufPuts(&b, n++ ? ", {\"label\": " : "{\"label\": ");
-        qkJsonString(&b, qkKeywords[i]);
-        qkBufPuts(&b, ", \"kind\": 14}");
-    }
-    for (int i = 1; i < B_COUNT; i++) {
-        qkBufPuts(&b, ", {\"label\": ");
-        qkJsonString(&b, qkBuiltinNames[i]);
-        qkBufPuts(&b, ", \"kind\": 3}");
-    }
-    for (int i = 0; parsed && i < prog.count; i++) {
-        const Decl* x = prog.decls[i];
-        if (x->isTest) continue;
-        const char* name = x->owner ? x->name + strlen(x->owner) + 1 : x->name;
-        int kind = x->kind == D_FN ? (x->owner ? 2 : 3) : x->kind == D_ENUM ? 13 : x->kind == D_CONST ? 21 : 22;
-        qkBufPuts(&b, ", {\"label\": ");
-        qkJsonString(&b, name);
-        qkBufPrintf(&b, ", \"kind\": %d}", kind);
-        for (int k = 0; x->kind == D_ENUM && k < x->caseCount; k++) {
-            qkBufPuts(&b, ", {\"label\": ");
-            qkJsonString(&b, x->cases[k]);
-            qkBufPuts(&b, ", \"kind\": 20}");
+    for (int i = 0; i < problemCount; i++) {
+        const Problem* p = &problems[i];
+        if (!p->here || p->line < fromLine || p->line > toLine) continue;
+        QkBuf title = {0};
+        Edit edits[64];
+        int count;
+        if (!quickFix(d, p, &title, edits, &count, 64)) {
+            qkBufFree(&title);
+            continue;
         }
+        qkBufPuts(&b, n++ ? ", {\"title\": " : "{\"title\": ");
+        qkJsonString(&b, title.data);
+        qkBufPuts(&b, ", \"kind\": \"quickfix\", \"isPreferred\": true, \"diagnostics\": [");
+        diagnostic(&b, d, p);
+        qkBufPuts(&b, "], \"edit\": {\"changes\": {");
+        qkJsonString(&b, d->uri);
+        qkBufPuts(&b, ": [");
+        for (int k = 0; k < count; k++) {
+            qkBufPuts(&b, k ? ", {\"range\": " : "{\"range\": ");
+            editRange(&b, d, edits[k].from, edits[k].to);
+            qkBufPuts(&b, ", \"newText\": ");
+            qkJsonString(&b, edits[k].with);
+            qkBufPuts(&b, "}");
+        }
+        qkBufPuts(&b, "]}}}");
+        qkBufFree(&title);
     }
     qkBufPuts(&b, "]");
     respond(id, b.data);
@@ -842,7 +1305,8 @@ int qkLsp(const char* prelude) {
         Doc* d = uri ? findDoc(uri) : NULL;
         if (!strcmp(name, "initialize")) {
             respond(id, "{\"capabilities\": {\"textDocumentSync\": 1, \"hoverProvider\": true, \"definitionProvider\": true, "
-                        "\"documentSymbolProvider\": true, \"documentFormattingProvider\": true, \"completionProvider\": {}, "
+                        "\"documentSymbolProvider\": true, \"documentFormattingProvider\": true, \"completionProvider\": {\"triggerCharacters\": [\".\"]}, "
+                        "\"codeActionProvider\": {\"codeActionKinds\": [\"quickfix\"]}, "
                         "\"referencesProvider\": true, \"renameProvider\": true, \"inlayHintProvider\": true, "
                         "\"signatureHelpProvider\": {\"triggerCharacters\": [\"(\", \",\"]}}, "
                         "\"serverInfo\": {\"name\": \"quark\"}}");
@@ -894,7 +1358,18 @@ int qkLsp(const char* prelude) {
             if (d) inlayHints(id, d);
             else respond(id, "[]");
         } else if (!strcmp(name, "textDocument/completion")) {
-            if (d) completion(id, d);
+            if (d) {
+                int line, col;
+                position(params, d, &line, &col);
+                completion(id, d, line, col);
+            } else {
+                respond(id, "[]");
+            }
+        } else if (!strcmp(name, "textDocument/codeAction")) {
+            J* range = qkJsonGet(params, "range");
+            J* from = qkJsonGet(qkJsonGet(range, "start"), "line");
+            J* to = qkJsonGet(qkJsonGet(range, "end"), "line");
+            if (d) codeActions(id, d, (from ? (int)from->num : 0) + 1, (to ? (int)to->num : 1 << 30) + 1);
             else respond(id, "[]");
         } else if (qkJsonGet(m, "id") && strcmp(name, "")) { /* a request it does not know */
             QkBuf b = {0};

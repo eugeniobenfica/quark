@@ -954,7 +954,9 @@ their content.
 | `quark fmt file.qk [--write]` | the canonical text |
 | `quark check file.qk` | only the errors |
 | `quark get [dir]` | fetch the packages `quark.toml` names (git) into `.quark/pkg`, and write `quark.lock` (above) |
-| `quark lsp [--prelude host.qk]` | a language server for editors (stdio): errors as you type, formatting, the type under the cursor, go to definition, the file's declarations, completion |
+| `quark lsp [--prelude host.qk]` | a language server for editors (stdio): errors as you type, formatting, the type under the cursor, go to definition, references, rename, the types worked out (inlay hints), a call's signature, the file's declarations, completion, and quick fixes (below) |
+| `quark dap [--prelude host.qk]` | a debug adapter for editors' debuggers (the Debug Adapter Protocol, stdio; below) |
+| `quark doc file.qk [-o out.md\|out.html]` | documentation: the `pub` declarations of the file and of the files it uses, each with its signature and the comment above it; Markdown on stdout or in a `.md`, one page in a `.html`. A type's own functions are listed under it; a result type left to be worked out is shown worked out |
 | `quark code file.qk [-o code.bin]` | the machine code (x86-64 or ARM64, as built), raw, and each function's offset: for a disassembler |
 | `quark object file.qk -o file.o [--symbol name] [--target arm64-macos]` | an object file a host links: the program compiled ahead of time, for platforms that allow no code made while running (see EMBEDDING.md). `--target` makes it for another machine: `x86_64-windows` (COFF), `x86_64-linux`, `arm64-linux` (ELF), `x86_64-macos`, `arm64-macos`, `arm64-ios` (Mach-O) |
 | `quark debug file.qk [--break LINE]...` | runs it stopping at those lines (or at the first): `c` go on, `s` (or Enter) the next line, `p name`, `l` the function's names and values, `bt` the calls, `b LINE`, `d LINE`, `q` |
@@ -966,6 +968,29 @@ their content.
 | `quark graph` / `quark text` / `quark catalog` | node graphs both ways, and what an editor can offer (pins with typed shapes) |
 | `quark diff a b [--json]` | the changes between two versions, by node key: nodes added, removed, changed (which inputs), statements moved (`.qk` or `.json`; exit 1 when they differ) |
 | `quark merge base ours theirs [-o out] [--json]` | a three-way merge by node key: canonical text (or a graph, for `.json`); conflicts named by key, ours kept there (exit 1) |
+
+**Completion and quick fixes.** After a dot the language server offers what goes there: a record's fields
+and its type's functions (`p.` → `x`, `y`, `scaled`), an enum's cases (`Color.` → `Red`, `Green`), a
+module's `pub` declarations (`g.` after `use geometry as g`), and for other values the built-in functions
+(`xs.map`). Inside a call it offers the names of the values not given yet (`move(p, ` → `dx:`, `dy:`).
+An error whose message says what to write comes with that edit as a quick fix: a snake_case name made
+camelCase everywhere in the file, `!x` made `not x`, a `let` at the top of a file made `const`,
+`effect fn` made `fn`, a misspelled name, field, case or parameter made the one meant ("did you mean"),
+and a `let` that is changed later made a `var`.
+
+**Debugging in an editor.** `quark dap` speaks the Debug Adapter Protocol, so VS Code and other clients
+debug Quark: `launch` with `"program"` (the `.qk` file), `"args"` and `"stopOnEntry"`; breakpoints by
+line in any of the program's files; continue, step over (`next`), step in and step out; the calls
+(stack trace), each one's names and their values (as `print` writes them), and `evaluate` for a name.
+The program's output comes to the client as output events. For VS Code, a launch configuration of a
+debugger type whose adapter is `quark dap`:
+
+```json
+{ "type": "quark", "request": "launch", "name": "Debug", "program": "${file}", "stopOnEntry": false }
+```
+
+The program runs in the adapter's own thread, so it stops only at breakpoints and steps (pause does
+nothing), and it reads no standard input (that is the client's).
 
 ## The standard library
 

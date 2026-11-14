@@ -9,6 +9,8 @@
  *   quark text  file.json                     a node graph back to Quark text
  *   quark ir    file.qk                       the intermediate code
  *   quark get   [dir]                         fetch the packages quark.toml names, write quark.lock
+ *   quark lsp / quark dap                     a language server and a debug adapter, for editors (stdio)
+ *   quark doc   file.qk [-o out.md|.html]     documentation of its pub declarations
  *
  * An executable made by `quark build` is this same program with the machine code appended: when it starts
  * and finds code at its own end, it runs that code instead of the command line. */
@@ -555,6 +557,8 @@ static int usage(void) {
           "  quark build file.qk [-o file.exe]         make a standalone executable\n"
           "  quark test  file.qk                       run its test \"...\" { } blocks\n"
           "  quark lsp   [--prelude host.qk]           a language server (stdio), for editors\n"
+          "  quark dap   [--prelude host.qk]           a debug adapter (stdio), for editors' debuggers\n"
+          "  quark doc   file.qk [-o out.md|out.html]  documentation of its pub declarations and their comments\n"
           "  quark check file.qk                       report errors only\n"
           "  quark fmt   file.qk [--write]             print (or rewrite) the canonical text\n"
           "  quark graph file.qk                       print the node graph (JSON)\n"
@@ -574,6 +578,10 @@ static int realMain(int argc, char** argv) {
     if (argc >= 2 && !strcmp(argv[1], "lsp")) { /* quark lsp [--prelude host.qk]: for editors */
         const char* prelude = argc >= 4 && !strcmp(argv[2], "--prelude") ? argv[3] : NULL;
         return qkLsp(prelude);
+    }
+    if (argc >= 2 && !strcmp(argv[1], "dap")) { /* quark dap [--prelude host.qk]: for editors' debuggers */
+        const char* prelude = argc >= 4 && !strcmp(argv[2], "--prelude") ? argv[3] : NULL;
+        return qkDap(prelude);
     }
     if (argc >= 2 && !strcmp(argv[1], "repl")) { /* quark repl: line by line */
         qkExitEnds = true;
@@ -781,6 +789,26 @@ static int realMain(int argc, char** argv) {
         const char* codePath = outPath ? outPath : "code.bin";
         if (!qkWriteFile(codePath, mc.code.data, mc.code.len)) return 1;
         for (int i = 0; i < ir.count; i++) printf("%08x %s\n", mc.fnAt[i], ir.fns[i].name);
+        return 0;
+    }
+    if (!strcmp(cmd, "doc")) { /* Markdown on stdout, or to -o: .html for a page, else Markdown */
+        Program prog;
+        if (!loadProgram(path, &prog)) return 1;
+        qkErrorSink = silent; /* checked for the result types it works out; a program with errors still has its docs */
+        qkCheck(&prog, false);
+        qkErrorSink = NULL;
+        size_t n = outPath ? strlen(outPath) : 0;
+        bool html = n > 5 && (!strcmp(outPath + n - 5, ".html") || !strcmp(outPath + n - 4, ".htm"));
+        QkBuf out = {0};
+        qkDoc(&prog, html, &out);
+        if (outPath) {
+            if (!qkWriteFile(outPath, out.data, out.len)) {
+                fprintf(stderr, "quark: cannot write %s\n", outPath);
+                return 1;
+            }
+            return 0;
+        }
+        fwrite(out.data, 1, out.len, stdout);
         return 0;
     }
     if (!strcmp(cmd, "fmt")) {

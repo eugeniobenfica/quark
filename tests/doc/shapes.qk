@@ -1,0 +1,30 @@
+use geometry
+
+// Anything with an area: a shape <of any kind> & size.
+pub type Shaped { fn area() -> Float }
+
+// A shape: round, or a box.
+//
+// Empty has no area.
+pub enum Shape { Circle(radius: Float), Box(width: Float, height: Float), Empty }
+
+// How many sides a box has.
+pub const sides = 4
+
+// The area of a shape, worked out from its kind.
+pub fn area(s: Shape) = match s {
+    Circle(r) => 3.14159 * r * r
+    Box(w, h) => w * h
+    Empty => 0.0
+}
+
+// Scales a shape by k (2 when it is not given).
+pub fn scaled(s: Shape, k: Float = 2.0) -> Shape = match s {
+    Circle(r) => Shape.Circle(r * k)
+    Box(w, h) => Shape.Box(w * k, h * k)
+    Empty => Shape.Empty
+}
+
+fn main() {
+    print(area(scaled(Shape.Circle(1.0))), Point(0.0, 0.0).distance(Point(3.0, 4.0)))
+}

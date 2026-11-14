@@ -107,6 +107,13 @@ if bash tests/lsp/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/l
 if command -v git > /dev/null 2>&1; then
     if bash tests/packages/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/packages/session.out; then ok; else bad "quark get"; diff tests/packages/session.out "$tmp/out" | head -5; fi
 fi
+# ... and while writing: fields, cases and named values completed; quick fixes for the errors that say what to write
+if bash tests/lsp/assist.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/lsp/assist.out; then ok; else bad "quark lsp (completion, quick fixes)"; diff tests/lsp/assist.out "$tmp/out" | head -5; fi
+# the debug adapter: breakpoints, stepping over, in and out, the calls, a frame's names, the program's output
+if bash tests/dap/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/dap/session.out; then ok; else bad "quark dap"; diff tests/dap/session.out "$tmp/out" | head -5; fi
+# documentation: the pub declarations of a file and the files it uses, with their comments (Markdown, HTML)
+if "$Q" doc tests/doc/shapes.qk | tr -d '\r' | cmp -s - tests/doc/shapes.md; then ok; else bad "quark doc"; fi
+if "$Q" doc tests/doc/shapes.qk -o "$tmp/shapes.html" && grep -qF '<pre><code>pub fn Point.distance(self, other: Point) -&gt; Float</code></pre>' "$tmp/shapes.html"; then ok; else bad "quark doc -o .html"; fi
 # System V calls into a host: records back in registers or through memory, arguments on the stack
 if "$(dirname "$Q")/sysv-hosts.exe" 2>&1 | tr -d '\r' > "$tmp/out" && cmp -s "$tmp/out" tests/sysv/hosts.out; then ok; else bad "System V host calls"; fi
 # embedding: the host example (host functions, events, hot reload, panics, budget, graphs, catalog)

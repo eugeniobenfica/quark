@@ -3,6 +3,7 @@
  *   quark run   file.qk [--fuel N] [--time] [-- args...]   compile to machine code in memory and run it
  *   quark build file.qk [-o file.exe]         a standalone executable (this program + the machine code);
  *                                             --no-avx for processors without AVX
+ *   quark build file.qk --target wasm32 [-o file.wasm]   a WebAssembly module and its loader (wasm.c)
  *   quark check file.qk                       only the errors
  *   quark fmt   file.qk [--write]             the canonical text
  *   quark graph file.qk                       the node graph, as JSON
@@ -654,6 +655,14 @@ static int realMain(int argc, char** argv) {
         int status = runMain(&mc, &ir, timed);
         qkDebugFinish(); /* --trace: the values, written */
         return status;
+    }
+    if (!strcmp(cmd, "build") && target && !strcmp(target, "wasm32")) { /* WebAssembly, and a JavaScript loader */
+        Program prog;
+        IrProgram ir;
+        if (!loadProgram(path, &prog) || !qkCheck(&prog, true)) return 1;
+        qkLower(&prog, &ir, fuel > 0);
+        qkOptimize(&ir);
+        return qkBuildWasm(&ir, path, fuel, outPath) ? 0 : 1;
     }
     if (!strcmp(cmd, "build")) {
         MachineCode mc;

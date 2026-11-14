@@ -152,7 +152,7 @@ programs never need one.
 
 ```bash
 ./build.sh            # build/libquark.a, build/quark.exe, build/host.exe (or build.bat with MSYS2)
-tests/run.sh          # programs, errors, panics, canonical text, graph round trips, quark build, tests, the language server, System V calls, the host
+tests/run.sh          # programs, errors, panics, canonical text, graph round trips, quark build, tests, the language server, System V calls, the host, WebAssembly
 ```
 
 ## Embedding
@@ -194,6 +194,8 @@ all of it, and the tests check its output.
 | `src/opt.c` | constants folded, common subexpressions, shared divisions, copies folded, dead code dropped |
 | `src/x64.c` | IR → x86-64 bytes: linear scan, SSE / AVX encoding, magic division, Windows x64 and System V calls, no assembler |
 | `src/arm64.c` | IR → ARM64 words: the same linear scan over x9-x15 / x19-x28 and d8-d31, AAPCS64 calls (records back in x0-x1, d0-d3 or through x8) |
+| `src/wasm.c` | IR → a WebAssembly module: registers as locals, jumps as nested blocks and one dispatch loop, call sites for panics |
+| `src/wasm.js` | the WebAssembly loader, written beside each module: its runtime (print, texts, maps, files, panics), for Node.js and browsers |
 | `src/runtime.c` | what compiled code calls: print, text, maps, the arena and its loop collections, files, panics with their calls; the loader |
 | `src/format.c` | the canonical text |
 | `src/graph.c` | node graph (JSON) out and in |
@@ -214,6 +216,21 @@ There are two backends, and the build picks the one of the processor it is built
   passes on ARM64 Linux, run in an emulated machine by `tools/arm64/vm.py` (QEMU and Alpine Linux:
   `boot`, then `test`). On Apple Silicon the code goes into `MAP_JIT` memory; that path is written but
   not yet run on a Mac.
+
+And one for the browser:
+
+- **WebAssembly** (wasm32): `quark build file.qk --target wasm32 [-o file.wasm]` writes the module
+  and `file.js`, its loader (`node file.js [args]`, or `Quark.run(bytes, {write, args})` in a page). The
+  module comes from the same IR; its runtime is the loader's JavaScript, imported (`rt`), working on the
+  module's memory with the native layouts (there is no C compiler to Wasm here, and a host that runs
+  Wasm has JavaScript anyway). Every `tests/run` program but `tasks.qk` passes, and every panic says what
+  the native one says, its stack of calls included (taken from the engine's stack trace: each frame's
+  offset finds its call site in the module's `quark` section). Not yet: tasks (`spawn`, `step`, `yield`,
+  `wait` need a stack of their own), the debugger, threads (`parallelMap` runs its elements one after
+  the other), giving memory back (the arena only grows; a program's memory goes when it ends). `sin`,
+  `cos`, `exp`... are the engine's, and may differ from the C library's in the last digit.
+  `tests/wasm/run.sh` runs the programs with Node.js, or, without it, all at once in a headless Edge or
+  Chrome.
 
 `quark code file.qk -o code.bin` writes the raw machine code and each function's offset, for a
 disassembler (`objdump -D -b binary -m aarch64` or `-m i386:x86-64`).
@@ -240,15 +257,16 @@ Done:
 - the embedding API, with host functions, capabilities, safe calls, hot reload, node keys and layout,
   and the catalog;
 - two backends: x86-64 (Windows x64 and System V calls) and ARM64 (AAPCS64), every test passing on
-  both.
+  both;
+- a WebAssembly backend for the browser and Node.js (`--target wasm32`), every program but tasks passing.
 
 Next:
 
-1. A WebAssembly backend (the browser).
-2. Run on Apple machines: the Mach-O objects link with LLVM's linker and their loads land on their table,
+1. Run on Apple machines: the Mach-O objects link with LLVM's linker and their loads land on their table,
    but the runtime has not yet been built and run on a Mac.
-3. Windows on ARM.
-4. `fold` across threads, SIMD for `map`, small element types (`[Byte]`, `[Float32]`).
+2. Windows on ARM.
+3. `fold` across threads, SIMD for `map`, small element types (`[Byte]`, `[Float32]`).
+4. WebAssembly: tasks (through the engine's stack switching), loops that give memory back.
 
 Node editors are tools of their own, outside the language: they read and write the files quark gives them
 (`quark graph`, `quark text`, `quark catalog`, `quark diff`, `quark merge`, `--layout`, `--trace`).

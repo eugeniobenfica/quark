@@ -25,6 +25,16 @@ mkdir -p build/obj
 objs=()
 $CC $FLAGS -c build/obj/stdlib.c -o build/obj/stdlib.o
 objs+=(build/obj/stdlib.o)
+# the WebAssembly loader (src/wasm.js) goes in as text too: quark build --target wasm32 writes it beside the module
+{
+    echo "/* Made by build.sh from src/wasm.js: the WebAssembly loader, a string a line. */"
+    echo "#include <stddef.h>"
+    echo "const char* const qkWasmLoaderLines[] = {"
+    tr -d '\r' < src/wasm.js | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/    "/; s/$/",/'
+    echo "    NULL};"
+} > build/obj/wasmjs.c
+$CC $FLAGS -c build/obj/wasmjs.c -o build/obj/wasmjs.o
+objs+=(build/obj/wasmjs.o)
 for f in src/*.c; do
     name=$(basename "$f" .c)
     [ "$name" = main ] && continue

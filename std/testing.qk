@@ -1,0 +1,44 @@
+// Checks for tests (quark test) and programs, beyond assert: each one that fails says what it found and
+// what it wanted, then stops (in a test, only that test). what, when given, names what is checked.
+// assertEqual(actual, expected): when they differ, both values go to the error output, whatever their
+// type, and the program stops.
+pub fn assertEqual<T>(actual: T, expected: T, what: Text = "") {
+    let same = actual == expected
+    if not same {
+        printErr("{named(what)}expected:", expected)
+        printErr("{named(what)}     got:", actual)
+    }
+    assert(same, "{named(what)}assertEqual: the values differ")
+}
+
+// actual and other differ, or stop, showing the value
+pub fn assertNotEqual<T>(actual: T, other: T, what: Text = "") {
+    let same = actual == other
+    if same {
+        printErr("{named(what)}both are:", actual)
+    }
+    assert(not same, "{named(what)}assertNotEqual: the values are the same")
+}
+
+// actual is within tolerance of expected, or stop: for Floats, which a computation seldom gives exactly
+pub fn assertNear(actual: Float, expected: Float, tolerance: Float = 1e-9, what: Text = "") {
+    assert(abs(actual - expected) <= tolerance, "{named(what)}assertNear: {actual} is not within {tolerance} of {expected}")
+}
+
+// the result is an Err whose message has part in it, or stop: for code that must refuse what it is given
+pub fn assertErr<T>(result: T!, part: Text = "", what: Text = "") {
+    let wrong = match result {
+        Ok(value) => {
+            printErr("{named(what)}got Ok:", value)
+            "the result is Ok"
+        }
+        Err(why) => if contains(why, part) {
+            ""
+        } else {
+            "the error \"{why}\" does not say \"{part}\""
+        }
+    }
+    assert(wrong == "", "{named(what)}assertErr: {wrong}")
+}
+
+fn named(what: Text) -> Text = if what == "" { "" } else { "{what}: " }

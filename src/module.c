@@ -1,13 +1,16 @@
 /* Quark — modules: `use geometry` in a file brings in the pub declarations of geometry.qk, the file next to it
- * (`use shapes.round`: shapes/round.qk). Every file of a program is parsed into the one Program, each
- * declaration marked with the file (module) it comes from; the checker lets a file see its own declarations,
- * the host's, and the pub ones of the files it uses (not the files those use). */
+ * (`use shapes.round`: shapes/round.qk), or of a package quark.toml names (`use geom.shapes`: package.c).
+ * Every file of a program is parsed into the one Program, each declaration marked with the file (module) it
+ * comes from; the checker lets a file see its own declarations, the host's, and the pub ones of the files it
+ * uses (not the files those use). */
 #include "qk.h"
 
 #include <stdio.h>
 
 extern const char* const qkStdNames[];
 extern const char* const qkStdTexts[];
+/* package.c: `use geom.shapes` with geom in quark.toml is .quark/pkg/geom/shapes.qk (NULL: not a package) */
+char* qkPackageFile(const char* from, const char* name, const char** error);
 
 /* std.json, std.math: the standard library, written in Quark, kept in the compiler (build.sh puts std/ there) */
 static char* stdModule(const char* path, size_t* len) {
@@ -55,7 +58,14 @@ bool qkLoadUses(Program* p, const char* path) {
             if (d->kind != D_USE || d->module != m) continue;
             const QkSource* from = d->src ? d->src : &p->src;
             bool std = !strncmp(d->name, "std.", 4);
-            char* file = std ? modulePath("", d->name) : modulePath(p->modules[m].path, d->name); /* std.json: "std/json.qk" */
+            const char* problem = NULL;
+            char* file = std ? modulePath("", d->name) /* std.json: "std/json.qk" */
+                             : qkPackageFile(p->modules[m].path, d->name, &problem); /* geom.shapes: .quark/pkg/geom/shapes.qk */
+            if (problem) {
+                qkError(from, d->line, d->col, "use %s: %s", d->name, problem);
+                continue;
+            }
+            if (!file) file = modulePath(p->modules[m].path, d->name);
             int found = -1;
             for (int k = 0; k < p->moduleCount && found < 0; k++)
                 if (!strcmp(p->modules[k].path, file)) found = k;

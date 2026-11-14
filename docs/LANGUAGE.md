@@ -554,6 +554,40 @@ fn main() {
 A file's graph holds its own declarations and its `use`s, as nodes of their own. A host compiles a
 program that uses files through `qkModuleReader` (the file system by default).
 
+### Packages
+
+A project that uses other people's code names it in `quark.toml`, at its root: its own name and
+version, and each package by git URL (or a path to a repository) and a tag or a commit:
+
+```toml
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+geom = { git = "https://example.org/geom.git", tag = "v1.2.0" }
+util = { git = "../util", rev = "3f2a9c1e07" }
+```
+
+`quark get` fetches each package with the system `git` into `.quark/pkg/<name>/`, and the packages
+those name in their own `quark.toml` (one folder per name for the whole project), and writes
+`quark.lock`: each package's exact commit and a SHA-256 of its files. Commit `quark.toml` and
+`quark.lock`; `.quark/` keeps itself out of git. Then `use geom.shapes` is `.quark/pkg/geom/shapes.qk`
+and `use geom` is `.quark/pkg/geom/geom.qk`, from any file of the project (the nearest `quark.toml`
+above it), with the same `pub` rules as a file's. `quark run`, `build`, `check` and the rest need no
+network: they check each package a program uses against `quark.lock` and stop at a package that is
+not fetched, or whose files are not the locked ones (`hash mismatch`: `quark get` puts them back).
+
+The lock wins: while `quark.toml` asks for what was locked, `quark get` checks out the locked commit,
+even if the tag has moved since, and fails if its files hash to anything else. To update a package,
+change its tag or commit in `quark.toml` and run `quark get`. A package's name is what `use` says
+(lowercase, digits, `_`) and its own `quark.toml`'s name; one asked for at two different pins, or a
+package that comes back to itself (`a cycle of packages: app -> util -> app`), is an error, found
+before any package's files change. A file next to yours with a package's name is one too.
+
+The manifest is TOML, not Quark: it is data, read before any code is, by `quark get` and by tools
+that know nothing of Quark, and a lock file wants the same format.
+
 ### Effects
 
 A function **changes the world** when it prints, reads or writes files, reads the clock or the
@@ -919,6 +953,7 @@ their content.
 | `quark test file.qk` | run its tests |
 | `quark fmt file.qk [--write]` | the canonical text |
 | `quark check file.qk` | only the errors |
+| `quark get [dir]` | fetch the packages `quark.toml` names (git) into `.quark/pkg`, and write `quark.lock` (above) |
 | `quark lsp [--prelude host.qk]` | a language server for editors (stdio): errors as you type, formatting, the type under the cursor, go to definition, the file's declarations, completion |
 | `quark code file.qk [-o code.bin]` | the machine code (x86-64 or ARM64, as built), raw, and each function's offset: for a disassembler |
 | `quark object file.qk -o file.o [--symbol name] [--target arm64-macos]` | an object file a host links: the program compiled ahead of time, for platforms that allow no code made while running (see EMBEDDING.md). `--target` makes it for another machine: `x86_64-windows` (COFF), `x86_64-linux`, `arm64-linux` (ELF), `x86_64-macos`, `arm64-macos`, `arm64-ios` (Mach-O) |

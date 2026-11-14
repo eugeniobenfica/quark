@@ -1,0 +1,77 @@
+$ quark run app/main.qk  (before quark get)
+app/main.qk:1:1: use geom: geom is not in app/quark.lock: run quark get
+  use geom
+  ^
+app/main.qk:2:1: use geom.shapes: geom is not in app/quark.lock: run quark get
+  use geom.shapes
+  ^
+app/main.qk:3:1: use util: util is not in app/quark.lock: run quark get
+  use util
+  ^
+$ quark get app
+geom             v1.0         2e4563f0cb33
+util             b24ea85382   b24ea853824a
+app 0.1.0: 2 packages locked
+# The exact code of every package, written by quark get: commit it with quark.toml.
+
+[[package]]
+name = "geom"
+git = "../geom"
+tag = "v1.0"
+commit = "2e4563f0cb33a3dc4f65b044f35d4a35f089550a"
+hash = "sha256-f3d7aba2036a2c8f403b5feade9d88bc1f0225b4abf8523244b7fa84d3b40e9e"
+
+[[package]]
+name = "util"
+git = "../util"
+rev = "b24ea85382"
+commit = "b24ea853824a4ac44b6fdfb707e62c237437b599"
+hash = "sha256-88c63096bc5a29e7b17525b149a55332589eef19030b6847b7976531c1482e24"
+$ quark run app/main.qk
+12 25 6
+$ a file in a folder of the project, run from here and from its folder
+49
+49
+$ quark run, the repositories gone (no network needed)
+12 25 6
+$ quark get, the repositories gone: all locked, all there
+geom             v1.0         2e4563f0cb33
+util             b24ea85382   b24ea853824a
+app 0.1.0: 2 packages locked
+$ a package's file changed by hand
+app/main.qk:1:1: use geom: hash mismatch: the files in app/.quark/pkg/geom/ are not the ones quark.lock has for geom (run quark get to restore them)
+  use geom
+  ^
+app/main.qk:2:1: use geom.shapes: hash mismatch: the files in app/.quark/pkg/geom/ are not the ones quark.lock has for geom (run quark get to restore them)
+  use geom.shapes
+  ^
+app/.quark/pkg/util/util.qk:1:1: use geom: hash mismatch: the files in app/.quark/pkg/geom/ are not the ones quark.lock has for geom (run quark get to restore them)
+  use geom
+  ^
+$ quark get puts it back
+12 25 6
+$ a tag moved: quark.lock still says the commit
+geom             v1.0         2e4563f0cb33
+util             b24ea85382   b24ea853824a
+app 0.1.0: 2 packages locked
+$ quark.lock's hash is not what the commit holds
+quark get: geom: hash mismatch: quark.lock has sha256-03d7aba2036a2c8f403b5feade9d88bc1f0225b4abf8523244b7fa84d3b40e9e, but ../geom at 2e4563f0cb33 hashes to sha256-f3d7aba2036a2c8f403b5feade9d88bc1f0225b4abf8523244b7fa84d3b40e9e
+$ quark.toml asks for another tag, not fetched yet
+app/main.qk:1:1: use geom: app/quark.toml asks for geom v2.0, quark.lock has v1.0: run quark get
+  use geom
+  ^
+app/main.qk:2:1: use geom.shapes: app/quark.toml asks for geom v2.0, quark.lock has v1.0: run quark get
+  use geom.shapes
+  ^
+$ quark get: util asks for geom v1.0, the app for v2.0
+quark get: geom is asked for twice: ../geom v2.0 by app, ../geom v1.0 by util
+$ a tag that is not there
+quark get: geom: no tag v9 in ../geom
+$ a file next to main.qk with a package's name
+app/main.qk:3:1: use util: util is both the package util and the file app/util.qk: rename the file
+  use util
+  ^
+$ a cycle: util needs app
+quark get: a cycle of packages: app -> util -> app
+$ a manifest with a mistake
+quark get: app/quark.toml:3: expected a string in quotes

@@ -71,7 +71,8 @@ editor, a server, a tool or any other C program can use it as its scripting lang
     `Entry(key, value)` too), slices (`xs[2..]`, `t[..3]`);
   - UTF-8 text that joins, compares, interpolates and formats (`"{x:.2}"`), splits, searches,
     replaces and parses, with `upper` / `lower` that know accents, Greek and Cyrillic;
-  - files that use files (`use geometry`, `pub fn ...`);
+  - files that use files (`use geometry`, `pub fn ...`), and packages from git repositories
+    (`quark.toml`, `quark get`, `use geom.shapes`), locked by commit and content hash;
   - `parallelMap`: a pure function on every element, on all the processor's threads;
   - take, skip, countBy, mean, sort and sortBy (either way: `descending: true`), reverse, first, last,
     count, minBy, maxBy, contains, indexOf, join;
@@ -200,6 +201,7 @@ all of it, and the tests check its output.
 | `src/api.c` | the embedding API (`include/quark.h`): machines, preludes, host functions, calls, catalog |
 | `src/lsp.c` | the language server |
 | `src/module.c` | `use`: the files a program names, read and joined to it |
+| `src/package.c` | packages: `quark.toml` and `quark.lock` (a TOML subset), `quark get` (the system git), SHA-256 of a package's files, `use pkg.module` |
 | `src/main.c` | the command line; executables carry their machine code at their end |
 | `examples/host/` | a small host application: its prelude, an item's script, the C host |
 
@@ -227,7 +229,7 @@ Done:
 - generic functions and generic types, by specialization; types that hold themselves;
 - functions that take functions (inlined), and functions kept as values (called through);
 - functions of a type, user-defined operators and order;
-- files that use files (`use`, `pub`);
+- files that use files (`use`, `pub`), and packages (`quark.toml`, `quark.lock`, `quark get`);
 - a standard library for UTF-8 text, arrays, maps, files, folders, the environment and the command
   line;
 - memory that loops give back as they go, and an arena per machine;

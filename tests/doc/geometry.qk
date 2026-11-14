@@ -1,0 +1,11 @@
+// Plane geometry: points and how far apart they are.
+pub type Point { x: Float, y: Float }
+
+// The distance between two points.
+pub fn Point.distance(self, other: Point) -> Float {
+    let dx = self.x - other.x
+    let dy = self.y - other.y
+    sqrt(dx * dx + dy * dy)
+}
+
+fn square(x: Float) = x * x

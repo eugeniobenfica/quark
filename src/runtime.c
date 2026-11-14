@@ -995,6 +995,10 @@ static bool isBreak(int line) {
 /* a statement starts: stop when it is a breakpoint, or the debugger is stepping; then read commands */
 static void rtDebugLine(int64_t line) {
     if (frameCount) frames[frameCount - 1].line = (int)line;
+    if (qkDebugger.stopped) {
+        if (qkDebugger.stepping || isBreak((int)line)) qkDebugger.stopped((int)line);
+        return;
+    }
     if (!qkDebugger.interactive || !(qkDebugger.stepping || isBreak((int)line))) return;
     fflush(stdout);
     fprintf(stderr, "stopped at %s:%lld in %s\n", qkRunPath, (long long)line, frameCount ? frames[frameCount - 1].fn : "?");
@@ -1050,6 +1054,22 @@ static void rtDebugLine(int64_t line) {
             fputs("  c continue, s step (or Enter), p name, l locals, bt calls, b LINE, d LINE, q quit\n", stderr);
         }
     }
+}
+
+int qkDebugDepth(void) { return frameCount; }
+
+const char* qkDebugFrame(int depth, int* line) {
+    if (depth < 0 || depth >= frameCount) return NULL;
+    if (line) *line = frames[depth].line;
+    return frames[depth].fn;
+}
+
+int qkDebugVarCount(int depth) { return depth >= 0 && depth < frameCount ? frames[depth].varCount : 0; }
+
+const char* qkDebugVar(int depth, int i, const char** text) {
+    if (depth < 0 || depth >= frameCount || i < 0 || i >= frames[depth].varCount) return NULL;
+    if (text) *text = frames[depth].vars[i].text;
+    return frames[depth].vars[i].name;
 }
 
 static void jsonText(FILE* f, const char* s) {

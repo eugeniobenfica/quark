@@ -1,0 +1,17 @@
+// Pipelines: 200,000 Ints and Floats through filter / map / sum, 300 times (SIMD lanes with --release).
+fn main() {
+    let n = 200_000
+    let ks = (0..n).map(i => i * 7919 % 1000)
+    let xs = (0..n).map(i => i % 1000 * 0.001)
+    let start = now()
+    var count = 0
+    var total = 0.0
+    for pass in 0..300 {
+        let least = pass % 500
+        count += ks.filter(k => k > least).map(k => k * 3 + 1).sum()
+        count += xs.filter(x => x > 0.5).len()
+        total += xs.map(x => sqrt(x) * 0.5).sum()
+    }
+    print("checksum", count, total)
+    print("ms", (now() - start) * 1000)
+}

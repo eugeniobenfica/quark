@@ -95,17 +95,22 @@ editor, a server, a tool or any other C program can use it as its scripting lang
 
 ## Speed
 
-Each benchmark runs the same work in Quark, in C compiled with `gcc -O2`, and in Lua 5.4 (a common
-embedded scripting language). Measured on Windows x64, best of five:
+Each benchmark runs the same work in Quark, in C compiled with `gcc -O2` (gcc 16), and in Lua 5.4 (a
+common embedded scripting language). Quark runs it twice: as `quark run` compiles it by default (the
+quick tier, a fraction of a millisecond), and with `--release` (the optimizing tier). Measured on Windows
+x64 with AVX2, best of seven:
 
-| | C (gcc -O2) | **Quark** | Lua 5.4 |
-| --- | --- | --- | --- |
-| Counting: 82,944 rows of three values counted four ways into 256 buckets, 200 times ([counting.qk](bench/counting.qk)) | 28.7 ms | **34.1 ms** | 915 ms |
-| Mandelbrot, 1000 × 1000, 100 steps ([mandelbrot.qk](bench/mandelbrot.qk)) | 32.2 ms | **34.9 ms** | 256 ms |
+| | C (gcc -O2) | **Quark** | **Quark --release** | Lua 5.4 |
+| --- | --- | --- | --- | --- |
+| Counting: 82,944 rows of three values counted four ways into 256 buckets, 200 times ([counting.qk](bench/counting.qk)) | 29.1 ms | 35.3 ms | **31.3 ms** | 915 ms |
+| Mandelbrot, 1000 × 1000, 100 steps ([mandelbrot.qk](bench/mandelbrot.qk)) | 32.6 ms | 35.4 ms | **34.6 ms** | 256 ms |
+| Pipelines: 200,000 Ints and Floats through `filter` / `map` / `sum`, 300 times ([pipeline.qk](bench/pipeline.qk)) | 118.8 ms | 251.6 ms | **33.8 ms** | |
 
-Quark is within 8–19% of optimized C and 7–27× faster than Lua 5.4. It also checks every array
-index and rounds integer division down, which the C code does not. Compiling a program takes
-about 0.2 ms.
+The quick tier is within 9–21% of optimized C on the first two, the release tier within 6–8%, and on
+fused pipelines the release tier is 3.5× faster than gcc -O2 (SIMD lanes; 65.6 ms on SSE without AVX).
+Both check every array index and round integer division down, which the C code does not, and both give
+the same results (Float sums keep their order). Compiling takes about 0.2 ms, or 0.2–1 ms with
+`--release`.
 
 Where the speed comes from:
 
@@ -134,13 +139,27 @@ Where the speed comes from:
 - **Memory only where it is made.** A loop that allocates nothing (all the benchmarks' hot loops)
   carries no memory bookkeeping at all.
 
+The release tier (`--release`, `qkVmRelease`; [src/release.c](src/release.c)) adds, on the IR in SSA form:
+
+- **escape analysis:** a small record or array that never leaves its function is not allocated, its
+  fields live in registers;
+- **devirtualization:** a call through an interface whose concrete type is known is a direct call;
+- **range analysis:** every Int's interval, narrowed by the branches that test it; bounds checks that
+  cannot fail are dropped (`rows[r * 3 + 2]` with `r < len(rows) / 3` too), and so are repeated ones and
+  the sign fix-ups and zero checks of divisions whose operands cannot be negative;
+- **loop-invariant code motion** and **strength reduction** (`i * 3` becomes a value of its own, added
+  to as `i` is), and `[b + (i + 1) * 8]` addressing folded;
+- **SIMD:** a fused `map` / `filter` / `sum` / `len` pipeline on Ints or Floats runs 4 lanes at a time
+  (AVX2) or 2 (SSE2/SSE4.2, ARM64 NEON), the rest one at a time. Float sums add the lanes in order, so
+  the result is the one the quick tier gives;
+- **block layout:** a loop's exits (a `return` inside it) move out of line.
+
 Next steps for speed:
 
-- range analysis, to drop bounds checks and sign fixes proven unneeded;
 - unboxed small element types (`[Byte]`, `[Float32]`);
-- SIMD for `map`;
 - threads for `map` and `fold`;
-- `counts[k] += 1` loops as tight as C's: the counting benchmark spends most of its 19% there.
+- more registers for values: the backends keep six as scratch, which is what the counting benchmark's
+  remaining gap is mostly about (a graph-coloring allocator gains little until they are freed).
 
 ## Build
 

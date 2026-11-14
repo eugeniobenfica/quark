@@ -294,6 +294,94 @@ static void emitCold(Gen* g) {
     g->coldCount = 0;
 }
 
+/* ---- SIMD (release.c's vector loops): NEON, two lanes of 64 bits ----------------------------------- */
+
+static int vecReg(Gen* g, int v) {
+    if (!inReg(g, v)) { /* release.c keeps few enough of them to stay in registers */
+        fprintf(stderr, "quark: internal error: a vector register has no register\n");
+        abort();
+    }
+    return fprOf(g, v);
+}
+
+static void neon3(Gen* g, uint32_t op, int d, int n, int m) { ins(g, op | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d); }
+
+static void genVector(Gen* g, const IrIns* in) {
+    switch (in->op) {
+    case IR_VLOAD: case IR_VSTORE: { /* ldur / stur q, [a + b * 8 + c] */
+        int base = gprIn(g, in->a, X1);
+        int64_t off = in->c;
+        int addr = base;
+        if (isK(g, in->b)) off += kOf(g, in->b) * in->imm;
+        else {
+            add3(g, X3, base, gprIn(g, in->b, X2), 3);
+            addr = X3;
+        }
+        if (off < -256 || off > 255) {
+            addImm(g, X3, addr, off);
+            addr = X3;
+            off = 0;
+        }
+        int q = vecReg(g, in->dst);
+        ins(g, (in->op == IR_VLOAD ? 0x3CC00000u : 0x3C800000u) | ((uint32_t)off & 0x1FF) << 12 | (uint32_t)addr << 5 | (uint32_t)q);
+        break;
+    }
+    case IR_VSPLAT: {
+        int d = vecReg(g, in->dst);
+        if (isFloat(g, in->a)) ins(g, 0x4E080400u | (uint32_t)fprIn(g, in->a, D0) << 5 | (uint32_t)d); /* dup v.2d, v.d[0] */
+        else ins(g, 0x4E080C00u | (uint32_t)gprIn(g, in->a, X0) << 5 | (uint32_t)d);                   /* dup v.2d, x */
+        break;
+    }
+    case IR_VLANE: {
+        int n = vecReg(g, in->a), l = in->c & 1;
+        if (isFloat(g, in->dst)) { /* dup d, v.d[l] */
+            int d = fprOut(g, in->dst, D0);
+            ins(g, 0x5E080400u | (uint32_t)l << 20 | (uint32_t)n << 5 | (uint32_t)d);
+            doneFpr(g, in->dst, d);
+        } else { /* umov x, v.d[l] */
+            int d = gprOut(g, in->dst, X0);
+            ins(g, 0x4E083C00u | (uint32_t)l << 20 | (uint32_t)n << 5 | (uint32_t)d);
+            doneGpr(g, in->dst, d);
+        }
+        break;
+    }
+    case IR_VEND: break;
+    case IR_VOP: {
+        int d = vecReg(g, in->dst), a = vecReg(g, in->a), b = in->b >= 0 ? vecReg(g, in->b) : 0;
+        switch (in->imm) {
+        case IR_FADD: neon3(g, 0x4E60D400u, d, a, b); break;
+        case IR_FSUB: neon3(g, 0x4EE0D400u, d, a, b); break;
+        case IR_FMUL: neon3(g, 0x6E60DC00u, d, a, b); break;
+        case IR_FDIV: neon3(g, 0x6E60FC00u, d, a, b); break;
+        case IR_FMIN: neon3(g, 0x4EE0F400u, d, a, b); break;
+        case IR_FMAX: neon3(g, 0x4E60F400u, d, a, b); break;
+        case IR_ADD: neon3(g, 0x4EE08400u, d, a, b); break;
+        case IR_SUB: neon3(g, 0x6EE08400u, d, a, b); break;
+        case IR_AND: neon3(g, 0x4E201C00u, d, a, b); break;
+        case IR_OR: neon3(g, 0x4EA01C00u, d, a, b); break;
+        case IR_XOR: neon3(g, 0x6E201C00u, d, a, b); break;
+        case IR_NOT: neon3(g, 0x4E601C00u, d, a, b); break; /* bic: a & ~b */
+        case IR_SQRT: ins(g, 0x6EE1F800u | (uint32_t)a << 5 | (uint32_t)d); break;
+        case IR_SHL: ins(g, 0x4F405400u | (uint32_t)(in->c & 63) << 16 | (uint32_t)a << 5 | (uint32_t)d); break;
+        case IR_CMP: case IR_FCMP: { /* all ones where it holds; NaN: false, but for != */
+            bool fl = in->imm == IR_FCMP;
+            uint32_t eq = fl ? 0x4E60E400u : 0x6EE08C00u, gt = fl ? 0x6EE0E400u : 0x4EE03400u, ge = fl ? 0x6E60E400u : 0x4EE03C00u;
+            switch (in->cond) {
+            case C_EQ: neon3(g, eq, d, a, b); break;
+            case C_NE: neon3(g, eq, d, a, b), ins(g, 0x6E205800u | (uint32_t)d << 5 | (uint32_t)d); break; /* mvn */
+            case C_LT: neon3(g, gt, d, b, a); break;
+            case C_LE: neon3(g, ge, d, b, a); break;
+            case C_GT: neon3(g, gt, d, a, b); break;
+            default: neon3(g, ge, d, a, b); break;
+            }
+            break;
+        }
+        }
+        break;
+    }
+    }
+}
+
 /* ---- one instruction ----------------------------------------------------------------------------- */
 
 /* The address [a + b * imm + c] as (base register, offset) */
@@ -369,6 +457,14 @@ static void divideByConstant(Gen* g, const IrIns* in) {
     ins(g, 0x9B407C00u | (uint32_t)X17 << 16 | (uint32_t)n << 5 | (uint32_t)X2);       /* smulh x2, n, m */
     if (m < 0) add3(g, X2, X2, n, 0);
     if (shift > 0) ins(g, 0x9340FC00u | (uint32_t)shift << 16 | (uint32_t)X2 << 5 | (uint32_t)X2); /* asr x2, x2, shift */
+    if (in->cond & DIV_NONNEG) { /* n >= 0: the truncated quotient is the floored one */
+        if (!quotient) {
+            movImm(g, X17, d);
+            ins(g, 0x9B008000u | (uint32_t)X17 << 16 | (uint32_t)n << 10 | (uint32_t)X2 << 5 | (uint32_t)X3); /* x3 = n - x2 * d */
+        }
+        storeBits(g, in->dst, quotient ? X2 : X3);
+        return;
+    }
     ins(g, 0x8B400000u | (uint32_t)n << 16 | 63u << 10 | (uint32_t)X2 << 5 | (uint32_t)X2); /* add x2, x2, n, lsr #63 */
     movImm(g, X17, d);
     ins(g, 0x9B008000u | (uint32_t)X17 << 16 | (uint32_t)n << 10 | (uint32_t)X2 << 5 | (uint32_t)X3); /* x3 = n - x2 * d */
@@ -420,7 +516,10 @@ static void genIns(Gen* g, const IrIns* in) {
         break;
     }
     case IR_MOV:
-        if (isFloat(g, in->dst)) {
+        if (g->fn->kinds[in->dst] == 'V') { /* orr v.16b */
+            int d = vecReg(g, in->dst), a = vecReg(g, in->a);
+            ins(g, 0x4EA01C00u | (uint32_t)a << 16 | (uint32_t)a << 5 | (uint32_t)d);
+        } else if (isFloat(g, in->dst)) {
             int d = fprOut(g, in->dst, D0);
             loadF(g, d, in->a);
             doneFpr(g, in->dst, d);
@@ -471,6 +570,12 @@ static void genIns(Gen* g, const IrIns* in) {
         }
         loadBits(g, X0, in->a);
         loadBits(g, X1, in->b);
+        if (in->cond & DIV_NONNEG) { /* a >= 0, b >= 1: no zero, no sign to fix */
+            ins(g, 0x9AC00C00u | (uint32_t)X1 << 16 | (uint32_t)X0 << 5 | (uint32_t)X2); /* sdiv */
+            if (in->op == IR_MOD) ins(g, 0x9B008000u | (uint32_t)X1 << 16 | (uint32_t)X0 << 10 | (uint32_t)X2 << 5 | (uint32_t)X3);
+            storeBits(g, in->dst, in->op == IR_DIV ? X2 : X3);
+            break;
+        }
         if (!(isK(g, in->b) && kOf(g, in->b) != 0)) { /* cbz x1: division by zero */
             Cold c = {here(g), PANIC_DIVIDE, in->line, -1, -1, g->inl};
             QK_PUSH(g->cold, g->coldCount, g->coldCap, c);
@@ -676,6 +781,7 @@ static void genIns(Gen* g, const IrIns* in) {
         coldJump(g, MI, PANIC_FUEL, in->line, -1, -1);
         break;
     case IR_NOP: break;
+    case IR_VLOAD: case IR_VSTORE: case IR_VSPLAT: case IR_VOP: case IR_VLANE: case IR_VEND: genVector(g, in); break;
     }
 }
 
@@ -779,7 +885,7 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut) {
     g->savedGpr = g->savedFpr = 0;
     for (int i = 0; i < count; i++) {
         int v = order[i];
-        int c = f->kinds[v] == 'F' ? 1 : 0;
+        int c = f->kinds[v] == 'F' || f->kinds[v] == 'V' ? 1 : 0;
         int from = crosses[v] ? volatileCount[c] : 0;
         int pick = -1;
         for (int r = 0; r < poolSize[c]; r++) {
@@ -862,7 +968,7 @@ static void genFn(Gen* g, const IrFn* f) {
     for (int k = 0; k < f->count; k++) {
         const IrIns* in = &f->code[k];
         if (in->op == IR_LABEL || in->op == IR_JMP) continue;
-        if (in->op == IR_STORE && in->dst >= 0) g->uses[in->dst]++;
+        if ((in->op == IR_STORE || in->op == IR_VSTORE) && in->dst >= 0) g->uses[in->dst]++;
         if (in->op != IR_CONST) {
             if (in->a >= 0) g->uses[in->a]++;
             if (in->b >= 0) g->uses[in->b]++;

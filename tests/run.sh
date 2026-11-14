@@ -19,6 +19,10 @@ done
 for f in tests/run/*.qk; do # the same programs calling C the System V way (Linux, macOS; through adapters on Windows)
     if "$Q" run "$f" --abi sysv > "$tmp/out" 2>&1 && cmp -s "$tmp/out" "${f%.qk}.out"; then ok; else bad "$f --abi sysv"; fi
 done
+for f in tests/run/*.qk; do # the optimizing tier: the same output (its SIMD loops on AVX2, and on SSE without AVX)
+    if "$Q" run "$f" --release > "$tmp/out" 2>&1 && cmp -s "$tmp/out" "${f%.qk}.out"; then ok; else bad "$f --release"; diff "${f%.qk}.out" "$tmp/out" | head -5; fi
+    if "$Q" run "$f" --release --no-avx > "$tmp/out" 2>&1 && cmp -s "$tmp/out" "${f%.qk}.out"; then ok; else bad "$f --release --no-avx"; fi
+done
 for f in tests/errors/*.qk; do
     want=$(head -1 "$f" | sed 's|^// error: ||')
     if "$Q" check "$f" > "$tmp/out" 2>&1; then bad "$f (no error)"; elif grep -qF -- "$want" "$tmp/out"; then ok; else bad "$f"; cat "$tmp/out"; fi
@@ -26,6 +30,7 @@ done
 for f in tests/panics/*.qk; do
     want=$(head -1 "$f" | sed 's|^// panic: ||')
     if "$Q" run "$f" --fuel 1000000 > "$tmp/out" 2>&1; then bad "$f (no panic)"; elif grep -qF -- "$want" "$tmp/out"; then ok; else bad "$f"; cat "$tmp/out"; fi
+    if "$Q" run "$f" --fuel 1000000 --release > "$tmp/out" 2>&1; then bad "$f --release (no panic)"; elif grep -qF -- "$want" "$tmp/out"; then ok; else bad "$f --release"; cat "$tmp/out"; fi
 done
 for f in examples/*.qk bench/*.qk tests/run/*.qk std/*.qk; do
     "$Q" fmt "$f" > "$tmp/a.qk"
@@ -99,8 +104,13 @@ if "$Q" check examples/words.qk --allow print 2>&1 | grep -qF "args is not given
 if "$Q" check examples/words.qk --allow "print, args, files, exit" > /dev/null 2>&1; then ok; else bad "--allow allows"; fi
 # a standalone executable runs without the compiler's command line
 if "$Q" build tests/run/loops.qk -o "$tmp/loops.exe" 2> /dev/null && "$tmp/loops.exe" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/run/loops.out; then ok; else bad "quark build"; fi
+if "$Q" build tests/run/simd.qk --release -o "$tmp/simd.exe" 2> /dev/null && "$tmp/simd.exe" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/run/simd.out; then ok; else bad "quark build --release"; fi
 # quark test: passing and failing tests, each on its own
 if "$Q" test tests/test/math.qk 2>&1 | sed 's/ ([0-9.]* ms)$//' > "$tmp/out"; cmp -s "$tmp/out" tests/test/math.out; then ok; else bad "quark test"; diff tests/test/math.out "$tmp/out" | head -5; fi
+if "$Q" test tests/test/math.qk --release 2>&1 | sed 's/ ([0-9.]* ms)$//' > "$tmp/out"; cmp -s "$tmp/out" tests/test/math.out; then ok; else bad "quark test --release"; fi
+# the release tier's SIMD loops for ARM64 (NEON): made, in an object of the right format
+if "$Q" object tests/run/simd.qk --release --target arm64-linux -o "$tmp/simd-arm64.o" && [ "$(od -An -tx1 -N4 "$tmp/simd-arm64.o" | tr -d ' 
+')" = 7f454c46 ]; then ok; else bad "quark object --release --target arm64-linux"; fi
 # the language server: diagnostics, hover, definition, symbols, formatting
 if bash tests/lsp/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/lsp/session.out; then ok; else bad "quark lsp"; diff tests/lsp/session.out "$tmp/out" | head -5; fi
 # System V calls into a host: records back in registers or through memory, arguments on the stack

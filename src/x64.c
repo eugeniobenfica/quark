@@ -488,6 +488,205 @@ static Mem memOf(Gen* g, const IrIns* ins) {
     return m;
 }
 
+/* ---- SIMD (release.c's vector loops) --------------------------------------------------------------- *
+ * AVX2: four lanes in ymm registers (VEX.256); else two in xmm (VEX.128 with AVX, SSE2 / SSE4.2 without). */
+
+static void memTail(Gen* g, int reg, Mem m) {
+    if (m.index < 0) {
+        byte(g, 0x80 | (reg & 7) << 3 | (m.base & 7));
+        if ((m.base & 7) == RSP) byte(g, 0x24);
+    } else {
+        int ss = m.scale == 8 ? 3 : m.scale == 4 ? 2 : m.scale == 2 ? 1 : 0;
+        byte(g, 0x84 | (reg & 7) << 3);
+        byte(g, ss << 6 | (m.index & 7) << 3 | (m.base & 7));
+    }
+    i32(g, m.disp);
+}
+
+/* three-byte VEX: L 0 (128) / 1 (256); pp 1: 66, 3: F2; map 1: 0F, 2: 0F38, 3: 0F3A */
+static void vexPrefix(Gen* g, int L, int pp, int map, int w, int reg, int vvvv, int index, int base) {
+    byte(g, 0xC4);
+    byte(g, (((reg >> 3) & 1) ^ 1) << 7 | (((index >> 3) & 1) ^ 1) << 6 | (((base >> 3) & 1) ^ 1) << 5 | map);
+    byte(g, w << 7 | ((~vvvv) & 15) << 3 | L << 2 | pp);
+}
+static void vexRR(Gen* g, int L, int pp, int map, int w, int op, int reg, int vvvv, int rmReg) {
+    vexPrefix(g, L, pp, map, w, reg, vvvv, 0, rmReg);
+    byte(g, op);
+    byte(g, 0xC0 | (reg & 7) << 3 | (rmReg & 7));
+}
+static void vexMem(Gen* g, int L, int pp, int map, int w, int op, int reg, int vvvv, Mem m) {
+    vexPrefix(g, L, pp, map, w, reg, vvvv, m.index >= 0 ? m.index : 0, m.base);
+    byte(g, op);
+    memTail(g, reg, m);
+}
+/* legacy SSE, 66 prefix: op reg, rm (map 1: 0F, 2: 0F 38) */
+static void sse66(Gen* g, int map, int op, int reg, int rmReg) {
+    byte(g, 0x66);
+    rex(g, false, reg, 0, rmReg, false);
+    byte(g, 0x0F);
+    if (map == 2) byte(g, 0x38);
+    byte(g, op);
+    byte(g, 0xC0 | (reg & 7) << 3 | (rmReg & 7));
+}
+
+static int vecReg(Gen* g, int v) {
+    if (!inReg(g, v)) { /* release.c keeps few enough of them to stay in registers */
+        fprintf(stderr, "quark: internal error: a vector register has no register\n");
+        abort();
+    }
+    return xmmOf(g, v);
+}
+
+static void vmov(Gen* g, int d, int s) { /* the whole register */
+    if (d == s) return;
+    if (qkUseAvx) vexRR(g, qkSimdLanes == 4, 1, 1, 0, 0x28, d, 0, s); /* vmovapd */
+    else sse66(g, 1, 0x28, d, s);                                     /* movapd */
+}
+
+/* d = a op b, lane by lane (66-prefixed op in map 0F or 0F38) */
+static void vbin(Gen* g, int map, int op, int d, int a, int b, bool commutes) {
+    if (qkUseAvx) {
+        vexRR(g, qkSimdLanes == 4, 1, map, 0, op, d, a, b);
+        return;
+    }
+    if (d == b && d != a) {
+        if (commutes) {
+            sse66(g, map, op, d, a);
+            return;
+        }
+        vmov(g, 0, a);
+        sse66(g, map, op, 0, b);
+        vmov(g, d, 0);
+        return;
+    }
+    vmov(g, d, a);
+    sse66(g, map, op, d, b);
+}
+
+static void genVector(Gen* g, const IrIns* ins) {
+    int L = qkSimdLanes == 4;
+    switch (ins->op) {
+    case IR_VLOAD: case IR_VSTORE: { /* movupd */
+        Mem m = memOf(g, ins);
+        int x = vecReg(g, ins->dst);
+        int op = ins->op == IR_VLOAD ? 0x10 : 0x11;
+        if (qkUseAvx) vexMem(g, L, 1, 1, 0, op, x, 0, m);
+        else memOp(g, 0x66, false, (const uint8_t[]){0x0F, (uint8_t)op}, 2, x, m);
+        break;
+    }
+    case IR_VSPLAT: {
+        int d = vecReg(g, ins->dst);
+        int s;
+        if (isFloat(g, ins->a) && inReg(g, ins->a)) {
+            s = xmmOf(g, ins->a);
+        } else { /* through rax: movq d, rax */
+            loadBits(g, RAX, ins->a);
+            if (qkUseAvx) vexRR(g, 0, 1, 1, 1, 0x6E, d, 0, RAX);
+            else sseRR(g, 0x66, true, 0x6E, d, RAX);
+            s = d;
+        }
+        if (L) vexRR(g, 1, 1, 2, 0, isFloat(g, ins->a) ? 0x19 : 0x59, d, 0, s); /* vbroadcastsd / vpbroadcastq */
+        else if (qkUseAvx) vexRR(g, 0, 1, 1, 0, 0x14, d, s, s);                 /* vunpcklpd d, s, s */
+        else {
+            vmov(g, d, s);
+            sse66(g, 1, 0x14, d, d); /* unpcklpd */
+        }
+        break;
+    }
+    case IR_VLANE: {
+        int s = vecReg(g, ins->a), l = ins->c;
+        if (L && l >= 2) { /* vextractf128 xmm0, ymm, 1 */
+            vexRR(g, 1, 1, 3, 0, 0x19, s, 0, 0);
+            byte(g, 1);
+            s = 0;
+            l -= 2;
+        }
+        bool fl = isFloat(g, ins->dst);
+        int t = fl && inReg(g, ins->dst) ? xmmOf(g, ins->dst) : 0;
+        if (l == 0) {
+            if (fl && t != s) {
+                if (qkUseAvx) vexRR(g, 0, 1, 1, 0, 0x28, t, 0, s);
+                else sse66(g, 1, 0x28, t, s);
+            }
+            if (!fl) t = s;
+        } else if (qkUseAvx) {
+            vexRR(g, 0, 1, 1, 0, 0x15, t, s, s); /* vunpckhpd t, s, s */
+        } else {
+            if (t != s) sse66(g, 1, 0x28, t, s);
+            sse66(g, 1, 0x15, t, t); /* unpckhpd */
+        }
+        if (fl) {
+            if (!inReg(g, ins->dst)) {
+                if (qkUseAvx) vexMem(g, 0, 3, 1, 0, 0x11, 0, 0, (Mem){RBP, -1, 1, slotDisp(g, ins->dst)}); /* vmovsd [slot], xmm0 */
+                else storeF(g, ins->dst, 0);
+            }
+        } else {
+            if (qkUseAvx) vexRR(g, 0, 1, 1, 1, 0x7E, t, 0, RAX); /* vmovq rax, xmm */
+            else sseRR(g, 0x66, true, 0x7E, t, RAX);
+            storeBits(g, ins->dst, RAX);
+        }
+        break;
+    }
+    case IR_VEND:
+        if (L) { /* vzeroupper: no penalty for the SSE code after */
+            byte(g, 0xC5);
+            byte(g, 0xF8);
+            byte(g, 0x77);
+        }
+        break;
+    case IR_VOP: {
+        int d = vecReg(g, ins->dst), a = vecReg(g, ins->a), b = ins->b >= 0 ? vecReg(g, ins->b) : 0;
+        switch (ins->imm) {
+        case IR_FADD: vbin(g, 1, 0x58, d, a, b, true); break;
+        case IR_FSUB: vbin(g, 1, 0x5C, d, a, b, false); break;
+        case IR_FMUL: vbin(g, 1, 0x59, d, a, b, true); break;
+        case IR_FDIV: vbin(g, 1, 0x5E, d, a, b, false); break;
+        case IR_FMIN: vbin(g, 1, 0x5D, d, a, b, false); break; /* as minsd: b when unordered */
+        case IR_FMAX: vbin(g, 1, 0x5F, d, a, b, false); break;
+        case IR_ADD: vbin(g, 1, 0xD4, d, a, b, true); break;   /* paddq */
+        case IR_SUB: vbin(g, 1, 0xFB, d, a, b, false); break;  /* psubq */
+        case IR_AND: vbin(g, 1, 0xDB, d, a, b, true); break;   /* pand */
+        case IR_OR: vbin(g, 1, 0xEB, d, a, b, true); break;    /* por */
+        case IR_XOR: vbin(g, 1, 0xEF, d, a, b, true); break;   /* pxor */
+        case IR_NOT: vbin(g, 1, 0xDF, d, b, a, false); break;  /* pandn: ~b & a */
+        case IR_SQRT:
+            if (qkUseAvx) vexRR(g, L, 1, 1, 0, 0x51, d, 0, a);
+            else sse66(g, 1, 0x51, d, a);
+            break;
+        case IR_SHL: /* psllq d, imm */
+            if (qkUseAvx) vexRR(g, L, 1, 1, 0, 0x73, 6, d, a);
+            else {
+                vmov(g, d, a);
+                sse66(g, 1, 0x73, 6, d);
+            }
+            byte(g, ins->c & 63);
+            break;
+        case IR_FCMP: { /* cmppd: eq 0, lt 1, le 2, neq (true when unordered) 4 */
+            static const int pred[] = {0, 4, 1, 2, 1, 2};
+            int x = a, y = b;
+            if (ins->cond == C_GT || ins->cond == C_GE) x = b, y = a;
+            vbin(g, 1, 0xC2, d, x, y, false);
+            byte(g, pred[ins->cond]);
+            break;
+        }
+        case IR_CMP: { /* pcmpeqq / pcmpgtq, then negated with all ones for != <= >= */
+            int c = ins->cond;
+            bool gt = c != C_EQ && c != C_NE;
+            int x = a, y = b;
+            if (c == C_LT || c == C_GE) x = b, y = a;
+            vbin(g, 2, gt ? 0x37 : 0x29, d, x, y, !gt);
+            if (c == C_NE || c == C_LE || c == C_GE) {
+                vbin(g, 1, 0x76, 0, 0, 0, true); /* pcmpeqd xmm0, xmm0: all ones */
+                vbin(g, 1, 0xEF, d, d, 0, true);
+            }
+            break;
+        }
+        }
+        break;
+    }
+    }
+}
+
 /* The magic multiplier and shift that divide by d (d >= 2) without a division (Hacker's Delight, 10-1). */
 static void magic(int64_t d, int64_t* m, int* shift) {
     const uint64_t two63 = UINT64_C(1) << 63;
@@ -563,6 +762,25 @@ static void divideByConstant(Gen* g, const IrIns* ins) {
     byte(g, 0xE8 | (R8 & 7));
     if (m < 0) rr(g, true, OP_ADD, 1, RDX, R8);
     if (shift > 0) shiftImm(g, RDX, 7, shift);
+    if (ins->cond & DIV_NONNEG) { /* n >= 0: truncated is floored, nothing to fix */
+        if (!quotient) {
+            if (fits32(d)) {
+                rex(g, true, RDX, 0, RDX, false); /* imul rdx, rdx, d */
+                byte(g, 0x69);
+                byte(g, 0xC0 | (RDX & 7) << 3 | (RDX & 7));
+                i32(g, (int32_t)d);
+            } else {
+                movImm(g, R11, d);
+                rr(g, true, OP_IMUL, 2, RDX, R11);
+            }
+            movRR(g, RAX, R8);
+            rr(g, true, OP_SUB, 1, RAX, RDX);
+            storeBits(g, ins->dst, RAX);
+            return;
+        }
+        storeBits(g, ins->dst, RDX);
+        return;
+    }
     movRR(g, RAX, R8); /* + 1 when n < 0: truncated toward zero */
     shiftImm(g, RAX, 5, 63);
     rr(g, true, OP_ADD, 1, RDX, RAX);
@@ -665,7 +883,9 @@ static void genIns(Gen* g, const IrIns* ins) {
         storeBits(g, ins->dst, RAX);
         break;
     case IR_MOV:
-        if (isFloat(g, ins->dst) && inReg(g, ins->dst)) {
+        if (g->fn->kinds[ins->dst] == 'V') {
+            vmov(g, vecReg(g, ins->dst), vecReg(g, ins->a));
+        } else if (isFloat(g, ins->dst) && inReg(g, ins->dst)) {
             loadF(g, xmmOf(g, ins->dst), ins->a);
         } else if (!isFloat(g, ins->dst) && inReg(g, ins->dst)) {
             loadBits(g, gprOf(g, ins->dst), ins->a);
@@ -693,6 +913,14 @@ static void genIns(Gen* g, const IrIns* ins) {
         /* floored: the quotient rounds down, the remainder takes the divisor's sign */
         loadBits(g, RAX, ins->a);
         loadBits(g, RCX, ins->b);
+        if (ins->cond & DIV_NONNEG) { /* a >= 0, b >= 1: xor edx, edx; div rcx */
+            rr(g, false, OP_XOR, 1, RDX, RDX);
+            rex(g, true, 0, 0, RCX, false);
+            byte(g, 0xF7);
+            byte(g, 0xF0 | RCX);
+            storeBits(g, ins->dst, ins->op == IR_DIV ? RAX : RDX);
+            break;
+        }
         rr(g, true, OP_TEST, 1, RCX, RCX);
         coldJump(g, CC_E, PANIC_DIVIDE, ins->line, -1, -1);
         /* cmp rcx, -1 */
@@ -996,6 +1224,9 @@ static void genIns(Gen* g, const IrIns* ins) {
         }
         jmpLabel(g, g->epilogue);
         break;
+    case IR_VLOAD: case IR_VSTORE: case IR_VSPLAT: case IR_VOP: case IR_VLANE: case IR_VEND:
+        genVector(g, ins);
+        break;
     case IR_FUEL: {
         movReloc(g, RAX, 2, 0);
         rex(g, true, 0, 0, RAX, false); /* dec qword [rax] */
@@ -1138,7 +1369,7 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut, int* gprUsed, int* xm
     *gprUsed = *xmmUsed = 0;
     for (int i = 0; i < count; i++) {
         int v = order[i];
-        int c = f->kinds[v] == 'F' ? 1 : 0;
+        int c = f->kinds[v] == 'F' || f->kinds[v] == 'V' ? 1 : 0;
         int from = crosses[v] ? volatileCount[c] : 0;
         int pick = -1;
         for (int r = 0; r < poolSize[c]; r++) {
@@ -1240,7 +1471,7 @@ static void genFn(Gen* g, const IrFn* f) {
     for (int k = 0; k < f->count; k++) {
         const IrIns* ins = &f->code[k];
         if (ins->op == IR_LABEL || ins->op == IR_JMP) continue;
-        if (ins->op == IR_STORE && ins->dst >= 0) g->uses[ins->dst]++;
+        if ((ins->op == IR_STORE || ins->op == IR_VSTORE) && ins->dst >= 0) g->uses[ins->dst]++;
         if (ins->op != IR_CONST) {
             if (ins->a >= 0) g->uses[ins->a]++;
             if (ins->b >= 0) g->uses[ins->b]++;

@@ -43,8 +43,20 @@ bool qkCpuHasAvx(void) {
     __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
     return (lo & 6) == 6; /* the system saves the AVX registers */
 }
+bool qkCpuHasAvx2(void) {
+    unsigned a, b, c, d;
+    if (!qkCpuHasAvx() || !__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+    return (b & (1u << 5)) != 0;
+}
+bool qkCpuHasSse42(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return false;
+    return (c & (1u << 20)) != 0;
+}
 #else
 bool qkCpuHasAvx(void) { return false; }
+bool qkCpuHasAvx2(void) { return false; }
+bool qkCpuHasSse42(void) { return false; }
 #endif
 const char* qkRunPath = "program";
 char** qkProgramArgs;

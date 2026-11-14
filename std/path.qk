@@ -1,0 +1,119 @@
+// Paths as text: joined, taken apart and normalized. Both / and \ separate parts, and a drive (C:) or a
+// leading separator makes a path absolute; the paths given back use /, and windowsPath turns them to \.
+// b after a, with one separator between; an absolute b stands alone
+pub fn joinPath(a: Text, b: Text) -> Text {
+    if a == "" or isAbsolute(b) {
+        return b
+    }
+    if b == "" {
+        return a
+    }
+    if endsWith(a, "/") or endsWith(a, "\\") {
+        a + b
+    } else {
+        a + "/" + b
+    }
+}
+
+// the path without "." parts, separators doubled or at the end, or a part followed by ".." (at the root,
+// ".." stays there); "a/./b/../c/" is "a/c", and an empty path is "."
+pub fn normalize(path: Text) -> Text {
+    let r = root(path)
+    var parts: [Text] = []
+    for p in partsOf(path[len(r)..]) {
+        if p == ".." and len(parts) > 0 and parts[len(parts) - 1] != ".." {
+            parts = parts[..len(parts) - 1]
+        } else if p == ".." and endsWith(r, "/") {
+            continue
+        } else {
+            parts.push(p)
+        }
+    }
+    let rest = join(parts, "/")
+    if r == "" and rest == "" { "." } else { r + rest }
+}
+
+// the parts after the root: "/usr/lib/" is ["usr", "lib"]
+pub fn pathParts(path: Text) -> [Text] {
+    let n = normalize(path)
+    if n == "." { [] } else { partsOf(n[len(root(n))..]) }
+}
+
+// the folder the path is in: "a/b/c.txt" is "a/b", "c.txt" is ".", and a root is itself
+pub fn parent(path: Text) -> Text {
+    let n = normalize(path)
+    let r = root(n)
+    let parts = partsOf(n[len(r)..])
+    if len(parts) == 0 {
+        return if r == "" { ".." } else { r }
+    }
+    if parts[len(parts) - 1] == ".." {
+        return n + "/.."
+    }
+    let up = r + join(parts[..len(parts) - 1], "/")
+    if up == "" { "." } else { up }
+}
+
+// the last part: "a/b/c.txt" is "c.txt", and a root has none ("")
+pub fn fileName(path: Text) -> Text {
+    let parts = pathParts(path)
+    if len(parts) == 0 { "" } else { parts[len(parts) - 1] }
+}
+
+// the file name's text after its last dot, without it: "a/b.tar.gz" is "gz"; ".profile" and "make" have none
+pub fn extension(path: Text) -> Text = splitName(fileName(path)).1
+
+// the file name without its extension: "a/b.tar.gz" is "b.tar"
+pub fn stem(path: Text) -> Text = splitName(fileName(path)).0
+
+// the path with its file name's extension changed (or added, or taken away with "")
+pub fn withExtension(path: Text, ext: Text) -> Text {
+    let old = fileName(path)
+    if old == "" or old == ".." {
+        return normalize(path)
+    }
+    let name = stem(path) + (if ext == "" { "" } else { "." + ext })
+    let up = parent(path)
+    if up == "." { name } else { joinPath(up, name) }
+}
+
+// whether it starts at a root: "/x", "\x", "C:/x", "C:\x"
+pub fn isAbsolute(path: Text) -> Bool {
+    let r = root(path)
+    r != "" and isSeparator(r[len(r) - 1..])
+}
+
+// the path with \ between its parts, as Windows writes it
+pub fn windowsPath(path: Text) -> Text = replace(path, "/", "\\")
+
+// a file name before and after its last dot: "b.tar.gz" is ("b.tar", "gz"), ".profile" is (".profile", "")
+fn splitName(name: Text) -> (Text, Text) {
+    let dots = split(name, ".")
+    let dot = len(name) - len(dots[len(dots) - 1]) - 1
+    if dot <= 0 or name == ".." {
+        (name, "")
+    } else {
+        (name[..dot], name[dot + 1..])
+    }
+}
+
+fn isSeparator(c: Text) -> Bool = c == "/" or c == "\\"
+
+// where the path starts, written with /: "/", "C:/", "C:" (a drive's current folder), or "" (relative)
+fn root(path: Text) -> Text {
+    let cs = chars(path).take(3).toArray()
+    let drive = len(cs) >= 2 and cs[1] == ":" and isLetter(cs[0])
+    if drive and len(cs) == 3 and isSeparator(cs[2]) {
+        return cs[0] + ":/"
+    }
+    if drive {
+        return cs[0] + ":"
+    }
+    if len(cs) >= 1 and isSeparator(cs[0]) { "/" } else { "" }
+}
+
+fn isLetter(c: Text) -> Bool = c >= "a" and c <= "z" or c >= "A" and c <= "Z"
+
+// the parts between separators, without empty ones and "."
+fn partsOf(path: Text) -> [Text] =
+    split(replace(path, "\\", "/"), "/").filter(p => p != "" and p != ".")

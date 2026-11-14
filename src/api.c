@@ -21,6 +21,7 @@ struct QkVm {
     int64_t fuel;
     bool noAvx;
     bool checked;
+    bool release;
     QkDiagnostic* diags;
     int diagCount, diagCap;
     char lastError[512];
@@ -177,6 +178,7 @@ void qkVmFuel(QkVm* vm, int64_t steps) { vm->fuel = steps > 0 ? steps : 0; }
 void qkVmMemoryLimit(QkVm* vm, int64_t bytes) { qkArenaLimit(vm->arena, bytes); }
 void qkVmChecked(QkVm* vm, bool checked) { vm->checked = checked; }
 void qkVmNoAvx(QkVm* vm, bool noAvx) { vm->noAvx = noAvx; }
+void qkVmRelease(QkVm* vm, bool release) { vm->release = release; }
 int qkDiagnosticCount(const QkVm* vm) { return vm->diagCount; }
 const QkDiagnostic* qkDiagnosticAt(const QkVm* vm, int i) { return i >= 0 && i < vm->diagCount ? &vm->diags[i] : NULL; }
 const char* qkLastError(const QkVm* vm) { return vm->lastError; }
@@ -222,7 +224,9 @@ QkModule* qkCompile(QkVm* vm, const char* name, const char* text, size_t len) {
     qkChecked = vm->checked;
     qkLower(&prog, &ir, vm->fuel > 0);
     qkChecked = false;
+    qkRelease = vm->release;
     qkOptimize(&ir);
+    qkRelease = false;
     MachineCode mc;
     qkGenCode(&ir, &mc);
     void** hosts = qkNew(sizeof(void*) * (size_t)(ir.externCount ? ir.externCount : 1));

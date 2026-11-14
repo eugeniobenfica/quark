@@ -8,7 +8,7 @@
 static bool defines(const IrIns* ins) {
     switch (ins->op) {
     case IR_STORE: case IR_BOUNDS: case IR_LABEL: case IR_JMP: case IR_JZ: case IR_JNZ: case IR_CALL: case IR_RTCALL: case IR_HOSTCALL:
-    case IR_RET: case IR_FUEL: case IR_NOP:
+    case IR_RET: case IR_FUEL: case IR_NOP: case IR_VSTORE: case IR_VEND:
         return false;
     default:
         return ins->dst >= 0;
@@ -20,6 +20,7 @@ static bool pure(const IrIns* ins) {
     case IR_CONST: case IR_MOV: case IR_ADD: case IR_SUB: case IR_MUL: case IR_NEG: case IR_FADD: case IR_FSUB: case IR_FMUL:
     case IR_FDIV: case IR_FNEG: case IR_SQRT: case IR_FMIN: case IR_FMAX: case IR_CMP: case IR_FCMP: case IR_NOT: case IR_I2F:
     case IR_F2I: case IR_ROUND: case IR_LOAD: case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SAR:
+    case IR_VLOAD: case IR_VSPLAT: case IR_VOP: case IR_VLANE:
         return true;
     default:
         return false;
@@ -41,7 +42,7 @@ static void addUse(Counts* c, const IrIns* ins, int v, int k) {
 static void countIns(Counts* c, const IrIns* ins, int k) {
     if (ins->op == IR_NOP || ins->op == IR_LABEL || ins->op == IR_JMP) return;
     if (defines(ins)) c->defs[ins->dst] += k;
-    if (ins->op == IR_STORE) addUse(c, ins, ins->dst, k);
+    if (ins->op == IR_STORE || ins->op == IR_VSTORE) addUse(c, ins, ins->dst, k);
     if (ins->op != IR_CONST) {
         addUse(c, ins, ins->a, k);
         addUse(c, ins, ins->b, k);
@@ -81,7 +82,7 @@ static int resolve(const int* rename, int v) {
 }
 
 static void renameOperands(IrIns* ins, const int* rename) {
-    if (ins->op == IR_STORE) ins->dst = resolve(rename, ins->dst);
+    if (ins->op == IR_STORE || ins->op == IR_VSTORE) ins->dst = resolve(rename, ins->dst);
     if (ins->op != IR_CONST) {
         ins->a = resolve(rename, ins->a);
         ins->b = resolve(rename, ins->b);
@@ -138,6 +139,8 @@ static void remainderFromQuotient(IrFn* f) {
             div.op = IR_DIV;
             div.dst = q;
             mul.op = IR_MUL;
+            mul.cond &= 1; /* DIV_NONNEG is the division's */
+            sub.cond &= 1;
             mul.dst = p;
             mul.a = q;
             sub.op = IR_SUB;
@@ -242,7 +245,7 @@ static void commonSubexpressions(IrFn* f) {
         default: break;
         }
         bool safeDivide = (ins->op == IR_DIV || ins->op == IR_MOD) && ins->b >= 0 && isK[ins->b] && kv[ins->b] != 0;
-        bool candidate = (pure(ins) || safeDivide) && ins->op != IR_LOAD && ins->op != IR_MOV && ins->op != IR_CONST &&
+        bool candidate = (pure(ins) || safeDivide) && ins->op != IR_LOAD && ins->op != IR_VLOAD && ins->op != IR_MOV && ins->op != IR_CONST &&
                          defines(ins) && defs[ins->dst] == 1;
         if (candidate) {
             Seen s = {0};
@@ -291,6 +294,10 @@ static void commonSubexpressions(IrFn* f) {
     for (int k = 0; k < f->count; k++)
         if (f->code[k].op != IR_NOP) renameOperands(&f->code[k], rename);
 }
+
+bool qkRelease;
+
+void qkCommonSubexpressions(IrFn* f) { commonSubexpressions(f); }
 
 static void optimizeFn(IrFn* f) {
     remainderFromQuotient(f); /* adds registers: before the counts are sized */
@@ -373,5 +380,6 @@ static void optimizeFn(IrFn* f) {
 }
 
 void qkOptimize(IrProgram* p) {
+    if (qkRelease) qkOptimizeRelease(p);
     for (int i = 0; i < p->count; i++) optimizeFn(&p->fns[i]);
 }

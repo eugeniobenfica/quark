@@ -188,6 +188,13 @@ cannot be loaded again for the others. `tests/object/host.c` is a host that link
 `qkVmChecked(vm, true)` makes Int `+ - *` past their limits stop the call (a development build, say);
 `qkVmMemoryLimit(vm, bytes)` stops a call whose program holds more memory than that.
 
+## The optimizing tier
+
+`qkVmRelease(vm, true)` compiles with the optimizing tier (as `quark build --release`): SSA form, range
+analysis, loop motion, devirtualized interface calls and SIMD loops. It takes a millisecond or so where the
+default takes a fraction of one, so it suits code compiled once and run long (a shipped level's scripts, a
+plugin loaded at start) more than hot reload while editing. Results are the same either way.
+
 ## Hot reload
 
 Compile the new text, then swap modules:

@@ -13,6 +13,8 @@
  *   quark lsp / quark dap                     a language server and a debug adapter, for editors (stdio)
  *   quark doc   file.qk [-o out.md|.html]     documentation of its pub declarations
  *
+ * --release (run, build, object, ir, test): the optimizing tier, slower to compile and faster to run.
+ *
  * An executable made by `quark build` is this same program with the machine code appended: when it starts
  * and finds code at its own end, it runs that code instead of the command line. */
 #define _DEFAULT_SOURCE /* POSIX: readlink, clock_gettime, chmod */
@@ -51,7 +53,7 @@ typedef struct Trailer {
     int64_t entry; /* main's offset */
     int64_t enter, escape;
     int64_t fuel;
-    int64_t features; /* 1: AVX */
+    int64_t features; /* 1: AVX, 2: AVX2, 4: SSE4.2 (--release SIMD) */
     uint64_t payloadSize;
 } Trailer;
 
@@ -116,8 +118,8 @@ static int runPayload(const char* self, int argc, char** argv) {
     if (t.fuel > 0) qkFuel = t.fuel;
     qkProgramArgs = argv + 1; /* everything after the executable's own name */
     qkProgramArgCount = argc > 1 ? argc - 1 : 0;
-    if ((t.features & 1) && !qkCpuHasAvx()) {
-        fputs("this program was built for processors with AVX, and this one has none\n", stderr);
+    if (((t.features & 1) && !qkCpuHasAvx()) || ((t.features & 2) && !qkCpuHasAvx2()) || ((t.features & 4) && !qkCpuHasSse42())) {
+        fputs("this program was built for processors with AVX (or AVX2, SSE4.2), and this one has none\n", stderr);
         return 1;
     }
     Loaded l;
@@ -556,6 +558,7 @@ static int usage(void) {
           "  quark object file.qk -o file.o [--symbol name]   an object file a host links (QkStaticProgram name)\n"
           "  quark run   file.qk [--fuel N] [--time] [--allow print,files,...] [-- args...]   compile to machine code and run it\n"
           "  quark build file.qk [-o file.exe]         make a standalone executable\n"
+          "  --release           (run, build, object, ir, test) the optimizing tier: slower to compile, faster to run\n"
           "  quark test  file.qk                       run its test \"...\" { } blocks\n"
           "  quark lsp   [--prelude host.qk]           a language server (stdio), for editors\n"
           "  quark dap   [--prelude host.qk]           a debug adapter (stdio), for editors' debuggers\n"
@@ -626,6 +629,7 @@ static int realMain(int argc, char** argv) {
         else if (!strcmp(argv[i], "--time")) timed = true;
         else if (!strcmp(argv[i], "--write")) write = true;
         else if (!strcmp(argv[i], "--no-avx")) noAvx = true;
+        else if (!strcmp(argv[i], "--release")) qkRelease = true; /* the optimizing tier */
         else if (!strcmp(argv[i], "--abi") && i + 1 < argc) { /* sysv on Windows: tests the Linux / macOS calls */
             const char* abi = argv[++i];
             qkAbi = !strcmp(abi, "sysv") ? QK_ABI_SYSV : QK_ABI_WIN64;
@@ -700,7 +704,7 @@ static int realMain(int argc, char** argv) {
         t.enter = mc.enter;
         t.escape = mc.escape;
         t.fuel = fuel;
-        t.features = qkUseAvx ? 1 : 0;
+        t.features = (qkUseAvx ? 1 : 0) | (qkSimdFeatures & 6);
         t.payloadSize = out.len - start;
         qkBufAdd(&out, &t, sizeof t);
         char defaultOut[1024];

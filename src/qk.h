@@ -504,10 +504,22 @@ typedef enum IrOp {
     IR_HOSTCALL,  /* rets = host function imm (args), C calling convention */
     IR_NOP,
     IR_AND, IR_OR, IR_XOR, /* ints: their bits */
-    IR_SHL, IR_SAR         /* a shifted left / right (keeping its sign) by b, b taken modulo 64 */
+    IR_SHL, IR_SAR,        /* a shifted left / right (keeping its sign) by b, b taken modulo 64 */
+    /* SIMD (release.c): registers of kind 'V' hold qkSimdLanes Ints or Floats */
+    IR_VLOAD,     /* dst = the lanes at [a + b * imm + c] */
+    IR_VSTORE,    /* [a + b * imm + c] = dst's lanes */
+    IR_VSPLAT,    /* dst = a (an Int or a Float) in every lane */
+    IR_VOP,       /* dst = a <imm> b lane by lane, imm a scalar op: ADD SUB AND OR XOR (Ints, or any bits), FADD FSUB FMUL
+                   * FDIV FMIN FMAX, SQRT (b < 0), SHL by c, CMP / FCMP by cond (all ones where true), NOT: a & ~b */
+    IR_VLANE,     /* dst (scalar) = lane c of a */
+    IR_VEND       /* after a vector loop (vzeroupper) */
 } IrOp;
 
 enum { C_EQ, C_NE, C_LT, C_LE, C_GT, C_GE };
+/* IR_DIV / IR_MOD's cond & 2 (release.c): neither operand can be negative, nor the divisor zero: truncation is
+ * the floored result, nothing to check or fix */
+enum { DIV_NONNEG = 2 };
+extern int qkSimdLanes; /* the vector registers' lanes in the last release compile: 4 (AVX2), 2 (SSE, NEON) */
 
 typedef struct IrIns {
     uint8_t op;
@@ -596,6 +608,13 @@ void qkIrDump(const IrProgram* p, QkBuf* out);
 /* Folds copies into the instructions that compute them, drops unused code, turns constants into immediates
  * (ints) or hoists them to the start (floats). */
 void qkOptimize(IrProgram* p);
+/* The optimizing tier (release.c), run by qkOptimize first when set (quark build / run / object --release,
+ * qkVmRelease): SSA form, range analysis, loop-invariant code motion, strength reduction, devirtualized
+ * interface calls, records kept in registers, SIMD loops. */
+extern bool qkRelease;
+extern int qkSimdFeatures; /* what the SIMD loops of the last release compile need: 2 AVX2, 4 SSE4.2 */
+void qkOptimizeRelease(IrProgram* p);
+void qkCommonSubexpressions(IrFn* f); /* opt.c's, for release.c: leaves NOPs */
 
 /* ---- the runtime the compiled code calls (runtime.c) --------------------------------------------- */
 
@@ -622,6 +641,8 @@ typedef enum RtId {
 extern const RtFn qkRuntime[RT_COUNT];
 extern bool qkUseAvx;      /* the code generator may use AVX (three-operand float instructions) */
 bool qkCpuHasAvx(void);
+bool qkCpuHasAvx2(void);
+bool qkCpuHasSse42(void);
 extern const char* qkRunPath; /* for messages */
 /* What args() gives a program: the command line after the program's own name (set by quark run / build). */
 extern char** qkProgramArgs;

@@ -3239,7 +3239,7 @@ void qkIrDump(const IrProgram* p, QkBuf* out) {
     static const char* const names[] = {"const", "mov", "add", "sub", "mul", "div", "mod", "neg", "fadd", "fsub", "fmul",
                                         "fdiv", "fneg", "sqrt", "fmin", "fmax", "cmp", "fcmp", "not", "i2f", "f2i", "round",
                                         "load", "store", "bounds", "label", "jmp", "jz", "jnz", "call", "rtcall", "ret", "fuel", "hostcall", "nop",
-                                        "and", "or", "xor", "shl", "sar"};
+                                        "and", "or", "xor", "shl", "sar", "vload", "vstore", "vsplat", "vop", "vlane", "vend"};
     static const char* const conds[] = {"==", "!=", "<", "<=", ">", ">="};
     for (int i = 0; i < p->count; i++) {
         const IrFn* f = &p->fns[i];
@@ -3260,7 +3260,8 @@ void qkIrDump(const IrProgram* p, QkBuf* out) {
             if (ins->op == IR_CONST || ins->op == IR_JMP || ins->op == IR_JZ || ins->op == IR_JNZ || ins->op == IR_LOAD ||
                 ins->op == IR_STORE || ins->op == IR_CALL || ins->op == IR_RTCALL || ins->op == IR_ROUND || ins->op == IR_HOSTCALL)
                 qkBufPrintf(out, " #%lld", (long long)ins->imm);
-            if ((ins->op == IR_LOAD || ins->op == IR_STORE) && ins->c) qkBufPrintf(out, " +%d", ins->c);
+            if ((ins->op == IR_LOAD || ins->op == IR_STORE || ins->op == IR_VLOAD || ins->op == IR_VSTORE || ins->op == IR_VLANE) && ins->c) qkBufPrintf(out, " +%d", ins->c);
+            if (ins->op == IR_VOP) qkBufPrintf(out, " %s%s%s", names[ins->imm], ins->imm == IR_CMP || ins->imm == IR_FCMP ? " " : "", ins->imm == IR_CMP || ins->imm == IR_FCMP ? conds[ins->cond] : "");
             if (ins->op == IR_CONST && ins->c == 1) qkBufPuts(out, " (data)");
             if (ins->op == IR_CONST && ins->c == 2) qkBufPuts(out, " (function)");
             for (int j = 0; j < ins->argCount; j++) qkBufPrintf(out, "%s%c%d", j ? ", " : " (", f->kinds[ins->args[j]] == 'F' ? 'f' : 'r', ins->args[j]);

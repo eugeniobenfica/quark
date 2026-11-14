@@ -965,6 +965,7 @@ their content.
 | `quark repl` | declarations, `let`s and expressions line by line: an expression's value is printed |
 | `quark run file.qk --profile` | where the time goes, by function (one sample a millisecond; inlined functions count in their caller) |
 | `quark run file.qk --checked` | Int `+ - *` past their limits stop the program (`quark test` always checks) |
+| `quark build file.qk --release` (also `run`, `object`, `test`, `ir`) | the optimizing tier: SSA, range analysis (bounds checks that cannot fail dropped), loop-invariant code motion, strength reduction, devirtualized interface calls, records kept in registers, SIMD for `map` / `filter` / `sum` pipelines. A millisecond or so to compile instead of a fraction; without it, `quark run` stays the quick tier |
 | `quark run file.qk --memory MB` | at most so much memory, then a panic |
 | `quark graph` / `quark text` / `quark catalog` | node graphs both ways, and what an editor can offer (pins with typed shapes) |
 | `quark diff a b [--json]` | the changes between two versions, by node key: nodes added, removed, changed (which inputs), statements moved (`.qk` or `.json`; exit 1 when they differ) |

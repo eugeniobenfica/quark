@@ -79,6 +79,9 @@ void qkVmMemoryLimit(QkVm* vm, int64_t bytes);
 void qkVmFuel(QkVm* vm, int64_t steps);
 /* 0: use AVX when the processor has it (the default); 1: never. */
 void qkVmNoAvx(QkVm* vm, bool noAvx);
+/* true: compile with the optimizing tier (SSA, range analysis, loop motion, SIMD...), slower to compile, faster
+ * to run; false (the default): the quick tier, a fraction of a millisecond. */
+void qkVmRelease(QkVm* vm, bool release);
 
 int qkDiagnosticCount(const QkVm* vm);
 const QkDiagnostic* qkDiagnosticAt(const QkVm* vm, int i);

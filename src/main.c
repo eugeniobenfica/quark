@@ -279,13 +279,8 @@ static int runMain(const MachineCode* mc, const IrProgram* ir, bool timed) {
 
 static const char* preludePath; /* --prelude: the host's declarations */
 
-static bool loadProgram(const char* path, Program* prog) {
-    size_t len;
-    char* text = qkReadFile(path, &len);
-    if (!text) {
-        fprintf(stderr, "quark: cannot read %s\n", path);
-        return false;
-    }
+/* A program's text (named path: its uses are read next to it), after the prelude's declarations. */
+static bool loadProgramText(const char* path, char* text, size_t len, Program* prog) {
     QkSource src = {path, text, len};
     if (!qkParse(&src, prog)) return false;
     if (preludePath) {
@@ -301,6 +296,16 @@ static bool loadProgram(const char* path, Program* prog) {
         qkAddPrelude(prog, &prelude);
     }
     return qkLoadUses(prog, path); /* the files its uses name */
+}
+
+static bool loadProgram(const char* path, Program* prog) {
+    size_t len;
+    char* text = qkReadFile(path, &len);
+    if (!text) {
+        fprintf(stderr, "quark: cannot read %s\n", path);
+        return false;
+    }
+    return loadProgramText(path, text, len, prog);
 }
 
 static bool compile(const char* path, int64_t fuel, MachineCode* mc, IrProgram* ir, bool* timed) {
@@ -448,6 +453,96 @@ static int runTests(const char* path, int64_t fuel) {
     return failed ? 1 : 0;
 }
 
+/* ---- quark diff, quark merge: versions of a program side by side, by node key --------------------- */
+
+static int usage(void);
+
+static bool endsWith(const char* s, const char* end) {
+    size_t n = strlen(s), m = strlen(end);
+    return n >= m && !strcmp(s + n - m, end);
+}
+
+/* A file's graph, malloc'd: a .json as it is, a program's made from its text. Each is read on its own (the
+ * compiler's memory is cleared after), so programs with the same names do not meet. */
+static char* graphOf(const char* path, size_t* len) {
+    char* json = NULL;
+    if (endsWith(path, ".json")) {
+        char* text = qkReadFile(path, len);
+        if (!text) fprintf(stderr, "quark: cannot read %s\n", path);
+        else json = memcpy(malloc(*len + 1), text, *len + 1);
+    } else {
+        Program prog;
+        if (loadProgram(path, &prog) && qkCheck(&prog, false)) {
+            QkBuf out = {0};
+            qkGraphExport(&prog, &out);
+            *len = out.len;
+            json = out.data;
+        }
+    }
+    qkNewReset();
+    qkTypesReset();
+    return json;
+}
+
+/*   quark diff a b [--json]                    exit 0: the same, 1: changes, 2: trouble
+ *   quark merge base ours theirs [-o out] [--json]   exit 0: merged, 1: conflicts (ours kept there) or errors */
+static int collab(int argc, char** argv) {
+    bool merge = !strcmp(argv[1], "merge");
+    int files = merge ? 3 : 2;
+    if (argc < 2 + files) return usage();
+    bool json = false;
+    const char* outPath = NULL;
+    for (int i = 2 + files; i < argc; i++) {
+        if (!strcmp(argv[i], "--json")) json = true;
+        else if (!strcmp(argv[i], "-o") && merge && i + 1 < argc) outPath = argv[++i];
+        else if (!strcmp(argv[i], "--prelude") && i + 1 < argc) preludePath = argv[++i];
+        else {
+            fprintf(stderr, "quark: unknown option %s\n", argv[i]);
+            return 2;
+        }
+    }
+    char* graphs[3];
+    size_t lens[3];
+    for (int i = 0; i < files; i++)
+        if (!(graphs[i] = graphOf(argv[2 + i], &lens[i]))) return 2;
+    QkBuf out = {0};
+    if (!merge) {
+        int changes = qkGraphDiff(graphs[0], lens[0], graphs[1], lens[1], json, &out);
+        if (changes < 0) return 2;
+        fwrite(out.data ? out.data : "", 1, out.len, stdout);
+        return changes ? 1 : 0;
+    }
+    QkBuf conflicts = {0};
+    int count = qkGraphMerge(graphs[0], lens[0], graphs[1], lens[1], graphs[2], lens[2], &out, json, &conflicts);
+    if (count < 0) return 2;
+    fwrite(conflicts.data ? conflicts.data : "", 1, conflicts.len, stderr);
+    Program prog;
+    if (!qkGraphImport(out.data, out.len, "the merged graph", &prog)) return 2;
+    QkBuf text = {0};
+    qkFormat(&prog, &text);
+    /* the merged program, checked as text (a side may use what the other removed): its graph, or the text */
+    const char* name = outPath ? outPath : argv[2];
+    char* copy = memcpy(qkNew(text.len + 1), text.data, text.len + 1);
+    bool checks = loadProgramText(name, copy, text.len, &prog) && qkCheck(&prog, false);
+    bool asGraph = outPath ? endsWith(outPath, ".json") : endsWith(argv[2], ".json");
+    QkBuf result = {0};
+    if (asGraph) {
+        if (!checks) {
+            fputs("quark: the merged program has errors, so it has no graph\n", stderr);
+            return 1;
+        }
+        qkGraphExport(&prog, &result);
+    } else {
+        result = text;
+    }
+    if (outPath ? !qkWriteFile(outPath, result.data, result.len) : !fwrite(result.data, 1, result.len, stdout)) {
+        fprintf(stderr, "quark: cannot write %s\n", outPath ? outPath : "the merge");
+        return 2;
+    }
+    if (!checks) fputs("quark: the merged program has errors\n", stderr);
+    return count || !checks ? 1 : 0;
+}
+
 static int usage(void) {
     fputs("Quark — a small compiled language whose programs are also node graphs.\n\n"
           "  quark debug file.qk [--break LINE]...   stop at lines, step, see the names' values\n"
@@ -462,6 +557,8 @@ static int usage(void) {
           "  quark fmt   file.qk [--write]             print (or rewrite) the canonical text\n"
           "  quark graph file.qk                       print the node graph (JSON)\n"
           "  quark text  file.json                     turn a node graph back into Quark\n"
+          "  quark diff  a b [--json]                  the changes, by node key (.qk or .json)\n"
+          "  quark merge base ours theirs [-o out]     three-way merge by node key; conflicts by key\n"
           "  quark ir    file.qk                       print the intermediate code\n"
           "  quark catalog file.qk | -                 every node an editor can offer (JSON)\n\n"
           "  --prelude host.qk   the host's declarations (extern fn, extern type) for run, check, graph, catalog\n"
@@ -479,6 +576,7 @@ static int realMain(int argc, char** argv) {
         qkExitEnds = true;
         return repl();
     }
+    if (argc >= 2 && (!strcmp(argv[1], "diff") || !strcmp(argv[1], "merge"))) return collab(argc, argv);
     if (argc < 3) return usage();
     const char* cmd = argv[1];
     const char* path = argv[2];

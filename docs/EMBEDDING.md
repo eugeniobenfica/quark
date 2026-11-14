@@ -207,7 +207,19 @@ Scripts keep no state between calls, so the new module goes on exactly where the
 | `qkGraphToText(vm, json, n)` | the canonical text of a graph |
 | `qkCompileGraph(vm, name, json, n)` | compiles a graph; each diagnostic's `key` names the node it is about (`tick/@3`) |
 | `qkFormatText(vm, text, n)` | the canonical text |
-| `qkCatalog(vm, text, n)` | every node an editor can offer: the built-ins with their pins, the operators, the statements, the prelude's externs and types, and the program's own functions and types |
+| `qkCatalog(vm, text, n)` | every node an editor can offer: the built-ins with their pins, the operators, the statements, the prelude's externs and types, and the program's own functions and types. Every pin has a `"shape"`, its type as data (`{"kind": "loop", "element": {"kind": "param", "name": "T"}}`), and every function a `"result"` shape: see [LANGUAGE.md](LANGUAGE.md#the-node-graph) |
+| `qkDiff(vm, a, an, b, bn, json)` | what changed from a to b, by node key: `changed main/n: input 0: 10 -> 12` lines, or JSON (`{"changes": [...]}`); `""` when they are the same |
+| `qkMerge(vm, base, bn, ours, on, theirs, tn, graph, &conflicts)` | a three-way merge by node key: the merged program's canonical text, or its graph when `graph` is true (`NULL` if the merged program has errors, with the diagnostics). `conflicts` (may be `NULL`; free it) gets `[{"key": "main/n", "what": "changed on both sides"}]`, `[]` when none. Ours is kept where the sides conflict |
+
+`qkDiff` and `qkMerge` take each version as text or as a graph (JSON, starting with `{`), so an editor
+can compare its graph with a teammate's text without converting either.
+
+```c
+char* conflicts;
+char* merged = qkMerge(vm, base, strlen(base), mine, strlen(mine), theirs, strlen(theirs), true, &conflicts);
+if (strcmp(conflicts, "[]")) showConflicts(conflicts); /* by key: the editor highlights those nodes */
+qkFree(conflicts);
+```
 
 Every node carries a **key**. A named node (a `let`, a `var`, a parameter, a loop variable) is keyed
 `function/name`. Any other statement is keyed by its place (`function/@2`, `function/@2/@0` inside

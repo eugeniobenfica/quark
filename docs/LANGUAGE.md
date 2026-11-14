@@ -867,7 +867,48 @@ Every node carries a `key`, a `line` in the canonical text, and its `type`:
 An editor keeps node positions in a side file under those keys (`quark graph --layout pos.json` puts
 them back in as `"pos"`), so moving nodes never touches the program. Graph → text always gives the
 canonical text, so a graph edited in a node editor and a program edited as text can live in one
-repository. `quark catalog` lists every node an editor can offer.
+repository. `quark catalog` lists every node an editor can offer. Each pin also has a `"shape"`, its
+type as data, so an editor can check a wire without reading type text. `map`'s `f` pin, for example:
+`{"kind": "fn", "params": [{"kind": "param", "name": "T"}, {"kind": "int"}], "returns": {"kind": "param", "name": "U"}}`.
+The kinds are `int`, `float`, `bool`, `text`, `any`, `never`, `nothing`, `enum` (any enum's case),
+`array` / `loop` / `range` / `optional` / `result` (with an `element`), `map` (`key`, `element`),
+`tuple` (`items`), `fn` (`params`, `returns`, `effect`), `named` (a record, an enum or an extern type,
+with its `args`), `param` (a type parameter: pins with the same name take the same type; `Number` is
+one with `"oneOf"` Int, Float) and `oneOf` (`options`). A built-in's `"pins"` also say when a pin
+takes a `var` (`"mutable"`), may be left out (`"optional"`) or takes any number of values
+(`"variadic"`).
+
+### Versions side by side
+
+Keys make changes readable and mergeable by node rather than by line:
+
+```
+$ quark diff base.qk ours.qk
+changed  main/n: input 0: 10 -> 12
+added    main/@0: call print
+$ quark merge base.qk ours.qk theirs.qk -o merged.qk
+conflict main/n: changed on both sides
+```
+
+`quark diff a b` reports each node **added**, **removed** or **changed** (which inputs or values, as
+`input 0: 10 -> 12`) and each statement **moved** (in its block, or to another one). Pass `--json` for
+`{"changes": [{"change", "key", "kind", "in", "line", "fields": [{"field", "was", "now"}]}]}`, which
+lists every node, including those inside an added one. The line is in the first version's text, or in
+the second's for an added node. Exit 0 means the same program, 1 means changes.
+
+`quark merge base ours theirs [-o out]` is a three-way merge. What only one side changed is taken
+from that side, each block's statements merge, and the result is canonical text (a graph when
+`out` or the inputs are `.json`). Where both sides changed one node, added statements at one place,
+reordered one block, or one removed a node the other still uses, the merge keeps ours (and the
+node), names the conflict by key and exits 1. `--json` gives the conflicts as
+`[{"key", "what"}]`. A merged program with errors is reported too (exit 1).
+
+Both commands take `.qk` files (through their graphs) or `.json` graphs. A statement keyed by its
+place (`main/@3`) gets a new place when one is inserted before it, so before comparing, the second
+version's statements are lined up with the first's block by block: named statements by name, then
+equal statements in order, then statements of the same kind between those. A new statement whose
+place-key is taken shows with its own key in a diff (`main/@0`). Statements that moved are found by
+their content.
 
 ## Tools
 
@@ -887,7 +928,9 @@ repository. `quark catalog` lists every node an editor can offer.
 | `quark run file.qk --profile` | where the time goes, by function (one sample a millisecond; inlined functions count in their caller) |
 | `quark run file.qk --checked` | Int `+ - *` past their limits stop the program (`quark test` always checks) |
 | `quark run file.qk --memory MB` | at most so much memory, then a panic |
-| `quark graph` / `quark text` / `quark catalog` | node graphs both ways, and what an editor can offer |
+| `quark graph` / `quark text` / `quark catalog` | node graphs both ways, and what an editor can offer (pins with typed shapes) |
+| `quark diff a b [--json]` | the changes between two versions, by node key: nodes added, removed, changed (which inputs), statements moved (`.qk` or `.json`; exit 1 when they differ) |
+| `quark merge base ours theirs [-o out] [--json]` | a three-way merge by node key: canonical text (or a graph, for `.json`); conflicts named by key, ours kept there (exit 1) |
 
 ## The standard library
 

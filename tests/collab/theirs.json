@@ -1,0 +1,9 @@
+{"changes": [
+  {"change": "changed", "key": "square/=", "kind": "op", "in": "square", "line": 2, "fields": [{"field": "op", "was": "*", "now": "+"}, {"field": "inputs.0", "was": {"node": "square/x"}, "now": {"node": "square/=.0"}}, {"field": "inputs.1", "was": {"node": "square/x"}, "now": {"value": "0", "of": "Int"}}]},
+  {"change": "added", "key": "square/=.0", "kind": "op", "in": "square", "line": 2},
+  {"change": "changed", "key": "main/i/@0.1", "kind": "op", "in": "main", "line": 8, "fields": [{"field": "kind", "was": "call", "now": "op"}, {"field": "fn", "was": "square", "now": null}, {"field": "inputs.0", "was": {"node": "main/i"}, "now": {"node": "main/i/@0.1.0"}}, {"field": "inputs.1", "was": null, "now": {"node": "main/i/@0.1.1"}}, {"field": "op", "was": null, "now": "+"}]},
+  {"change": "added", "key": "main/i/@0.1.0", "kind": "call", "in": "main", "line": 10},
+  {"change": "added", "key": "main/i/@0.1.1", "kind": "call", "in": "main", "line": 10},
+  {"change": "changed", "key": "main/@4.0", "kind": "call", "in": "main", "line": 11, "fields": [{"field": "inputs.0", "was": {"value": "\"done\"", "of": "Text"}, "now": {"value": "\"all done\"", "of": "Text"}}]},
+  {"change": "added", "key": "cube", "kind": "fn", "decl": true}
+]}

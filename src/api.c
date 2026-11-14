@@ -495,6 +495,69 @@ char* qkGraphToText(QkVm* vm, const char* json, size_t len) {
     return s;
 }
 
+/* ---- versions side by side: diffs and merges by node key ----------------------------------------- */
+
+/* a program's graph, malloc'd: given as its graph (JSON: '{' first) or as its text */
+static char* graphFrom(QkVm* vm, const char* s, size_t len, size_t* outLen) {
+    size_t i = 0;
+    while (i < len && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) i++;
+    char* json = i < len && s[i] == '{' ? memcpy(malloc(len + 1), s, len) : qkTextToGraph(vm, s, len, NULL);
+    if (!json) return NULL;
+    if (i < len && s[i] == '{') json[len] = '\0';
+    *outLen = strlen(json);
+    return json;
+}
+
+char* qkDiff(QkVm* vm, const char* a, size_t aLen, const char* b, size_t bLen, bool json) {
+    size_t la, lb;
+    char* ga = graphFrom(vm, a, aLen, &la);
+    char* gb = ga ? graphFrom(vm, b, bLen, &lb) : NULL;
+    char* s = NULL;
+    if (gb) {
+        begin(vm);
+        QkBuf out = {0};
+        if (qkGraphDiff(ga, la, gb, lb, json, &out) >= 0) s = takeText(&out);
+        else qkBufFree(&out);
+        end();
+    }
+    free(ga);
+    free(gb);
+    return s;
+}
+
+char* qkMerge(QkVm* vm, const char* base, size_t baseLen, const char* ours, size_t oursLen, const char* theirs, size_t theirsLen,
+              bool graph, char** conflicts) {
+    if (conflicts) *conflicts = NULL;
+    size_t lens[3];
+    char* gs[3] = {NULL, NULL, NULL};
+    const char* texts[3] = {base, ours, theirs};
+    size_t sizes[3] = {baseLen, oursLen, theirsLen};
+    for (int i = 0; i < 3; i++)
+        if (!(gs[i] = graphFrom(vm, texts[i], sizes[i], &lens[i]))) {
+            for (int k = 0; k < i; k++) free(gs[k]);
+            return NULL;
+        }
+    begin(vm);
+    QkBuf merged = {0}, found = {0}, text = {0};
+    Program p;
+    bool ok = qkGraphMerge(gs[0], lens[0], gs[1], lens[1], gs[2], lens[2], &merged, true, &found) >= 0 &&
+              qkGraphImport(merged.data, merged.len, "merge", &p);
+    if (ok) qkFormat(&p, &text);
+    end();
+    qkBufFree(&merged);
+    for (int i = 0; i < 3; i++) free(gs[i]);
+    if (conflicts) *conflicts = takeText(&found);
+    else qkBufFree(&found);
+    if (!ok) {
+        qkBufFree(&text);
+        return NULL;
+    }
+    if (!graph) return takeText(&text);
+    char* g = qkTextToGraph(vm, text.data, text.len, NULL); /* the merged program checked: NULL if it has errors */
+    qkBufFree(&text);
+    return g;
+}
+
 /* ---- the catalog: every node an editor can offer ------------------------------------------------- */
 
 typedef struct BuiltinNode {
@@ -645,6 +708,222 @@ static void jsonText(QkBuf* b, const char* s) {
     qkBufByte(b, '"');
 }
 
+/* ---- pin shapes: a pin's type as data, so an editor checks a wire without reading type text -----------
+ *
+ * {"kind": "int" | "float" | "bool" | "text" | "any" | "never" | "nothing" | "enum" (any enum's case)}
+ * {"kind": "array" | "loop" (an array, a range or a loop) | "range" | "optional" | "result", "element": shape}
+ * {"kind": "map", "key": shape, "element": shape}       {"kind": "tuple", "items": [shape...]}
+ * {"kind": "fn", "params": [shape...], "returns": shape, "effect": true?}
+ * {"kind": "named", "name": "Point", "args": [shape...]?}  a record, an enum, an extern type (Pair<Int, Text>)
+ * {"kind": "param", "name": "T", "oneOf": [shape...]?}   a type parameter: every pin with the same name takes the
+ *                                                        same type (Number: one of Int, Float)
+ * {"kind": "oneOf", "options": [shape...]}               any of these (Int | Float | Text) */
+
+typedef struct Shaper {
+    const char* p;
+    const char* const* params; /* the type parameters' names */
+    int paramCount;
+    bool builtin;              /* a built-in's text: its type parameters are single capital letters */
+} Shaper;
+
+static void shapeSpaces(Shaper* s) {
+    while (*s->p == ' ') s->p++;
+}
+
+static bool shapeEat(Shaper* s, const char* word) {
+    shapeSpaces(s);
+    size_t n = strlen(word);
+    if (strncmp(s->p, word, n)) return false;
+    s->p += n;
+    return true;
+}
+
+static size_t shapeWord(Shaper* s) {
+    shapeSpaces(s);
+    size_t n = 0;
+    for (;; n++) { /* geo.Point: a dot inside a name (not "Any...") */
+        char c = s->p[n];
+        bool letter = ((c | 32) >= 'a' && (c | 32) <= 'z') || c == '_';
+        if (!letter && !(n && c >= '0' && c <= '9') && !(n && c == '.' && ((s->p[n + 1] | 32) >= 'a' && (s->p[n + 1] | 32) <= 'z'))) break;
+    }
+    return n;
+}
+
+static void shapeUnion(Shaper* s, QkBuf* out);
+
+static void shapeList(Shaper* s, QkBuf* out, char close) { /* "(A, B)" after its opening: [shape, shape] */
+    qkBufByte(out, '[');
+    for (int i = 0; !shapeEat(s, close == ')' ? ")" : close == ']' ? "]" : ">") && *s->p; i++) {
+        if (i) qkBufPuts(out, ", ");
+        const char* at = s->p;
+        size_t n = shapeWord(s);
+        if (n && s->p[n] == ':' && close == ')') s->p += n + 1; /* (loud: Bool) -> Text: the name is not the type */
+        else s->p = at;
+        shapeUnion(s, out);
+        shapeEat(s, ",");
+        if (s->p == at) break;
+    }
+    qkBufByte(out, ']');
+}
+
+static void shapeFn(Shaper* s, QkBuf* out, bool effect) { /* after "(": params, then -> returns */
+    qkBufPuts(out, "{\"kind\": \"fn\", \"params\": ");
+    shapeList(s, out, ')');
+    qkBufPuts(out, ", \"returns\": ");
+    if (shapeEat(s, "->")) shapeUnion(s, out);
+    else qkBufPuts(out, "{\"kind\": \"nothing\"}");
+    if (effect) qkBufPuts(out, ", \"effect\": true");
+    qkBufByte(out, '}');
+}
+
+static void shapeOne(Shaper* s, QkBuf* out) {
+    QkBuf base = {0};
+    shapeSpaces(s);
+    if (shapeEat(s, "[")) {
+        QkBuf first = {0};
+        shapeUnion(s, &first);
+        if (shapeEat(s, ":")) {
+            qkBufPrintf(&base, "{\"kind\": \"map\", \"key\": %s, \"element\": ", first.data);
+            shapeUnion(s, &base);
+            qkBufByte(&base, '}');
+        } else {
+            qkBufPrintf(&base, "{\"kind\": \"array\", \"element\": %s}", first.data);
+        }
+        qkBufFree(&first);
+        shapeEat(s, "]");
+    } else if (shapeEat(s, "effect (") || shapeEat(s, "effect fn(")) {
+        shapeFn(s, &base, true);
+    } else if (shapeEat(s, "fn(") || shapeEat(s, "fn (")) {
+        shapeFn(s, &base, false);
+    } else if (shapeEat(s, "(")) { /* (A, B) -> R, or the tuple (A, B) */
+        const char* at = s->p;
+        QkBuf items = {0};
+        shapeList(s, &items, ')');
+        shapeSpaces(s);
+        if (!strncmp(s->p, "->", 2)) {
+            s->p = at;
+            shapeFn(s, &base, false);
+        } else {
+            qkBufPrintf(&base, "{\"kind\": \"tuple\", \"items\": %s}", items.data);
+        }
+        qkBufFree(&items);
+    } else if (shapeEat(s, "an enum") || shapeEat(s, "a case")) {
+        qkBufPuts(&base, "{\"kind\": \"enum\"}");
+    } else if (shapeEat(s, "a lambda")) {
+        qkBufPuts(&base, "{\"kind\": \"fn\", \"params\": [], \"returns\": {\"kind\": \"any\"}}");
+    } else if (shapeEat(s, "a range of ")) {
+        qkBufPuts(&base, "{\"kind\": \"range\", \"element\": ");
+        shapeOne(s, &base);
+        qkBufByte(&base, '}');
+    } else if (shapeEat(s, "a loop of ")) {
+        qkBufPuts(&base, "{\"kind\": \"loop\", \"element\": ");
+        shapeOne(s, &base);
+        qkBufByte(&base, '}');
+    } else {
+        size_t n = shapeWord(s);
+        char name[96];
+        snprintf(name, sizeof name, "%.*s", (int)(n < sizeof name ? n : sizeof name - 1), s->p);
+        s->p += n;
+        static const char* const plain[][2] = {{"Int", "int"}, {"Float", "float"}, {"Bool", "bool"}, {"Text", "text"},
+                                               {"Any", "any"}, {"Never", "never"}, {"nothing", "nothing"}, {"", "any"}};
+        bool done = false;
+        for (size_t i = 0; i < sizeof plain / sizeof plain[0] && !done; i++)
+            if (!strcmp(name, plain[i][0])) {
+                qkBufPrintf(&base, "{\"kind\": \"%s\"}", plain[i][1]);
+                done = true;
+            }
+        bool param = s->builtin && n == 1 && name[0] >= 'A' && name[0] <= 'Z';
+        for (int i = 0; i < s->paramCount; i++) param |= !strcmp(s->params[i], name);
+        if (done) {
+        } else if (!strcmp(name, "Number")) {
+            qkBufPuts(&base, "{\"kind\": \"param\", \"name\": \"Number\", \"oneOf\": [{\"kind\": \"int\"}, {\"kind\": \"float\"}]}");
+        } else if (!strcmp(name, "Loop") && shapeEat(s, "<")) {
+            qkBufPuts(&base, "{\"kind\": \"loop\", \"element\": ");
+            shapeUnion(s, &base);
+            shapeEat(s, ">");
+            qkBufByte(&base, '}');
+        } else if (param) {
+            qkBufPrintf(&base, "{\"kind\": \"param\", \"name\": \"%s\"}", name);
+        } else {
+            qkBufPrintf(&base, "{\"kind\": \"named\", \"name\": \"%s\"", name);
+            if (shapeEat(s, "<")) {
+                qkBufPuts(&base, ", \"args\": ");
+                shapeList(s, &base, '>');
+            }
+            qkBufByte(&base, '}');
+        }
+    }
+    for (;;) { /* T? T! T!ParseError */
+        if (*s->p == '?' || *s->p == '!') {
+            bool optional = *s->p++ == '?';
+            QkBuf wrapped = {0};
+            qkBufPrintf(&wrapped, "{\"kind\": \"%s\", \"element\": %s", optional ? "optional" : "result", base.data);
+            if (!optional && shapeWord(s)) {
+                qkBufPuts(&wrapped, ", \"error\": ");
+                shapeOne(s, &wrapped);
+            }
+            qkBufByte(&wrapped, '}');
+            qkBufFree(&base);
+            base = wrapped;
+        } else {
+            break;
+        }
+    }
+    qkBufAdd(out, base.data, base.len);
+    qkBufFree(&base);
+}
+
+static void shapeUnion(Shaper* s, QkBuf* out) {
+    QkBuf first = {0};
+    shapeOne(s, &first);
+    shapeSpaces(s);
+    if (*s->p != '|') {
+        qkBufAdd(out, first.data, first.len);
+        qkBufFree(&first);
+        return;
+    }
+    qkBufPrintf(out, "{\"kind\": \"oneOf\", \"options\": [%s", first.data);
+    qkBufFree(&first);
+    while (shapeEat(s, "|")) {
+        qkBufPuts(out, ", ");
+        shapeOne(s, out);
+    }
+    qkBufPuts(out, "]}");
+}
+
+/* ", \"key\": {shape}" for a type's text */
+static void shapeField(QkBuf* out, const char* key, const char* text, const char* const* params, int paramCount, bool builtin) {
+    Shaper s = {text ? text : "", params, paramCount, builtin};
+    qkBufPrintf(out, ", \"%s\": ", key);
+    if (!text || !*text) qkBufPuts(out, "{\"kind\": \"nothing\"}");
+    else shapeUnion(&s, out);
+}
+
+/* A built-in's pins from its text ("source: Loop<T>, f: fn(T, Int) -> U"): name, shape, and whether it is a var
+ * ("(a var)"), may be left out ("(may be left out)") or takes any number of values ("Any..."). */
+static void builtinPins(QkBuf* out, const char* params) {
+    qkBufPuts(out, ", \"pins\": [");
+    Shaper s = {params, NULL, 0, true};
+    for (int i = 0; *s.p; i++) {
+        shapeSpaces(&s);
+        size_t n = strcspn(s.p, ":");
+        if (!s.p[n]) break;
+        qkBufPuts(out, i ? ", {\"name\": " : "{\"name\": ");
+        char name[64];
+        snprintf(name, sizeof name, "%.*s", (int)(n < sizeof name ? n : sizeof name - 1), s.p);
+        jsonText(out, name);
+        s.p += n + 1;
+        qkBufPuts(out, ", \"shape\": ");
+        shapeUnion(&s, out);
+        if (shapeEat(&s, "...")) qkBufPuts(out, ", \"variadic\": true");
+        if (shapeEat(&s, "(a var)")) qkBufPuts(out, ", \"mutable\": true");
+        if (shapeEat(&s, "(may be left out)")) qkBufPuts(out, ", \"optional\": true");
+        qkBufPuts(out, "}");
+        if (!shapeEat(&s, ",")) break;
+    }
+    qkBufPuts(out, "]");
+}
+
 static void typeExprText(const TypeExpr* t, QkBuf* b) {
     QkBuf s = {0};
     qkFormatTypeExpr(t, &s);
@@ -683,21 +962,24 @@ static void declEntry(QkBuf* out, const Decl* d, bool checked, bool* first) {
             jsonText(out, d->params[k].name);
             qkBufPuts(out, ", \"type\": ");
             typeExprText(d->params[k].type, out);
+            QkBuf t = {0};
+            if (d->params[k].type) qkFormatTypeExpr(d->params[k].type, &t);
+            shapeField(out, "shape", t.data, d->typeParams, d->typeParamCount, false);
+            qkBufFree(&t);
             qkBufPuts(out, "}");
         }
         qkBufPuts(out, "]");
     }
     if (d->kind == D_FN) {
-        if (checked && d->retType) {
-            QkBuf r = {0};
-            if (d->retType->kind != TY_VOID) qkTypeName(d->retType, &r);
+        QkBuf r = {0}; /* as written (Pair<B, A>), else as the checker found it */
+        if (d->ret) qkFormatTypeExpr(d->ret, &r);
+        else if (checked && d->retType && d->retType->kind != TY_VOID) qkTypeName(d->retType, &r);
+        if ((checked && d->retType) || d->ret) {
             qkBufPuts(out, ", \"returns\": ");
             jsonText(out, r.data ? r.data : "");
-            qkBufFree(&r);
-        } else if (d->ret) {
-            qkBufPuts(out, ", \"returns\": ");
-            typeExprText(d->ret, out);
+            shapeField(out, "result", r.data, d->typeParams, d->typeParamCount, false);
         }
+        qkBufFree(&r);
     }
     qkBufPuts(out, "}");
 }
@@ -715,6 +997,8 @@ char* qkCatalog(QkVm* vm, const char* text, size_t len) {
         jsonText(&out, n->params);
         qkBufPuts(&out, ", \"returns\": ");
         jsonText(&out, n->returns);
+        builtinPins(&out, n->params);
+        shapeField(&out, "result", n->returns, NULL, 0, true);
         qkBufPuts(&out, ", \"doc\": ");
         jsonText(&out, n->doc);
         qkBufPuts(&out, "}");

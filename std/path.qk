@@ -1,6 +1,7 @@
 // Paths as text: joined, taken apart and normalized. Both / and \ separate parts, and a drive (C:) or a
 // leading separator makes a path absolute; the paths given back use /, and windowsPath turns them to \.
-// b after a, with one separator between; an absolute b stands alone
+//
+// joinPath(a, b): b after a, with one separator between; an absolute b stands alone
 pub fn joinPath(a: Text, b: Text) -> Text {
     if a == "" or isAbsolute(b) {
         return b

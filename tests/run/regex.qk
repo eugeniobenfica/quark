@@ -1,0 +1,33 @@
+// std.regex: patterns that match text, found, found all, and replaced.
+use std.regex
+
+fn show(m: Match?) -> Text = match m {
+    Some(x) => "{x.start}..{x.end} \"{x.text}\" [" + join(x.groups, ", ") + "]"
+    None => "none"
+}
+
+fn check(p: Text) -> Text = match regex(p) {
+    Ok(r) => "ok: {r.pattern}"
+    Err(why) => why
+}
+
+fn main() {
+    let cases = [("a+b", "xxaabyab"), ("colou?r", "the color and colour"), ("^\\d\{3\}-\\d\{4\}$", "555-1234"), ("[a-c]+", "zzabcabz"), ("[^a-z ]+", "hello WORLD 42"), ("(\\w+)@(\\w+)\\.com", "write to ana@mail.com today"), ("<.+>", "<a><b>"), ("<.+?>", "<a><b>"), ("(?:ab)+", "xabababy"), ("cat|dog|bird", "hotdog"), ("\\bis\\b", "this island is"), ("x*", "abc"), ("(a)|(b)", "b"), ("é+", "caféé!"), ("a\{2,3\}", "aaaa"), ("a\{2,\}", "caaaaat"), ("\\s+$", "trailing   "), ("[\\d.]+", "pi is 3.14"), ("a.c", "a\nc abc")]
+    for c in cases {
+        let (p, text) = c
+        let r = regex(p)?
+        print(p, "|", show(r.find(text)))
+    }
+    let word = regex("[A-Za-z]+")?
+    print(word.findAll("one, two; three!").map(m => m.text), word.matches("hello"), word.matches("hello!"))
+    print(regex("a*")?.findAll("baaac").map(m => "{m.start}:{m.text}"))
+    let date = regex("(\\d\{4\})-(\\d\{2\})-(\\d\{2\})")?
+    print(date.replaceAll("from 2026-11-13 to 2027-01-02", "$3/$2/$1"), date.replaceAll("2026-11-13", "$$$0"))
+    print(word.replaceEach("make it loud", m => upper(m.text)), regex(",\\s*")?.split("a, b,c,   d"))
+    print(show(regex("(a|ab)(c|bcd)(d*)")?.find("abcd")), regex("^$")?.matches(""), regex("^a|b$")?.findAll("ab").len())
+    let slow = regex("(a*)*b")?
+    print(slow.matches(repeat("a", 5000)), slow.matches(repeat("a", 5000) + "b"))
+    for bad in ["a(b", "a)b", "[abc", "*a", "a\{3,1\}", "x\\", "[z-a]", "[\\D]", "^*"] {
+        print(bad, "|", check(bad))
+    }
+}

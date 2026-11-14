@@ -115,6 +115,18 @@ if "$Q" graph examples/host/item.qk $P > "$tmp/g.json" && "$Q" text "$tmp/g.json
 if "$Q" catalog - $P | grep -q '"name": "moveBy", "kind": "extern fn", "host": true'; then ok; else bad "catalog"; fi
 "$Q" fmt examples/host/app.qk > "$tmp/a.qk"
 if cmp -s examples/host/app.qk "$tmp/a.qk"; then ok; else bad "app.qk is not in canonical form"; fi
+# WebAssembly: the programs and the panics built with --target wasm32, run by Node.js or a headless Edge / Chrome
+# (tests/wasm/run.sh; skipped when there is none)
+bash tests/wasm/run.sh "$Q" > "$tmp/wasm.txt" 2>&1
+if grep -q '^wasm: skipped' "$tmp/wasm.txt"; then
+    tail -1 "$tmp/wasm.txt"
+else
+    pass=$((pass + $(grep -c '^PASS' "$tmp/wasm.txt")))
+    if grep -q '^FAIL' "$tmp/wasm.txt" || ! grep -q '^wasm: .* 0 failed' "$tmp/wasm.txt"; then
+        fail=$((fail + 1))
+        grep -v '^PASS' "$tmp/wasm.txt" | head -20
+    fi
+fi
 rm -rf "$tmp"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

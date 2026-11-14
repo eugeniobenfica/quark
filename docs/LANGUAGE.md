@@ -864,6 +864,7 @@ repository. `quark catalog` lists every node an editor can offer.
 | --- | --- |
 | `quark run file.qk [-- args]` | compile to machine code in memory and run it |
 | `quark build file.qk [-o out]` | a standalone executable |
+| `quark build file.qk --target wasm32 [-o file.wasm]` | a WebAssembly module, and `file.js` beside it: its loader and runtime. `node file.js [args]` runs it; in a page, `Quark.run(bytes, {write(fd, bytes), args, files, host})` gives a promise of its exit status (`files`: `{path: text}` it can read, in memory; `host`: its `extern fn`s). Panics say what the native ones say. Not yet: tasks and the debugger; `parallelMap` runs on one thread, and memory is given back only when the program ends |
 | `quark test file.qk` | run its tests |
 | `quark fmt file.qk [--write]` | the canonical text |
 | `quark check file.qk` | only the errors |
@@ -890,5 +891,5 @@ Written in Quark, in `std/`, kept inside the compiler (`use std.name`, no file n
 ## Not yet
 
 - Small arrays (`[Byte]`, `[Float32]`), SIMD for `map`, `fold` across threads.
-- A WebAssembly backend.
+- Tasks on WebAssembly (`spawn`, `step`, `yield`, `wait`), and loops that give memory back there.
 - Windows on ARM (`quark object` and the backend's Windows ARM64 calls).

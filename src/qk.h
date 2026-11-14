@@ -704,6 +704,10 @@ void* qkRelocTarget(int kind, int64_t target, uint8_t* data, void* const* hosts)
 bool qkGenCode(const IrProgram* p, MachineCode* out);
 bool qkGenX64(const IrProgram* p, MachineCode* out);
 bool qkGenArm64(const IrProgram* p, MachineCode* out);
+/* WebAssembly (wasm.c): a module from the same IR (its runtime imported from a JavaScript loader), and quark build
+ * --target wasm32's files: the module and the loader beside it (outPath: the .wasm, NULL: next to path). */
+bool qkGenWasm(const IrProgram* p, const char* path, int64_t fuel, QkBuf* out);
+bool qkBuildWasm(const IrProgram* p, const char* path, int64_t fuel, const char* outPath);
 enum { QK_ARCH_X64, QK_ARCH_ARM64 };
 enum { QK_OS_WINDOWS, QK_OS_LINUX, QK_OS_MACOS };
 extern int qkTargetArch, qkTargetOs;

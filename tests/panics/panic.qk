@@ -1,0 +1,6 @@
+// panic: 7 is odd
+fn half(n: Int) -> Int = if n % 2 == 0 { n / 2 } else { panic("{n} is odd") }
+
+fn main() {
+    print(half(7))
+}

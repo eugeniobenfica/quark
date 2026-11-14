@@ -1,0 +1,5 @@
+// panic: too big for an Int
+fn main() {
+    let x = 1e300
+    print(toInt(x * 10))
+}

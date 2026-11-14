@@ -1,0 +1,27 @@
+// An item's behavior: each event is a function the host calls.
+// The item's own variables are a record: start gives the first one, tick the next.
+type Mover { speed: Float, rounds: Int }
+
+fn start(item: Item) -> Mover {
+    setColor(item, 0.9, 0.7, 0.2, 1.0)
+    note(item, "ready")
+    Mover(speed: 120, rounds: 0)
+}
+
+fn tick(item: Item, mover: Mover, dt: Float) -> Mover {
+    let at = position(item)
+    if at.x > 300 {
+        moveTo(item, Point(0, at.y))
+        return Mover(speed: mover.speed * 1.5, rounds: mover.rounds + 1)
+    }
+    let boost = if flag("fast") { 2 } else { 1 }
+    moveBy(item, mover.speed * boost * dt, 0)
+    mover
+}
+
+fn meet(item: Item, other: Item) {
+    if other != item {
+        note(item, "met")
+        delete(other)
+    }
+}

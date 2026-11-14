@@ -1,5 +1,5 @@
 // error: a lambda cannot have any
-effect fn shout(x: Int) -> Int {
+fn shout(x: Int) -> Int {
     print(x)
     x
 }

@@ -1,0 +1,8 @@
+// error: Rock cannot be a Speaker: it needs fn Rock.speak
+type Rock { weight: Int }
+
+type Speaker { fn speak() -> Text }
+
+fn main() {
+    let s: Speaker = Rock(3)
+}

@@ -1,0 +1,6 @@
+// error: unknown name "square"
+use lib.hidden
+
+fn main() {
+    print(square(2.0))
+}

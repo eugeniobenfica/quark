@@ -1,0 +1,10 @@
+{
+ "main/total": {"value": "3", "hits": 4},
+ "main/start": {"value": "Point(x: 1, y: 2)", "hits": 1},
+ "main/i": {"value": "2", "hits": 3},
+ "scale/p": {"value": "Point(x: 1, y: 2)", "hits": 1},
+ "scale/k": {"value": "10", "hits": 1},
+ "scale/bigger": {"value": "Point(x: 10, y: 20)", "hits": 1},
+ "main/moved": {"value": "Point(x: 10, y: 20)", "hits": 1},
+ "main/name": {"value": "quark", "hits": 1}
+}

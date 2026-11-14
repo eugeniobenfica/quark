@@ -1,0 +1,4 @@
+// error: countBy: the lambda gives Float, which cannot be a map's key
+fn main() {
+    print([1.5, 2.5].countBy(x => x))
+}

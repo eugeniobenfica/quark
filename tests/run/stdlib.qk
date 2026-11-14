@@ -1,0 +1,18 @@
+// The standard library, written in Quark and kept in the compiler: math (vectors), and JSON read and written.
+use std.math
+use std.json
+
+fn main() {
+    let a = Vec2(3, 4)
+    let b = Vec2(1, 0).rotated(pi / 2)
+    print(a.length(), (a + b * 2).length(), a.normalized(), Vec3(1, 0, 0).cross(Vec3(0, 1, 0)))
+    let text = "\{\"name\": \"Ana\", \"age\": 31, \"tags\": [\"a\", \"b\n\"], \"ok\": true, \"none\": null, \"pi\": 3.5\}"
+    match parseJson(text) {
+        Ok(j) => {
+            print(toJson(j))
+            print(j.field("name")?.text() ?? "?", j.field("age")?.number() ?? 0)
+        }
+        Err(why) => print(why)
+    }
+    print(parseJson("[1, 2,"), parseJson("\{\"a\" 1\}"), toJson(Json.List([Json.Num(1), Json.Str("x\"y")])))
+}

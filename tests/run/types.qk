@@ -1,0 +1,42 @@
+// Functions of a type, operators through them, == on records, text and files.
+type Money { cents: Int }
+type Line { item: Text, price: Money }
+enum Suit { Hearts, Spades }
+
+fn Money.plus(self, b: Money) -> Money = Money(self.cents + b.cents)
+
+fn Money.minus(self, b: Money) -> Money = Money(self.cents - b.cents)
+
+fn Money.times(self, count: Int) -> Money = Money(self.cents * count)
+
+fn Money.negate(self) -> Money = Money(-self.cents)
+
+fn Money.show(self) -> Text = "{self.cents / 100}.{self.cents % 100 / 10}{self.cents % 10}"
+
+fn Suit.color(self) -> Text = match self {
+    Hearts => "red"
+    Spades => "black"
+}
+
+fn main() {
+    let lines = [Line("tea", Money(250)), Line("cake", Money(475)), Line("tea", Money(250))]
+    var total = Money(0)
+    for line in lines {
+        total += line.price
+    }
+    let doubled = total * 2
+    print(total.show(), doubled.show(), (doubled - total).show(), (-total).cents, show(Money(5)))
+    print(lines[0] == lines[2], lines[0] != lines[1], Money(1) == Money(1), Suit.Hearts.color())
+    let sum = lines.map(l => l.price).fold(Money(0), (acc, m) => acc + m)
+    print(sum == total, sum)
+    let csv = "name,score\nana, 7\nbia,x\ncarla,10\n"
+    var scores = 0
+    for row in split(trim(csv), "\n") {
+        let cells = split(row, ",")
+        scores += parseInt(trim(cells[1])) ?? 0
+    }
+    print(scores, split("  many   words here ", ""), parseFloat("1e3"), parseFloat("1.5.2"), parseInt("-12"))
+    let path = "build/types-test.txt"
+    print(writeFile(path, csv), (readFile(path) ?? "") == csv, readFile("build/no/such/file") ?? "none")
+    print(len(args()))
+}

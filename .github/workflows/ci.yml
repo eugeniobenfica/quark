@@ -1,0 +1,31 @@
+# Builds Quark and runs every test on real Linux and macOS (Intel) machines, where the System V calling
+# convention is the platform's own, and on Windows.
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build.sh
+      - run: bash tests/run.sh
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc diffutils
+      - run: ./build.sh
+      - run: bash tests/run.sh

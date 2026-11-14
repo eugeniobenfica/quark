@@ -1,0 +1,128 @@
+// The general-purpose pieces: patterns, let ... else, results and ?, slices, maps, formats, order, generics and
+// functions that take functions.
+type Version { major: Int, minor: Int }
+enum Grade { A, B, C, F }
+
+fn Version.compare(self, b: Version) -> Int = if self.major != b.major {
+    self.major - b.major
+} else {
+    self.minor - b.minor
+}
+
+fn grade(score: Int) -> Grade = match score {
+    90.. => Grade.A
+    75..90 => Grade.B
+    50..75 => Grade.C
+    _ => Grade.F
+}
+
+fn command(line: Text) -> Text = match trim(line) {
+    "quit" => "bye"
+    "help" => "commands: help, quit"
+    _ => "unknown: {line}"
+}
+
+fn describe(x: Int?) -> Text = match x {
+    Some(n) if n < 0 => "negative"
+    Some(n) if n == 0 => "zero"
+    Some(n) => "positive {n}"
+    None => "nothing"
+}
+
+fn parseVersion(text: Text) -> Version! {
+    let parts = split(text, ".")
+    if len(parts) != 2 {
+        return Err("expected major.minor, found \"{text}\"")
+    }
+    let major = parseInt(parts[0]) ?? -1
+    let minor = parseInt(parts[1]) ?? -1
+    if major < 0 or minor < 0 {
+        return Err("not numbers: {text}")
+    }
+    Version(major, minor)
+}
+
+fn newest(texts: [Text]) -> Version! {
+    var best = Version(0, 0)
+    for t in texts {
+        let v = parseVersion(t)?
+        if v > best {
+            best = v
+        }
+    }
+    best
+}
+
+fn firstWord(t: Text) -> Text? {
+    let Some(w) = first(words(t)) else {
+        return None
+    }
+    upper(w[0..1]) + w[1..]
+}
+
+fn largest<T>(xs: [T], better: (T, T) -> Bool) -> T? {
+    var best: T? = None
+    for x in xs {
+        let Some(b) = best else {
+            best = x
+            continue
+        }
+        if better(x, b) {
+            best = x
+        }
+    }
+    best
+}
+
+fn swapPair<A, B>(a: A, b: B, join: (B, A) -> Text) -> Text = join(b, a)
+
+fn applyTwice(f: (Int) -> Int, x: Int) -> Int = f(f(x))
+
+fn wordCounts(text: Text) -> [Text: Int] {
+    var counts: [Text: Int] = [:]
+    for w in words(lower(text)) {
+        counts[w] = (counts[w] ?? 0) + 1
+    }
+    counts
+}
+
+fn main() {
+    print([95, 80, 60, 10].map(grade), grade(90).index())
+    print(command("quit"), command(" help "), command("dance"))
+    print(describe(Some(-3)), describe(Some(0)), describe(Some(7)), describe(None))
+    print(parseVersion("1.12"), parseVersion("1"), parseVersion("a.b"))
+    print(newest(["1.2", "1.10", "0.9"]), newest(["1.2", "x"]))
+    print(newest(["2.0"]) ?? Version(0, 0), firstWord("  hello world"), firstWord("   "))
+    let xs = [5, 3, 9, 1, 7]
+    print(xs[1..3], xs[..2], xs[3..], "quark"[1..3], sort(xs), reverse(xs), xs)
+    let versions = [Version(1, 10), Version(1, 2), Version(0, 9)]
+    print(sort(versions), Version(1, 2) < Version(1, 10), sortBy(["ccc", "a", "bb"], t => len(t)))
+    print(largest(xs, (a, b) => a > b), largest(["pear", "fig", "banana"], (a, b) => len(a) > len(b)))
+    let k = 10
+    print(applyTwice(x => x * k, 3), applyTwice(x => x + 1, 0), swapPair(1, "one", (b, a) => "{b}={a}"))
+    let counts = wordCounts("the cat and the hat and THE end")
+    print(counts, len(counts), counts["the"], counts["dog"], contains(counts, "cat"))
+    var ages = ["ana": 31, "bia": 27]
+    ages["caio"] = 40
+    ages["ana"] = 32
+    ages.remove("bia")
+    for name, age in ages {
+        print(name, age)
+    }
+    print(keys(ages), values(ages), ages)
+    let pi = 3.14159
+    print("{pi:.2}|{7:4}|{pi:8.3}|{"ab":5}|{42:.1}")
+    let text = "one two  three\nfour\r\nfive\n"
+    print(words(text), lines(text), chars("añb"), len(chars("añb")))
+    print(contains("quark", "ar"), indexOf("quark", "rk"), indexOf("quark", "z"), startsWith("quark", "qu"), endsWith("quark", "rk"))
+    print(replace("a-b-c", "-", "+"), repeat("ab", 3), join(["x", "y", "z"], ", "), upper("MiXed"), lower("MiXed"))
+    print(contains(xs, 9), indexOf(xs, 1), first(xs), last(xs), first(xs, x => x > 5), last(xs, x => x < 5))
+    print(count(xs, x => x % 2 == 1), minBy(["pear", "fig"], t => len(t)), maxBy(versions, v => v.minor), first([0][1..]))
+    let ok: Int! = 5
+    let failed: Int! = Err("no")
+    print(ok, failed, ok ?? 0, failed ?? -1)
+    let a = [1, 2, 3]
+    var b = a
+    b[0] = 100
+    print(a, b)
+}

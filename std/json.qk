@@ -1,0 +1,188 @@
+// JSON: a value of any shape, read from text and written back.
+pub enum Json {
+    Null
+    Bool(b: Bool)
+    Num(n: Float)
+    Str(s: Text)
+    List(items: [Json])
+    Object(fields: [Text: Json])
+}
+
+// the text, as JSON's value, or why it is not JSON
+pub fn parseJson(text: Text) -> Json! {
+    let cs = chars(text)
+    let (value, at) = readValue(cs, skip(cs, 0))?
+    let end = skip(cs, at)
+    if end < len(cs) {
+        return Err("JSON: \"{cs[end]}\" after the value, at character {end}")
+    }
+    value
+}
+
+// the value as JSON text, on one line
+pub fn toJson(j: Json) -> Text = match j {
+    Null => "null"
+    Bool(b) => if b { "true" } else { "false" }
+    Num(n) => if n == floor(n) and abs(n) < 1e15 { "{floor(n)}" } else { "{n}" }
+    Str(s) => quote(s)
+    List(items) => "[" + items.map(toJson).toArray().join(",") + "]"
+    Object(fields) => "\{" + fields.map(e => quote(e.key) + ":" + toJson(e.value)).toArray().join(",") + "\}"
+}
+
+// a field of an object, or None
+pub fn Json.field(self, name: Text) -> Json? = match self {
+    Object(fields) => fields[name]
+    _ => None
+}
+
+// the number in it, or None
+pub fn Json.number(self) -> Float? = match self {
+    Num(n) => n
+    _ => None
+}
+
+// the text in it, or None
+pub fn Json.text(self) -> Text? = match self {
+    Str(s) => s
+    _ => None
+}
+
+fn quote(s: Text) -> Text {
+    var out = "\""
+    for c in chars(s) {
+        out = out + (match c {
+            "\"" => "\\\""
+            "\\" => "\\\\"
+            "\n" => "\\n"
+            "\t" => "\\t"
+            "\r" => "\\r"
+            _ => c
+        })
+    }
+    out + "\""
+}
+
+fn skip(cs: [Text], from: Int) -> Int {
+    var i = from
+    while i < len(cs) and (cs[i] == " " or cs[i] == "\n" or cs[i] == "\t" or cs[i] == "\r") {
+        i += 1
+    }
+    i
+}
+
+fn readValue(cs: [Text], at: Int) -> (Json, Int)! {
+    if at >= len(cs) {
+        return Err("JSON: the text ends where a value should be")
+    }
+    let c = cs[at]
+    if c == "\{" {
+        return readObject(cs, at + 1)
+    }
+    if c == "[" {
+        return readList(cs, at + 1)
+    }
+    if c == "\"" {
+        let (s, next) = readText(cs, at + 1)?
+        return (Json.Str(s), next)
+    }
+    if word(cs, at, "true") {
+        return (Json.Bool(true), at + 4)
+    }
+    if word(cs, at, "false") {
+        return (Json.Bool(false), at + 5)
+    }
+    if word(cs, at, "null") {
+        return (Json.Null, at + 4)
+    }
+    readNumber(cs, at)
+}
+
+fn word(cs: [Text], at: Int, w: Text) -> Bool =
+    at + len(w) <= len(cs) and join(cs[at..at + len(w)], "") == w
+
+fn readNumber(cs: [Text], at: Int) -> (Json, Int)! {
+    var i = at
+    while i < len(cs) and contains("-+0123456789.eE", cs[i]) {
+        i += 1
+    }
+    let digits = join(cs[at..i], "")
+    let Some(n) = parseFloat(digits) else {
+        return Err("JSON: \"{if i < len(cs) { cs[i] } else { digits }}\" is not a value, at character {at}")
+    }
+    (Json.Num(n), i)
+}
+
+fn readText(cs: [Text], from: Int) -> (Text, Int)! {
+    var out = ""
+    var i = from
+    while i < len(cs) and cs[i] != "\"" {
+        if cs[i] == "\\" and i + 1 < len(cs) {
+            i += 1
+            out = out + (match cs[i] {
+                "n" => "\n"
+                "t" => "\t"
+                "r" => "\r"
+                _ => cs[i]
+            })
+        } else {
+            out = out + cs[i]
+        }
+        i += 1
+    }
+    if i >= len(cs) {
+        return Err("JSON: a text that never ends, from character {from - 1}")
+    }
+    (out, i + 1)
+}
+
+fn readList(cs: [Text], from: Int) -> (Json, Int)! {
+    var items: [Json] = []
+    var i = skip(cs, from)
+    if i < len(cs) and cs[i] == "]" {
+        return (Json.List(items), i + 1)
+    }
+    while true {
+        let (item, next) = readValue(cs, skip(cs, i))?
+        items.push(item)
+        i = skip(cs, next)
+        if i < len(cs) and cs[i] == "," {
+            i += 1
+        } else {
+            break
+        }
+    }
+    if i >= len(cs) or cs[i] != "]" {
+        return Err("JSON: a list without its ], at character {i}")
+    }
+    (Json.List(items), i + 1)
+}
+
+fn readObject(cs: [Text], from: Int) -> (Json, Int)! {
+    var fields: [Text: Json] = [:]
+    var i = skip(cs, from)
+    if i < len(cs) and cs[i] == "\}" {
+        return (Json.Object(fields), i + 1)
+    }
+    while true {
+        if i >= len(cs) or cs[i] != "\"" {
+            return Err("JSON: a field's name in quotes, at character {i}")
+        }
+        let (name, afterName) = readText(cs, i + 1)?
+        i = skip(cs, afterName)
+        if i >= len(cs) or cs[i] != ":" {
+            return Err("JSON: a : after \"{name}\", at character {i}")
+        }
+        let (value, next) = readValue(cs, skip(cs, i + 1))?
+        fields[name] = value
+        i = skip(cs, next)
+        if i < len(cs) and cs[i] == "," {
+            i = skip(cs, i + 1)
+        } else {
+            break
+        }
+    }
+    if i >= len(cs) or cs[i] != "\}" {
+        return Err("JSON: an object without its \}, at character {i}")
+    }
+    (Json.Object(fields), i + 1)
+}

@@ -1,0 +1,17 @@
+// Random numbers: seeded, so the same every run; randomInt's end is not included.
+fn main() {
+    seedRandom(42)
+    var rolls: [Int] = []
+    for i in 0..10 {
+        rolls.push(randomInt(1, 7))
+    }
+    var counts = fill(6, 0)
+    var sum = 0.0
+    for i in 0..60_000 {
+        counts[randomInt(0, 6)] += 1
+        sum += random()
+    }
+    print(rolls, counts.all(c => c > 9_000 and c < 11_000), sum / 60_000 > 0.49 and sum / 60_000 < 0.51)
+    seedRandom(42)
+    print(randomInt(1, 7) == rolls[0])
+}

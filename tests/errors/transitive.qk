@@ -1,0 +1,6 @@
+// error: unknown name "pi"
+use lib.middle
+
+fn main() {
+    print(pi)
+}

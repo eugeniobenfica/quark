@@ -1,0 +1,6 @@
+// error: Point has no +: write fn Point.plus
+type Point { x: Float, y: Float }
+
+fn main() {
+    print(Point(1, 2) + Point(3, 4))
+}

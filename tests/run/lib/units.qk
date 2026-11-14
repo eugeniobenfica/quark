@@ -1,0 +1,3 @@
+pub const pi = 3.14159
+
+pub const unitName = "m"

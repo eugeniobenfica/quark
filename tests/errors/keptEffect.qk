@@ -1,0 +1,8 @@
+// error: print has effects: this lambda's type says it has none
+fn main() {
+    let f: (Int) -> Int = x => {
+        print(x)
+        x
+    }
+    print(f(1))
+}

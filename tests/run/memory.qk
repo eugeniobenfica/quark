@@ -1,0 +1,57 @@
+// Loops that make garbage on every turn: what their vars hold survives each collection, the rest goes.
+type Entry { name: Text, tags: [Text], score: Int }
+enum Shape { Dot, Label(text: Text), Path(points: [Int]) }
+
+fn label(i: Int) -> Text = "item-{i}"
+
+fn grow(n: Int) -> [Text] {
+    var out: [Text] = []
+    for i in 0..n {
+        out.push("{label(i)}/{i * i}")
+    }
+    out
+}
+
+fn main() {
+    var entries: [Entry] = []
+    var latest = Entry("none", [], 0)
+    var shape = Shape.Dot
+    var byFirst: [Text: [Int]] = [:]
+    var shared = "shared text, many times"
+    var parts: [Text] = []
+    var turns = 0
+    for round in 0..40 {
+        var inner = ""
+        for i in 0..5000 {
+            let t = "{round}:{i}:" + repeat("x", i % 7)
+            inner = t[0..min(len(t), 6)]
+            turns += 1
+        }
+        let e = Entry(label(round), [inner, shared, "{round % 3}"], round * 10)
+        entries.push(e)
+        latest = e with { score: e.score + 1 }
+        shape = if round % 2 == 0 {
+            Shape.Label("round {round}")
+        } else {
+            Shape.Path([round, round + 1, round + 2])
+        }
+        let key = "r{round % 4}"
+        byFirst[key] = (byFirst[key] ?? []).map(x => x + 1).toArray()
+        var list = byFirst[key] ?? []
+        list.push(round)
+        byFirst[key] = list
+        if round % 10 == 0 {
+            shared = "shared now {round}"
+            parts = grow(round + 1)
+        }
+    }
+    var text = ""
+    var n = 0
+    while n < 200_000 {
+        text = "n is {n}"
+        n += 1
+    }
+    print(turns, len(entries), entries[0], entries[39].tags, latest)
+    print(shape, byFirst, len(parts), parts[30], text)
+    print(entries.map(e => e.score).sum(), entries.all(e => len(e.tags) == 3), sort(keys(byFirst)))
+}

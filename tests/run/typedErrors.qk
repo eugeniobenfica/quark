@@ -1,0 +1,41 @@
+// Results whose error is a type of its own: an enum the caller takes apart, passed on by ?.
+enum ParseError { Empty, NotANumber(text: Text), TooBig(n: Int) }
+
+fn parseAge(t: Text) -> Int!ParseError {
+    if len(trim(t)) == 0 {
+        return Err(ParseError.Empty)
+    }
+    let Some(n) = parseInt(trim(t)) else {
+        return Err(ParseError.NotANumber(t))
+    }
+    if n > 150 {
+        return Err(ParseError.TooBig(n))
+    }
+    n
+}
+
+fn sumAges(texts: [Text]) -> Int!ParseError {
+    var total = 0
+    for t in texts {
+        total += parseAge(t)?
+    }
+    total
+}
+
+fn explain(e: ParseError) -> Text = match e {
+    Empty => "nothing written"
+    NotANumber(t) => "\"{t}\" is not a number"
+    TooBig(n) => "{n} is too old"
+}
+
+fn main() {
+    print(parseAge("42"), parseAge(""), parseAge("x"), parseAge("200"))
+    for input in [["1", "2"], ["1", "abc"], ["3", "999"]] {
+        match sumAges(input) {
+            Ok(n) => print("total", n)
+            Err(e) => print("error:", explain(e))
+        }
+    }
+    let plain: Int! = Err("a message, as before")
+    print(plain, parseAge("7") ?? 0, parseAge("-") == Err(ParseError.NotANumber("-")))
+}

@@ -1,0 +1,10 @@
+// error: this match may miss some values
+enum Shape { Circle(r: Float), Empty }
+
+fn f(s: Shape?) -> Int = match s {
+    Some(Circle(_)) => 1
+    None => 0
+}
+
+fn main() {
+}

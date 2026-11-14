@@ -1,0 +1,22 @@
+[Grade.A, Grade.B, Grade.C, Grade.F] 0
+bye commands: help, quit unknown: dance
+negative zero positive 7 nothing
+Ok(Version(major: 1, minor: 12)) Err(expected major.minor, found "1") Err(not numbers: a.b)
+Ok(Version(major: 1, minor: 10)) Err(expected major.minor, found "x")
+Version(major: 2, minor: 0) Some(Hello) None
+[3, 9] [5, 3] [1, 7] ua [1, 3, 5, 7, 9] [7, 1, 9, 3, 5] [5, 3, 9, 1, 7]
+[Version(major: 0, minor: 9), Version(major: 1, minor: 2), Version(major: 1, minor: 10)] true [a, bb, ccc]
+Some(9) Some(banana)
+300 2 one=1
+[the: 3, cat: 1, and: 2, hat: 1, end: 1] 5 Some(3) None true
+ana 32
+caio 40
+[ana, caio] [32, 40] [ana: 32, caio: 40]
+3.14|   7|   3.142|   ab|42.0
+[one, two, three, four, five] [one two  three, four, five] [a, ñ, b] 3
+true Some(3) None true true
+a+b+c ababab x, y, z MIXED mixed
+true Some(3) Some(5) Some(7) Some(9) Some(1)
+5 fig Version(major: 1, minor: 10) None
+Ok(5) Err(no) 5 -1
+[1, 2, 3] [100, 2, 3]

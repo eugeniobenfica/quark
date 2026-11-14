@@ -1,0 +1,12 @@
+// An Int's bits: & | ^ ~ << >> (>> keeps the sign; a count is taken modulo 64); << >> & bind like *, | ^ like +.
+type Box<T> { item: T }
+
+fn bits(x: Int, n: Int) -> [Int] =
+    [x & 12, x | 3, x ^ 5, x << n, x >> n, ~x, -x >> 1, 1 << 63, x << 65]
+
+fn main() {
+    let t: Box<Box<Int>> = Box(Box(3))
+    print(bits(10, 2), 6 & 3 == 2, 1 + 2 << 3, t.item.item)
+    let k = 200
+    print(k & 255, k >> 4, k << 2 | 1)
+}

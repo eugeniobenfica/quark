@@ -1,0 +1,6 @@
+// error: Int has no function speak: talk<Int> needs fn Int.speak
+fn talk<T>(x: T) -> Text = x.speak()
+
+fn main() {
+    print(talk(3))
+}

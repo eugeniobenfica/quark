@@ -1,0 +1,14 @@
+{"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {"textDocumentSync": 1, "hoverProvider": true, "definitionProvider": true, "documentSymbolProvider": true, "documentFormattingProvider": true, "completionProvider": {}, "referencesProvider": true, "renameProvider": true, "inlayHintProvider": true, "signatureHelpProvider": {"triggerCharacters": ["(", ","]}}, "serverInfo": {"name": "quark"}}}
+{"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": "file:///work/demo.qk", "diagnostics": [{"range": {"start": {"line": 1, "character": 16}, "end": {"line": 1, "character": 17}}, "severity": 1, "source": "quark", "message": "arithmetic needs numbers, not Int and Bool"}]}}
+{"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": "file:///work/demo.qk", "diagnostics": []}}
+{"jsonrpc": "2.0", "id": 2, "result": {"contents": {"kind": "markdown", "value": "```quark\nlet total: Int\n```"}}}
+{"jsonrpc": "2.0", "id": 3, "result": {"contents": {"kind": "markdown", "value": "```quark\nfn square(x: Int) -> Int\n```"}}}
+{"jsonrpc": "2.0", "id": 4, "result": {"uri": "file:///work/demo.qk", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9}}}}
+{"jsonrpc": "2.0", "id": 5, "result": [{"name": "square", "kind": 12, "location": {"uri": "file:///work/demo.qk", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9}}}}, {"name": "main", "kind": 12, "location": {"uri": "file:///work/demo.qk", "range": {"start": {"line": 2, "character": 3}, "end": {"line": 2, "character": 7}}}}]}
+{"jsonrpc": "2.0", "id": 8, "result": [{"uri": "file:///work/demo.qk", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9}}}, {"uri": "file:///work/demo.qk", "range": {"start": {"line": 3, "character": 16}, "end": {"line": 3, "character": 22}}}]}
+{"jsonrpc": "2.0", "id": 9, "result": {"changes": {"file:///work/demo.qk": [{"range": {"start": {"line": 3, "character": 8}, "end": {"line": 3, "character": 13}}, "newText": "sum"}, {"range": {"start": {"line": 4, "character": 10}, "end": {"line": 4, "character": 15}}, "newText": "sum"}]}}}
+{"jsonrpc": "2.0", "id": 10, "result": [{"position": {"line": 3, "character": 13}, "label": ": Int", "kind": 1}]}
+{"jsonrpc": "2.0", "id": 11, "result": {"signatures": [{"label": "fn square(x: Int) -> Int", "parameters": [{"label": "x: Int"}]}], "activeSignature": 0, "activeParameter": 0}}
+{"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": "file:///work/demo.qk", "diagnostics": []}}
+{"jsonrpc": "2.0", "id": 6, "result": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 4, "character": 0}}, "newText": "fn main() {\n    print(1 + 2)\n}\n"}]}
+{"jsonrpc": "2.0", "id": 7, "result": null}

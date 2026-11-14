@@ -1,8 +1,14 @@
-// error: print has effects (it changes the world): write effect fn greet
-fn greet() {
-    print("hi")
+// error: even has effects: a lambda cannot have any
+fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
+
+fn odd(n: Int) -> Bool {
+    if n == 0 {
+        print("bottom")
+        return false
+    }
+    even(n - 1)
 }
 
 fn main() {
-    greet()
+    print([1, 2].map(n => even(n)).toArray())
 }

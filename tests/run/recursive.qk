@@ -1,0 +1,58 @@
+// Types that hold themselves: trees, lists, expressions; and == on optionals and cases with data.
+enum Expr { Num(v: Int), Add(a: Expr, b: Expr), Mul(a: Expr, b: Expr), Neg(e: Expr) }
+
+fn eval(e: Expr) -> Int = match e {
+    Num(v) => v
+    Add(a, b) => eval(a) + eval(b)
+    Mul(a, b) => eval(a) * eval(b)
+    Neg(x) => -eval(x)
+}
+
+fn show(e: Expr) -> Text = match e {
+    Num(v) => "{v}"
+    Add(a, b) => "({show(a)} + {show(b)})"
+    Mul(a, b) => "{show(a)} * {show(b)}"
+    Neg(x) => "-{show(x)}"
+}
+
+enum List { Nil, Cons(head: Int, tail: List) }
+
+fn sumList(l: List) -> Int = match l {
+    Nil => 0
+    Cons(h, t) => h + sumList(t)
+}
+
+type Node { value: Text, next: Node? }
+
+fn chain(n: Node?) -> Text = match n {
+    None => "end"
+    Some(x) => x.value + " -> " + chain(x.next)
+}
+
+fn main() {
+    let e = Expr.Add(Expr.Num(2), Expr.Mul(Expr.Num(3), Expr.Neg(Expr.Num(4))))
+    print(show(e), "=", eval(e))
+    print(e)
+    var l = List.Nil
+    for i in 0..300000 {
+        l = List.Cons("{i}".len(), l)
+    }
+    print(sumList(List.Cons(1, List.Cons(2, List.Nil))))
+    let n = Node("a", Node("b", Node("c", None)))
+    print(chain(n))
+    var m = n
+    m.next = Node("z", None)
+    print(chain(m), chain(n))
+    print(n)
+    let x: Int? = Some(3)
+    print(x == None, x == 3, x != Some(4), None == x)
+    check()
+}
+
+enum Shape { Circle(radius: Float), Box(w: Float, h: Float), Empty }
+
+fn check() {
+    print(Shape.Circle(1) == Shape.Circle(1), Shape.Circle(1) == Shape.Circle(2), Shape.Box(1, 2) != Shape.Empty)
+    let r: Int! = Ok(2)
+    print(r == Ok(2), r == 2)
+}

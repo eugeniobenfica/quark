@@ -1,0 +1,20 @@
+// parallelMap: a pure function on every element, the elements shared out to the processor's threads.
+type Stat { n: Int, steps: Int }
+
+fn collatz(n: Int) -> Stat {
+    var x = n
+    var steps = 0
+    while x != 1 {
+        x = if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+        steps += 1
+    }
+    Stat(n, steps)
+}
+
+fn main() {
+    let stats = (1..200_001).parallelMap(collatz)
+    let longest = stats.maxBy(s => s.steps)
+    print(len(stats), longest)
+    let roots = [1.0, 4.0, 9.0, 16.0].parallelMap(x => sqrt(x) * 2)
+    print(roots, stats.map(s => s.steps).sum())
+}

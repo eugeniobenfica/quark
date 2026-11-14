@@ -1,0 +1,5 @@
+// panic: cuts a character in two
+fn main() {
+    let t = "ação"
+    print(t[0..2])
+}

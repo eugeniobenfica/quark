@@ -1,0 +1,5 @@
+// panic: mean of nothing (the list is empty)
+fn main() {
+    let xs: [Int] = []
+    print(xs.mean())
+}

@@ -1,28 +1,29 @@
-/* Quark — the embedding API: a C program (an engine, an editor) compiles Quark, calls it, gives it host
+/* Quark — the embedding API: any C program (an application, an editor, a server, a tool) compiles Quark, calls it, gives it host
  * functions, and turns programs into node graphs and back. Link build/libquark.a; nothing else is needed.
  *
  *   QkVm* vm = qkVmNew();
- *   qkVmPrelude(vm, "extern type Object\n"
- *                   "extern fn moveBy(o: Object, dx: Float, dy: Float)\n");
- *   qkVmHost(vm, "moveBy", (void*)moveBy);            // void moveBy(int64_t o, double dx, double dy)
- *   QkModule* m = qkCompile(vm, "ship.qk", text, len);
+ *   qkVmPrelude(vm, "extern type Item\n"
+ *                   "extern effect fn moveBy(i: Item, dx: Float, dy: Float)\n");
+ *   qkVmHost(vm, "moveBy", (void*)moveBy);            // void moveBy(int64_t i, double dx, double dy)
+ *   QkModule* m = qkCompile(vm, "item.qk", text, len);
  *   if (!m) for (int i = 0; i < qkDiagnosticCount(vm); i++) show(qkDiagnosticAt(vm, i));
- *   int update = qkFind(m, "update");                  // fn update(self: Object, dt: Float)
- *   QkValue args[2] = {{.i = objectId}, {.f = 1.0 / 60}};
- *   if (!qkCall(m, update, args, 2, NULL, 0)) log(qkLastError(vm));   // a panic never ends the host
+ *   int tick = qkFind(m, "tick");                      // fn tick(item: Item, dt: Float)
+ *   QkValue args[2] = {{.i = itemId}, {.f = 1.0 / 60}};
+ *   if (!qkCall(m, tick, args, 2, NULL, 0)) log(qkLastError(vm));   // a panic never ends the host
  *
  * Values cross as 8-byte slots (QkValue). A type takes as many slots as it has parts, in order:
  *   Int, Bool, an enum, an extern type ........ 1 (.i)        Float ..... 1 (.f)
- *   Vec2 / Vec3 / Vec4 ......................... 2 / 3 / 4 (.f) Text ...... 2 (.p the bytes, .i the length)
+ *   Text ....................................... 2 (.p the bytes, .i the length)
  *   [T] ........................................ 2 (.p the elements, .i the count; each element is T's slots)
  *   a record ................................... its fields' slots, one after the other
  *
  * Host functions (extern fn) are plain C functions: each slot is one argument (int64_t, or double for Float
  * slots); one result slot is returned as int64_t or double, several as a struct of slots returned by value
- * (the Windows x64 convention passes it through a hidden pointer, which Quark does).
+ * (Windows x64 passes it through a hidden pointer, System V in registers or through that pointer; Quark
+ * follows the platform's convention).
  *
- * One call at a time per process (the runtime's arena, budget and panic exit are shared). Memory a call
- * allocates (arrays it returns) stays valid until the next call. */
+ * One call at a time per process (the budget and the panic exit are shared). Each machine has its own
+ * memory: what a call allocates (arrays and texts it returns) stays valid until that machine's next call. */
 #ifndef QUARK_PUBLIC_H
 #define QUARK_PUBLIC_H
 
@@ -59,6 +60,21 @@ void qkVmFree(QkVm* vm);
 bool qkVmPrelude(QkVm* vm, const char* text);
 /* The C function behind `extern fn name`. Compiling a program that calls an extern with none fails. */
 void qkVmHost(QkVm* vm, const char* name, void* function);
+/* How `use name` reads name.qk (next to the program's name): the file system by default; a host may give its
+ * own reader, which returns malloc'd text (and its length) or NULL. */
+extern char* (*qkModuleReader)(const char* path, size_t* len);
+/* What the programs compiled from now on may call that reaches outside them (NULL, the default: everything).
+ * A list of names, by spaces or commas: host functions ("moveBy say"), all of a type's or a prefix's
+ * ("Object.*", "net*"), and the built-in groups print, files, env, args, exit, stdin, clock. A program that calls
+ * anything else does not compile: "moveBy is not given to this program". One machine per level of trust, or a
+ * list set before each qkCompile: a third-party plugin gets less than the application's own scripts. */
+void qkVmCapabilities(QkVm* vm, const char* list);
+/* Int + - * stop the call with a panic when they go past the limits (overflow), instead of wrapping around
+ * (false, the default: as fast as C's). For development builds, say. */
+void qkVmChecked(QkVm* vm, bool checked);
+/* At most this many bytes of memory for the machine's programs (0: no limit, the default); past it a call stops
+ * with "used more memory than it is given", and the host goes on. */
+void qkVmMemoryLimit(QkVm* vm, int64_t bytes);
 /* At most this many loop steps per call (0: no limit); past it a call stops with "ran too long". */
 void qkVmFuel(QkVm* vm, int64_t steps);
 /* 0: use AVX when the processor has it (the default); 1: never. */
@@ -88,6 +104,38 @@ const char* qkSlotKinds(const QkModule* m, int fn);
 /* Runs a function. False when it stopped (an index outside an array, a division by zero, the budget...):
  * qkLastError says why, and the host goes on. */
 bool qkCall(QkModule* m, int fn, const QkValue* args, int argSlots, QkValue* results, int resultSlots);
+
+/* A program compiled ahead of time (quark object file.qk -o file.o --symbol name), linked into the host: for
+ * platforms where nothing may be made executable while running (iOS, consoles). Declare it
+ *     extern QkStaticProgram name;
+ * and qkModuleStatic gives the module (its host functions from qkVmHost, as for qkCompile; NULL when one is
+ * missing: qkLastError says which). parallelMap runs on one thread there. */
+typedef struct QkStaticFn {
+    const char* name;
+    int64_t at, params, results;
+    const char* kinds;
+} QkStaticFn;
+typedef struct QkStaticProgram {
+    uint64_t magic;
+    const uint8_t* code;
+    int64_t codeLen, enter, escape;
+    void** table;
+    int64_t tableCount;
+    const int64_t* relocs; /* each table entry's kind and target */
+    uint8_t* data;
+    int64_t dataLen, fnCount;
+    const QkStaticFn* fns;
+    int64_t externCount;
+    const char* const* externs;
+} QkStaticProgram;
+QkModule* qkModuleStatic(QkVm* vm, QkStaticProgram* p);
+/* A function as a task (a coroutine: a long job, a conversation, a workflow that waits): it runs a step at a time,
+ * on a stack of its own. qkTaskResume runs it until it calls yield() or wait(seconds), or ends: 1 it gave its turn
+ * back (resume it when the host is ready), 0 it is done, -1 it stopped (qkLastError says why). It gives nothing. */
+typedef struct QkTaskHandle QkTaskHandle;
+QkTaskHandle* qkTaskStart(QkModule* m, int fn, const QkValue* args, int argSlots);
+int qkTaskResume(QkTaskHandle* t);
+void qkTaskEnd(QkTaskHandle* t);
 
 /* ---- text and graphs (malloc'd text, free with qkFree; NULL on errors, see the diagnostics) --------- */
 

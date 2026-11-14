@@ -1,0 +1,4 @@
+// error: write not x
+fn main() {
+    print(!true)
+}

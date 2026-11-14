@@ -1,0 +1,9 @@
+// panic: called from down at line 3
+// A panic names the calls it went through: real ones (recursion) and inlined ones.
+fn down(n: Int) -> Int = if n == 0 { ratio(n) } else { down(n - 1) + 1 }
+
+fn ratio(n: Int) -> Int = 100 / n
+
+fn main() {
+    print(down(2))
+}

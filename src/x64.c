@@ -1,13 +1,16 @@
-/* Quark — the x86-64 backend (Windows x64 calling convention for the runtime). No assembler, no linker:
- * instructions are encoded here, byte by byte.
+/* Quark — the x86-64 backend: Windows x64, or System V (Linux, macOS) for the calls into C. No assembler, no
+ * linker: instructions are encoded here, byte by byte.
  *
  * Registers: the most used virtual registers (loops weigh 8x per level) own a callee-saved register for the
- * whole function — rbx, rsi, rdi, r12-r15 for ints, xmm6-xmm15 for floats; the rest live in the frame.
+ * whole function — rbx, rsi, rdi, r12-r15 for ints, xmm6-xmm15 for floats (System V: rbx, r12-r15, and
+ * xmm8-xmm15, saved around calls into C, which may change every xmm); the rest live in the frame.
  * rax, rcx, rdx, r8-r11 and xmm0-xmm5 are scratch.
  *
  * Calls between Quark functions: arguments go to [rsp + 8i] of the caller (its outgoing area), the callee
  * reads them at [rbp + 16 + 8i] and writes its results there before returning; the caller reads them back.
- * Calls to the runtime follow Windows x64 (rcx, rdx, r8, r9 / xmm0-3, 32 bytes of shadow space). */
+ * Calls to the runtime and the host follow the platform: Windows x64 (rcx, rdx, r8, r9 / xmm0-3 by position,
+ * 32 bytes of shadow space), or System V (rdi, rsi, rdx, rcx, r8, r9 for ints and xmm0-7 for floats, each
+ * counted on its own). */
 #include "qk.h"
 
 #include <stdio.h>
@@ -24,6 +27,7 @@ typedef struct Cold {
     int at;      /* the rel32 of the jump to it */
     int code, line;
     int a, b;    /* registers to report (-1: none) */
+    int inl;     /* the inlined calls it is in */
 } Cold;
 
 typedef struct Gen {
@@ -50,7 +54,43 @@ typedef struct Gen {
     bool afterJump;   /* the last instruction was an unconditional jump */
     Fixup* callFixups;
     int callCount, callCap;
+    bool sysv;        /* System V calls into C */
+    int xmmFirst;     /* the first callee-saved xmm: 6 (Windows), 8 (System V) */
+    int* first;       /* each virtual register's first and last mention */
+    int* last;
+    int at;           /* the instruction being generated */
+    int spillBase;    /* System V: frame slots where live xmm registers wait out a call into C */
+    int fnIndex;      /* the function being generated */
+    int inl;          /* the instruction's inlined calls */
 } Gen;
+
+int qkAbi =
+#ifdef _WIN32
+    QK_ABI_WIN64;
+#else
+    QK_ABI_SYSV;
+#endif
+
+/* The processor and system the code is made for: the one quark runs on, unless quark object --target says */
+int qkTargetArch =
+#if defined(__aarch64__) || defined(_M_ARM64)
+    QK_ARCH_ARM64;
+#else
+    QK_ARCH_X64;
+#endif
+int qkTargetOs =
+#if defined(_WIN32)
+    QK_OS_WINDOWS;
+#elif defined(__APPLE__)
+    QK_OS_MACOS;
+#else
+    QK_OS_LINUX;
+#endif
+
+bool qkGenCode(const IrProgram* p, MachineCode* out) {
+    if (qkTargetArch == QK_ARCH_ARM64) return qkGenArm64(p, out);
+    return qkGenX64(p, out);
+}
 
 /* ---- encoding ------------------------------------------------------------------------------------ */
 
@@ -100,7 +140,8 @@ static void sseRM(Gen* g, int prefix, bool w, int op, int reg, int base, int32_t
 }
 
 static const uint8_t OP_MOV_LOAD[] = {0x8B}, OP_MOV_STORE[] = {0x89}, OP_ADD[] = {0x03}, OP_SUB[] = {0x2B},
-                     OP_IMUL[] = {0x0F, 0xAF}, OP_CMP[] = {0x3B}, OP_TEST[] = {0x85}, OP_XOR[] = {0x33};
+                     OP_IMUL[] = {0x0F, 0xAF}, OP_CMP[] = {0x3B}, OP_TEST[] = {0x85}, OP_XOR[] = {0x33},
+                     OP_AND[] = {0x23}, OP_OR[] = {0x0B};
 
 static void movRR(Gen* g, int dst, int src) {
     if (dst != src) rr(g, true, OP_MOV_LOAD, 1, dst, src);
@@ -121,6 +162,15 @@ static void movImm(Gen* g, int reg, int64_t v) {
 
 /* mov reg, imm64 with an address patched at load time */
 static void movReloc(Gen* g, int reg, int kind, int64_t target) {
+    if (qkObjectMode) { /* mov reg, [rip + disp32]: the address from the table (the object file's relocation) */
+        rex(g, true, reg, 0, 0, false);
+        byte(g, 0x8B);
+        byte(g, 0x05 | (reg & 7) << 3);
+        Reloc r = {here(g), kind, target};
+        QK_PUSH(g->mc->relocs, g->mc->relocCount, g->mc->relocCap, r);
+        i32(g, 0);
+        return;
+    }
     rex(g, true, 0, 0, reg, false);
     byte(g, 0xB8 | (reg & 7));
     Reloc r = {here(g), kind, target};
@@ -223,7 +273,7 @@ static void storeF(Gen* g, int v, int xmm) {
 static void aluWith(Gen* g, const uint8_t* op, int opLen, int reg, int v) {
     if (isK(g, v)) {
         int64_t k = kOf(g, v);
-        int digit = op[0] == 0x03 ? 0 : op[0] == 0x2B ? 5 : op[0] == 0x3B ? 7 : op[0] == 0x33 ? 6 : -1;
+        int digit = op[0] == 0x03 ? 0 : op[0] == 0x2B ? 5 : op[0] == 0x3B ? 7 : op[0] == 0x33 ? 6 : op[0] == 0x23 ? 4 : op[0] == 0x0B ? 1 : -1;
         if (!fits32(k) || (opLen == 1 && digit < 0)) { /* through a scratch register */
             movImm(g, R11, k);
             rr(g, true, op, opLen, reg, R11);
@@ -280,19 +330,95 @@ static void callRuntime(Gen* g, RtId id) {
     byte(g, 0xD0);
 }
 
-/* panic(code, line, a, b) — rax holds a, rdx holds b, set by the caller */
-static void panic(Gen* g, int code, int line) {
-    movRR(g, R8, RAX);
-    movRR(g, R9, RDX);
-    movImm(g, RCX, code);
-    movImm(g, RDX, line);
+/* The panic's frame, for its stack of calls: qkPanicFrame = rbp (through r11, which nothing here holds). */
+static void markPanicFrame(Gen* g) {
+    movReloc(g, R11, RELOC_PANIC_FRAME, 0);
+    rm(g, true, OP_MOV_STORE, 1, RBP, R11, 0);
+}
+
+/* panic(code, line, a, b) — rax holds a, rdx holds b, set by the caller; line carries the inlined calls above
+ * its 32 bits */
+static void panic(Gen* g, int code, int64_t line) {
+    markPanicFrame(g);
+    if (g->sysv) { /* rdi, rsi, rdx, rcx */
+        movRR(g, RCX, RDX);
+        movRR(g, RDX, RAX);
+        movImm(g, RDI, code);
+        movImm(g, RSI, line);
+    } else {
+        movRR(g, R8, RAX);
+        movRR(g, R9, RDX);
+        movImm(g, RCX, code);
+        movImm(g, RDX, line);
+    }
     callRuntime(g, RT_PANIC);
+}
+
+/* System V: C may change every xmm, so the callee-saved ones that hold a value still needed after the call
+ * wait in the frame. save: before the call (true), after it (false). */
+static void spillAcrossC(Gen* g, bool save) {
+    if (!g->sysv) return;
+    for (int v = 0; v < g->fn->vregCount; v++) {
+        if (g->home[v] < 16 + g->xmmFirst || g->first[v] >= g->at || g->last[v] <= g->at) continue;
+        int x = g->home[v] - 16;
+        int32_t disp = -(g->slotBase + 8 * (g->spillBase + x - g->xmmFirst + 1));
+        sseRM(g, 0xF2, false, save ? 0x11 : 0x10, x, RBP, disp); /* movsd */
+    }
+}
+
+/* The arguments of a call into C, from their homes to where the platform wants them. kinds: 'I' / 'F' per
+ * argument. hidden: System V, a pointer to room for the results goes first (in rdi). */
+static void cArguments(Gen* g, const int* args, int count, const char* kinds, int hiddenBuffer) {
+    static const int winGpr[] = {RCX, RDX, R8, R9};
+    static const int sysvGpr[] = {RDI, RSI, RDX, RCX, R8, R9};
+    if (!g->sysv) {
+        int hidden = hiddenBuffer >= 0 ? 1 : 0;
+        for (int i = 0; i < count; i++) { /* the stack ones first: they go through rax */
+            int pos = i + hidden;
+            if (pos < 4) continue;
+            loadBits(g, RAX, args[i]);
+            rm(g, true, OP_MOV_STORE, 1, RAX, RSP, 8 * pos);
+        }
+        for (int i = 0; i < count; i++) {
+            int pos = i + hidden;
+            if (pos >= 4) continue;
+            if (kinds[i] == 'F') loadF(g, pos, args[i]);
+            else loadBits(g, winGpr[pos], args[i]);
+        }
+        if (hidden) { /* lea rcx, [rsp + buffer] */
+            static const uint8_t LEA[] = {0x8D};
+            rm(g, true, LEA, 1, RCX, RSP, hiddenBuffer);
+        }
+        return;
+    }
+    int ints = hiddenBuffer >= 0 ? 1 : 0, floats = 0, stack = 0;
+    for (int i = 0; i < count; i++) { /* past the registers: on the stack, in order */
+        bool f = kinds[i] == 'F';
+        if (f ? floats++ < 8 : ints++ < 6) continue;
+        loadBits(g, RAX, args[i]);
+        rm(g, true, OP_MOV_STORE, 1, RAX, RSP, 8 * stack++);
+    }
+    ints = hiddenBuffer >= 0 ? 1 : 0;
+    floats = 0;
+    for (int i = 0; i < count; i++) {
+        if (kinds[i] == 'F') {
+            if (floats < 8) loadF(g, floats, args[i]);
+            floats++;
+        } else {
+            if (ints < 6) loadBits(g, sysvGpr[ints], args[i]);
+            ints++;
+        }
+    }
+    if (hiddenBuffer >= 0) { /* lea rdi, [rsp + buffer] */
+        static const uint8_t LEA[] = {0x8D};
+        rm(g, true, LEA, 1, RDI, RSP, hiddenBuffer);
+    }
 }
 
 static void coldJump(Gen* g, int cc, int code, int line, int a, int b) {
     byte(g, 0x0F);
     byte(g, 0x80 | cc);
-    Cold c = {here(g), code, line, a, b};
+    Cold c = {here(g), code, line, a, b, g->inl};
     QK_PUSH(g->cold, g->coldCount, g->coldCap, c);
     i32(g, 0);
 }
@@ -306,7 +432,7 @@ static void emitCold(Gen* g) {
         else rr(g, false, OP_XOR, 1, RAX, RAX);
         if (c->b >= 0) loadBits(g, RDX, c->b);
         else rr(g, false, OP_XOR, 1, RDX, RDX);
-        panic(g, c->code, c->line);
+        panic(g, c->code, c->line | (int64_t)c->inl << 32);
     }
     g->coldCount = 0;
 }
@@ -504,7 +630,7 @@ static bool leaFor(Gen* g, const IrIns* ins) {
 
 /* x = [m]; x = x + k; [m] = x, with x read nowhere else: add qword [m], k */
 static bool addToMemory(Gen* g, const IrIns* ld, const IrIns* add, const IrIns* st) {
-    if (ld->op != IR_LOAD || add->op != IR_ADD || st->op != IR_STORE) return false;
+    if (ld->op != IR_LOAD || add->op != IR_ADD || st->op != IR_STORE || add->cond) return false;
     int v = ld->dst;
     if (isFloat(g, v) || add->dst != v || add->a != v || st->dst != v || g->uses[v] != 2) return false;
     if (!isK(g, add->b) || kOf(g, add->b) < -128 || kOf(g, add->b) > 127) return false;
@@ -517,11 +643,19 @@ static bool addToMemory(Gen* g, const IrIns* ld, const IrIns* add, const IrIns* 
 }
 
 static void genIns(Gen* g, const IrIns* ins) {
+    g->inl = ins->inl;
     switch (ins->op) {
     case IR_CONST:
         if (isK(g, ins->dst)) break;
         if (ins->c == 1) {
             movReloc(g, RAX, 1, ins->imm);
+        } else if (ins->c == 2) { /* lea rax, [rip + function]: a function kept as a value */
+            byte(g, 0x48);
+            byte(g, 0x8D);
+            byte(g, 0x05);
+            Fixup fx = {here(g), (int)ins->imm};
+            QK_PUSH(g->callFixups, g->callCount, g->callCap, fx);
+            i32(g, 0);
         } else if (inReg(g, ins->dst) && !isFloat(g, ins->dst)) {
             movImm(g, gprOf(g, ins->dst), ins->imm);
             break;
@@ -541,12 +675,13 @@ static void genIns(Gen* g, const IrIns* ins) {
         }
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: {
-        if (leaFor(g, ins)) break;
+        if (!ins->cond && leaFor(g, ins)) break; /* lea sets no flags: a checked one is a real add */
         const uint8_t* op = ins->op == IR_ADD ? OP_ADD : ins->op == IR_SUB ? OP_SUB : OP_IMUL;
         int opLen = ins->op == IR_MUL ? 2 : 1;
         int d = inReg(g, ins->dst) && (!inReg(g, ins->b) || gprOf(g, ins->b) != gprOf(g, ins->dst)) ? gprOf(g, ins->dst) : RAX;
         loadBits(g, d, ins->a);
         aluWith(g, op, opLen, d, ins->b);
+        if (ins->cond) coldJump(g, CC_O, PANIC_OVERFLOW, ins->line, -1, -1); /* checked: past the limits */
         if (d == RAX) storeBits(g, ins->dst, RAX);
         break;
     }
@@ -597,6 +732,31 @@ static void genIns(Gen* g, const IrIns* ins) {
         land(g, exact);
         if (ins->op == IR_MOD) movRR(g, RAX, RDX);
         land(g, done);
+        storeBits(g, ins->dst, RAX);
+        break;
+    }
+    case IR_AND: case IR_OR: case IR_XOR: {
+        const uint8_t* op = ins->op == IR_AND ? OP_AND : ins->op == IR_OR ? OP_OR : OP_XOR;
+        int d = inReg(g, ins->dst) && (!inReg(g, ins->b) || gprOf(g, ins->b) != gprOf(g, ins->dst)) ? gprOf(g, ins->dst) : RAX;
+        loadBits(g, d, ins->a);
+        aluWith(g, op, 1, d, ins->b);
+        if (d == RAX) storeBits(g, ins->dst, RAX);
+        break;
+    }
+    case IR_SHL: case IR_SAR: { /* shl / sar rax, cl (or an immediate); the count modulo 64, as the processor takes it */
+        int digit = ins->op == IR_SHL ? 4 : 7;
+        loadBits(g, RAX, ins->a);
+        if (isK(g, ins->b)) {
+            rex(g, true, 0, 0, RAX, false);
+            byte(g, 0xC1);
+            byte(g, 0xC0 | digit << 3 | RAX);
+            byte(g, (int)(kOf(g, ins->b) & 63));
+        } else {
+            loadBits(g, RCX, ins->b);
+            rex(g, true, 0, 0, RAX, false);
+            byte(g, 0xD3);
+            byte(g, 0xC0 | digit << 3 | RAX);
+        }
         storeBits(g, ins->dst, RAX);
         break;
     }
@@ -694,6 +854,13 @@ static void genIns(Gen* g, const IrIns* ins) {
         if (x == 0) loadF(g, 0, ins->a);
         int d = inReg(g, ins->dst) ? gprOf(g, ins->dst) : RAX;
         sseRR(g, 0xF2, true, 0x2C, d, x); /* cvttsd2si d, x */
+        if (ins->cond) { /* too big or NaN give 0x8000000000000000, the one value d - 1 overflows on */
+            rex(g, true, 0, 0, d, false); /* cmp d, 1 */
+            byte(g, 0x83);
+            byte(g, 0xF8 | (d & 7));
+            byte(g, 1);
+            coldJump(g, CC_O, PANIC_TOO_BIG, ins->line, -1, -1);
+        }
         if (d == RAX) storeBits(g, ins->dst, RAX);
         break;
     }
@@ -757,12 +924,21 @@ static void genIns(Gen* g, const IrIns* ins) {
             loadBits(g, RAX, ins->args[i]);
             rm(g, true, OP_MOV_STORE, 1, RAX, RSP, 8 * i);
         }
-        byte(g, 0xE8);
-        {
+        if (ins->a >= 0) { /* call r11: a function kept as a value */
+            loadBits(g, R11, ins->a);
+            byte(g, 0x41);
+            byte(g, 0xFF);
+            byte(g, 0xD3);
+        } else {
+            byte(g, 0xE8);
             Fixup f = {here(g), (int)ins->imm};
             QK_PUSH(g->callFixups, g->callCount, g->callCap, f);
+            i32(g, 0);
         }
-        i32(g, 0);
+        {
+            CallSite s = {here(g), ins->line, g->fnIndex, (int32_t)ins->imm, ins->inl};
+            QK_PUSH(g->mc->sites, g->mc->siteCount, g->mc->siteCap, s);
+        }
         for (int i = 0; i < ins->retCount; i++) {
             rm(g, true, OP_MOV_LOAD, 1, RAX, RSP, 8 * i);
             storeBits(g, ins->rets[i], RAX);
@@ -770,54 +946,47 @@ static void genIns(Gen* g, const IrIns* ins) {
         break;
     case IR_RTCALL: {
         const RtFn* f = &qkRuntime[ins->imm];
-        static const int gprArgs[] = {RCX, RDX, R8, R9};
-        for (int i = 0; i < ins->argCount; i++) {
-            if (f->args[i] == 'F') loadF(g, i, ins->args[i]);
-            else loadBits(g, gprArgs[i], ins->args[i]);
-        }
+        if (ins->imm == RT_FAIL) markPanicFrame(g);
+        spillAcrossC(g, true);
+        cArguments(g, ins->args, ins->argCount, f->args, -1);
         callRuntime(g, (RtId)ins->imm);
         if (ins->retCount) {
             if (f->ret == 'F') storeF(g, ins->rets[0], 0);
             else storeBits(g, ins->rets[0], RAX);
         }
+        spillAcrossC(g, false);
         break;
     }
     case IR_HOSTCALL: {
-        /* Windows x64: argument i in rcx/rdx/r8/r9 or xmm0-3 by position, the fifth on at [rsp + 8i]; several
-         * results come back through a hidden first argument pointing at room after the arguments */
+        /* Windows x64: one result in rax / xmm0, several through a hidden first argument pointing at room after
+         * the arguments. System V: up to two slots in rax, rdx / xmm0, xmm1 (each in the next of its kind),
+         * more through the hidden pointer. */
         const IrExtern* x = &g->prog->externs[ins->imm];
-        static const int gprArgs[] = {RCX, RDX, R8, R9};
-        int hidden = ins->retCount > 1 ? 1 : 0;
+        int hidden = ins->retCount > (g->sysv ? 2 : 1) ? 1 : 0;
         int positions = ins->argCount + hidden;
         int buffer = 8 * (positions > 4 ? positions : 4);
-        for (int i = 0; i < ins->argCount; i++) { /* the stack ones first: they go through rax */
-            int pos = i + hidden;
-            if (pos < 4) continue;
-            loadBits(g, RAX, ins->args[i]);
-            rm(g, true, OP_MOV_STORE, 1, RAX, RSP, 8 * pos);
-        }
-        for (int i = 0; i < ins->argCount; i++) {
-            int pos = i + hidden;
-            if (pos >= 4) continue;
-            if (x->argKinds[i] == 'F') loadF(g, pos, ins->args[i]);
-            else loadBits(g, gprArgs[pos], ins->args[i]);
-        }
-        if (hidden) { /* lea rcx, [rsp + buffer] */
-            static const uint8_t LEA[] = {0x8D};
-            rm(g, true, LEA, 1, RCX, RSP, buffer);
-        }
+        spillAcrossC(g, true);
+        cArguments(g, ins->args, ins->argCount, x->argKinds, hidden ? buffer : -1);
         movReloc(g, RAX, RELOC_HOST, ins->imm);
         byte(g, 0xFF); /* call rax */
         byte(g, 0xD0);
         if (hidden) {
             for (int i = 0; i < ins->retCount; i++) {
-                rm(g, true, OP_MOV_LOAD, 1, RAX, RSP, buffer + 8 * i);
-                storeBits(g, ins->rets[i], RAX);
+                rm(g, true, OP_MOV_LOAD, 1, RCX, RSP, buffer + 8 * i);
+                storeBits(g, ins->rets[i], RCX);
+            }
+        } else if (g->sysv) {
+            int reg[2], ints = 0, floats = 0;
+            for (int i = 0; i < ins->retCount; i++) reg[i] = x->retKinds[i] == 'F' ? floats++ : ints++ ? RDX : RAX;
+            for (int i = ins->retCount - 1; i >= 0; i--) { /* the second first: xmm1 may be the first one's home */
+                if (x->retKinds[i] == 'F') storeF(g, ins->rets[i], reg[i]);
+                else storeBits(g, ins->rets[i], reg[i]);
             }
         } else if (ins->retCount) {
             if (x->retKinds[0] == 'F') storeF(g, ins->rets[0], 0);
             else storeBits(g, ins->rets[0], RAX);
         }
+        spillAcrossC(g, false);
         break;
     }
     case IR_RET:
@@ -949,11 +1118,14 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut, int* gprUsed, int* xm
         }
         order[j + 1] = v;
     }
-    /* a value no call crosses takes a volatile register first (nothing to save), the others a callee-saved one */
-    static const int regList[2][15] = {{R10, RBX, RSI, RDI, R12, R13, R14, R15},
+    /* a value no call crosses takes a volatile register first (nothing to save), the others a callee-saved one;
+     * System V: rsi and rdi carry C's arguments, and xmm6-7 too, so they hold nothing */
+    static const int winList[2][15] = {{R10, RBX, RSI, RDI, R12, R13, R14, R15},
                                        {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
+    static const int sysvList[2][15] = {{R10, RBX, R12, R13, R14, R15}, {1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15}};
+    const int(*regList)[15] = g->sysv ? sysvList : winList;
     static const int volatileCount[2] = {1, 5};
-    static const int poolSize[2] = {8, 15};
+    const int poolSize[2] = {g->sysv ? 6 : 8, g->sysv ? 13 : 15};
     bool* crosses = qkNew((size_t)n);
     for (int k = 0; k < f->count; k++) {
         if (f->code[k].op != IR_CALL && f->code[k].op != IR_RTCALL && f->code[k].op != IR_HOSTCALL) continue;
@@ -988,7 +1160,7 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut, int* gprUsed, int* xm
         int reg = regList[c][pick];
         g->home[v] = c ? 16 + reg : reg;
         if (pick >= volatileCount[c]) {
-            int saved = c ? reg - 6 + 1 : pick - volatileCount[c] + 1;
+            int saved = c ? reg - g->xmmFirst + 1 : pick - volatileCount[c] + 1;
             if (c && saved > *xmmUsed) *xmmUsed = saved;
             if (!c && saved > *gprUsed) *gprUsed = saved;
         }
@@ -996,13 +1168,19 @@ static void allocate(Gen* g, const IrFn* f, int* slotsOut, int* gprUsed, int* xm
     int slots = 0;
     for (int v = 0; v < f->vregCount; v++)
         if (g->home[v] == INT32_MIN) g->home[v] = -(++slots);
+    g->spillBase = slots;
+    if (g->sysv) slots += 8; /* xmm8-15 across calls into C */
     *slotsOut = slots;
+    g->first = first;
+    g->last = last;
 }
 
 static void genFn(Gen* g, const IrFn* f) {
     g->fn = f;
     g->home = qkNew(sizeof(int) * (size_t)(f->vregCount ? f->vregCount : 1));
-    static const int gprs[] = {RBX, RSI, RDI, R12, R13, R14, R15};
+    static const int winGprs[] = {RBX, RSI, RDI, R12, R13, R14, R15};
+    static const int sysvGprs[] = {RBX, R12, R13, R14, R15};
+    const int* gprs = g->sysv ? sysvGprs : winGprs;
     int slots, gprUsed, xmmUsed;
     allocate(g, f, &slots, &gprUsed, &xmmUsed);
     g->pushed = gprUsed;
@@ -1029,8 +1207,15 @@ static void genFn(Gen* g, const IrFn* f) {
     byte(g, 0x81);
     byte(g, 0xEC);
     i32(g, frame);
-    for (int i = 0; i < g->xmmCount; i++) { /* movups [rbp - xmmBase - 16i], xmm(6+i) */
-        int x = 6 + i;
+    bool calls = false;
+    for (int k = 0; k < f->count && !calls; k++) calls = f->code[k].op == IR_CALL;
+    if (calls) { /* too many calls deep (a function that calls itself without end): a panic, not a crash */
+        movReloc(g, R11, RELOC_STACK_LIMIT, 0);
+        rm(g, true, OP_CMP, 1, RSP, R11, 0);
+        coldJump(g, CC_B, PANIC_STACK, f->line, -1, -1);
+    }
+    for (int i = 0; i < g->xmmCount; i++) { /* movups [rbp - xmmBase - 16i], xmm(first + i) */
+        int x = g->xmmFirst + i;
         rex(g, false, x, 0, RBP, false);
         byte(g, 0x0F);
         byte(g, 0x11);
@@ -1074,6 +1259,7 @@ static void genFn(Gen* g, const IrFn* f) {
             g->afterJump = false;
             continue;
         }
+        g->at = k;
         genIns(g, &f->code[k]);
         int op = f->code[k].op;
         if (op != IR_LABEL) g->afterJump = op == IR_JMP || op == IR_RET;
@@ -1082,7 +1268,7 @@ static void genFn(Gen* g, const IrFn* f) {
     /* epilogue */
     g->labelAt[g->epilogue] = here(g);
     for (int i = 0; i < g->xmmCount; i++) {
-        int x = 6 + i;
+        int x = g->xmmFirst + i;
         rex(g, false, x, 0, RBP, false);
         byte(g, 0x0F);
         byte(g, 0x10);
@@ -1148,7 +1334,7 @@ static void genTrampoline(Gen* g) {
     rm(g, true, OP_MOV_LOAD, 1, RAX, R11, 0); /* the outer call's escape stack, kept */
     rm(g, true, OP_MOV_STORE, 1, RAX, RBP, -224);
     rm(g, true, OP_MOV_STORE, 1, RSP, R11, 0); /* ours */
-    movRR(g, RBX, RCX); /* e */
+    movRR(g, RBX, g->sysv ? RDI : RCX); /* e */
     /* the outgoing area: 8 bytes per slot (arguments or results, the larger), 32 at least, 16 aligned */
     rm(g, true, OP_MOV_LOAD, 1, RAX, RBX, 16);
     rm(g, true, OP_MOV_LOAD, 1, RDX, RBX, 32);
@@ -1232,10 +1418,13 @@ bool qkGenX64(const IrProgram* p, MachineCode* out) {
     g.mc = out;
     g.b = &out->code;
     g.prog = p;
+    g.sysv = qkAbi == QK_ABI_SYSV;
+    g.xmmFirst = g.sysv ? 8 : 6;
     g.fnAt = qkNew(sizeof(int) * (size_t)(p->count ? p->count : 1));
     for (int i = 0; i < p->count; i++) {
         while (g.b->len % 16) byte(&g, 0xCC);
         g.fnAt[i] = here(&g);
+        g.fnIndex = i;
         genFn(&g, &p->fns[i]);
     }
     genTrampoline(&g);
@@ -1246,5 +1435,48 @@ bool qkGenX64(const IrProgram* p, MachineCode* out) {
     out->fnCount = p->count;
     out->fnAt = qkNew(sizeof(int32_t) * (size_t)(p->count ? p->count : 1));
     for (int i = 0; i < p->count; i++) out->fnAt[i] = g.fnAt[i];
+    return true;
+}
+
+/* For testing the System V code on Windows: one stub per runtime function, called the System V way, which
+ * calls the function the Windows way. Its arguments wait in the stub's frame, then go where Windows wants
+ * them; rbx, rbp and r12-r15 are kept by both conventions, and everything else System V lets change. */
+bool qkGenSysvAdapters(QkBuf* out, int32_t* at) {
+    Gen g = {0};
+    g.b = out;
+    static const int sysvGpr[] = {RDI, RSI, RDX, RCX, R8, R9};
+    static const int winGpr[] = {RCX, RDX, R8, R9};
+    for (int id = 0; id < RT_COUNT; id++) {
+        const RtFn* f = &qkRuntime[id];
+        while (g.b->len % 16) byte(&g, 0xCC);
+        at[id] = here(&g);
+        if (!f->addr) continue;
+        byte(&g, 0x55); /* push rbp */
+        movRR(&g, RBP, RSP);
+        rex(&g, true, 0, 0, RSP, false); /* sub rsp, 176: 14 saved arguments, then the outgoing area */
+        byte(&g, 0x81);
+        byte(&g, 0xEC);
+        i32(&g, 176);
+        for (int i = 0; i < 6; i++) rm(&g, true, OP_MOV_STORE, 1, sysvGpr[i], RBP, -8 * (i + 1));
+        for (int i = 0; i < 8; i++) sseRM(&g, 0xF2, false, 0x11, i, RBP, -56 - 8 * (i + 1));
+        int ints = 0, floats = 0;
+        for (int i = 0; f->args[i]; i++) {
+            bool isF = f->args[i] == 'F';
+            int32_t from = isF ? -56 - 8 * (++floats) : -8 * (++ints);
+            if (i < 4) {
+                if (isF) sseRM(&g, 0xF2, false, 0x10, i, RBP, from);
+                else rm(&g, true, OP_MOV_LOAD, 1, winGpr[i], RBP, from);
+            } else {
+                rm(&g, true, OP_MOV_LOAD, 1, RAX, RBP, from);
+                rm(&g, true, OP_MOV_STORE, 1, RAX, RSP, 8 * i);
+            }
+        }
+        movImm(&g, RAX, (int64_t)(intptr_t)f->addr);
+        byte(&g, 0xFF); /* call rax */
+        byte(&g, 0xD0);
+        movRR(&g, RSP, RBP);
+        byte(&g, 0x5D); /* pop rbp */
+        byte(&g, 0xC3);
+    }
     return true;
 }

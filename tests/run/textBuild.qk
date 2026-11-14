@@ -1,0 +1,16 @@
+// A text built one piece at a time grows in place: a million pieces cost what a million bytes do.
+fn main() {
+    var s = ""
+    for i in 0..1_000_000 {
+        s = s + "x"
+    }
+    var t = "a"
+    let keep = t
+    t = t + "b"
+    let other = keep + "c" // keep is not the arena's top any more: a copy, and t stays "ab"
+    var u = ""
+    for w in ["one", "two", "three"] {
+        u = u + w + " "
+    }
+    print(len(s), t, keep, other, u + "!", s[0..3])
+}

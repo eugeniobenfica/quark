@@ -19,7 +19,7 @@ static bool pure(const IrIns* ins) {
     switch (ins->op) {
     case IR_CONST: case IR_MOV: case IR_ADD: case IR_SUB: case IR_MUL: case IR_NEG: case IR_FADD: case IR_FSUB: case IR_FMUL:
     case IR_FDIV: case IR_FNEG: case IR_SQRT: case IR_FMIN: case IR_FMAX: case IR_CMP: case IR_FCMP: case IR_NOT: case IR_I2F:
-    case IR_F2I: case IR_ROUND: case IR_LOAD:
+    case IR_F2I: case IR_ROUND: case IR_LOAD: case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SAR:
         return true;
     default:
         return false;
@@ -71,7 +71,8 @@ typedef struct Seen {
 } Seen;
 
 static bool commutative(int op) {
-    return op == IR_ADD || op == IR_MUL || op == IR_FADD || op == IR_FMUL || op == IR_FMIN || op == IR_FMAX;
+    return op == IR_ADD || op == IR_MUL || op == IR_FADD || op == IR_FMUL || op == IR_FMIN || op == IR_FMAX || op == IR_AND || op == IR_OR ||
+           op == IR_XOR;
 }
 
 static int resolve(const int* rename, int v) {
@@ -88,9 +89,9 @@ static void renameOperands(IrIns* ins, const int* rename) {
     for (int i = 0; i < ins->argCount; i++) ins->args[i] = resolve(rename, ins->args[i]);
 }
 
-/* In a straight run of code, the same pure computation on the same values is done once (p * 3 for three
- * loads of one pixel, say). Constants count by value, and a float constant is one register for the whole
- * function. Only registers set once are merged. */
+/* In a straight run of code, the same pure computation on the same values is done once (i * 3 for the
+ * three loads xs[i * 3], xs[i * 3 + 1] and xs[i * 3 + 2], say). Constants count by value, and a float constant
+ * is one register for the whole function. Only registers set once are merged. */
 static int addReg(IrFn* f, char kind) {
     if (f->vregCount == f->vregCap) {
         int cap = f->vregCap ? f->vregCap * 2 : 64;
@@ -107,7 +108,7 @@ static int addReg(IrFn* f, char kind) {
 }
 
 /* x % d by a constant (not a power of two) is x - x / d * d: then x / d nearby is shared, one multiplication
- * by d's magic number for both, as pixel % width and pixel / width are. */
+ * by d's magic number for both, as i % width and i / width are. */
 static void remainderFromQuotient(IrFn* f) {
     int n = f->vregCount ? f->vregCount : 1;
     int* defs = qkNew(sizeof(int) * (size_t)n);
@@ -121,7 +122,7 @@ static void remainderFromQuotient(IrFn* f) {
     int found = 0;
     for (int k = 0; k < f->count; k++) {
         const IrIns* ins = &f->code[k];
-        if (ins->op == IR_CONST && ins->c != 1 && f->kinds[ins->dst] == 'I' && defs[ins->dst] == 1) kv[ins->dst] = ins->imm;
+        if (ins->op == IR_CONST && ins->c < 1 && f->kinds[ins->dst] == 'I' && defs[ins->dst] == 1) kv[ins->dst] = ins->imm;
         else if (ins->op == IR_MOV && defs[ins->dst] == 1 && f->kinds[ins->dst] == 'I') kv[ins->dst] = kv[ins->a]; /* let d = 1000 */
         else if (ins->op == IR_MOD && ins->b >= 0 && kv[ins->b] > 1 && (kv[ins->b] & (kv[ins->b] - 1))) found++;
     }
@@ -169,7 +170,7 @@ static void commonSubexpressions(IrFn* f) {
     }
     for (int k = 0; k < f->count; k++) {
         const IrIns* ins = &f->code[k];
-        if (ins->op == IR_CONST && ins->c != 1 && defs[ins->dst] == 1) {
+        if (ins->op == IR_CONST && ins->c < 1 && defs[ins->dst] == 1) {
             isK[ins->dst] = 1;
             kv[ins->dst] = ins->imm;
         }
@@ -206,10 +207,15 @@ static void commonSubexpressions(IrFn* f) {
                 memcpy(&r, &v, 8);
                 break;
             }
-            case IR_ADD: fold = aK && bK; r = (int64_t)((uint64_t)x + (uint64_t)y); break;
-            case IR_SUB: fold = aK && bK; r = (int64_t)((uint64_t)x - (uint64_t)y); break;
-            case IR_MUL: fold = aK && bK; r = (int64_t)((uint64_t)x * (uint64_t)y); break;
+            case IR_ADD: fold = aK && bK && !(ins->cond && __builtin_add_overflow(x, y, &r)); r = (int64_t)((uint64_t)x + (uint64_t)y); break;
+            case IR_SUB: fold = aK && bK && !(ins->cond && __builtin_sub_overflow(x, y, &r)); r = (int64_t)((uint64_t)x - (uint64_t)y); break;
+            case IR_MUL: fold = aK && bK && !(ins->cond && __builtin_mul_overflow(x, y, &r)); r = (int64_t)((uint64_t)x * (uint64_t)y); break;
             case IR_NEG: fold = aK; r = (int64_t)(0 - (uint64_t)x); break;
+            case IR_AND: fold = aK && bK; r = x & y; break;
+            case IR_OR: fold = aK && bK; r = x | y; break;
+            case IR_XOR: fold = aK && bK; r = x ^ y; break;
+            case IR_SHL: fold = aK && bK; r = (int64_t)((uint64_t)x << (y & 63)); break;
+            case IR_SAR: fold = aK && bK; r = x >> (y & 63); break;
             default: fold = false;
             }
             if (fold) {
@@ -345,7 +351,7 @@ static void optimizeFn(IrFn* f) {
     for (int k = 0; k < f->paramCount; k++) defParam[f->params[k]] = true;
     for (int k = 0; k < f->count; k++) {
         IrIns* ins = &f->code[k];
-        if (ins->op != IR_CONST || ins->c == 1 || c.defs[ins->dst] != 1 || defParam[ins->dst]) continue;
+        if (ins->op != IR_CONST || ins->c >= 1 || c.defs[ins->dst] != 1 || defParam[ins->dst]) continue;
         if (f->kinds[ins->dst] == 'I') {
             f->isConst[ins->dst] = 1;
             f->constValue[ins->dst] = ins->imm;

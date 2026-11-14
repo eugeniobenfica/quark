@@ -1,0 +1,5 @@
+// error: a map's key is an Int, a Text, a Bool, an enum's case or a record of two Ints, not Float
+fn main() {
+    let m: [Float: Int] = [:]
+    print(m)
+}

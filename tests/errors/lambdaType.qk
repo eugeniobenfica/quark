@@ -1,0 +1,4 @@
+// error: needs its type written
+fn main() {
+    let f = x => x + 1
+}

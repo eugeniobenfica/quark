@@ -1,0 +1,7 @@
+// error: a type's function works on self, its first value: fn Point.scale(self, ...)
+type Point { x: Float, y: Float }
+
+fn Point.scale(k: Float, p: Point) -> Point = Point(p.x * k, p.y * k)
+
+fn main() {
+}

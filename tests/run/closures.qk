@@ -1,0 +1,34 @@
+// Closures: a lambda kept as a value takes the values of the names around it, as they are where it is made.
+type Button { label: Text, onPress: () -> Text }
+
+fn adder(k: Int) -> (Int) -> Int = x => x + k
+
+fn compose(f: (Int) -> Int, g: (Int) -> Int) -> (Int) -> Int = x => g(f(x))
+
+fn counterFrom(start: Int) -> () -> Int = () => start * 10
+
+fn makeButtons(names: [Text]) -> [Button] =
+    names.map(n => Button(n, () => "pressed {upper(n)}")).toArray()
+
+fn main() {
+    let add2 = adder(2)
+    print(add2(3), adder(10)(5))
+    let both = compose(adder(1), x => x * 100)
+    print(both(4))
+    var k = 5
+    let times = (x: Int) => x * k
+    k = 1000 // the lambda took k's value when it was made
+    let f: (Int) -> Int = times
+    print(f(2), counterFrom(7)())
+    for b in makeButtons(["ok", "cancel"]) {
+        print(b.label, b.onPress())
+    }
+    let scale = 3
+    let tripled = (1..200_001).parallelMap(x => x * scale)
+    print(tripled.sum())
+    var handlers: [(Int) -> Int] = []
+    for i in 0..3 {
+        handlers.push(x => x + i)
+    }
+    print(handlers.map(h => h(10)))
+}

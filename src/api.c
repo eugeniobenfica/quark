@@ -1,4 +1,4 @@
-/* Quark — the embedding API (include/quark.h): what an engine or an editor uses. It wraps the compiler
+/* Quark — the embedding API (include/quark.h): what a host application or an editor uses. It wraps the compiler
  * (parse, check, lower, optimize, x64), the loader and the trampoline, collects errors instead of printing
  * them, and frees the compiler's memory after every compile: a module keeps only its machine code and a
  * small table of its functions. */
@@ -15,13 +15,21 @@ typedef struct HostFn {
 
 struct QkVm {
     char* prelude;
+    char* capabilities; /* what the programs it compiles may call (NULL: everything) */
     HostFn* hosts;
     int hostCount, hostCap;
     int64_t fuel;
     bool noAvx;
+    bool checked;
     QkDiagnostic* diags;
     int diagCount, diagCap;
     char lastError[512];
+    QkArena* arena; /* the machine's own memory: its calls never touch another machine's values */
+};
+
+struct QkTaskHandle {
+    QkTask* task;
+    QkModule* module;
 };
 
 typedef struct ModFn {
@@ -92,7 +100,11 @@ static void fail(QkVm* vm, const char* fmt, const char* a) {
 
 /* ---- the machine --------------------------------------------------------------------------------- */
 
-QkVm* qkVmNew(void) { return calloc(1, sizeof(QkVm)); }
+QkVm* qkVmNew(void) {
+    QkVm* vm = calloc(1, sizeof(QkVm));
+    if (vm) vm->arena = qkArenaNew();
+    return vm;
+}
 
 void qkVmFree(QkVm* vm) {
     if (!vm) return;
@@ -100,6 +112,8 @@ void qkVmFree(QkVm* vm) {
     free(vm->hosts);
     free(vm->diags);
     free(vm->prelude);
+    free(vm->capabilities);
+    qkArenaFree(vm->arena);
     free(vm);
 }
 
@@ -118,7 +132,7 @@ static bool parseWithPrelude(QkVm* vm, const char* name, const char* text, size_
         if (!parseText("prelude", vm->prelude, strlen(vm->prelude), &prelude)) return false;
         qkAddPrelude(out, &prelude);
     }
-    return true;
+    return qkLoadUses(out, name); /* use geometry: geometry.qk next to the program's name (qkModuleReader reads it) */
 }
 
 bool qkVmPrelude(QkVm* vm, const char* text) {
@@ -130,6 +144,15 @@ bool qkVmPrelude(QkVm* vm, const char* text) {
     free(vm->prelude);
     vm->prelude = dupText(text);
     return vm->prelude != NULL;
+}
+
+void qkVmCapabilities(QkVm* vm, const char* list) {
+    free(vm->capabilities);
+    vm->capabilities = NULL;
+    if (!list) return;
+    size_t n = strlen(list);
+    vm->capabilities = malloc(n + 1);
+    if (vm->capabilities) memcpy(vm->capabilities, list, n + 1);
 }
 
 void qkVmHost(QkVm* vm, const char* name, void* function) {
@@ -151,6 +174,8 @@ void qkVmHost(QkVm* vm, const char* name, void* function) {
 }
 
 void qkVmFuel(QkVm* vm, int64_t steps) { vm->fuel = steps > 0 ? steps : 0; }
+void qkVmMemoryLimit(QkVm* vm, int64_t bytes) { qkArenaLimit(vm->arena, bytes); }
+void qkVmChecked(QkVm* vm, bool checked) { vm->checked = checked; }
 void qkVmNoAvx(QkVm* vm, bool noAvx) { vm->noAvx = noAvx; }
 int qkDiagnosticCount(const QkVm* vm) { return vm->diagCount; }
 const QkDiagnostic* qkDiagnosticAt(const QkVm* vm, int i) { return i >= 0 && i < vm->diagCount ? &vm->diags[i] : NULL; }
@@ -185,16 +210,21 @@ QkModule* qkCompile(QkVm* vm, const char* name, const char* text, size_t len) {
     if (!name) name = "program";
     begin(vm);
     Program prog;
-    if (!parseWithPrelude(vm, name, text, len, &prog) || !qkCheck(&prog, false)) {
+    qkCapabilities = vm->capabilities;
+    bool checked = parseWithPrelude(vm, name, text, len, &prog) && qkCheck(&prog, false);
+    qkCapabilities = NULL;
+    if (!checked) {
         end();
         return NULL;
     }
     qkUseAvx = !vm->noAvx && qkCpuHasAvx();
     IrProgram ir;
+    qkChecked = vm->checked;
     qkLower(&prog, &ir, vm->fuel > 0);
+    qkChecked = false;
     qkOptimize(&ir);
     MachineCode mc;
-    qkGenX64(&ir, &mc);
+    qkGenCode(&ir, &mc);
     void** hosts = qkNew(sizeof(void*) * (size_t)(ir.externCount ? ir.externCount : 1));
     for (int i = 0; i < ir.externCount; i++) {
         hosts[i] = hostFor(vm, ir.externs[i].name);
@@ -217,12 +247,13 @@ QkModule* qkCompile(QkVm* vm, const char* name, const char* text, size_t len) {
         end();
         return NULL;
     }
+    qkLoadTrace(&m->loaded, &mc, &ir); /* a panic names the functions it went through */
     m->vm = vm;
     m->name = dupText(name);
     m->fns = calloc((size_t)(ir.count ? ir.count : 1), sizeof(ModFn));
     for (int i = 0, k = 0; i < prog.count; i++) {
         Decl* d = prog.decls[i];
-        if (d->kind != D_FN || d->isExtern) continue;
+        if (d->kind != D_FN || d->isExtern || d->isTemplate || d->inlineOnly) continue; /* as qkLower: the IR's own */
         ModFn* f = &m->fns[m->count++];
         const IrFn* irf = &ir.fns[k];
         f->name = dupText(d->name);
@@ -291,6 +322,91 @@ int qkParamSlots(const QkModule* m, int fn) { return fnAt(m, fn) ? m->fns[fn].pa
 int qkResultSlots(const QkModule* m, int fn) { return fnAt(m, fn) ? m->fns[fn].results : -1; }
 const char* qkSlotKinds(const QkModule* m, int fn) { return fnAt(m, fn) ? m->fns[fn].kinds : NULL; }
 
+/* A script's function as a task: qkTaskResume runs it until it calls yield() or wait(), or ends. */
+QkTaskHandle* qkTaskStart(QkModule* m, int fn, const QkValue* args, int argSlots) {
+    QkVm* vm = m->vm;
+    const ModFn* f = fnAt(m, fn);
+    vm->lastError[0] = 0;
+    if (!f || argSlots != f->params || f->results) {
+        snprintf(vm->lastError, sizeof vm->lastError, "%s: a task runs a function that gives nothing, with its %d slots", m->name,
+                 f ? f->params : 0);
+        return NULL;
+    }
+    QkArena* savedArena = qkArenaUse(vm->arena);
+    QkTask* t = qkTaskNew(&m->loaded, m->loaded.code + f->at, (const uint64_t*)args, argSlots);
+    qkArenaUse(savedArena);
+    QkTaskHandle* h = t ? calloc(1, sizeof *h) : NULL;
+    if (h) {
+        h->task = t;
+        h->module = m;
+    }
+    return h;
+}
+
+int qkTaskResume(QkTaskHandle* h) {
+    if (!h) return -1;
+    QkVm* vm = h->module->vm;
+    int64_t savedFuel = qkFuel;
+    const char* savedPath = qkRunPath;
+    if (vm->fuel > 0) qkFuel = vm->fuel;
+    qkRunPath = h->module->name;
+    QkArena* savedArena = qkArenaUse(vm->arena);
+    int r = qkTaskStep(h->task);
+    qkArenaUse(savedArena);
+    qkFuel = savedFuel;
+    qkRunPath = savedPath;
+    if (r < 0) snprintf(vm->lastError, sizeof vm->lastError, "%s", qkTaskError(h->task));
+    return r;
+}
+
+void qkTaskEnd(QkTaskHandle* h) {
+    if (!h) return;
+    qkTaskFree(h->task);
+    free(h);
+}
+
+QkModule* qkModuleStatic(QkVm* vm, QkStaticProgram* p) {
+    vm->lastError[0] = 0;
+    if (!p || p->magic != 0x316B72617551ULL) {
+        snprintf(vm->lastError, sizeof vm->lastError, "not a program made by quark object");
+        return NULL;
+    }
+    void** hosts = calloc((size_t)(p->externCount ? p->externCount : 1), sizeof(void*));
+    for (int64_t i = 0; i < p->externCount; i++) {
+        for (int k = 0; k < vm->hostCount; k++)
+            if (!strcmp(vm->hosts[k].name, p->externs[i])) hosts[i] = vm->hosts[k].fn;
+        if (!hosts[i]) {
+            snprintf(vm->lastError, sizeof vm->lastError, "extern fn %s has no function in this host (qkVmHost)", p->externs[i]);
+            free(hosts);
+            return NULL;
+        }
+    }
+    for (int64_t i = 0; i < p->tableCount; i++) /* the addresses the code reads: data, not code, so this is allowed */
+        p->table[i] = qkRelocTarget((int)p->relocs[2 * i], p->relocs[2 * i + 1], p->data, hosts);
+    QkModule* m = calloc(1, sizeof *m);
+    m->vm = vm;
+    m->name = dupText("program");
+    m->loaded.code = (uint8_t*)p->code;
+    m->loaded.codeLen = (size_t)p->codeLen;
+    m->loaded.linked = true;
+    void* at = (uint8_t*)p->code + p->enter;
+    memcpy(&m->loaded.enter, &at, sizeof at);
+    at = (uint8_t*)p->code + p->escape;
+    memcpy(&m->loaded.escape, &at, sizeof at);
+    m->fns = calloc((size_t)(p->fnCount ? p->fnCount : 1), sizeof(ModFn));
+    for (int64_t i = 0; i < p->fnCount; i++) {
+        ModFn* f = &m->fns[m->count++];
+        f->name = dupText(p->fns[i].name);
+        f->signature = dupText(p->fns[i].name);
+        f->params = (int)p->fns[i].params;
+        f->results = (int)p->fns[i].results;
+        f->kinds = dupText(p->fns[i].kinds);
+        f->at = (int32_t)p->fns[i].at;
+    }
+    free(hosts);
+    return m;
+}
+
 bool qkCall(QkModule* m, int fn, const QkValue* args, int argSlots, QkValue* results, int resultSlots) {
     QkVm* vm = m->vm;
     const ModFn* f = fnAt(m, fn);
@@ -317,7 +433,9 @@ bool qkCall(QkModule* m, int fn, const QkValue* args, int argSlots, QkValue* res
     const char* savedPath = qkRunPath;
     if (vm->fuel > 0) qkFuel = vm->fuel;
     qkRunPath = m->name;
+    QkArena* savedArena = qkArenaUse(vm->arena);
     bool ok = qkRunEntry(&m->loaded, m->loaded.code + f->at, (const uint64_t*)args, argSlots, out, f->results);
+    qkArenaUse(savedArena);
     qkFuel = savedFuel;
     qkRunPath = savedPath;
     if (!ok) snprintf(vm->lastError, sizeof vm->lastError, "%s", qkPanicText);
@@ -408,31 +526,106 @@ static const BuiltinNode kBuiltins[] = {
     {"min", "Math", "a: Number, b: Number", "Number", "the smaller"},
     {"max", "Math", "a: Number, b: Number", "Number", "the larger"},
     {"clamp", "Math", "value: Number, low: Number, high: Number", "Number", "kept between low and high"},
-    {"lerp", "Math", "a: Float, b: Float, t: Float", "Float", "from a to b as t goes 0 to 1 (vectors too)"},
-    {"Vec2", "Vectors", "x: Float, y: Float", "Vec2", "a 2D vector"},
-    {"Vec3", "Vectors", "x: Float, y: Float, z: Float", "Vec3", "a 3D vector"},
-    {"Vec4", "Vectors", "x: Float, y: Float, z: Float, w: Float", "Vec4", "a 4D vector (a color: r, g, b, a)"},
-    {"length", "Vectors", "v: Vec", "Float", "a vector's length"},
-    {"dot", "Vectors", "a: Vec, b: Vec", "Float", "dot product"},
+    {"lerp", "Math", "a: Float, b: Float, t: Float", "Float", "from a to b as t goes 0 to 1"},
     {"map", "Loops", "source: Loop<T>, f: fn(T, Int) -> U", "Loop<U>", "each value changed (f may take the index)"},
     {"filter", "Loops", "source: Loop<T>, keep: fn(T, Int) -> Bool", "Loop<T>", "only the values kept"},
     {"fold", "Loops", "source: Loop<T>, start: A, f: fn(A, T) -> A", "A", "all values into one, from start"},
-    {"sum", "Loops", "source: Loop<Number>", "Number", "the total (vectors too)"},
+    {"sum", "Loops", "source: Loop<Number>", "Number", "the total"},
     {"min", "Loops", "source: Loop<Number>", "Number", "the smallest (stops on an empty list)"},
     {"max", "Loops", "source: Loop<Number>", "Number", "the largest (stops on an empty list)"},
     {"any", "Loops", "source: Loop<T>, test: fn(T) -> Bool", "Bool", "true if one passes"},
     {"all", "Loops", "source: Loop<T>, test: fn(T) -> Bool", "Bool", "true if every one passes"},
-    {"histogram", "Loops", "source: Loop<T>, bins: Int, bin: fn(T) -> Int", "[Int]", "how many values fall in each bin"},
     {"len", "Loops", "source: Loop<T>", "Int", "how many values"},
     {"toArray", "Loops", "source: Loop<T>", "[T]", "the values, kept in an array"},
     {"fill", "Arrays", "count: Int, value: T", "[T]", "an array of count copies"},
     {"push", "Arrays", "list: [T] (a var), value: T", "", "adds value at the end of a var array"},
+    {"first", "Loops", "source: Loop<T>, test: fn(T) -> Bool (may be left out)", "T?", "the first value (that passes the test)"},
+    {"last", "Loops", "source: Loop<T>, test: fn(T) -> Bool (may be left out)", "T?", "the last value (that passes the test)"},
+    {"count", "Loops", "source: Loop<T>, test: fn(T) -> Bool", "Int", "how many pass the test"},
+    {"contains", "Loops", "source: Loop<T>, value: T", "Bool", "true if value is among them"},
+    {"indexOf", "Loops", "source: Loop<T>, value: T", "Int?", "where value first is"},
+    {"minBy", "Loops", "source: Loop<T>, key: fn(T) -> K", "T", "the value with the smallest key (stops on an empty list)"},
+    {"maxBy", "Loops", "source: Loop<T>, key: fn(T) -> K", "T", "the value with the largest key (stops on an empty list)"},
+    {"sort", "Arrays", "source: Loop<T>, descending: Bool (may be left out)", "[T]", "in order (numbers, texts, cases, or T.compare); stable"},
+    {"sortBy", "Arrays", "source: Loop<T>, key: fn(T) -> K, descending: Bool (may be left out)", "[T]", "in the order of the key; stable"},
+    {"take", "Loops", "source: Loop<T>, count: Int", "Loop<T>", "the first count values (fewer if there are fewer)"},
+    {"skip", "Loops", "source: Loop<T>, count: Int", "Loop<T>", "all but the first count values"},
+    {"countBy", "Loops", "source: Loop<T>, key: fn(T) -> K", "[K: Int]", "how many values give each key"},
+    {"mean", "Loops", "source: Loop<Number>", "Float", "the average (stops on an empty list)"},
+    {"count", "Loops", "source: Loop<T>", "Int", "how many values"},
+    {"get", "Arrays", "list: [T], index: Int", "T?", "the value at index, or None when it is outside"},
+    {"panic", "Tests", "message: Text", "Never", "stops the program (the host's call) with the message"},
+    {"parallelMap", "Loops", "source: Loop<T>, f: fn(T) -> U", "[U]", "f on every value, on the processor's threads"},
+    {"random", "Random", "", "Float", "effect: a Float in [0, 1)"},
+    {"randomInt", "Random", "low: Int, high: Int", "Int", "effect: an Int from low to high (high not included)"},
+    {"seedRandom", "Random", "seed: Int", "", "effect: starts the random sequence again from seed"},
+    {"spawn", "Tasks", "f: fn()", "Int", "effect: a task of f, run a step at a time"},
+    {"step", "Tasks", "task: Int", "Bool", "effect: runs the task until it yields; true while it has more"},
+    {"yield", "Tasks", "", "", "effect: gives the turn back to whoever stepped the task"},
+    {"wait", "Tasks", "seconds: Float", "", "effect: gives the turn back until the time went by"},
+    {"reverse", "Arrays", "source: Loop<T>", "[T]", "last first"},
+    {"keys", "Maps", "map: [K: V]", "[K]", "the keys, in the order they came"},
+    {"values", "Maps", "map: [K: V]", "[V]", "the values, in the order their keys came"},
+    {"contains", "Maps", "map: [K: V], key: K", "Bool", "true if the key is in it"},
+    {"remove", "Maps", "map: [K: V] (a var), key: K", "", "takes the key out of a var map"},
+    {"len", "Maps", "map: [K: V]", "Int", "how many keys"},
     {"Some", "Optionals", "value: T", "T?", "a value that is there (None: none)"},
+    {"Ok", "Results", "value: T", "T!", "a value: it worked"},
+    {"Err", "Results", "message: Text", "T!", "it did not work, and why"},
+    {"index", "Enums", "case: an enum", "Int", "the case's place among its enum's cases (from 0)"},
+    {"words", "Text", "text: Text", "[Text]", "the pieces between runs of spaces"},
+    {"lines", "Text", "text: Text", "[Text]", "the lines, without their line breaks"},
+    {"chars", "Text", "text: Text", "[Text]", "each character (UTF-8)"},
+    {"contains", "Text", "text: Text, part: Text", "Bool", "true if part is in the text"},
+    {"indexOf", "Text", "text: Text, part: Text", "Int?", "where part starts (in bytes)"},
+    {"startsWith", "Text", "text: Text, part: Text", "Bool", "true if the text starts with part"},
+    {"endsWith", "Text", "text: Text, part: Text", "Bool", "true if the text ends with part"},
+    {"replace", "Text", "text: Text, old: Text, new: Text", "Text", "every old replaced by new"},
+    {"upper", "Text", "text: Text", "Text", "A to Z for a to z"},
+    {"lower", "Text", "text: Text", "Text", "a to z for A to Z"},
+    {"repeat", "Text", "text: Text, times: Int", "Text", "the text so many times"},
+    {"join", "Text", "texts: Loop<Text>, separator: Text", "Text", "the texts, separated"},
+    {"assert", "Tests", "condition: Bool, message: Text (may be left out)", "", "stops (the test fails) when the condition is false"},
     {"toText", "Text", "value: Int | Float | Bool | Text | a case", "Text", "the value as text (\"{x}\" in a text does it too)"},
     {"len", "Text", "text: Text", "Int", "how many bytes"},
+    {"split", "Text", "text: Text, separator: Text", "[Text]", "the pieces between separators (\"\": between words)"},
+    {"trim", "Text", "text: Text", "Text", "without spaces and line breaks at either end"},
+    {"parseInt", "Text", "text: Text", "Int?", "the Int the text is, or None"},
+    {"parseFloat", "Text", "text: Text", "Float?", "the Float the text is, or None"},
     {"print", "Out", "values: Any...", "", "effect: shows the values, separated by spaces"},
     {"now", "Out", "", "Float", "effect: seconds, for timing"},
+    {"readLine", "Out", "", "Text?", "effect: the next line of the input (None at its end)"},
+    {"readFile", "Out", "path: Text", "Text!", "effect: a file's contents (Err says why it cannot be read)"},
+    {"writeFile", "Out", "path: Text, text: Text", "Bool", "effect: replaces a file's contents (false if it cannot)"},
+    {"args", "Out", "", "[Text]", "effect: the command line after the program's name"},
+    {"printErr", "Out", "values: Any...", "", "effect: like print, to the error stream"},
+    {"exit", "Out", "code: Int", "", "effect: ends the program with this status"},
+    {"env", "Out", "name: Text", "Text?", "effect: an environment variable"},
+    {"fileExists", "Out", "path: Text", "Bool", "effect: true if the file can be read"},
+    {"listDir", "Out", "path: Text", "[Text]!", "effect: the names in a folder, sorted"},
+    {"time", "Out", "", "Float", "effect: seconds since 1970 (the wall clock)"},
 };
+
+/* Is `name` the name of a built-in's value at place `at` (fn split(text, separator): 1 is separator)? The
+ * catalog is the one list of the built-ins' values, for named values (split(t, separator: ",")) and for editors. */
+bool qkBuiltinParam(const char* fn, int at, const char* name, QkBuf* expected) {
+    bool any = false;
+    for (size_t i = 0; i < sizeof kBuiltins / sizeof kBuiltins[0]; i++) {
+        if (strcmp(kBuiltins[i].name, fn)) continue;
+        const char* p = kBuiltins[i].params;
+        for (int k = 0; *p && k < at; k++) { /* to the value at place `at` */
+            p = strstr(p, ", ");
+            if (!p) break;
+            p += 2;
+        }
+        if (!p || !*p) continue;
+        size_t n = strcspn(p, ":");
+        if (strlen(name) == n && !strncmp(p, name, n)) return true;
+        if (expected && !any) qkBufAdd(expected, p, n);
+        any = true;
+    }
+    return false;
+}
 
 static void jsonText(QkBuf* b, const char* s) {
     qkBufByte(b, '"');
@@ -460,11 +653,12 @@ static void typeExprText(const TypeExpr* t, QkBuf* b) {
 }
 
 static void declEntry(QkBuf* out, const Decl* d, bool checked, bool* first) {
+    if (d->kind == D_USE) return;
     qkBufPuts(out, *first ? "\n    {\"name\": " : ",\n    {\"name\": ");
     *first = false;
     jsonText(out, d->name);
     const char* kind = d->kind == D_ENUM ? "enum" : d->kind == D_TYPE ? (d->isExtern ? "extern type" : "type")
-                                                                      : (d->isExtern ? "extern fn" : "fn");
+                     : d->kind == D_CONST ? "const" : (d->isExtern ? "extern fn" : "fn");
     qkBufPuts(out, ", \"kind\": ");
     jsonText(out, kind);
     qkBufPrintf(out, ", \"host\": %s", d->fromPrelude ? "true" : "false");
@@ -525,12 +719,11 @@ char* qkCatalog(QkVm* vm, const char* text, size_t len) {
         jsonText(&out, n->doc);
         qkBufPuts(&out, "}");
     }
-    qkBufPuts(&out, "],\n \"types\": [\"Int\", \"Float\", \"Bool\", \"Text\", \"Vec2\", \"Vec3\", \"Vec4\", \"[T]\", \"T?\"],\n"
+    qkBufPuts(&out, "],\n \"types\": [\"Int\", \"Float\", \"Bool\", \"Text\", \"[T]\", \"[K: V]\", \"T?\", \"T!\"],\n"
                     " \"operators\": [\"+\", \"-\", \"*\", \"/\", \"%\", \"==\", \"!=\", \"<\", \"<=\", \">\", \">=\", \"and\", \"or\","
-                    " \"not\", \"neg\", \"..\", \"??\", \"with\"],\n"
+                    " \"not\", \"neg\", \"..\", \"??\", \"?\", \"with\"],\n"
                     " \"statements\": [\"let\", \"var\", \"set\", \"do\", \"if\", \"match\", \"for\", \"while\", \"return\", \"break\","
                     " \"continue\"],\n"
-                    " \"events\": [\"start(self)\", \"update(self, dt)\", \"hit(self, other)\", \"click(self)\"],\n"
                     " \"decls\": [");
     begin(vm);
     Program p;
@@ -538,7 +731,8 @@ char* qkCatalog(QkVm* vm, const char* text, size_t len) {
     if (parseWithPrelude(vm, "program", text, len, &p)) {
         int errors = qkErrorCount;
         bool checked = qkCheck(&p, false) && qkErrorCount == errors;
-        for (int i = 0; i < p.count; i++) declEntry(&out, p.decls[i], checked, &first);
+        for (int i = 0; i < p.count; i++)
+            if (!p.decls[i]->templateOf && !p.decls[i]->isTest && !p.decls[i]->lifted) declEntry(&out, p.decls[i], checked, &first);
     }
     end();
     qkBufPuts(&out, "]}\n");

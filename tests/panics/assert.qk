@@ -1,0 +1,4 @@
+// panic: 3: the total is wrong
+fn main() {
+    assert(1 + 1 == 3, "the total is wrong")
+}

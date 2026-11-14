@@ -1,0 +1,8 @@
+// error: a match on a Text needs a last arm _ => ...
+fn main() {
+    let r = match "a" {
+        "a" => 1
+        "b" => 2
+    }
+    print(r)
+}

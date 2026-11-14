@@ -1,0 +1,52 @@
+// Loops that take and skip, count by a key, average and sort either way; maps as loop sources of Entry; Never;
+// effects inferred; self; a number times a value; interfaces whose functions give nothing.
+type Vec { x: Float, y: Float }
+type Box<T> { item: T, label: Text }
+type Shouter { effect fn shout(word: Text) }
+type Loud { mark: Text }
+
+fn Vec.times(self, k: Float) -> Vec = Vec(self.x * k, self.y * k)
+
+fn Box.relabel(self, label: Text) -> Box<T> = self with { label: label }
+
+fn Loud.shout(self, word: Text) {
+    print(upper(word) + self.mark)
+}
+
+fn half(n: Int) -> Int = if n % 2 == 0 { n / 2 } else { panic("{n} is odd") }
+
+fn orDie(x: Int?) -> Int = x ?? exit(3)
+
+// prints: inferred to change the world, so it may print; a lambda given to map may not call it
+fn greet(name: Text) -> Int {
+    print("hi {name}")
+    len(name)
+}
+
+fn main() {
+    let xs = [5, 3, 8, 1, 9, 2]
+    print((0..100).filter(x => x % 3 == 0).take(4).toArray(), xs.skip(2).toArray())
+    print(xs.take(0).toArray(), xs.take(-1).toArray(), xs.skip(99).toArray(), xs.skip(-2).len())
+    print(xs.take(3).map((x, i) => x * 10 + i).toArray(), xs.skip(1).filter(x => x > 2).take(2).sum())
+    print(xs.sort(descending: true), xs.sortBy(x => x % 3, descending: true), xs.sort(descending: false))
+    print(xs.mean(), (1..5).mean(), [0.5, 1.5].mean())
+    let counts = words("a b a c b a").countBy(w => w)
+    print(counts, counts.map(e => "{e.key}={e.value}").toArray(), counts.maxBy(e => e.value))
+    print(counts.count(e => e.value > 1), counts.sortBy(e => e.value, descending: true).take(2).toArray(), counts.len())
+    for e in counts.take(1) {
+        let Entry(word, n) = e
+        print("{word} x{n}")
+    }
+    print(half(10), orDie(Some(4)))
+    let n = match parseInt("12") {
+        Some(v) => v
+        None => panic("not a number")
+    }
+    print(n, 2 * Vec(1, 2), Vec(1, 2) * 3)
+    print(Box(7, "seven").relabel("7").label)
+    let s: Shouter = Loud("!")
+    s.shout("done")
+    print(greet("ana"))
+    let log = (t: Text) => print("log: " + t)
+    log("kept, with its effect inferred")
+}

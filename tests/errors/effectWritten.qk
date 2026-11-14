@@ -1,0 +1,8 @@
+// error: effects are inferred: write fn, without effect
+effect fn greet() {
+    print("hi")
+}
+
+fn main() {
+    greet()
+}

@@ -1,0 +1,5 @@
+// error: cannot read
+use missing
+
+fn main() {
+}

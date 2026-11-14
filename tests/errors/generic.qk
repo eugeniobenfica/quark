@@ -1,0 +1,6 @@
+// error: wrap: what T is cannot be told from the values given
+fn wrap<T>() -> [T] = []
+
+fn main() {
+    print(len(wrap()))
+}

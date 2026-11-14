@@ -1,0 +1,41 @@
+// Patterns inside patterns, records and tuples taken apart, and functions that give back several values.
+enum Shape { Circle(r: Float), Box(w: Float, h: Float), Empty }
+type Point { x: Int, y: Int }
+
+fn divmod(a: Int, b: Int) -> (Int, Int) = (a / b, a % b)
+
+fn describe(s: Shape?) -> Text = match s {
+    Some(Circle(r)) if r > 10 => "a big circle"
+    Some(Circle(r)) => "a circle of {r}"
+    Some(Box(w, 1)) => "a strip {w} long"
+    Some(Box(w, h)) => "a box {w}x{h}"
+    Some(Empty) => "nothing in it"
+    None => "no shape"
+}
+
+fn where(p: Point) -> Text = match p {
+    Point(0, 0) => "the origin"
+    Point(0, y) => "on the y axis at {y}"
+    Point(x, 0) => "on the x axis at {x}"
+    Point(x, y) => "at {x}, {y}"
+}
+
+fn swap(t: (Int, Text)) -> (Text, Int) = (t.1, t.0)
+
+fn main() {
+    print(describe(Shape.Circle(12)), describe(Shape.Circle(2)), describe(Shape.Box(5, 1)), describe(Shape.Box(2, 3)))
+    print(describe(Shape.Empty), describe(None))
+    print(where(Point(0, 0)), where(Point(0, 4)), where(Point(3, 0)), where(Point(1, 2)))
+    let (q, r) = divmod(17, 5)
+    let Point(px, py) = Point(7, 8)
+    print(q, r, px + py, swap((1, "one")), divmod(-7, 2))
+    let pairs = [(1, "a"), (2, "b")]
+    for pair in pairs {
+        let (n, name) = pair
+        print(n, name)
+    }
+    let Some((a, b)) = first(pairs) else {
+        return
+    }
+    print(a, b)
+}

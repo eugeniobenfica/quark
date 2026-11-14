@@ -1,0 +1,6 @@
+// panic: division by zero
+fn inverse(n: Int) -> Int = 1000 / (n - 5000)
+
+fn main() {
+    print((0..10_000).parallelMap(inverse).sum())
+}

@@ -1,0 +1,13 @@
+// use ... as: a module's names through a name of its own, so two modules may both have an area.
+use lib.geometry as geo
+
+fn area(side: Float) -> Float = side * side // its own: geometry's is geo.area
+
+fn main() {
+    let shapes: [geo.Shape] = [geo.Shape.Circle(1), geo.Shape.Rect(geo.Vec2(2, 3))]
+    for s in shapes {
+        print(geo.describe(s), geo.area(s))
+    }
+    let v = geo.Vec2(1, 2) + geo.Vec2(3, 4) // its operators work through the alias
+    print(v, area(3), geo.Shape.Circle(2))
+}

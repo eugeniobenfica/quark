@@ -1,0 +1,12 @@
+// Files that use files: geometry.qk's pub declarations, and what it uses itself stays its own.
+use lib.geometry
+
+fn square(n: Int) -> Int = n * n // its own square: geometry's is not seen here
+
+fn main() {
+    let shapes = [Shape.Circle(1), Shape.Rect(Vec2(2, 3))]
+    for s in shapes {
+        print(describe(s))
+    }
+    print(Vec2(1, 2) + Vec2(3, 4), square(7))
+}

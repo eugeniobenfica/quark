@@ -1,0 +1,14 @@
+// A program compiled ahead of time into an object file, linked into a C host (tests/object/host.c).
+extern fn hostScale() -> Float
+
+fn area(w: Float, h: Float) -> Float = w * h * hostScale()
+
+fn greet(times: Int) {
+    for i in 0..times {
+        print("hello {i} from an object file, {upper("ação")}")
+    }
+}
+
+fn divide(a: Int, b: Int) -> Int = a / b
+
+fn total(n: Int) -> Int = (1..n + 1).map(x => x * x).sum()

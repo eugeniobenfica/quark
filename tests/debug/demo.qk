@@ -1,0 +1,18 @@
+// A program to stop in: tests/run.sh drives quark debug through it, and writes its trace.
+type Point { x: Int, y: Int }
+
+fn scale(p: Point, k: Int) -> Point {
+    let bigger = Point(p.x * k, p.y * k)
+    bigger
+}
+
+fn main() {
+    var total = 0
+    let start = Point(1, 2)
+    for i in 0..3 {
+        total += i
+    }
+    let moved = scale(start, 10)
+    let name = "quark"
+    print(total, moved, name)
+}

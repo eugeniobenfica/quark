@@ -1,6 +1,7 @@
 type Point { x: Float, y: Float }
+type Vec2 { x: Float, y: Float }
 type Particle { position: Vec2, velocity: Vec2, alive: Bool }
-enum Mode { Waveform, Parade, Vectorscope, Histogram }
+enum Weekday { Monday, Tuesday, Wednesday, Thursday }
 
 fn fib(n: Int) -> Int {
     if n < 2 {
@@ -9,14 +10,22 @@ fn fib(n: Int) -> Int {
     fib(n - 1) + fib(n - 2)
 }
 
+fn Vec2.plus(self, b: Vec2) -> Vec2 = Vec2(self.x + b.x, self.y + b.y)
+
+fn Vec2.times(self, k: Float) -> Vec2 = Vec2(self.x * k, self.y * k)
+
+fn Vec2.dot(self, b: Vec2) -> Float = self.x * b.x + self.y * b.y
+
+fn Vec2.length(self) -> Float = sqrt(self.dot(self))
+
 fn mid(a: Point, b: Point) -> Point = Point((a.x + b.x) / 2, (a.y + b.y) / 2)
 
 fn step(p: Particle, dt: Float) -> Particle =
     Particle(position: p.position + p.velocity * dt, velocity: p.velocity * 0.5, alive: p.alive)
 
-fn modeName(m: Mode) -> Int = match m {
-    Waveform => 1
-    Parade => 2
+fn dayNumber(d: Weekday) -> Int = match d {
+    Monday => 1
+    Tuesday => 2
     _ => 0
 }
 
@@ -39,13 +48,16 @@ fn main() {
         p = step(p, 1.0)
     }
     print(p)
-    print(Mode.Parade, modeName(Mode.Parade), modeName(Mode.Histogram))
+    print(Weekday.Tuesday, dayNumber(Weekday.Tuesday), dayNumber(Weekday.Thursday))
     var counts = fill(5, 0)
     for v in [1, 3, 3, 4, 1, 1] {
         counts[v] += 1
     }
     print(counts, len(counts))
-    let h = (0..1000).histogram(10, i => i % 10)
+    var h = fill(10, 0)
+    for i in 0..1000 {
+        h[i % 10] += 1
+    }
     print(h)
     let total = (1..11).fold(1, (acc, x) => acc * x)
     print(total, [2.5, -1.0, 9.0].max(), [4, 2, 8].min(), max(3, 7.5))
@@ -54,7 +66,7 @@ fn main() {
     v = Vec2(v.y, v.x)
     v *= 3
     print(v, length(Vec2(3, 4)), dot(v, v))
-    let words = [Mode.Waveform, Mode.Vectorscope]
+    let words = [Weekday.Monday, Weekday.Wednesday]
     print(words, round(2.5), floor(-2.5), ceil(2.1), abs(-3), clamp(15, 0, 10))
     let squares = (0..5).map((x, i) => x * i)
     print(squares, squares[4])

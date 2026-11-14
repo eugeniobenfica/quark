@@ -1,0 +1,40 @@
+// Orders, one per line: what each customer spent, the best sellers, and the average order.
+const sample = "ana,tea,4.50,2\nbia,coffee,3.20,1\nana,cake,6.00,1\ncaio,tea,4.50,3\nbia,tea,4.50,1\ncaio,coffee,3.20,2"
+
+type Order { customer: Text, item: Text, price: Float, count: Int }
+
+fn Order.total(self) -> Float = self.price * self.count
+
+// a line as an order, or why it is not one
+fn parseOrder(line: Text) -> Order! {
+    let parts = split(line, ",")
+    if len(parts) != 4 {
+        return Err("expected customer,item,price,count, found \"{line}\"")
+    }
+    let Some(price) = parseFloat(parts[2]) else {
+        return Err("not a price: \"{parts[2]}\"")
+    }
+    let Some(count) = parseInt(parts[3]) else {
+        return Err("not a count: \"{parts[3]}\"")
+    }
+    Order(parts[0], parts[1], price, count)
+}
+
+fn main() {
+    var orders: [Order] = []
+    for line in lines(sample) {
+        orders.push(parseOrder(line)?)
+    }
+    var spent: [Text: Float] = [:]
+    for o in orders {
+        spent[o.customer] = (spent[o.customer] ?? 0) + o.total()
+    }
+    print("{len(orders)} orders, {orders.map(o => o.total()).mean():.2} on average")
+    for e, i in spent.sortBy(e => e.value, descending: true) {
+        print("{i + 1}. {e.key:5} {e.value:6.2}")
+    }
+    let sold = orders.countBy(o => o.item)
+    for e in sold.sortBy(e => e.value, descending: true).take(2) {
+        print("best seller: {e.key} ({e.value} orders)")
+    }
+}

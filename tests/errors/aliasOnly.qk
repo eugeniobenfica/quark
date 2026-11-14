@@ -1,0 +1,6 @@
+// error: unknown name "describe"
+use lib.hidden2 as h
+
+fn main() {
+    print(describe(1))
+}

@@ -1,0 +1,4 @@
+// error: mean: expected numbers
+fn main() {
+    print(["a"].mean())
+}

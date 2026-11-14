@@ -1,0 +1,30 @@
+// The most used words of a text: a file named on the command line (quark run examples/words.qk -- notes.txt),
+// or a short one of its own.
+const sample = "The fox saw the dog. The dog saw the fox, and the fox ran."
+
+fn clean(word: Text) -> Text = replace(replace(word, ",", ""), ".", "")
+
+fn source() -> Text! {
+    let Some(path) = first(args()) else {
+        return sample
+    }
+    readFile(path)
+}
+
+fn main() {
+    let text = match source() {
+        Ok(t) => t
+        Err(why) => {
+            printErr(why)
+            exit(1)
+        }
+    }
+    let counts = words(lower(text))
+        .map(clean)
+        .filter(w => len(w) > 0)
+        .countBy(w => w)
+    print("{len(counts)} different words, {len(words(text))} in all")
+    for e, i in counts.sortBy(e => e.value, descending: true).take(4) {
+        print("{i + 1:2}. {e.key:5} {e.value:2} {repeat("#", e.value)}")
+    }
+}

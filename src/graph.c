@@ -7,12 +7,12 @@
  * text -> graph -> text gives back the formatter's text exactly.
  *
  * {"quark": 1, "decls": [
- *   {"kind": "fn", "name": "luma", "params": [{"id": 1, "name": "r", "type": "Int"}], "returns": "Int",
+ *   {"kind": "fn", "name": "square", "params": [{"id": 1, "name": "x", "type": "Int"}], "returns": "Int",
  *    "form": "expr", "result": {"node": 4}, "nodes": [{"id": 4, "kind": "op", "op": "+", "inputs": [...]}, ...]},
  *   {"kind": "type", "name": "Point", "fields": [{"name": "x", "type": "Float"}]},
- *   {"kind": "enum", "name": "Mode", "cases": ["Waveform", "Parade"]}]}
+ *   {"kind": "enum", "name": "Color", "cases": ["Red", "Green"]}]}
  *
- * Inputs: {"node": id} | {"value": "12", "of": "Int"} | {"case": "Mode.Parade"} | {"fn": "luma"}.
+ * Inputs: {"node": id} | {"value": "12", "of": "Int"} | {"case": "Color.Red"} | {"fn": "square"}.
  * Blocks: {"stmts": [ids], "closing": "comment"}. A node's "key" (fn/name, for named nodes) is stable while
  * the name is: an editor keeps positions in a side file under it. */
 #include "qk.h"
@@ -21,18 +21,6 @@
 #include <stdlib.h>
 
 /* ---- reading JSON -------------------------------------------------------------------------------- */
-
-typedef enum JKind { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } JKind;
-
-typedef struct J {
-    JKind kind;
-    double num;
-    bool b;
-    const char* str;
-    struct J** items; /* array items, or object values */
-    const char** keys;
-    int count, cap;
-} J;
 
 typedef struct JParser {
     const char* p;
@@ -53,10 +41,37 @@ static const char* jstring(JParser* jp) {
             char k = *jp->p++;
             if (k == 'n') c = '\n';
             else if (k == 't') c = '\t';
-            else if (k == 'u' && jp->p + 4 <= jp->end) {
+            else if (k == 'r') c = '\r';
+            else if (k == 'b') c = '\b';
+            else if (k == 'f') c = '\f';
+            else if (k == 'u' && jp->p + 4 <= jp->end) { /* a code point, as UTF-8 (a surrogate pair is one) */
                 char hex[5] = {jp->p[0], jp->p[1], jp->p[2], jp->p[3], 0};
-                c = (char)strtol(hex, NULL, 16);
+                unsigned long u = strtoul(hex, NULL, 16);
                 jp->p += 4;
+                if (u >= 0xD800 && u < 0xDC00 && jp->p + 6 <= jp->end && jp->p[0] == '\\' && jp->p[1] == 'u') {
+                    char low[5] = {jp->p[2], jp->p[3], jp->p[4], jp->p[5], 0};
+                    unsigned long l = strtoul(low, NULL, 16);
+                    if (l >= 0xDC00 && l < 0xE000) {
+                        u = 0x10000 + ((u - 0xD800) << 10) + (l - 0xDC00);
+                        jp->p += 6;
+                    }
+                }
+                if (u < 0x80) {
+                    qkBufByte(&b, (uint8_t)u);
+                } else if (u < 0x800) {
+                    qkBufByte(&b, (uint8_t)(0xC0 | (u >> 6)));
+                    qkBufByte(&b, (uint8_t)(0x80 | (u & 63)));
+                } else if (u < 0x10000) {
+                    qkBufByte(&b, (uint8_t)(0xE0 | (u >> 12)));
+                    qkBufByte(&b, (uint8_t)(0x80 | ((u >> 6) & 63)));
+                    qkBufByte(&b, (uint8_t)(0x80 | (u & 63)));
+                } else {
+                    qkBufByte(&b, (uint8_t)(0xF0 | (u >> 18)));
+                    qkBufByte(&b, (uint8_t)(0x80 | ((u >> 12) & 63)));
+                    qkBufByte(&b, (uint8_t)(0x80 | ((u >> 6) & 63)));
+                    qkBufByte(&b, (uint8_t)(0x80 | (u & 63)));
+                }
+                continue;
             } else c = k;
         }
         qkBufByte(&b, (uint8_t)c);
@@ -157,11 +172,18 @@ static J* jvalue(JParser* jp) {
     return v;
 }
 
-static J* jget(const J* o, const char* key) {
+J* qkJsonGet(const J* o, const char* key) {
     if (!o || o->kind != J_OBJ) return NULL;
     for (int i = 0; i < o->count; i++)
         if (!strcmp(o->keys[i], key)) return o->items[i];
     return NULL;
+}
+static J* jget(const J* o, const char* key) { return qkJsonGet(o, key); }
+
+J* qkJsonParse(const char* text, size_t len) {
+    JParser jp = {text, text + len, false};
+    J* v = jvalue(&jp);
+    return jp.failed ? NULL : v;
 }
 
 static const char* jstr(const J* o, const char* key) {
@@ -182,9 +204,10 @@ typedef struct Out {
     const char* fn;
     int nodeCount;
     const J* layout;  /* {"key": [x, y]} or NULL */
+    const Decl* decl; /* the function: which names its lets use more than once */
 } Out;
 
-static void jsonString(QkBuf* b, const char* s) {
+void qkJsonString(QkBuf* b, const char* s) {
     qkBufByte(b, '"');
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
@@ -196,6 +219,14 @@ static void jsonString(QkBuf* b, const char* s) {
         else qkBufByte(b, c);
     }
     qkBufByte(b, '"');
+}
+
+static void jsonString(QkBuf* b, const char* s) { qkJsonString(b, s); }
+
+/* the node a name's uses wire to: a lambda's captured copy wires to the name it copies */
+static int wireOf(const Binding* b) {
+    while (b->capturedFrom) b = b->capturedFrom;
+    return b->nodeId;
 }
 
 static void typeString(const TypeExpr* t, QkBuf* b) {
@@ -276,6 +307,37 @@ static void inputs(Out* o, QkBuf* node, Expr* const* list, int n, const char* ke
     qkBufFree(&in);
 }
 
+/* A pattern: "pattern" as text (Circle, 3, 80..90, "\"quit\"", _), and for a case its names, each a node the
+ * wires from them come from. */
+static void writePattern(Out* o, const Arm* a, QkBuf* node) {
+    qkBufPuts(node, "\"pattern\": ");
+    if (a->pattern) {
+        jsonString(node, a->pattern);
+    } else {
+        QkBuf p = {0};
+        qkFormatPattern(a, &p);
+        jsonString(node, p.data);
+        qkBufFree(&p);
+    }
+    if (a->bindCount || (a->pattern && !strcmp(a->pattern, "(,)"))) {
+        qkBufPuts(node, ", \"binds\": [");
+        for (int f = 0; f < a->bindCount; f++) {
+            if (a->subs && a->subs[f]) { /* a pattern inside: its own pattern and names */
+                qkBufPuts(node, f ? ", {" : "{");
+                writePattern(o, a->subs[f], node);
+                qkBufPuts(node, "}");
+                continue;
+            }
+            int bid = o->nextId++;
+            if (a->bindings && a->bindings[f]) a->bindings[f]->nodeId = bid;
+            qkBufPrintf(node, "%s{\"id\": %d, \"name\": ", f ? ", " : "", bid);
+            jsonString(node, a->binds[f]);
+            qkBufPuts(node, "}");
+        }
+        qkBufPuts(node, "]");
+    }
+}
+
 /* An expression as a node; returns its id. Its inputs are written (and numbered) first. */
 static int writeNode(Out* o, const Expr* e, const char* key) {
     e = visible(e);
@@ -304,8 +366,18 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
             jsonString(&node, e->rawParts[i]);
         }
         qkBufPuts(&node, "]");
+        if (e->formats) { /* "{x:.2}": each value's format, "" for none */
+            qkBufPuts(&node, ", \"formats\": [");
+            for (int i = 0; i < e->argCount; i++) {
+                if (i) qkBufPuts(&node, ", ");
+                jsonString(&node, e->formats[i] ? e->formats[i] : "");
+            }
+            qkBufPuts(&node, "]");
+        }
         inputs(o, &node, e->args, e->argCount, key);
         break;
+    case E_TRY: inputs(o, &node, &((Expr*)e)->a, 1, key); break;
+    case E_MAP: inputs(o, &node, e->args, e->argCount, key); break;
     case E_CALL:
         qkBufPuts(&node, ", \"fn\": ");
         jsonString(&node, e->name);
@@ -329,7 +401,13 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
         break;
     case E_BINARY: case E_RANGE: case E_UNARY:
         qkBufPuts(&node, ", \"op\": ");
-        jsonString(&node, e->kind == E_UNARY ? (e->op == T_NOT ? "not" : "neg") : qkTokName((TokKind)e->op));
+        jsonString(&node, e->kind == E_UNARY ? (e->op == T_NOT ? "not" : e->op == T_TILDE ? "~" : "neg") : qkTokName((TokKind)e->op));
+        if (e->kind == E_RANGE && (!e->a || !e->b)) { /* xs[2..], xs[..3]: the end that is left out */
+            qkBufPuts(&node, e->a ? ", \"open\": \"end\"" : ", \"open\": \"start\"");
+            pair[0] = e->a ? e->a : e->b;
+            inputs(o, &node, pair, e->a || e->b ? 1 : 0, key);
+            break;
+        }
         pair[0] = e->a;
         pair[1] = e->b;
         inputs(o, &node, pair, e->kind == E_UNARY ? 1 : 2, key);
@@ -352,6 +430,10 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
             e->params[i].binding->nodeId = pid;
             qkBufPrintf(&node, "%s{\"id\": %d, \"name\": ", i ? ", " : "", pid);
             jsonString(&node, e->params[i].name);
+            if (e->params[i].type) {
+                qkBufPuts(&node, ", \"type\": ");
+                typeString(e->params[i].type, &node);
+            }
             qkBufPuts(&node, "}");
         }
         qkBufPuts(&node, "]");
@@ -375,18 +457,11 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
         for (int i = 0; i < e->armCount; i++) {
             const Arm* a = &e->arms[i];
             char* armKey = keyIndex(key, "/arm", i);
-            qkBufPuts(&node, i ? ", {\"pattern\": " : "{\"pattern\": ");
-            jsonString(&node, a->pattern ? a->pattern : a->intPattern ? a->intPattern->raw : "_");
-            if (a->bindCount) { /* Circle(r): the names, each a node the arm's wires come from */
-                qkBufPuts(&node, ", \"binds\": [");
-                for (int f = 0; f < a->bindCount; f++) {
-                    int bid = o->nextId++;
-                    if (a->bindings && a->bindings[f]) a->bindings[f]->nodeId = bid;
-                    qkBufPrintf(&node, "%s{\"id\": %d, \"name\": ", f ? ", " : "", bid);
-                    jsonString(&node, a->binds[f]);
-                    qkBufPuts(&node, "}");
-                }
-                qkBufPuts(&node, "]");
+            qkBufPuts(&node, i ? ", {" : "{");
+            writePattern(o, a, &node);
+            if (a->guard) {
+                qkBufPuts(&node, ", \"guard\": ");
+                writeInput(o, a->guard, &node, keyJoin(armKey, "", "/if"));
             }
             if (a->comment) {
                 qkBufPuts(&node, ", \"comment\": ");
@@ -409,8 +484,9 @@ static int writeNode(Out* o, const Expr* e, const char* key) {
         break;
     default: break;
     }
-    static const char* const kinds[] = {"value", "value", "value", "value", "name", "call", "field", "index", "op",
-                                        "op", "op", "if", "match", "lambda", "array", "block", "case", "with", "text"};
+    static const char* const kinds[E_KIND_COUNT] = {"value", "value", "value", "value", "name", "call", "field", "index", "op",
+                                                    "op", "op", "if", "match", "lambda", "array", "block", "case", "with", "text",
+                                                    "try", "map"};
     startNode(o, id, kinds[e->kind], key, e->line);
     typeField(o, e->type);
     qkBufAdd(&o->nodes, node.data ? node.data : "", node.len);
@@ -433,11 +509,11 @@ static void writeInput(Out* o, const Expr* e, QkBuf* b, const char* key) {
         return;
     }
     case E_CASE:
-        qkBufPrintf(b, "{\"case\": \"%s.%s\"}", e->decl->name, e->name);
+        qkBufPrintf(b, "{\"case\": \"%s.%s\"}", e->decl->templateOf ? e->decl->templateOf->name : e->decl->name, e->name);
         return;
     case E_NAME:
         if (e->binding) {
-            qkBufPrintf(b, "{\"node\": %d}", e->binding->nodeId);
+            qkBufPrintf(b, "{\"node\": %d}", wireOf(e->binding));
         } else if (e->decl && e->decl->kind == D_FN) { /* a function given where a lambda goes */
             qkBufPuts(b, "{\"fn\": ");
             jsonString(b, e->name);
@@ -454,8 +530,39 @@ static void writeInput(Out* o, const Expr* e, QkBuf* b, const char* key) {
 }
 
 /* A statement's key: fn/name for the named ones (let, var, for), else its place: prefix/@index. */
+static int namedIn(const Block* b, const char* name);
+
+static int namedInExpr(const Expr* e, const char* name) {
+    if (!e) return 0;
+    int n = namedInExpr(e->a, name) + namedInExpr(e->b, name) + namedInExpr(e->body, name) + namedInExpr(e->elseExpr, name);
+    for (int i = 0; i < e->argCount; i++) n += namedInExpr(e->args[i], name);
+    for (int i = 0; i < e->armCount; i++) n += namedInExpr(e->arms[i].body, name);
+    if (e->thenBlock) n += namedIn(e->thenBlock, name);
+    if (e->block) n += namedIn(e->block, name);
+    return n;
+}
+
+/* How many lets, vars and fors of a function name this */
+static int namedIn(const Block* b, const char* name) {
+    int n = 0;
+    for (int i = 0; b && i < b->count; i++) {
+        const Stmt* s = b->stmts[i];
+        if ((s->kind == S_LET || s->kind == S_VAR || s->kind == S_FOR) && s->name && !strcmp(s->name, name)) n++;
+        n += namedInExpr(s->value, name) + namedInExpr(s->iter, name) + namedInExpr(s->target, name);
+        if (s->body) n += namedIn(s->body, name);
+        if (s->elseBody) n += namedIn(s->elseBody, name);
+    }
+    return n;
+}
+
+/* A named statement is keyed fn/name; when the function names two (a for i in each of two loops), each is
+ * keyed by its place too (main/@3/i). Other statements by their place. */
 static const char* stmtKey(Out* o, const Stmt* s, const char* prefix, int i) {
-    if (s->kind == S_LET || s->kind == S_VAR || s->kind == S_FOR) return keyJoin(o->fn, "/", s->name);
+    if ((s->kind == S_LET || s->kind == S_VAR || s->kind == S_FOR) && s->name) {
+        bool once = !o->decl || !o->decl->body || o->decl->body->kind != E_BLOCK || namedIn(o->decl->body->block, s->name) <= 1;
+        if (once) return keyJoin(o->fn, "/", s->name);
+        return keyJoin(keyIndex(prefix, "/@", i), "/", s->name);
+    }
     return keyIndex(prefix, "/@", i);
 }
 
@@ -483,6 +590,17 @@ static int writeStmt(Out* o, const Stmt* s, const char* key) {
         inputs(o, &node, &((Stmt*)s)->value, 1, in);
         break;
     case S_LET: case S_VAR:
+        if (s->pattern) { /* let Some(x) = value else { ... } */
+            kind = "let";
+            qkBufPuts(&node, ", ");
+            writePattern(o, s->pattern, &node);
+            inputs(o, &node, &((Stmt*)s)->value, 1, in);
+            if (s->elseBody) {
+                qkBufPuts(&node, ", \"else\": ");
+                writeBlock(o, s->elseBody, &node, keyJoin(key, "", "/else"));
+            }
+            break;
+        }
         s->binding->nodeId = id;
         kind = s->kind == S_LET ? "let" : "var";
         qkBufPuts(&node, ", \"name\": ");
@@ -544,8 +662,10 @@ static void writeParams(QkBuf* out, const Decl* d, Out* o) {
         if (d->params[k].binding) d->params[k].binding->nodeId = pid;
         qkBufPrintf(out, "%s{\"id\": %d, \"name\": ", k ? ", " : "", pid);
         jsonString(out, d->params[k].name);
-        qkBufPuts(out, ", \"type\": ");
-        typeString(d->params[k].type, out);
+        if (k || !d->impliedSelf) { /* fn Vec2.length(self): its type is the type's */
+            qkBufPuts(out, ", \"type\": ");
+            typeString(d->params[k].type, out);
+        }
         qkBufPuts(out, ", \"key\": ");
         jsonString(out, keyJoin(d->name, "/", d->params[k].name));
         if (d->params[k].fallback && o) { /* its default: a value, or nodes of its own */
@@ -559,7 +679,15 @@ static void writeParams(QkBuf* out, const Decl* d, Out* o) {
         qkBufPuts(out, ", \"returns\": ");
         typeString(d->ret, out);
     }
-    if (d->isEffect) qkBufPuts(out, ", \"effect\": true");
+    if (d->isEffect && !d->isTest) qkBufPuts(out, ", \"effect\": true");
+    if (d->typeParamCount && !d->impliedTypes) {
+        qkBufPuts(out, ", \"typeParams\": [");
+        for (int k = 0; k < d->typeParamCount; k++) {
+            if (k) qkBufPuts(out, ", ");
+            jsonString(out, d->typeParams[k]);
+        }
+        qkBufPuts(out, "]");
+    }
 }
 
 void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
@@ -573,14 +701,32 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
     int written = 0;
     for (int i = 0; i < p->count; i++) {
         const Decl* d = p->decls[i];
-        if (d->fromPrelude) continue; /* the host's: in the catalog, not in the program */
+        if (d->fromPrelude || d->templateOf || d->module || d->lifted) continue; /* the host's: in the catalog; another file's: in its own graph */
         qkBufPuts(out, written++ ? ",\n  {\"kind\": " : "  {\"kind\": ");
-        const char* kind = d->kind == D_FN ? (d->isExtern ? "extern fn" : "fn")
-                           : d->kind == D_TYPE ? (d->isExtern ? "extern type" : "type") : d->kind == D_CONST ? "let" : "enum";
+        const char* kind = d->kind == D_FN ? (d->isExtern ? "extern fn" : d->isTest ? "test" : "fn")
+                           : d->kind == D_TYPE ? (d->isExtern ? "extern type" : "type") : d->kind == D_CONST ? "const"
+                           : d->kind == D_USE ? "use" : "enum";
         jsonString(out, kind);
         qkBufPuts(out, ", \"name\": ");
         jsonString(out, d->name);
+        if (d->isPub) qkBufPuts(out, ", \"pub\": true");
+        if ((d->kind == D_TYPE || d->kind == D_ENUM) && d->typeParamCount) { /* type Pair<A, B> */
+            qkBufPuts(out, ", \"typeParams\": [");
+            for (int k = 0; k < d->typeParamCount; k++) {
+                if (k) qkBufPuts(out, ", ");
+                jsonString(out, d->typeParams[k]);
+            }
+            qkBufPuts(out, "]");
+        }
         notes(out, d->leading, d->trailing, false);
+        if (d->kind == D_USE) { /* another file: its declarations are its own graph's */
+            if (d->alias) {
+                qkBufPuts(out, ", \"alias\": ");
+                jsonString(out, d->alias);
+            }
+            qkBufPuts(out, "}");
+            continue;
+        }
         if (d->kind == D_ENUM) {
             qkBufPuts(out, ", \"cases\": [");
             for (int k = 0; k < d->caseCount; k++) {
@@ -606,7 +752,7 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
             continue;
         }
         if (d->kind == D_CONST) { /* a constant: its value's nodes */
-            Out o = {{0}, 1, d->name, 0, layout};
+            Out o = {{0}, 1, d->name, 0, layout, d};
             if (d->ret) {
                 qkBufPuts(out, ", \"annotation\": ");
                 typeString(d->ret, out);
@@ -623,7 +769,17 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
             continue;
         }
         if (d->kind == D_TYPE) {
-            if (!d->isExtern) {
+            if (d->isInterface) { /* its functions, as they are written */
+                qkBufPuts(out, ", \"interface\": true, \"functions\": [");
+                for (int k = 0; k < d->paramCount; k++) {
+                    QkBuf m = {0};
+                    qkFormatMember(&d->params[k], &m);
+                    if (k) qkBufPuts(out, ", ");
+                    jsonString(out, m.data);
+                    qkBufFree(&m);
+                }
+                qkBufPuts(out, "]");
+            } else if (!d->isExtern) {
                 qkBufPuts(out, ", \"fields\": [");
                 for (int k = 0; k < d->paramCount; k++) {
                     qkBufPuts(out, k ? ", {\"name\": " : "{\"name\": ");
@@ -638,7 +794,7 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
             continue;
         }
         if (d->isExtern) {
-            Out o = {{0}, 1, d->name, 0, layout};
+            Out o = {{0}, 1, d->name, 0, layout, d};
             writeParams(out, d, &o);
             if (o.nodeCount) { /* defaults with nodes */
                 qkBufPuts(out, ",\n   \"nodes\": [\n");
@@ -649,7 +805,7 @@ void qkGraphExportWith(const Program* p, QkBuf* out, const char* layoutJson) {
             qkBufPuts(out, "}");
             continue;
         }
-        Out o = {{0}, 1, d->name, 0, layout};
+        Out o = {{0}, 1, d->name, 0, layout, d};
         writeParams(out, d, &o);
         QkBuf body = {0};
         if (d->body->kind == E_BLOCK) {
@@ -701,7 +857,7 @@ bool qkKeyAtLine(const Program* p, int line, char* out, size_t size) {
             bestLine = d->line;
         }
         if (d->kind == D_FN && d->body && d->body->kind == E_BLOCK) {
-            Out o = {{0}, 1, d->name, 0, NULL};
+            Out o = {{0}, 1, d->name, 0, NULL, d};
             keyInBlock(&o, d->body->block, d->name, line, &best, &bestLine);
         }
     }
@@ -718,6 +874,7 @@ typedef struct In {
     const char** names; /* the name a binding node carries */
     int maxId;
     bool failed;
+    char* building;     /* nodes being built: one met again is wired into itself */
 } In;
 
 static void inFail(In* in, const char* what, int id) {
@@ -725,23 +882,7 @@ static void inFail(In* in, const char* what, int id) {
     in->failed = true;
 }
 
-static TypeExpr* parseTypeText(const char* s) {
-    TypeExpr* t = qkNew(sizeof *t);
-    if (!s) s = "Int";
-    size_t len = strlen(s);
-    if (len > 1 && s[len - 1] == '?') { /* T? */
-        t->optional = true;
-        t->elem = parseTypeText(qkDup(s, len - 1));
-        return t;
-    }
-    if (s[0] == '[') {
-        size_t n = strlen(s);
-        t->elem = parseTypeText(qkDup(s + 1, n >= 2 ? n - 2 : 0));
-    } else {
-        t->name = s;
-    }
-    return t;
-}
+static TypeExpr* parseTypeText(const char* s) { return qkParseTypeText(s); }
 
 static Expr* buildNode(In* in, int id);
 static Block* buildBlock(In* in, const J* b);
@@ -767,7 +908,7 @@ static Expr* literal(const char* raw, const char* of) {
             char c = *s++;
             if (c == '\\' && s < end) {
                 char k = *s++;
-                c = k == 'n' ? '\n' : k == 't' ? '\t' : k;
+                c = k == 'n' ? '\n' : k == 't' ? '\t' : k == 'r' ? '\r' : k;
             }
             qkBufByte(&b, (uint8_t)c);
         }
@@ -834,7 +975,60 @@ static Expr** buildInputs(In* in, const J* node, int* count) {
     return out;
 }
 
+/* "pattern" and "binds" (see writePattern) back into an arm */
+static void readPattern(In* in, const J* a, Arm* arm) {
+    const char* pat = jstr(a, "pattern");
+    if (pat && !strcmp(pat, "(,)")) arm->pattern = pat;
+    else if (pat && strcmp(pat, "_")) {
+        const char* dots = strstr(pat, "..");
+        if (pat[0] == '"') {
+            arm->textPattern = literal(pat, "Text");
+        } else if (dots) { /* 80..90, 90.., ..60 */
+            arm->isRange = true;
+            if (dots > pat) arm->intPattern = literal(qkDup(pat, (size_t)(dots - pat)), "Int");
+            if (dots[2]) arm->intHigh = literal(dots + 2, "Int");
+        } else if (pat[0] == '-' || (pat[0] >= '0' && pat[0] <= '9')) {
+            arm->intPattern = literal(pat, "Int");
+        } else {
+            arm->pattern = pat;
+        }
+    }
+    J* binds = jget(a, "binds");
+    if (binds && binds->count) { /* Circle(r): r names a node the arm's wires come from */
+        arm->bindCount = binds->count;
+        arm->binds = qkNew(sizeof(char*) * (size_t)binds->count);
+        for (int f = 0; f < binds->count; f++) {
+            if (jget(binds->items[f], "pattern")) { /* a pattern inside */
+                if (!arm->subs) arm->subs = qkNew(sizeof(Arm*) * (size_t)binds->count);
+                arm->subs[f] = qkNew(sizeof(Arm));
+                readPattern(in, binds->items[f], arm->subs[f]);
+                arm->binds[f] = "_";
+                continue;
+            }
+            arm->binds[f] = jstr(binds->items[f], "name") ? jstr(binds->items[f], "name") : "_";
+            int bid = jint(binds->items[f], "id", -1);
+            if (bid >= 0 && bid <= in->maxId) in->names[bid] = arm->binds[f];
+        }
+    }
+}
+
+static Expr* buildNodeInner(In* in, int id);
+
 static Expr* buildNode(In* in, int id) {
+    if (id >= 0 && id <= in->maxId && in->building) {
+        if (in->building[id]) {
+            inFail(in, "a node wired into itself (its value uses it)", id);
+            return zero();
+        }
+        in->building[id] = 1;
+        Expr* e = buildNodeInner(in, id);
+        in->building[id] = 0;
+        return e;
+    }
+    return buildNodeInner(in, id);
+}
+
+static Expr* buildNodeInner(In* in, int id) {
     J* node = id >= 0 && id <= in->maxId ? in->byId[id] : NULL;
     if (!node) {
         inFail(in, "a missing node", id);
@@ -850,6 +1044,7 @@ static Expr* buildNode(In* in, int id) {
         e->paramCount = pn;
         for (int i = 0; i < pn; i++) {
             e->params[i].name = jstr(ps->items[i], "name");
+            if (jstr(ps->items[i], "type")) e->params[i].type = parseTypeText(jstr(ps->items[i], "type"));
             int pid = jint(ps->items[i], "id", -1);
             if (pid >= 0 && pid <= in->maxId) in->names[pid] = e->params[i].name;
         }
@@ -893,6 +1088,12 @@ static Expr* buildNode(In* in, int id) {
         e->argNames = qkNew(sizeof(char*) * (size_t)(n ? n : 1));
         e->parts = qkNew(sizeof(char*) * (size_t)(n + 1));
         e->rawParts = qkNew(sizeof(char*) * (size_t)(n + 1));
+        J* formats = jget(node, "formats");
+        if (formats && formats->kind == J_ARR) {
+            e->formats = qkNew(sizeof(char*) * (size_t)(n + 1));
+            for (int i = 0; i < n && i < formats->count; i++)
+                if (formats->items[i]->kind == J_STR && formats->items[i]->str[0]) e->formats[i] = formats->items[i]->str;
+        }
         for (int i = 0; i <= n; i++) {
             const char* raw = parts && i < parts->count && parts->items[i]->kind == J_STR ? parts->items[i]->str : "";
             e->rawParts[i] = raw;
@@ -905,19 +1106,39 @@ static Expr* buildNode(In* in, int id) {
         }
         return e;
     }
+    if (!strcmp(kind, "try")) {
+        Expr* e = qkNewExpr(E_TRY, 0, 0);
+        e->a = n > 0 ? args[0] : zero();
+        return e;
+    }
+    if (!strcmp(kind, "map")) {
+        Expr* e = qkNewExpr(E_MAP, 0, 0);
+        e->args = args;
+        e->argCount = e->argCap = n;
+        e->argNames = qkNew(sizeof(char*) * (size_t)(n ? n : 1));
+        return e;
+    }
     if (!strcmp(kind, "op")) {
         const char* op = jstr(node, "op");
         if (!op) op = "+";
-        if (!strcmp(op, "neg") || !strcmp(op, "not")) {
+        const char* open = jstr(node, "open");
+        if (open && !strcmp(op, "..")) { /* a range without its start or its end */
+            Expr* e = qkNewExpr(E_RANGE, 0, 0);
+            e->op = T_DOTDOT;
+            if (!strcmp(open, "end")) e->a = n > 0 ? args[0] : zero();
+            else e->b = n > 0 ? args[0] : zero();
+            return e;
+        }
+        if (!strcmp(op, "neg") || !strcmp(op, "not") || !strcmp(op, "~")) {
             Expr* e = qkNewExpr(E_UNARY, 0, 0);
-            e->op = !strcmp(op, "neg") ? T_MINUS : T_NOT;
+            e->op = !strcmp(op, "neg") ? T_MINUS : !strcmp(op, "~") ? T_TILDE : T_NOT;
             e->a = n > 0 ? args[0] : zero();
             return e;
         }
         Expr* e = qkNewExpr(!strcmp(op, "..") ? E_RANGE : E_BINARY, 0, 0);
         e->op = -1;
-        for (int k = T_AND; k <= T_QQ; k++)
-            if (!strcmp(qkTokName((TokKind)k), op)) e->op = k;
+        for (int k = T_AND; k <= T_SHR; k++)
+            if (k != T_TILDE && !strcmp(qkTokName((TokKind)k), op)) e->op = k;
         if (e->op < 0) inFail(in, "an unknown operator", id);
         e->a = n > 0 ? args[0] : zero();
         e->b = n > 1 ? args[1] : zero();
@@ -962,22 +1183,9 @@ static Expr* buildNode(In* in, int id) {
         for (int i = 0; arms && i < arms->count; i++) {
             J* a = arms->items[i];
             Arm arm = {0};
-            const char* pat = jstr(a, "pattern");
-            if (pat && strcmp(pat, "_")) {
-                if (pat[0] == '-' || (pat[0] >= '0' && pat[0] <= '9')) arm.intPattern = literal(pat, "Int");
-                else arm.pattern = pat;
-            }
+            readPattern(in, a, &arm);
             arm.comment = jstr(a, "comment");
-            J* binds = jget(a, "binds");
-            if (binds && binds->count) { /* Circle(r): r names a node the arm's wires come from */
-                arm.bindCount = binds->count;
-                arm.binds = qkNew(sizeof(char*) * (size_t)binds->count);
-                for (int f = 0; f < binds->count; f++) {
-                    arm.binds[f] = jstr(binds->items[f], "name") ? jstr(binds->items[f], "name") : "_";
-                    int bid = jint(binds->items[f], "id", -1);
-                    if (bid >= 0 && bid <= in->maxId) in->names[bid] = arm.binds[f];
-                }
-            }
+            if (jget(a, "guard")) arm.guard = buildInput(in, jget(a, "guard"));
             if (jget(a, "block")) {
                 arm.body = qkNewExpr(E_BLOCK, 0, 0);
                 arm.body->block = buildBlock(in, jget(a, "block"));
@@ -1024,7 +1232,13 @@ static Stmt* buildStmt(In* in, int id) {
     s->blankBefore = blank && blank->kind == J_BOOL && blank->b;
     J* list = jget(node, "inputs");
     J* first = list && list->kind == J_ARR && list->count ? list->items[0] : NULL;
-    if (!strcmp(kind, "let") || !strcmp(kind, "var")) {
+    if (!strcmp(kind, "let") && jstr(node, "pattern")) { /* let Some(x) = value else { ... } */
+        s->kind = S_LET;
+        s->pattern = qkNew(sizeof(Arm));
+        readPattern(in, node, s->pattern);
+        s->value = buildInput(in, first);
+        if (jget(node, "else")) s->elseBody = buildBlock(in, jget(node, "else"));
+    } else if (!strcmp(kind, "let") || !strcmp(kind, "var")) {
         s->kind = kind[0] == 'l' ? S_LET : S_VAR;
         s->name = jstr(node, "name");
         if (jstr(node, "annotation")) s->typeAnn = parseTypeText(jstr(node, "annotation"));
@@ -1071,6 +1285,17 @@ static Stmt* buildStmt(In* in, int id) {
     return s;
 }
 
+/* the highest id among a pattern's binds, the patterns inside them too */
+static int maxBindId(const J* binds) {
+    int maxId = 0;
+    for (int f = 0; binds && f < binds->count; f++) {
+        if (jint(binds->items[f], "id", 0) > maxId) maxId = jint(binds->items[f], "id", 0);
+        int inner = maxBindId(jget(binds->items[f], "binds"));
+        if (inner > maxId) maxId = inner;
+    }
+    return maxId;
+}
+
 static int maxIdOf(const J* dj) {
     int maxId = 0;
     J* params = jget(dj, "params");
@@ -1082,14 +1307,15 @@ static int maxIdOf(const J* dj) {
         if (jint(nd, "id", 0) > maxId) maxId = jint(nd, "id", 0);
         J* ix = jget(nd, "index");
         if (ix && jint(ix, "id", 0) > maxId) maxId = jint(ix, "id", 0);
+        int own = maxBindId(jget(nd, "binds")); /* let Some(x) = ... else, inner patterns too */
+        if (own > maxId) maxId = own;
         J* ps = jget(nd, "params");
         for (int q = 0; ps && q < ps->count; q++)
             if (jint(ps->items[q], "id", 0) > maxId) maxId = jint(ps->items[q], "id", 0);
         J* arms = jget(nd, "arms");
         for (int q = 0; arms && q < arms->count; q++) {
-            J* binds = jget(arms->items[q], "binds");
-            for (int f = 0; binds && f < binds->count; f++)
-                if (jint(binds->items[f], "id", 0) > maxId) maxId = jint(binds->items[f], "id", 0);
+            int b = maxBindId(jget(arms->items[q], "binds"));
+            if (b > maxId) maxId = b;
         }
     }
     return maxId;
@@ -1120,7 +1346,18 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
             qkError(src, 0, 0, "declaration %d has no kind or name", i + 1);
             return false;
         }
-        if (!strcmp(kind, "enum")) {
+        J* pub = jget(dj, "pub");
+        d->isPub = pub && pub->kind == J_BOOL && pub->b;
+        J* tps = jget(dj, "typeParams");
+        if (tps && tps->kind == J_ARR && tps->count) {
+            d->typeParams = qkNew(sizeof(char*) * (size_t)tps->count);
+            for (int k = 0; k < tps->count; k++) d->typeParams[k] = tps->items[k]->kind == J_STR ? tps->items[k]->str : "T";
+            d->typeParamCount = tps->count;
+        }
+        if (!strcmp(kind, "use")) {
+            d->kind = D_USE;
+            d->alias = jstr(dj, "alias");
+        } else if (!strcmp(kind, "enum")) {
             d->kind = D_ENUM;
             J* cases = jget(dj, "cases");
             d->caseFields = qkNew(sizeof(Param*) * 64);
@@ -1146,20 +1383,32 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
             d->isExtern = true;
         } else if (!strcmp(kind, "type")) {
             d->kind = D_TYPE;
+            J* functions = jget(dj, "functions");
+            for (int k = 0; functions && k < functions->count; k++) { /* an interface */
+                Param f = qkParseMemberText(functions->items[k]->kind == J_STR ? functions->items[k]->str : NULL);
+                QK_PUSH(d->params, d->paramCount, d->paramCap, f);
+                d->isInterface = true;
+            }
             J* fields = jget(dj, "fields");
             for (int k = 0; fields && k < fields->count; k++) {
                 Param f = {jstr(fields->items[k], "name"), parseTypeText(jstr(fields->items[k], "type")), 0, 0, NULL};
                 QK_PUSH(d->params, d->paramCount, d->paramCap, f);
             }
         } else { /* fn, extern fn, let: nodes of their own */
-            bool isConst = !strcmp(kind, "let");
+            bool isConst = !strcmp(kind, "const");
             d->kind = isConst ? D_CONST : D_FN;
             d->isExtern = !strcmp(kind, "extern fn");
             J* effect = jget(dj, "effect");
             d->isEffect = effect && effect->kind == J_BOOL && effect->b;
+            if (!strcmp(kind, "test")) { /* test "name": its name as text */
+                d->isTest = d->isEffect = true;
+                Expr* title = literal(strlen(d->name) > 5 ? d->name + 5 : "\"\"", "Text");
+                d->testName = title->text;
+            }
             In in = {src, NULL, NULL, maxIdOf(dj), false};
             in.byId = qkNew(sizeof(J*) * (size_t)(in.maxId + 1));
             in.names = qkNew(sizeof(char*) * (size_t)(in.maxId + 1));
+            in.building = qkNew((size_t)in.maxId + 1);
             J* nodes = jget(dj, "nodes");
             for (int k = 0; nodes && k < nodes->count; k++) {
                 int nid = jint(nodes->items[k], "id", -1);
@@ -1168,7 +1417,7 @@ bool qkGraphImport(const char* json, size_t len, const char* path, Program* out)
             J* params = jget(dj, "params");
             for (int k = 0; params && k < params->count; k++) {
                 J* pj = params->items[k];
-                Param prm = {jstr(pj, "name"), parseTypeText(jstr(pj, "type")), 0, 0, NULL};
+                Param prm = {jstr(pj, "name"), jstr(pj, "type") ? parseTypeText(jstr(pj, "type")) : NULL, 0, 0, NULL};
                 int pid = jint(pj, "id", -1);
                 if (pid >= 0 && pid <= in.maxId) in.names[pid] = prm.name;
                 if (jget(pj, "default")) prm.fallback = buildInput(&in, jget(pj, "default"));

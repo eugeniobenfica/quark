@@ -1,0 +1,5 @@
+// panic: cannot read no/such/file.txt
+fn main() {
+    let text = readFile("no/such/file.txt")?
+    print(text)
+}

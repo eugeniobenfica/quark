@@ -1,0 +1,7 @@
+ok    gcd of two numbers
+ok    the mean of nothing is None
+FAIL  a wrong expectation fails
+      tests/test/math.qk:18: gcd(10, 4) is 2, not 3
+FAIL  an index out of range fails too
+      tests/test/math.qk:23: index 5 is outside the array (its length is 2)
+2 passed, 2 failed

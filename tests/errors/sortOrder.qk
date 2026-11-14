@@ -1,0 +1,6 @@
+// error: sort orders numbers, texts and cases
+type P { x: Int }
+
+fn main() {
+    print(sort([P(2), P(1)]))
+}

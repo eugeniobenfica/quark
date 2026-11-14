@@ -1,0 +1,7 @@
+// error: the else of let Some(...) must leave
+fn main() {
+    let Some(n) = parseInt("3") else {
+        print("no")
+    }
+    print(n)
+}

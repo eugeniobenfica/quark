@@ -1,0 +1,5 @@
+// panic: a slice to 4 goes past the end (the length is 3)
+fn main() {
+    let xs = [1, 2, 3]
+    print(xs[1..4])
+}

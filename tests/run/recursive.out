@@ -1,0 +1,9 @@
+(2 + 3 * -4) = -10
+Expr.Add(a: Expr.Num(v: 2), b: Expr.Mul(a: Expr.Num(v: 3), b: Expr.Neg(e: Expr.Num(v: 4))))
+3
+a -> b -> c -> end
+a -> z -> end a -> b -> c -> end
+Node(value: a, next: Some(Node(value: b, next: Some(Node(value: c, next: None)))))
+false true true false
+true false true
+true true

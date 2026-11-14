@@ -1,5 +1,5 @@
 // Shapes, their areas, and a report.
-let unit = 10.0
+const unit = 10.0
 
 enum Shape { Circle(radius: Float), Box(width: Float, height: Float), Empty }
 type Item { name: Text, shape: Shape, count: Int }
@@ -23,7 +23,7 @@ fn biggest(items: [Item]) -> Item? {
     best
 }
 
-effect fn report(items: [Item], title: Text = "Stock") {
+fn report(items: [Item], title: Text = "Stock") {
     print("{title}: {len(items)} items, {items.map(i => area(i.shape) * i.count).sum()} square units")
     match biggest(items) {
         Some(item) => print("biggest: {item.name}")

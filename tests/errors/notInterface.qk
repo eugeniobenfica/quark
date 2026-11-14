@@ -1,0 +1,10 @@
+// error: the new value: expected Button, found Dog
+type Button { onPress: (Int) -> Int }
+type Dog { name: Text }
+
+fn Dog.onPress(self, x: Int) -> Int = x
+
+fn main() {
+    var b = Button(x => x)
+    b = Dog("rex")
+}

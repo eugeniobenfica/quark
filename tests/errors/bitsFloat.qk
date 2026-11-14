@@ -1,0 +1,4 @@
+// error: & | ^ << >> work on the bits of Ints
+fn main() {
+    print(1.5 & 2)
+}

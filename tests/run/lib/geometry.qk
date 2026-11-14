@@ -1,0 +1,17 @@
+// Shapes and their areas: what a program that uses geometry sees is what is pub.
+use units
+
+pub type Vec2 { x: Float, y: Float }
+pub enum Shape { Circle(radius: Float), Rect(size: Vec2) }
+
+pub fn Vec2.plus(self, b: Vec2) -> Vec2 = Vec2(self.x + b.x, self.y + b.y)
+
+pub fn area(s: Shape) -> Float = match s {
+    Circle(r) => pi * square(r)
+    Rect(size) => size.x * size.y
+}
+
+pub fn describe(s: Shape) -> Text = "{area(s):.2} {unitName}²"
+
+// not pub: only this file sees it
+fn square(x: Float) -> Float = x * x

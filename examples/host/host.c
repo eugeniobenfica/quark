@@ -1,16 +1,16 @@
-/* A tiny engine that runs Quark the way Artifice would: the engine's API is a prelude of extern fns backed by
- * C functions, each object's behavior is a script whose events (start, update, hit) the engine calls every
- * frame, the object's variables live in the engine between calls, a script can be swapped while the game
- * runs, a script that fails stops only itself, and the node editor's graphs compile like text.
+/* A small application that embeds Quark: its API is a prelude of extern fns backed by C functions, each
+ * item's behavior is a script whose events (start, tick, meet) the application calls on every tick, the item's
+ * variables live in the application between calls, a script can be swapped while it runs, a script that fails
+ * stops only itself, and a node editor's graphs compile like text.
  *
- *   build/host.exe [examples/host/engine.qk] [examples/host/ship.qk] */
+ *   build/host.exe [examples/host/app.qk] [examples/host/item.qk] */
 #include "quark.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- the engine's objects ------------------------------------------------------------------------ */
+/* ---- the application's items --------------------------------------------------------------------- */
 
 typedef struct Obj {
     const char* name;
@@ -19,38 +19,38 @@ typedef struct Obj {
     int alive;
 } Obj;
 
-static Obj objects[3] = {{"nobody"}, {"ship1", 0, 10}, {"ship2", 100, 50}};
-static int spaceDown;
+static Obj items[3] = {{"nobody"}, {"item1", 0, 10}, {"item2", 100, 50}};
+static int fastOn;
 
 /* The C side of the prelude's extern fns: one argument per slot, Float slots as double. */
-typedef struct V2 {
+typedef struct Point {
     double x, y;
-} V2;
+} Point;
 
-static V2 position(int64_t o) {
-    V2 v = {objects[o].x, objects[o].y};
-    return v; /* two slots: Quark passes the hidden pointer Windows x64 uses for it */
+static Point position(int64_t i) {
+    Point p = {items[i].x, items[i].y};
+    return p; /* two slots: Quark passes the hidden pointer Windows x64 uses for it */
 }
-static void moveBy(int64_t o, double dx, double dy) {
-    objects[o].x += dx;
-    objects[o].y += dy;
+static void moveBy(int64_t i, double dx, double dy) {
+    items[i].x += dx;
+    items[i].y += dy;
 }
-static void moveTo(int64_t o, double x, double y) {
-    objects[o].x = x;
-    objects[o].y = y;
+static void moveTo(int64_t i, double x, double y) {
+    items[i].x = x;
+    items[i].y = y;
 }
-static void setColor(int64_t o, double r, double g, double b, double a) { /* five arguments: the fifth on the stack */
-    objects[o].r = r;
-    objects[o].g = g;
-    objects[o].b = b;
-    objects[o].a = a;
+static void setColor(int64_t i, double r, double g, double b, double a) { /* five arguments: the fifth on the stack */
+    items[i].r = r;
+    items[i].g = g;
+    items[i].b = b;
+    items[i].a = a;
 }
-static void say(int64_t o, const char* text, int64_t len) { printf("  %s says \"%.*s\"\n", objects[o].name, (int)len, text); }
-static void destroy(int64_t o) {
-    objects[o].alive = 0;
-    printf("  %s is destroyed\n", objects[o].name);
+static void note(int64_t i, const char* text, int64_t len) { printf("  %s notes \"%.*s\"\n", items[i].name, (int)len, text); }
+static void delete(int64_t i) {
+    items[i].alive = 0;
+    printf("  %s is deleted\n", items[i].name);
 }
-static int64_t keyDown(const char* key, int64_t len) { return spaceDown && len == 5 && !memcmp(key, "space", 5); }
+static int64_t flag(const char* name, int64_t len) { return fastOn && len == 4 && !memcmp(name, "fast", 4); }
 
 /* ---- helpers ------------------------------------------------------------------------------------- */
 
@@ -90,33 +90,33 @@ static void showDiagnostics(QkVm* vm) {
     }
 }
 
-/* Each ship's variables (its Ship record: speed, laps), kept by the engine between calls. */
+/* Each item's variables (its Mover record: speed, rounds), kept by the application between calls. */
 static QkValue state[3][2];
 
-static void frames(QkVm* vm, QkModule* m, int count, int spaceFrom) {
-    int update = qkFind(m, "update");
-    for (int f = 0; f < count; f++) {
-        spaceDown = f >= spaceFrom;
-        for (int o = 1; o <= 2; o++) {
-            if (!objects[o].alive) continue;
-            QkValue args[4] = {{.i = o}, state[o][0], state[o][1], {.f = 1.0 / 60}};
+static void ticks(QkVm* vm, QkModule* m, int count, int fastFrom) {
+    int tick = qkFind(m, "tick");
+    for (int t = 0; t < count; t++) {
+        fastOn = t >= fastFrom;
+        for (int i = 1; i <= 2; i++) {
+            if (!items[i].alive) continue;
+            QkValue args[4] = {{.i = i}, state[i][0], state[i][1], {.f = 1.0 / 60}};
             QkValue next[2];
-            if (!qkCall(m, update, args, 4, next, 2)) {
-                printf("  %s stopped: %s\n", objects[o].name, qkLastError(vm));
+            if (!qkCall(m, tick, args, 4, next, 2)) {
+                printf("  %s stopped: %s\n", items[i].name, qkLastError(vm));
                 continue;
             }
-            state[o][0] = next[0];
-            state[o][1] = next[1];
+            state[i][0] = next[0];
+            state[i][1] = next[1];
         }
     }
-    for (int o = 1; o <= 2; o++)
-        printf("  %s: x %.2f, speed %.1f, laps %lld%s\n", objects[o].name, objects[o].x, state[o][0].f, (long long)state[o][1].i,
-               objects[o].alive ? "" : " (destroyed)");
+    for (int i = 1; i <= 2; i++)
+        printf("  %s: x %.2f, speed %.1f, rounds %lld%s\n", items[i].name, items[i].x, state[i][0].f, (long long)state[i][1].i,
+               items[i].alive ? "" : " (deleted)");
 }
 
 int main(int argc, char** argv) {
-    const char* preludePath = argc > 1 ? argv[1] : "examples/host/engine.qk";
-    const char* scriptPath = argc > 2 ? argv[2] : "examples/host/ship.qk";
+    const char* preludePath = argc > 1 ? argv[1] : "examples/host/app.qk";
+    const char* scriptPath = argc > 2 ? argv[2] : "examples/host/item.qk";
     size_t len;
 
     QkVm* vm = qkVmNew();
@@ -129,14 +129,14 @@ int main(int argc, char** argv) {
     qkVmHost(vm, "moveBy", (void*)moveBy);
     qkVmHost(vm, "moveTo", (void*)moveTo);
     qkVmHost(vm, "setColor", (void*)setColor);
-    qkVmHost(vm, "say", (void*)say);
-    qkVmHost(vm, "destroy", (void*)destroy);
-    qkVmHost(vm, "keyDown", (void*)keyDown);
-    qkVmFuel(vm, 1000000); /* a script that loops forever stops, the game does not */
+    qkVmHost(vm, "note", (void*)note);
+    qkVmHost(vm, "delete", (void*)delete);
+    qkVmHost(vm, "flag", (void*)flag);
+    qkVmFuel(vm, 1000000); /* a script that loops forever stops, the application does not */
 
     printf("compile %s\n", scriptPath);
     char* text = readFile(scriptPath, &len);
-    QkModule* m = qkCompile(vm, "ship.qk", text, len);
+    QkModule* m = qkCompile(vm, "item.qk", text, len);
     if (!m) {
         showDiagnostics(vm);
         return 1;
@@ -145,94 +145,105 @@ int main(int argc, char** argv) {
         printf("  %s  [%s]\n", qkFunctionSignature(m, i), qkSlotKinds(m, i));
 
     printf("start\n");
-    for (int o = 1; o <= 2; o++) {
-        objects[o].alive = 1;
-        QkValue self = {.i = o};
-        if (!qkCall(m, qkFind(m, "start"), &self, 1, state[o], 2)) printf("  %s\n", qkLastError(vm));
+    for (int i = 1; i <= 2; i++) {
+        items[i].alive = 1;
+        QkValue item = {.i = i};
+        if (!qkCall(m, qkFind(m, "start"), &item, 1, state[i], 2)) printf("  %s\n", qkLastError(vm));
     }
-    printf("  ship1 color %.1f %.1f %.1f %.1f\n", objects[1].r, objects[1].g, objects[1].b, objects[1].a);
+    printf("  item1 color %.1f %.1f %.1f %.1f\n", items[1].r, items[1].g, items[1].b, items[1].a);
 
-    printf("120 frames (space held from frame 60)\n");
-    frames(vm, m, 120, 60);
+    printf("120 ticks (fast from tick 60)\n");
+    ticks(vm, m, 120, 60);
 
-    printf("hit\n");
+    printf("meet\n");
     QkValue pair[2] = {{.i = 1}, {.i = 2}};
-    qkCall(m, qkFind(m, "hit"), pair, 2, NULL, 0);
+    qkCall(m, qkFind(m, "meet"), pair, 2, NULL, 0);
 
-    printf("hot reload: laps no longer speed the ship up\n");
-    char* faster = replaced(text, "ship.speed * 1.5", "ship.speed");
-    QkModule* m2 = qkCompile(vm, "ship.qk", faster, strlen(faster));
+    printf("hot reload: rounds no longer speed the item up\n");
+    char* steady = replaced(text, "mover.speed * 1.5", "mover.speed");
+    QkModule* m2 = qkCompile(vm, "item.qk", steady, strlen(steady));
     if (!m2) {
         showDiagnostics(vm);
         return 1;
     }
     qkModuleFree(m);
     m = m2;
-    frames(vm, m, 240, 1000);
+    ticks(vm, m, 240, 1000);
 
     printf("a script that fails\n");
-    char* broken = replaced(faster, "    let at = position(self)",
-                            "    let at = position(self)\n    let xs = [1, 2, 3]\n    moveBy(self, toFloat(xs[ship.laps + 5]), 0)");
+    char* broken = replaced(steady, "    let at = position(item)",
+                            "    let at = position(item)\n    let xs = [1, 2, 3]\n    moveBy(item, toFloat(xs[mover.rounds + 5]), 0)");
     QkModule* bad = qkCompile(vm, "broken.qk", broken, strlen(broken));
     if (!bad) {
         showDiagnostics(vm);
         return 1;
     }
-    frames(vm, bad, 1, 1000);
-    printf("  the engine goes on with the good one:\n");
-    frames(vm, m, 1, 1000);
+    ticks(vm, bad, 1, 1000);
+    printf("  the application goes on with the good one:\n");
+    ticks(vm, m, 1, 1000);
     qkModuleFree(bad);
 
     printf("a script that never stops\n");
-    const char* forever = "effect fn update(self: Object, ship: Ship, dt: Float) -> Ship {\n"
+    const char* forever = "fn tick(item: Item, mover: Mover, dt: Float) -> Mover {\n"
                           "    while true {\n"
-                          "        moveBy(self, 0, 0)\n"
+                          "        moveBy(item, 0, 0)\n"
                           "    }\n"
-                          "    ship\n"
+                          "    mover\n"
                           "}\n"
                           "\n"
-                          "type Ship { speed: Float, laps: Int }\n";
+                          "type Mover { speed: Float, rounds: Int }\n";
     QkModule* loop = qkCompile(vm, "forever.qk", forever, strlen(forever));
     if (!loop) {
         showDiagnostics(vm);
         return 1;
     }
-    frames(vm, loop, 1, 1000);
+    ticks(vm, loop, 1, 1000);
     qkModuleFree(loop);
 
     printf("from the node editor: text -> graph -> compiled\n");
-    char* graph = qkTextToGraph(vm, faster, strlen(faster), "{\"update/at\": [40, 120]}");
+    char* graph = qkTextToGraph(vm, steady, strlen(steady), "{\"tick/at\": [40, 120]}");
     if (!graph) {
         showDiagnostics(vm);
         return 1;
     }
-    printf("  update/at placed at (40, 120): %s\n", strstr(graph, "\"pos\": [40, 120]") ? "yes" : "no");
-    QkModule* fromGraph = qkCompileGraph(vm, "ship.graph", graph, strlen(graph));
+    printf("  tick/at placed at (40, 120): %s\n", strstr(graph, "\"pos\": [40, 120]") ? "yes" : "no");
+    QkModule* fromGraph = qkCompileGraph(vm, "item.graph", graph, strlen(graph));
     if (!fromGraph) {
         showDiagnostics(vm);
         return 1;
     }
-    QkValue self = {.i = 1};
+    QkValue item = {.i = 1};
     QkValue fresh[2];
-    qkCall(fromGraph, qkFind(fromGraph, "start"), &self, 1, fresh, 2);
-    printf("  start from the graph gives speed %.1f, laps %lld\n", fresh[0].f, (long long)fresh[1].i);
+    qkCall(fromGraph, qkFind(fromGraph, "start"), &item, 1, fresh, 2);
+    printf("  start from the graph gives speed %.1f, rounds %lld\n", fresh[0].f, (long long)fresh[1].i);
     qkModuleFree(fromGraph);
 
     printf("a graph with a mistake: errors point at nodes\n");
     char* wrong = replaced(graph, "\"fn\": \"moveBy\"", "\"fn\": \"moveByy\"");
-    QkModule* none = qkCompileGraph(vm, "ship.graph", wrong, strlen(wrong));
+    QkModule* none = qkCompileGraph(vm, "item.graph", wrong, strlen(wrong));
     if (!none) showDiagnostics(vm);
 
-    char* catalog = qkCatalog(vm, faster, strlen(faster));
-    printf("catalog: %s, %s, %s\n", strstr(catalog, "\"name\": \"histogram\"") ? "built-ins" : "-",
-           strstr(catalog, "\"name\": \"moveBy\", \"kind\": \"extern fn\", \"host\": true") ? "the engine's externs" : "-",
-           strstr(catalog, "\"name\": \"update\", \"kind\": \"fn\", \"host\": false") ? "the script's events" : "-");
+    char* catalog = qkCatalog(vm, steady, strlen(steady));
+    printf("catalog: %s, %s, %s\n", strstr(catalog, "\"name\": \"split\"") ? "built-ins" : "-",
+           strstr(catalog, "\"name\": \"moveBy\", \"kind\": \"extern fn\", \"host\": true") ? "the application's externs" : "-",
+           strstr(catalog, "\"name\": \"tick\", \"kind\": \"fn\", \"host\": false") ? "the script's events" : "-");
+
+    printf("a plugin with fewer capabilities: it may read items and print, nothing else\n");
+    qkVmCapabilities(vm, "position flag print");
+    QkModule* plugin = qkCompile(vm, "plugin.qk", steady, strlen(steady));
+    if (plugin) {
+        printf("  the plugin compiled, but it should not have\n");
+        qkModuleFree(plugin);
+    } else {
+        printf("  refused: %s\n", qkDiagnosticAt(vm, 0)->message);
+    }
+    qkVmCapabilities(vm, NULL);
 
     qkFree(catalog);
     qkFree(graph);
     free(wrong);
     free(broken);
-    free(faster);
+    free(steady);
     free(text);
     free(prelude);
     qkModuleFree(m);

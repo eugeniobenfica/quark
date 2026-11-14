@@ -1,0 +1,44 @@
+// Tasks: functions that run a step at a time, giving the turn back with yield; the caller decides when they go on.
+fn countdown(name: Text, from: Int) {
+    for i in 0..from {
+        print(name, from - i)
+        yield()
+    }
+    print(name, "done")
+}
+
+fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+
+fn main() {
+    let a = spawn(() => countdown("a", 3))
+    let b = spawn(() => countdown("b", 2))
+    var aGoes = true
+    var bGoes = true
+    while aGoes or bGoes {
+        if aGoes {
+            aGoes = step(a)
+        }
+        if bGoes {
+            bGoes = step(b)
+        }
+    }
+    var produced: [Int] = []
+    let gen = spawn(() => {
+        for n in 0..5 {
+            print("making", fib(n + 20))
+            yield()
+        }
+    })
+    var steps = 0
+    while step(gen) {
+        steps += 1
+    }
+    print("steps", steps)
+    let t0 = now()
+    let sleeper = spawn(() => wait(0.05))
+    var turns = 0
+    while step(sleeper) {
+        turns += 1
+    }
+    print(now() - t0 >= 0.05, turns > 0)
+}

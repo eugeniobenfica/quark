@@ -1,0 +1,22 @@
+stopped at tests/debug/demo.qk:6 in scale
+  p = Point(x: 1, y: 2)
+  k = 10
+  bigger = Point(x: 10, y: 20)
+(quark)   p = Point(x: 1, y: 2)
+  k = 10
+  bigger = Point(x: 10, y: 20)
+(quark)   scale at line 6
+  main at line 15
+(quark) stopped at tests/debug/demo.qk:16 in main
+  total = 3
+  start = Point(x: 1, y: 2)
+  i = 2
+  moved = Point(x: 10, y: 20)
+(quark)   total = 3
+(quark) stopped at tests/debug/demo.qk:17 in main
+  total = 3
+  start = Point(x: 1, y: 2)
+  i = 2
+  moved = Point(x: 10, y: 20)
+  name = quark
+(quark) 

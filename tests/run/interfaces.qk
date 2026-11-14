@@ -1,0 +1,33 @@
+// Generic functions check what they call on T in each instance; an interface lists functions, and any type with
+// those functions of its own goes into it, so one array holds dogs and cats.
+type Dog { name: Text }
+type Cat { name: Text, lives: Int }
+type Speaker { fn speak() -> Text, fn rename(to: Text) -> Text }
+type Logger { effect fn log(line: Text) }
+type Console { prefix: Text }
+
+fn Dog.speak(self) -> Text = "woof, I am {self.name}"
+
+fn Dog.rename(self, to: Text) -> Text = "{self.name} is now {to}"
+
+fn Cat.speak(self) -> Text = "meow x{self.lives}"
+
+fn Cat.rename(self, to: Text) -> Text = "cats keep their names"
+
+fn Console.log(self, line: Text) {
+    print(self.prefix + line)
+}
+
+fn talk<T>(x: T) -> Text = x.speak() + "!"
+
+fn chorus(all: [Speaker]) -> Text = all.map(s => s.speak()).toArray().join(" / ")
+
+fn main() {
+    print(talk(Dog("rex")), talk(Cat("tom", 9)))
+    let pets: [Speaker] = [Dog("rex"), Cat("tom", 9), Dog("fido")]
+    print(chorus(pets))
+    let one: Speaker = Cat("kit", 3)
+    print(one.rename("max"), pets[0].rename("max"))
+    let out: Logger = Console("> ")
+    out.log("logged through an interface")
+}

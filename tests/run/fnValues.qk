@@ -1,0 +1,38 @@
+// Functions kept as values: in lets, fields, arrays and maps, called through them; lambdas with their type.
+type Button { label: Text, onPress: (Int) -> Int }
+type Handler { name: Text, run: effect (Text) -> Int }
+
+fn double(x: Int) -> Int = x * 2
+
+fn square(x: Int) -> Int = x * x
+
+fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))
+
+fn shout(t: Text) -> Int {
+    print(upper(t))
+    len(t)
+}
+
+fn pick(big: Bool) -> (Int) -> Int = if big { square } else { double }
+
+fn main() {
+    let f = double
+    let g: (Int) -> Int = x => x + 100
+    let p = pick(true)
+    print(f(4), g(1), p(5), twice(f, 3), twice(g, 0))
+    let ops = [double, square, x => x - 1]
+    print(ops.map(op => op(6)))
+    let b = Button("ok", square)
+    print(b.label, b.onPress(9))
+    var named: [Text: (Int) -> Int] = [:]
+    named["d"] = double
+    named["s"] = square
+    for key, op in named {
+        print(key, op(3), [1, 2, 3].map(op))
+    }
+    let h = Handler("loud", shout)
+    print(h.run("hey"))
+    var current = f
+    current = g
+    print(current(5))
+}

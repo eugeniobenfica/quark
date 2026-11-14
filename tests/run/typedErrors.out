@@ -1,0 +1,5 @@
+Ok(42) Err(ParseError.Empty) Err(ParseError.NotANumber(text: x)) Err(ParseError.TooBig(n: 200))
+total 3
+error: "abc" is not a number
+error: 999 is too old
+Err(a message, as before) 7 true

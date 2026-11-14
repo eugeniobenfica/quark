@@ -1,0 +1,5 @@
+// error: an interface lists functions (fn name(...) -> Type), a record fields (name: Type): not both
+type Speaker { name: Text, fn speak() -> Text }
+
+fn main() {
+}

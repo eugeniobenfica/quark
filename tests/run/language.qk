@@ -1,11 +1,13 @@
 // The second layer of the language: constants, with, text, effects, defaults, enums with data, optionals.
-let gravity = Vec2(0, 300)
-let palette = [rgb(232, 185, 49), rgb(79, 142, 247)]
+const gravity = Vec2(0, 300)
+const palette = [rgb(232, 185, 49), rgb(79, 142, 247)]
 
+type Vec2 { x: Float, y: Float }
+type Color { r: Float, g: Float, b: Float, a: Float }
 type Ship { name: Text, speed: Float, laps: Int }
 enum Shape { Circle(radius: Float), Box(width: Float, height: Float), Empty }
 
-fn rgb(r: Int, g: Int, b: Int, a: Float = 1.0) -> Vec4 = Vec4(r / 255.0, g / 255.0, b / 255.0, a)
+fn rgb(r: Int, g: Int, b: Int, a: Float = 1.0) -> Color = Color(r / 255.0, g / 255.0, b / 255.0, a)
 
 fn area(s: Shape) -> Float = match s {
     Circle(r) => 3.0 * r * r
@@ -24,7 +26,7 @@ fn find(names: [Text], wanted: Text) -> Int? {
 
 fn lap(ship: Ship) -> Ship = ship with { speed: ship.speed * 1.5, laps: ship.laps + 1 }
 
-effect fn report(ship: Ship, label: Text = "ship") {
+fn report(ship: Ship, label: Text = "ship") {
     print("{label} {ship.name}: {ship.laps} laps at {ship.speed}")
 }
 

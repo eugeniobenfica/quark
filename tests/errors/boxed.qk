@@ -1,0 +1,7 @@
+// error: next holds its own type: set it whole
+type Node { value: Int, next: Node? }
+
+fn main() {
+    var n = Node(1, Node(2, None))
+    n.next.value = 3
+}

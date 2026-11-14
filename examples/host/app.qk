@@ -1,0 +1,14 @@
+// What a host application gives its scripts (its prelude): its API as Quark sees it.
+// Every program the host compiles sees these; the host registers a C function for each extern fn.
+// An extern effect fn changes the world (an action node, on the execution wire); the others only read it.
+extern type Item
+
+type Point { x: Float, y: Float }
+
+extern fn position(i: Item) -> Point
+extern effect fn moveBy(i: Item, dx: Float, dy: Float)
+extern effect fn moveTo(i: Item, p: Point)
+extern effect fn setColor(i: Item, r: Float, g: Float, b: Float, a: Float)
+extern effect fn note(i: Item, message: Text)
+extern effect fn delete(i: Item)
+extern fn flag(name: Text) -> Bool

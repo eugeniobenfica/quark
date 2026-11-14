@@ -103,6 +103,10 @@ if "$Q" build tests/run/loops.qk -o "$tmp/loops.exe" 2> /dev/null && "$tmp/loops
 if "$Q" test tests/test/math.qk 2>&1 | sed 's/ ([0-9.]* ms)$//' > "$tmp/out"; cmp -s "$tmp/out" tests/test/math.out; then ok; else bad "quark test"; diff tests/test/math.out "$tmp/out" | head -5; fi
 # the language server: diagnostics, hover, definition, symbols, formatting
 if bash tests/lsp/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/lsp/session.out; then ok; else bad "quark lsp"; diff tests/lsp/session.out "$tmp/out" | head -5; fi
+# packages: quark get from git repositories the script makes (no network), use pkg.module, quark.lock, the errors
+if command -v git > /dev/null 2>&1; then
+    if bash tests/packages/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/packages/session.out; then ok; else bad "quark get"; diff tests/packages/session.out "$tmp/out" | head -5; fi
+fi
 # System V calls into a host: records back in registers or through memory, arguments on the stack
 if "$(dirname "$Q")/sysv-hosts.exe" 2>&1 | tr -d '\r' > "$tmp/out" && cmp -s "$tmp/out" tests/sysv/hosts.out; then ok; else bad "System V host calls"; fi
 # embedding: the host example (host functions, events, hot reload, panics, budget, graphs, catalog)

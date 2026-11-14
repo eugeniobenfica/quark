@@ -8,6 +8,7 @@
  *   quark graph file.qk                       the node graph, as JSON
  *   quark text  file.json                     a node graph back to Quark text
  *   quark ir    file.qk                       the intermediate code
+ *   quark get   [dir]                         fetch the packages quark.toml names, write quark.lock
  *
  * An executable made by `quark build` is this same program with the machine code appended: when it starts
  * and finds code at its own end, it runs that code instead of the command line. */
@@ -448,6 +449,8 @@ static int runTests(const char* path, int64_t fuel) {
     return failed ? 1 : 0;
 }
 
+int qkGet(const char* root); /* package.c */
+
 static int usage(void) {
     fputs("Quark — a small compiled language whose programs are also node graphs.\n\n"
           "  quark debug file.qk [--break LINE]...   stop at lines, step, see the names' values\n"
@@ -463,7 +466,8 @@ static int usage(void) {
           "  quark graph file.qk                       print the node graph (JSON)\n"
           "  quark text  file.json                     turn a node graph back into Quark\n"
           "  quark ir    file.qk                       print the intermediate code\n"
-          "  quark catalog file.qk | -                 every node an editor can offer (JSON)\n\n"
+          "  quark catalog file.qk | -                 every node an editor can offer (JSON)\n"
+          "  quark get   [dir]                         fetch the packages quark.toml names (git), write quark.lock\n\n"
           "  --prelude host.qk   the host's declarations (extern fn, extern type) for run, check, graph, catalog\n"
           "  --layout pos.json   graph: node positions by key, written into the nodes as \"pos\"\n",
           stderr);
@@ -479,6 +483,8 @@ static int realMain(int argc, char** argv) {
         qkExitEnds = true;
         return repl();
     }
+    if (argc >= 2 && !strcmp(argv[1], "get")) /* quark get [dir]: the packages quark.toml names, into .quark/pkg */
+        return argc > 3 ? usage() : qkGet(argc == 3 ? argv[2] : ".");
     if (argc < 3) return usage();
     const char* cmd = argv[1];
     const char* path = argv[2];

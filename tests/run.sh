@@ -129,10 +129,10 @@ for v in base ours theirs; do "$Q" graph $C/$v.qk > "$tmp/$v.json"; done # graph
 if "$Q" merge "$tmp/base.json" "$tmp/ours.json" "$tmp/theirs.json" -o "$tmp/m.json" && "$Q" text "$tmp/m.json" | cmp -s - $C/merged.qk; then ok; else bad "quark merge (graphs)"; fi
 for v in conflict removed; do
     "$Q" merge $C/base.qk $C/ours.qk $C/$v.qk -o "$tmp/m.qk" 2> "$tmp/err"
-    if [ $? -eq 1 ] && cmp -s "$tmp/err" $C/$v.out && cmp -s "$tmp/m.qk" $C/$v-merged.qk; then ok; else bad "quark merge ($v)"; cat "$tmp/err"; fi
+    if [ $? -eq 1 ] && tr -d '\r' < "$tmp/err" | cmp -s - $C/$v.out && cmp -s "$tmp/m.qk" $C/$v-merged.qk; then ok; else bad "quark merge ($v)"; cat "$tmp/err"; fi
 done
 "$Q" merge $C/base.qk $C/ours.qk $C/conflict.qk --json -o "$tmp/m.qk" 2> "$tmp/err"
-if cmp -s "$tmp/err" $C/conflict.json; then ok; else bad "quark merge --json"; fi
+if tr -d '\r' < "$tmp/err" | cmp -s - $C/conflict.json; then ok; else bad "quark merge --json"; fi
 if command -v "$CCX" > /dev/null 2>&1; then # the embedding API's qkDiff and qkMerge
     if "$CCX" -Iinclude $C/api.c "$(dirname "$Q")/libquark.a" -lm -o "$tmp/collab" && "$tmp/collab" $C | tr -d '\r' | cmp -s - $C/api.out; then ok; else bad "qkDiff, qkMerge"; fi
 fi

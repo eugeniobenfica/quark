@@ -1,0 +1,235 @@
+// Dates and times in UTC, on the Gregorian calendar: from and to the seconds time() gives, weekdays, days
+// added, and ISO 8601 text both ways (2026-11-13, 2026-11-13T09:30:05.250Z).
+pub type Date { year: Int, month: Int, day: Int }
+
+// a moment to the millisecond, in UTC
+pub type DateTime {
+    year: Int
+    month: Int
+    day: Int
+    hour: Int
+    minute: Int
+    second: Int
+    millisecond: Int
+}
+
+pub enum Weekday { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday }
+
+// the moment that many seconds after 1970-01-01T00:00:00Z: utc(time()) is now
+pub fn utc(seconds: Float) -> DateTime {
+    let ms = round(seconds * 1000)
+    let d = dateOfDays(ms / 86_400_000)
+    let inDay = ms % 86_400_000
+    DateTime(d.year, d.month, d.day, inDay / 3_600_000, inDay / 60_000 % 60, inDay / 1000 % 60, inDay % 1000)
+}
+
+// the date that many days after 1970-01-01 (before it, below 0)
+pub fn dateOfDays(days: Int) -> Date {
+    let z = days + 719_468
+    let era = z / 146_097
+    let doe = z - era * 146_097
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }
+    Date(yoe + era * 400 + (if month <= 2 { 1 } else { 0 }), month, doy - (153 * mp + 2) / 5 + 1)
+}
+
+pub fn isLeapYear(year: Int) -> Bool = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+pub fn daysInMonth(year: Int, month: Int) -> Int = match month {
+    2 => if isLeapYear(year) { 29 } else { 28 }
+    _ if month == 4 or month == 6 or month == 9 or month == 11 => 30
+    _ => 31
+}
+
+// the days from 1970-01-01 to it (before it, below 0)
+pub fn Date.days(self) -> Int {
+    let y = if self.month <= 2 { self.year - 1 } else { self.year }
+    let era = y / 400
+    let yoe = y - era * 400
+    let doy = (153 * (if self.month > 2 { self.month - 3 } else { self.month + 9 }) + 2) / 5 + self.day - 1
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+// whether the month is 1 to 12 and the day is in it
+pub fn Date.isValid(self) -> Bool =
+    self.month >= 1 and self.month <= 12 and self.day >= 1 and self.day <= daysInMonth(self.year, self.month)
+
+pub fn Date.weekday(self) -> Weekday = match (self.days() + 3) % 7 {
+    0 => Weekday.Monday
+    1 => Weekday.Tuesday
+    2 => Weekday.Wednesday
+    3 => Weekday.Thursday
+    4 => Weekday.Friday
+    5 => Weekday.Saturday
+    _ => Weekday.Sunday
+}
+
+// the date n days later (earlier, for n below 0)
+pub fn Date.addDays(self, n: Int) -> Date = dateOfDays(self.days() + n)
+
+// the same day n months later, or the month's last day when it has fewer: 01-31 plus a month is 02-28
+pub fn Date.addMonths(self, n: Int) -> Date {
+    let m = self.year * 12 + self.month - 1 + n
+    let year = m / 12
+    let month = m % 12 + 1
+    Date(year, month, min(self.day, daysInMonth(year, month)))
+}
+
+// the moment at that time of the day: Date(2026, 11, 13).at(9, 30)
+pub fn Date.at(self, hour: Int, minute: Int, second: Int = 0, millisecond: Int = 0) -> DateTime =
+    DateTime(self.year, self.month, self.day, hour, minute, second, millisecond)
+
+pub fn Date.compare(self, b: Date) -> Int = self.days() - b.days()
+
+// as ISO 8601: 2026-11-13
+pub fn Date.toIso(self) -> Text =
+    "{padded(self.year, 4)}-{padded(self.month, 2)}-{padded(self.day, 2)}"
+
+pub fn DateTime.date(self) -> Date = Date(self.year, self.month, self.day)
+
+// the seconds from 1970-01-01T00:00:00Z to it, as time() gives them
+pub fn DateTime.seconds(self) -> Float = toFloat(self.milliseconds()) / 1000
+
+pub fn DateTime.weekday(self) -> Weekday = self.date().weekday()
+
+pub fn DateTime.addSeconds(self, s: Float) -> DateTime = utc(self.seconds() + s)
+
+pub fn DateTime.addDays(self, n: Int) -> DateTime {
+    let d = self.date().addDays(n)
+    self with { year: d.year, month: d.month, day: d.day }
+}
+
+pub fn DateTime.compare(self, b: DateTime) -> Int = self.milliseconds() - b.milliseconds()
+
+// as ISO 8601 in UTC: 2026-11-13T09:30:05Z, with .250 before the Z when there are milliseconds
+pub fn DateTime.toIso(self) -> Text {
+    let ms = if self.millisecond == 0 {
+        ""
+    } else {
+        ".{padded(self.millisecond, 3)}"
+    }
+    "{self.date().toIso()}T{padded(self.hour, 2)}:{padded(self.minute, 2)}:{padded(self.second, 2)}{ms}Z"
+}
+
+// an ISO 8601 date, YYYY-MM-DD, or why it is not one
+pub fn parseDate(text: Text) -> Date! {
+    let cs = chars(trim(text))
+    let d = readDate(cs, text)?
+    if len(cs) > 10 {
+        return Err("date: \"{cs[10]}\" after the date in \"{text}\"")
+    }
+    d
+}
+
+// an ISO 8601 date and time: 2026-11-13T09:30, with seconds (:05), their fraction (.25) and Z or an offset
+// (+02:00, -0530) after it if it has them; the time may follow a space instead of the T, and a date alone is
+// its midnight. Without Z or an offset it is taken as UTC; with an offset it is turned to UTC.
+pub fn parseDateTime(text: Text) -> DateTime! {
+    let cs = chars(trim(text))
+    let d = readDate(cs, text)?
+    if len(cs) == 10 {
+        return d.at(0, 0)
+    }
+    if not contains("Tt ", cs[10]) {
+        return Err("date: a T before the time in \"{text}\"")
+    }
+    let hour = number(cs, 11, 2) ?? -1
+    let minute = if len(cs) > 13 and cs[13] == ":" {
+        number(cs, 14, 2) ?? -1
+    } else {
+        -1
+    }
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 {
+        return Err("date: expected the time as hh:mm in \"{text}\"")
+    }
+    var at = 16
+    var second = 0
+    var ms = 0
+    if at < len(cs) and cs[at] == ":" {
+        second = number(cs, at + 1, 2) ?? -1
+        if second < 0 or second > 59 {
+            return Err("date: expected seconds (00 to 59) after hh:mm in \"{text}\"")
+        }
+        at += 3
+        if at < len(cs) and (cs[at] == "." or cs[at] == ",") {
+            at += 1
+            var scale = 100
+            while at < len(cs) and contains("0123456789", cs[at]) {
+                ms += (parseInt(cs[at]) ?? 0) * scale
+                scale /= 10
+                at += 1
+            }
+        }
+    }
+    let moment = d.at(hour, minute, second, ms)
+    if at == len(cs) {
+        return moment
+    }
+    if (cs[at] == "Z" or cs[at] == "z") and at + 1 == len(cs) {
+        return moment
+    }
+    if cs[at] == "+" or cs[at] == "-" {
+        let sign = if cs[at] == "+" { 1 } else { -1 }
+        let oh = number(cs, at + 1, 2) ?? -1
+        let colon = at + 3 < len(cs) and cs[at + 3] == ":"
+        let om = if at + 3 == len(cs) {
+            0
+        } else {
+            number(cs, at + (if colon { 4 } else { 3 }), 2) ?? -1
+        }
+        let end = if at + 3 == len(cs) {
+            at + 3
+        } else if colon { at + 6 } else { at + 5 }
+        if oh >= 0 and oh <= 23 and om >= 0 and om <= 59 and end == len(cs) {
+            return moment.addSeconds(toFloat(-sign * (oh * 3600 + om * 60)))
+        }
+    }
+    Err("date: \"{join(cs[at..], "")}\" is not Z or an offset (+hh:mm) in \"{text}\"")
+}
+
+fn DateTime.milliseconds(self) -> Int =
+    self.date().days() * 86_400_000 + self.hour * 3_600_000 + self.minute * 60_000 + self.second * 1000 + self.millisecond
+
+fn readDate(cs: [Text], text: Text) -> Date! {
+    let y = number(cs, 0, 4)
+    let m = if len(cs) > 4 and cs[4] == "-" { number(cs, 5, 2) } else { None }
+    let d = if len(cs) > 7 and cs[7] == "-" { number(cs, 8, 2) } else { None }
+    let Some(year) = y else {
+        return Err("date: expected YYYY-MM-DD, found \"{text}\"")
+    }
+    let Some(month) = m else {
+        return Err("date: expected YYYY-MM-DD, found \"{text}\"")
+    }
+    let Some(day) = d else {
+        return Err("date: expected YYYY-MM-DD, found \"{text}\"")
+    }
+    let date = Date(year, month, day)
+    if not date.isValid() {
+        return Err("date: {date.toIso()} is not a day of the calendar")
+    }
+    date
+}
+
+// the n digits at cs[at..] as a number, or None
+fn number(cs: [Text], at: Int, n: Int) -> Int? {
+    if at + n > len(cs) {
+        return None
+    }
+    var v = 0
+    for c in cs[at..at + n] {
+        if not contains("0123456789", c) {
+            return None
+        }
+        v = v * 10 + (parseInt(c) ?? 0)
+    }
+    v
+}
+
+// n's digits, with zeros in front to make at least the width
+fn padded(n: Int, width: Int) -> Text {
+    let t = toText(abs(n))
+    let sign = if n < 0 { "-" } else { "" }
+    sign + repeat("0", max(0, width - len(t))) + t
+}

@@ -1,0 +1,9 @@
+// panic: the corner: assertEqual: the values differ
+use std.testing
+
+type Point { x: Int, y: Int }
+
+fn main() {
+    assertEqual(Point(1, 2), Point(1, 2))
+    assertEqual(Point(1, 2), Point(1, 3), what: "the corner")
+}

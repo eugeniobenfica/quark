@@ -1,0 +1,28 @@
+// std.time: dates and times in UTC, from and to seconds, weekdays, and ISO 8601 both ways.
+use std.time
+
+fn show(r: DateTime!) -> Text = match r {
+    Ok(x) => x.toIso()
+    Err(why) => why
+}
+
+fn main() {
+    let epoch = utc(0)
+    print(epoch.toIso(), epoch.weekday(), utc(1_700_000_000.25).toIso(), utc(-1).toIso())
+    let d = Date(2024, 2, 28)
+    print(d.addDays(1).toIso(), d.addDays(2).toIso(), d.addDays(-59).toIso(), d.weekday(), d.days())
+    print(Date(2026, 1, 31).addMonths(1).toIso(), Date(2024, 1, 31).addMonths(1).toIso(), Date(2026, 3, 15).addMonths(-15).toIso())
+    print(dateOfDays(0).toIso(), dateOfDays(-719_468).toIso(), Date(2000, 3, 1).days(), Date(1600, 2, 29).isValid(), Date(1900, 2, 29).isValid())
+    let t = Date(2026, 11, 13).at(9, 30, second: 5)
+    print(t.toIso(), t.seconds(), utc(t.seconds()) == t, t.addSeconds(86_399.5).toIso(), t.addDays(-365).toIso())
+    print(t < t.addSeconds(0.001), Date(2026, 1, 1) > Date(2025, 12, 31), sort([Date(2026, 5, 1), Date(1999, 9, 9), Date(2026, 4, 30)]).map(x => x.toIso()))
+    for text in ["2026-11-13", "2026-11-13T09:30", "2026-11-13 09:30:05", "2026-11-13T09:30:05.25Z", "2026-11-13T23:30:00+02:00", "2026-11-13T00:15-0530", "2026-12-31T23:59:59-01"] {
+        print(text, "->", show(parseDateTime(text)))
+    }
+    for text in ["2026-02-30", "2026-1-5", "2026-11-13T25:00", "2026-11-13T09:30:61", "2026-11-13T09:30 UTC", "13/11/2026", ""] {
+        print(text, "->", parseDateTime(text))
+    }
+    print((parseDate("1969-07-20") ?? Date(0, 1, 1)).weekday(), parseDate("2026-11-13x"))
+    let now = utc(time())
+    print(now.year >= 2026, now.date().isValid(), Weekday.Sunday.index())
+}

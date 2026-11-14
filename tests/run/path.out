@@ -1,0 +1,20 @@
+a/b/c.txt a/b/c /etc C:\x/y z
+"a/./b/../c/" -> "a/c" [a, c]
+"/../x//y/." -> "/x/y" [x, y]
+"../../a" -> "../../a" [.., .., a]
+"a/.." -> "." []
+"" -> "." []
+"C:\Users\..\Temp\" -> "C:/Temp" [Temp]
+"C:x\..\.." -> "C:.." [..]
+"./" -> "." []
+a/b/c.txt | a/b | c.txt | txt | c | a/b/c.md
+c.txt | . | c.txt | txt | c | c.md
+/ | / |  |  |  | /
+/usr | / | usr |  | usr | /usr.md
+.. | ../.. | .. |  | .. | ..
+C:\docs\é.tar.gz | C:/docs | é.tar.gz | gz | é.tar | C:/docs/é.tar.md
+.profile | . | .profile |  | .profile | .profile.md
+make | . | make |  | make | make.md
+notes. | . | notes. |  | notes | notes.md
+true true true false false
+C:\a\b\c a/b

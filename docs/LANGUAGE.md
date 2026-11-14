@@ -528,7 +528,7 @@ instance is checked with its own type, and a type without the function is an err
 `use geometry` at the top of a file brings in the `pub` declarations of `geometry.qk`, the file next
 to it; `use shapes.round` is `shapes/round.qk`. `use geometry as geo` brings them in by the alias only:
 `geo.area(s)`, `geo.Vec2(1, 2)`, `[geo.Shape]`, `geo.Shape.Circle(1)`, and a type's own functions and
-operators work on its values as before. `use std.math` and `use std.json` are the standard library,
+operators work on its values as before. `use std.math`, `use std.json`, `use std.time`... are the standard library,
 written in Quark and kept in the compiler (below). A file sees its own declarations, the host's, and the
 `pub` ones of the files it uses, not the files those use. Two files may each have a private function of
 one name; a `pub` name that meets another in a file that sees both is an error that names the file.
@@ -897,6 +897,11 @@ Written in Quark, in `std/`, kept inside the compiler (`use std.name`, no file n
 | --- | --- |
 | `std.math` | `pi`, `tau`; `Vec2`, `Vec3` with `+ - * /` and unary `-`, `dot`, `cross`, `length`, `distance`, `normalized`, `lerp`, `angle`, `rotated` |
 | `std.json` | `enum Json { Null, Bool, Num, Str, List, Object }`, `parseJson(text) -> Json!`, `toJson(j)`, `j.field(name)`, `j.number()`, `j.text()` |
+| `std.time` | UTC on the Gregorian calendar: `Date(year, month, day)`, `DateTime(year, month, day, hour, minute, second, millisecond)`, `enum Weekday`; `utc(seconds)` (`utc(time())` is now), `dateOfDays(n)`, `isLeapYear`, `daysInMonth`; `d.days()`, `d.weekday()`, `d.addDays(n)`, `d.addMonths(n)`, `d.at(hour, minute, second, millisecond)`, `d.isValid()`, `dt.date()`, `dt.seconds()`, `dt.addSeconds(s)`, `dt.addDays(n)`; `<` and `sort`; ISO 8601: `toIso()`, `parseDate(text) -> Date!`, `parseDateTime(text) -> DateTime!` (with seconds, fractions, `Z` or an offset turned to UTC) |
+| `std.regex` | `regex(pattern) -> Regex!`: literals, `.`, `[a-z]`, `[^...]`, `\d \w \s \D \W \S \b \B`, `^ $`, `* + ? {n} {n,} {n,m}` (and lazy, with `?` after), `\|`, groups `( )` and `(?: )`; `r.matches(text)` (all of it), `r.find(text) -> Match?`, `r.findAll(text)`, `r.replaceAll(text, "$1")`, `r.replaceEach(text, m => ...)`, `r.split(text)`; `Match(start, end, text, groups)`, in bytes. Linear in the text times the pattern, never exponential |
+| `std.collections` | values that share what they hold: `Queue<T>` (a deque: `Queue.Empty`, `queueOf(xs)`, `pushBack`, `pushFront`, `front`, `back`, `popFront`, `popBack`, `size`, `isEmpty`, `toArray`, each end O(1)) and `Heap<T>` (a priority queue, smallest by `<` on top: `Heap.Empty`, `heapOf(xs)`, `push`, `top`, `pop`, `merge`, `size`, `isEmpty`, `toArray` sorted; O(log n)); `Keyed(key, value)` orders a heap by a key |
+| `std.path` | `/` and `\` both: `joinPath(a, b)`, `normalize(path)`, `parent`, `fileName`, `extension`, `stem`, `withExtension(path, ext)`, `pathParts`, `isAbsolute`, `windowsPath` |
+| `std.testing` | `assertEqual(actual, expected, what: ...)` shows both values (of any type print shows) when they differ, `assertNotEqual`, `assertNear(a, b, tolerance: ...)`, `assertErr(result, part: ...)` |
 
 ## Not yet
 

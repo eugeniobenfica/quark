@@ -1,0 +1,26 @@
+// std.testing: checks that pass say nothing; tests/panics/assertEqual.qk shows one that fails.
+use std.testing
+
+type Point { x: Int, y: Int }
+enum Shape { Dot, Circle(r: Float) }
+
+fn main() {
+    assertEqual(2 + 2, 4)
+    assertEqual("ab" + "c", "abc", what: "joined text")
+    assertEqual(Point(1, 2), Point(1, 2))
+    assertEqual(Shape.Circle(2), Shape.Circle(2.0))
+    assertEqual(parseInt("12"), Some(12))
+    assertNotEqual(Point(1, 2), Point(2, 1))
+    assertNear(0.1 + 0.2, 0.3)
+    assertNear(3.14159, 3.14, tolerance: 0.01)
+    assertErr(parseVersion("x"), part: "major.minor")
+    print("all passed")
+}
+
+fn parseVersion(t: Text) -> Int! {
+    let parts = split(t, ".")
+    if len(parts) != 2 {
+        return Err("expected major.minor, found \"{t}\"")
+    }
+    parseInt(parts[0]) ?? 0
+}

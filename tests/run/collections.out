@@ -1,0 +1,9 @@
+true None 0
+[1, 2, 3, 4] Some(1) Some(4) 4 [0, 1, 2, 3, 4, 5]
+[70, 60, 50, 40, 30, 20, 10, 5]
+1 Some(99999)
+Some(1) 7 [1, 1, 2, 3, 4, 5, 9] Some(2) Some(1)
+[apple, fig, pear] [0, 1, 1, 2, 3, 4, 5, 7, 9]
+test [test, build, ship]
+[a, b, c] a
+10000 Some(0) [0, 1, 2, 3, 4]

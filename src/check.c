@@ -1031,6 +1031,11 @@ static Decl* typeFunction(Checker* c, const Type* t, const char* name) {
     QkBuf full = {0};
     qkBufPrintf(&full, "%s.%s", t->decl->templateOf ? t->decl->templateOf->name : t->decl->name, name);
     Decl* d = findDecl(c, full.data);
+    const Decl* owner = t->decl->templateOf ? t->decl->templateOf : t->decl;
+    for (int i = 0; !d && i < c->prog->count; i++) { /* a type's functions go with its values: from its own file too (a generic of std on a program's type) */
+        Decl* o = c->prog->decls[i];
+        if (o->module == owner->module && o->kind == D_FN && !strcmp(o->name, full.data)) d = o;
+    }
     qkBufFree(&full);
     return d && d->kind == D_FN ? d : NULL;
 }
@@ -2536,7 +2541,7 @@ static Type* checkCall(Checker* c, Expr* e) {
             for (int i = 1; i < e->argCount; i++)
                 if (e->args[i]->kind != E_LAMBDA) checkExpr(c, e->args[i], true);
             return &qkTypeError;
-        } else if (!d && c->typing && c->typing->templateOf && t->kind != TY_ERROR && !fnField(t, e->name)) { /* an instance: say whose T it is */
+        } else if (!d && c->typing && c->typing->templateOf && t->kind != TY_ERROR && !fnField(t, e->name) && !builtinNamed(e->name)) { /* an instance: say whose T it is (a built-in, xs.push, is not) */
             QkBuf n = {0};
             qkTypeName(t, &n);
             qkError(c->src, e->line, e->col, "%s has no function %s: %s needs fn %s.%s(...) for it", n.data, e->name, c->typing->name, n.data, e->name);
@@ -3352,6 +3357,25 @@ static Type* checkBinary(Checker* c, Expr* e) {
         if (a == b && a->kind == TY_BOOL) return &qkTypeBool;
         if (a == b && (a->kind == TY_RECORD || a->kind == TY_ENUM || a->kind == TY_HANDLE)) {
             Decl* d = typeFunction(c, a, "compare"); /* fn T.compare(a: T, b: T) -> Int: below 0, 0, above 0 */
+            if (d && d->paramCount == 2 && d->isTemplate) { /* a generic type's compare: its instance, as a call would make */
+                Expr* call = qkNew(sizeof *call);
+                call->kind = E_CALL;
+                call->line = e->line;
+                call->col = e->col;
+                call->name = d->name;
+                call->args = qkNew(sizeof(Expr*) * 2);
+                call->args[0] = e->a;
+                call->args[1] = e->b;
+                call->argNames = qkNew(sizeof(const char*) * 2);
+                call->argCount = 2;
+                e->a->typed = e->b->typed = true;
+                Type* r = checkTemplateCall(c, call, d);
+                if (r->kind == TY_ERROR) return r;
+                e->decl = call->decl;
+                e->ordered = call->ordered;
+                e->orderedCount = 2;
+                return &qkTypeBool;
+            }
             if (d && d->paramCount == 2) {
                 Type* r = fnReturnType(c, d, e);
                 if (r->kind != TY_INT && r->kind != TY_ERROR) {

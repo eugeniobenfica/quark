@@ -1,0 +1,195 @@
+// Collections that are values: Queue (a double-ended queue) and Heap (a priority queue). A change gives a
+// new collection and leaves the old one as it was; the two share what they hold.
+pub enum Queue<T> { Empty, Items(front: Chain<T>, back: Chain<T>, size: Int) }
+
+// a min-heap: top() is the smallest by <, so T is a number, a text, or a type with compare
+pub enum Heap<T> { Empty, Node(size: Int, rank: Int, top: T, left: Heap<T>, right: Heap<T>) }
+
+// a value ordered by its key alone, for a heap that ranks values by something else: Keyed(priority, job)
+pub type Keyed<K, V> { key: K, value: V }
+
+pub fn Keyed.compare(self, b: Keyed<K, V>) -> Int {
+    if self.key < b.key {
+        return -1
+    }
+    if b.key < self.key { 1 } else { 0 }
+}
+
+// the values in order, first to last
+pub fn queueOf<T>(xs: [T]) -> Queue<T> = balance(chainOf(xs), Chain.End, len(xs))
+
+pub fn Queue.size(self) -> Int = match self {
+    Empty => 0
+    Items(_, _, n) => n
+}
+
+pub fn Queue.isEmpty(self) -> Bool = self.size() == 0
+
+// the first value, or None
+pub fn Queue.front(self) -> T? = match self {
+    Empty => None
+    Items(f, b, _) => if f.isEnd() { b.head() } else { f.head() }
+}
+
+// the last value, or None
+pub fn Queue.back(self) -> T? = match self {
+    Empty => None
+    Items(f, b, _) => if b.isEnd() { f.head() } else { b.head() }
+}
+
+// the queue with x after the last
+pub fn Queue.pushBack(self, x: T) -> Queue<T> = match self {
+    Empty => Queue.Items(Chain.End, Chain.Link(x, Chain.End), 1)
+    Items(f, b, n) => balance(f, Chain.Link(x, b), n + 1)
+}
+
+// the queue with x before the first
+pub fn Queue.pushFront(self, x: T) -> Queue<T> = match self {
+    Empty => Queue.Items(Chain.Link(x, Chain.End), Chain.End, 1)
+    Items(f, b, n) => balance(Chain.Link(x, f), b, n + 1)
+}
+
+// the queue without its first value (an empty one stays empty)
+pub fn Queue.popFront(self) -> Queue<T> = match self {
+    Empty => self
+    Items(f, b, n) => if f.isEnd() { Queue.Empty } else { balance(f.tail(), b, n - 1) }
+}
+
+// the queue without its last value (an empty one stays empty)
+pub fn Queue.popBack(self) -> Queue<T> = match self {
+    Empty => self
+    Items(f, b, n) => if b.isEnd() { Queue.Empty } else { balance(f, b.tail(), n - 1) }
+}
+
+// the values, first to last
+pub fn Queue.toArray(self) -> [T] = match self {
+    Empty => []
+    Items(f, b, _) => f.toArray() + b.toArray().reverse()
+}
+
+// the values in a heap, smallest on top
+pub fn heapOf<T>(xs: [T]) -> Heap<T> {
+    var h: Heap<T> = Heap.Empty
+    for x in xs {
+        h = h.push(x)
+    }
+    h
+}
+
+pub fn Heap.size(self) -> Int = match self {
+    Empty => 0
+    Node(n, _, _, _, _) => n
+}
+
+pub fn Heap.isEmpty(self) -> Bool = self.size() == 0
+
+// the smallest value, or None
+pub fn Heap.top(self) -> T? = match self {
+    Empty => None
+    Node(_, _, x, _, _) => x
+}
+
+// the heap with x in it
+pub fn Heap.push(self, x: T) -> Heap<T> = meld(self, Heap.Node(1, 1, x, Heap.Empty, Heap.Empty))
+
+// the heap without its smallest value (an empty one stays empty)
+pub fn Heap.pop(self) -> Heap<T> = match self {
+    Empty => self
+    Node(_, _, _, l, r) => meld(l, r)
+}
+
+// both heaps' values in one
+pub fn Heap.merge(self, b: Heap<T>) -> Heap<T> = meld(self, b)
+
+// the values, smallest first
+pub fn Heap.toArray(self) -> [T] {
+    var out: [T] = []
+    var h = self
+    while true {
+        let Node(_, _, x, l, r) = h else {
+            break
+        }
+        out.push(x)
+        h = meld(l, r)
+    }
+    out
+}
+
+// a list linked from its head: the front of a queue, or its back from the last value
+enum Chain<T> { End, Link(head: T, tail: Chain<T>) }
+
+fn chainOf<T>(xs: [T]) -> Chain<T> {
+    var c: Chain<T> = Chain.End
+    for i in 0..len(xs) {
+        c = Chain.Link(xs[len(xs) - 1 - i], c)
+    }
+    c
+}
+
+fn Chain.head(self) -> T? = match self {
+    End => None
+    Link(x, _) => x
+}
+
+fn Chain.isEnd(self) -> Bool = match self {
+    End => true
+    _ => false
+}
+
+fn Chain.tail(self) -> Chain<T> = match self {
+    End => self
+    Link(_, rest) => rest
+}
+
+fn Chain.toArray(self) -> [T] {
+    var out: [T] = []
+    var c = self
+    while true {
+        let Link(x, rest) = c else {
+            break
+        }
+        out.push(x)
+        c = rest
+    }
+    out
+}
+
+// a queue whose sides are both full once it holds two values, so its two ends are each a step away: when
+// one side runs out, it takes half the other's (a cost spread over the steps that emptied it)
+fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Queue<T> {
+    if n == 0 {
+        return Queue.Empty
+    }
+    if n == 1 or not (f.isEnd() or b.isEnd()) {
+        return Queue.Items(f, b, n)
+    }
+    let xs = if f.isEnd() { b.toArray().reverse() } else { f.toArray() }
+    Queue.Items(chainOf(xs[..n / 2]), chainOf(xs[n / 2..].reverse()), n)
+}
+
+fn rank<T>(h: Heap<T>) -> Int = match h {
+    Empty => 0
+    Node(_, r, _, _, _) => r
+}
+
+// a node over two heaps, the one of higher rank on the left (a leftist heap: its right spine is short)
+fn node<T>(x: T, a: Heap<T>, b: Heap<T>) -> Heap<T> {
+    let n = a.size() + b.size() + 1
+    if rank(a) >= rank(b) {
+        Heap.Node(n, rank(b) + 1, x, a, b)
+    } else {
+        Heap.Node(n, rank(a) + 1, x, b, a)
+    }
+}
+
+fn meld<T>(a: Heap<T>, b: Heap<T>) -> Heap<T> = match a {
+    Empty => b
+    Node(_, _, x, al, ar) => match b {
+        Empty => a
+        Node(_, _, y, bl, br) => if y < x {
+            node(y, bl, meld(a, br))
+        } else {
+            node(x, al, meld(ar, b))
+        }
+    }
+}

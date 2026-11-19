@@ -1,0 +1,22 @@
+name: Diagnose
+
+# Temporary: where the Linux x86-64 bootstrap compiler stops.
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release download --repo ${{ github.repository }} --pattern quark-x86_64-linux --dir boot && chmod 755 boot/quark-x86_64-linux
+      - run: printf 'const k = 1.5 * 2.0\nfn main() {\n    print("hi", k, 1e-310)\n}\n' > hi.qk
+      - run: boot/quark-x86_64-linux version || true
+      - run: boot/quark-x86_64-linux run hi.qk || true
+      - run: QUARK_CONSTS=off boot/quark-x86_64-linux run hi.qk || true
+      - run: boot/quark-x86_64-linux check compiler/mainlinux.qk || true
+      - run: QUARK_CONSTS=off boot/quark-x86_64-linux check compiler/mainlinux.qk || true
+      - run: QUARK_CONSTS=off boot/quark-x86_64-linux build compiler/mainlinux.qk -o s1 --time || true
+      - run: boot/quark-x86_64-linux build compiler/mainlinux.qk -o s1b --time || true

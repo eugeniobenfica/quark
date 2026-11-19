@@ -35,3 +35,6 @@ a graph with a mistake: errors point at nodes
 catalog: built-ins, the application's externs, the script's events
 a plugin with fewer capabilities: it may read items and print, nothing else
   refused: plugin.qk:6:5: setColor is not given to this program (the host allows: position flag print)
+a task beside calls: each call's memory goes back when the next one starts, the task keeps its own
+  import round 0; import round 1; import round 2;
+  4 calls of work between its steps, each making a text of 1088890 bytes

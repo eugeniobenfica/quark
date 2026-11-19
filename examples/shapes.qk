@@ -33,8 +33,8 @@ fn report(items: [Item], title: Text = "Stock") {
 
 fn main() {
     var items: [Item] = []
-    items.push(Item("plate", Shape.Circle(radius: unit), count: 4))
-    items.push(Item("tile", Shape.Box(2, 2), count: 50))
+    items.push(Item("plate", .Circle(radius: unit), count: 4))
+    items.push(Item("tile", .Box(2, 2), count: 50))
     let more = items[0] with { name: "big plate", count: 1 }
     items.push(more)
     report(items)

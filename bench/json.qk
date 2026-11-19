@@ -1,0 +1,25 @@
+// JSON: a document of objects and arrays written out and read back (std.json: texts, enums, maps, recursion).
+use std.json
+
+fn document(n: Int) -> Json {
+    var items: [Json] = []
+    for i in 0..n {
+        let tags = [Json.Str("t{i % 7}"), .Str("k{i % 11}")]
+        items.push(
+            .Object(["id": Json.Integer(i), "name": Json.Str("item {i}"), "price": .Num(i * 0.25), "tags": .List(tags)]),
+        )
+    }
+    .Object(["items": Json.List(items), "count": Json.Integer(n)])
+}
+
+fn main() {
+    let start = monotonicTime()
+    var checksum = 0
+    let text = toJson(document(20_000))
+    for _ in 0..8 {
+        let j = parseJson(text) ?? panic("bad JSON")
+        checksum += len(toJson(j)) + (j.field("count")?.integer() ?? 0)
+    }
+    print("checksum", checksum)
+    print("ms", (monotonicTime() - start) * 1000)
+}

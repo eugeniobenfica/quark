@@ -2,12 +2,10 @@
 // or a short one of its own.
 const sample = "The fox saw the dog. The dog saw the fox, and the fox ran."
 
-fn clean(word: Text) -> Text = replace(replace(word, ",", ""), ".", "")
+fn clean(word: Text) -> Text = word.replace(",", "").replace(".", "")
 
 fn source() -> Text! {
-    let Some(path) = first(args()) else {
-        return sample
-    }
+    let path = args().first() ?? return sample
     readFile(path)
 }
 
@@ -19,12 +17,14 @@ fn main() {
             exit(1)
         }
     }
-    let counts = words(lower(text))
+    let counts = text
+        .lower()
+        .words()
         .map(clean)
         .filter(w => len(w) > 0)
         .countBy(w => w)
-    print("{len(counts)} different words, {len(words(text))} in all")
-    for e, i in counts.sortBy(e => e.value, descending: true).take(4) {
-        print("{i + 1:2}. {e.key:5} {e.value:2} {repeat("#", e.value)}")
+    print("{len(counts)} different words, {len(text.words())} in all")
+    for (i, e) in counts.sortedBy(e => e.value, descending: true).take(4).enumerate() {
+        print("{i + 1:2}. {e.key:5} {e.value:2} {"#" * e.value}")
     }
 }

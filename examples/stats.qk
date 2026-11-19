@@ -3,11 +3,11 @@ type Student { name: Text, score: Int }
 enum Grade { A, B, C, D, F }
 
 fn grade(score: Int) -> Grade = match score {
-    90.. => Grade.A
-    80..90 => Grade.B
-    70..80 => Grade.C
-    60..70 => Grade.D
-    _ => Grade.F
+    90.. => .A
+    80..90 => .B
+    70..80 => .C
+    60..70 => .D
+    _ => .F
 }
 
 // a made-up class: scores from a fixed sequence, between 35 and 100
@@ -16,7 +16,7 @@ fn testClass(size: Int) -> [Student] =
 
 // how many students fall in each band of ten points, and in each grade
 fn bands(students: [Student]) -> [Int] {
-    var counts = fill(11, 0)
+    var counts = [0] * 11
     for s in students {
         counts[s.score / 10] += 1
     }
@@ -24,7 +24,7 @@ fn bands(students: [Student]) -> [Int] {
 }
 
 fn grades(students: [Student]) -> [Int] {
-    var counts = fill(5, 0)
+    var counts = [0] * 5
     for s in students {
         counts[grade(s.score).index()] += 1
     }

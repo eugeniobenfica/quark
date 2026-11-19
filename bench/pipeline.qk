@@ -3,7 +3,7 @@ fn main() {
     let n = 200_000
     let ks = (0..n).map(i => i * 7919 % 1000)
     let xs = (0..n).map(i => i % 1000 * 0.001)
-    let start = now()
+    let start = monotonicTime()
     var count = 0
     var total = 0.0
     for pass in 0..300 {
@@ -13,5 +13,5 @@ fn main() {
         total += xs.map(x => sqrt(x) * 0.5).sum()
     }
     print("checksum", count, total)
-    print("ms", (now() - start) * 1000)
+    print("ms", (monotonicTime() - start) * 1000)
 }

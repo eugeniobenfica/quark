@@ -239,6 +239,45 @@ int main(int argc, char** argv) {
     }
     qkVmCapabilities(vm, NULL);
 
+    printf("a task beside calls: each call's memory goes back when the next one starts, the task keeps its own\n");
+    const char* jobs = "fn job(name: Text) {\n"
+                       "    var log = \"\"\n"
+                       "    for round in 0..3 {\n"
+                       "        log = log + \"{name} round {round}; \"\n"
+                       "        yield()\n"
+                       "    }\n"
+                       "    print(\"  \" + trim(log))\n"
+                       "}\n"
+                       "\n"
+                       "fn work(n: Int) -> Int {\n"
+                       "    var s = \"\"\n"
+                       "    for i in 0..n {\n"
+                       "        s = s + \"line {i}\\n\"\n"
+                       "    }\n"
+                       "    len(s)\n"
+                       "}\n";
+    QkModule* jm = qkCompile(vm, "jobs.qk", jobs, strlen(jobs));
+    if (!jm) {
+        showDiagnostics(vm);
+        return 1;
+    }
+    static const char name[] = "import"; /* the host's memory: it outlives the task */
+    QkValue jobArgs[2] = {{.p = name}, {.i = 6}};
+    QkTaskHandle* job = qkTaskStart(jm, qkFind(jm, "job"), jobArgs, 2);
+    int calls = 0;
+    int64_t made = 0;
+    while (job) {
+        QkValue n = {.i = 100000}, len;
+        if (qkCall(jm, qkFind(jm, "work"), &n, 1, &len, 1)) made = len.i;
+        calls++;
+        if (qkTaskResume(job) != 1) {
+            qkTaskEnd(job);
+            job = NULL;
+        }
+    }
+    printf("  %d calls of work between its steps, each making a text of %lld bytes\n", calls, (long long)made);
+    qkModuleFree(jm);
+
     qkFree(catalog);
     qkFree(graph);
     free(wrong);

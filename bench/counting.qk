@@ -3,7 +3,7 @@ fn blend(a: Int, b: Int, c: Int) -> Int = round(0.2126 * a + 0.7152 * b + 0.0722
 
 // how many rows hold each value (0 to 255) in one column
 fn tally(rows: [Int], column: Int) -> [Int] {
-    var counts = fill(256, 0)
+    var counts = [0] * 256
     for r in 0..len(rows) / 3 {
         counts[rows[r * 3 + column]] += 1
     }
@@ -12,7 +12,7 @@ fn tally(rows: [Int], column: Int) -> [Int] {
 
 // how many rows blend to each value
 fn tallyBlend(rows: [Int]) -> [Int] {
-    var counts = fill(256, 0)
+    var counts = [0] * 256
     for r in 0..len(rows) / 3 {
         counts[blend(rows[r * 3], rows[r * 3 + 1], rows[r * 3 + 2])] += 1
     }
@@ -23,11 +23,11 @@ fn main() {
     let n = 384 * 216
     // three values per row, from a fixed sequence
     let rows = (0..n * 3).map(i => (i * 2654435761 + 12345) / 7 % 256)
-    let start = now()
+    let start = monotonicTime()
     var checksum = 0
     for pass in 0..200 {
         checksum += tally(rows, 0)[pass % 256] + tally(rows, 1)[7] + tally(rows, 2)[200] + tallyBlend(rows)[pass % 256]
     }
     print("checksum", checksum)
-    print("ms", (now() - start) * 1000)
+    print("ms", (monotonicTime() - start) * 1000)
 }

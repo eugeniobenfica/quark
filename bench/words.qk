@@ -1,0 +1,21 @@
+// Words: a long text made, split into words, counted in a map, the most used sorted out (texts and maps).
+const vocabulary = [
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu",
+]
+
+fn main() {
+    let start = monotonicTime()
+    var checksum = 0
+    for pass in 0..400 {
+        var text = ""
+        for i in 0..20_000 {
+            let w = vocabulary[(i * 7 + pass) % len(vocabulary)]
+            text += "{w}{i % 97} "
+        }
+        let counts = text.words().countBy(w => w)
+        let top = counts.sortedBy(e => e.value, descending: true).take(10)
+        checksum += len(counts) + top.map(e => e.value).sum()
+    }
+    print("checksum", checksum)
+    print("ms", (monotonicTime() - start) * 1000)
+}

@@ -1,0 +1,43 @@
+// Records: an array of records that hold arrays, changed in place turn after turn (what a compiler's IR does).
+type Ins { op: Int, args: [Int], rets: [Int] }
+type Fn { name: Text, code: [Ins] }
+
+fn build(n: Int, seed: Int) -> Fn {
+    var f = Fn("f{seed}", [])
+    for i in 0..n {
+        f.code.push(Ins(i % 13, [i, i + seed, i * 2], [i + 1]))
+    }
+    f
+}
+
+fn Fn.rewrite(var self) {
+    for k in 0..len(self.code) {
+        let ins = self.code[k]
+        if ins.op % 3 == 0 {
+            self.code[k] = Ins(ins.op + 1, ins.args + [ins.rets[0]], ins.rets)
+        } else {
+            self.code[k].args[0] += 1
+        }
+    }
+}
+
+fn main() {
+    let start = monotonicTime()
+    var checksum = 0
+    var fns: [Fn] = []
+    for s in 0..60 {
+        fns.push(build(8000, s))
+    }
+    for _ in 0..40 {
+        for i in 0..len(fns) {
+            fns[i].rewrite()
+        }
+    }
+    for f in fns {
+        for ins in f.code {
+            checksum += ins.op + len(ins.args) + ins.args[0]
+        }
+    }
+    print("checksum", checksum)
+    print("ms", (monotonicTime() - start) * 1000)
+}

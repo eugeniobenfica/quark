@@ -17,9 +17,9 @@ fn inside(cx: Float, cy: Float) -> Bool {
 }
 
 fn main() {
-    let start = now()
+    let start = monotonicTime()
     let size = 1000
     let count = (0..size * size).filter(k => inside(k % size * 3.0 / size - 2.0, k / size * 3.0 / size - 1.5)).len()
     print("inside", count)
-    print("ms", (now() - start) * 1000)
+    print("ms", (monotonicTime() - start) * 1000)
 }

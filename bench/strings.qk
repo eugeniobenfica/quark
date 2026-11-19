@@ -1,0 +1,20 @@
+// Strings: texts built from pieces, sliced, compared and joined (what a code generator or a formatter does).
+fn line(i: Int) -> Text = "    mov r{i % 16}, [rbp - {8 * (i % 32)}] // slot {i}"
+
+fn main() {
+    let start = monotonicTime()
+    var checksum = 0
+    for pass in 0..150 {
+        var out: [Text] = []
+        for i in 0..20_000 {
+            let l = line(i + pass)
+            if l[4..7] == "mov" and not l.contains("r15") {
+                out.push(l.trim())
+            }
+        }
+        let joined = out.join("\n")
+        checksum += len(joined) + len(joined.lines())
+    }
+    print("checksum", checksum)
+    print("ms", (monotonicTime() - start) * 1000)
+}

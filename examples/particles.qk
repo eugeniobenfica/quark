@@ -2,9 +2,9 @@
 type Vec2 { x: Float, y: Float }
 type Particle { position: Vec2, velocity: Vec2, life: Float }
 
-fn Vec2.plus(self, b: Vec2) -> Vec2 = Vec2(self.x + b.x, self.y + b.y)
+fn Vec2.plus(self, b: Self) -> Self = Self(self.x + b.x, self.y + b.y)
 
-fn Vec2.times(self, k: Float) -> Vec2 = Vec2(self.x * k, self.y * k)
+fn Vec2.times(self, k: Float) -> Self = Self(self.x * k, self.y * k)
 
 fn update(p: Particle, dt: Float, gravity: Vec2) -> Particle =
     Particle(position: p.position + p.velocity * dt, velocity: p.velocity + gravity * dt, life: p.life - dt)
@@ -17,7 +17,7 @@ fn spawn(i: Int) -> Particle {
 fn main() {
     var particles = (0..10_000).map(spawn)
     let gravity = Vec2(0, 300)
-    let start = now()
+    let start = monotonicTime()
     for step in 0..120 {
         particles = particles.map(p => update(p, 1.0 / 60, gravity))
     }
@@ -25,5 +25,5 @@ fn main() {
     let center = particles.fold(Vec2(0, 0), (sum, p) => sum + p.position) * (1.0 / len(particles))
     print("alive", alive, "of", len(particles))
     print("center", center)
-    print("120 steps of 10000 particles in", (now() - start) * 1000, "ms")
+    print("120 steps of 10000 particles in", (monotonicTime() - start) * 1000, "ms")
 }

@@ -1,0 +1,14 @@
+// Sorting: a million Ints, sorted ten times, and the texts of a hundred thousand of them.
+fn main() {
+    let n = 1_000_000
+    let xs = (0..n).map(i => (i * 2654435761 + 12345) % 1_000_003)
+    let start = monotonicTime()
+    var check = 0
+    for pass in 0..10 {
+        let sorted = xs.map(x => x + pass).sorted()
+        check += sorted[n / 2]
+    }
+    let texts = (0..100_000).map(i => "item{i * 7919 % 100_000}").sorted()
+    print("checksum", check, texts[500])
+    print("ms", (monotonicTime() - start) * 1000)
+}

@@ -1,0 +1,25 @@
+// Trees: binary trees made and walked, 2^20 nodes at the deepest, again and again (allocation and recursion).
+enum Tree { Leaf, Node(left: Tree, right: Tree) }
+
+fn make(depth: Int) -> Tree = if depth == 0 {
+    .Leaf
+} else {
+    .Node(make(depth - 1), make(depth - 1))
+}
+
+fn size(t: Tree) -> Int = match t {
+    Leaf => 1
+    Node(l, r) => size(l) + size(r)
+}
+
+fn main() {
+    let start = monotonicTime()
+    var total = 0
+    for depth in 4..21 {
+        for _ in 0..1 << (21 - depth) {
+            total += size(make(depth))
+        }
+    }
+    print("checksum", total)
+    print("ms", (monotonicTime() - start) * 1000)
+}

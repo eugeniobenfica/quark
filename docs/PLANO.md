@@ -108,10 +108,29 @@ preciso, numa versão mínima.
 
 ### B3. Uma IR intermediária entre o checker e a IR de máquina
 
-> **Não começado (19/11/2026), de propósito.** É a refatoração de maior risco do plano, e o próprio plano a põe
-> atrás da Fase A: o caminho novo só pode substituir o antigo depois de comparado com ele, função a função, por um
-> teste diferencial (A3) que ainda não existe. Começá-la sem essa rede seria trocar o coração do compilador às
-> cegas. Com A3 pronto, o primeiro passo é o desaçucaramento.
+> **Começado em 19/11/2026 pelo passo 2.** O passo 1 (desaçucarar) foi medido antes e deixado de lado. `is`,
+> `let ... else`, `with` e a interpolação somam umas 200 linhas das 8.483 do lowering. O grosso está nos built-ins
+> especializados e nas decisões de memória.
+>
+> **Feito:**
+> - As decisões de memória que dependem só da árvore checada saíram de `lower.qk` para `compiler/ownership.qk`:
+>   - cópia, cópia funda, empréstimo ou tomada de um `let`;
+>   - aliasing fundo;
+>   - mudanças das funções `var self`;
+>   - o que um laço muda e faz.
+>
+>   O tipo `Ownership` não lê nem escreve código.
+> - O aliasing fundo deixou de ser escrito pela emissão. Antes, cada padrão, `for` e `let` gravava `aliasDeep` enquanto o código era gerado. Agora uma passada própria (`decideAliases`) decide tudo antes, na ordem em que o código é feito, numa tabela por binding e outra por `let` (`borrowed`).
+> - Os acessores da árvore (`aOf`, `argsOf`, `writtenArgs`...) passaram a ser do `Ast`.
+>
+> **Números:**
+> - `lower.qk` foi de 8.483 para cerca de 7.450 linhas.
+> - O critério é `tools/parity.sh`. O IR de 209 programas, nos dois tiers, sai igual byte a byte com o compilador antigo e o novo, e o código de máquina do próprio compilador também.
+> - Custo: a passada separada percorre a árvore mais uma vez. São cerca de 5% do tempo de lowering, uns 2% de compilar o compilador.
+>
+> **Próximos passos:**
+> - As decisões que ainda dependem do estado da emissão: o self por endereço, a área da função e a coleta por turno de laço, que lê o IR emitido.
+> - Depois, as análises novas que isto destrava: escape e reutilização no lugar.
 
 **Hoje:** `lower.qk` vai da árvore checada direto para instruções com registradores, decidindo no caminho
 cópias, empréstimos, coleta de laço, C, closures e açúcar.

@@ -317,3 +317,64 @@ pub fn Ast.decl(var self, d: Decl) -> Int {
     self.decls.push(d)
     len(self.decls) - 1
 }
+
+// ---- the tree read: an expression's parts ----
+// C's e->a, e->b, e->body, e->elseExpr, e->args, the arms, e->thenBlock, e->block (-1 / empty: none)
+pub fn Ast.aOf(self, e: Int) -> Int = match self.exprs[e].node {
+    Field(t, _) => t
+    Index(t, _) => t
+    Unary(_, x) => x
+    Binary(_, l, _) => l
+    Range(l, _) => l
+    If(c, _, _) => c
+    Match(s, _, _) => s
+    Case(_, t, _) => t
+    With(t, _, _) => t
+    Try(v) => v
+    Is(v, _) => v
+    _ => -1
+}
+
+pub fn Ast.bOf(self, e: Int) -> Int = match self.exprs[e].node {
+    Index(_, i) => i
+    Binary(_, _, r) => r
+    Range(_, h) => h
+    _ => -1
+}
+
+pub fn Ast.argsOf(self, e: Int) -> [Int] = match self.exprs[e].node {
+    Call(_, _, args, _, _, _) => args
+    ArrayLit(items) => items
+    With(_, values, _) => values
+    Interp(values, _, _, _, _) => values
+    MapLit(items) => items
+    _ => []
+}
+
+pub fn Ast.armsOf(self, e: Int) -> [Int] = match self.exprs[e].node {
+    Match(_, arms, _) => arms
+    Is(_, pattern) => [pattern]
+    _ => []
+}
+
+// A call's arguments as C's tree has them: the values a call to a function or a case got converted for their
+// parameters are converted in its ordered list only (C's args keep what was written).
+pub fn Ast.writtenArgs(self, e: Int) -> [Int] {
+    let x = self.exprs[e]
+    let Call(_, _, args, _, _, _) = x.node else {
+        return self.argsOf(e)
+    }
+    if x.builtin != 0 or len(x.ordered) == 0 {
+        return args
+    }
+    args.map(a => self.unwrapAll(a))
+}
+
+// the node an implicit conversion holds, through every one around it
+pub fn Ast.unwrapAll(self, e: Int) -> Int {
+    var x = e
+    while self.exprs[x].implicit and self.exprs[x].node is Call(_, _, args, _, _, _) and len(args) > 0 {
+        x = self.argsOf(x)[0]
+    }
+    x
+}

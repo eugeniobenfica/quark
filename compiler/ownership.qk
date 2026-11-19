@@ -1,0 +1,1141 @@
+// What a value's memory needs, worked out from the checked tree alone, before any code is made: which values are
+// copied when kept (a var's or a parameter's arrays and maps, deep where they may share containers with a deep var),
+// which lets borrow a var's value instead (nothing it holds changes while it lives), which var self calls change
+// what, and what a loop's body changes and makes. compiler/lower.qk asks these questions and makes the code its
+// answers call for; nothing here reads or writes code.
+use ast
+use types
+
+pub type Ownership {
+    p: Program
+    debug: Bool = false // --debug: every value its own (nothing borrowed)
+    inBlock: Int = -1 // the block whose statements are being decided (decideAliases)
+    changes: [[Int]] = [] // each var self function's changes in place (container types), by declaration (borrows)
+    changesMade: Bool = false
+    blockSays: BlockSays = BlockSays() // the last block's (borrows)
+    aliasDeep: [Bool] = [] // by binding: its value may share containers with a deep var (decideAliases)
+    borrowed: [Int] = [] // by statement: a let that copies its value (0), borrows it (1) or takes it (2) (decideAliases)
+}
+
+// ---- the tree, as these questions read it ----
+fn Ownership.ty(self, e: Int) -> Int = self.p.ast.exprs[e].ty
+
+fn Ownership.tk(self, t: Int) -> Kind = self.p.types[t].kind
+
+fn Ownership.ek(self, e: Int) -> Kind = self.p.types[self.p.ast.exprs[e].ty].kind
+
+fn Ownership.dl(self, d: Int) -> Decl = self.p.ast.decls[d]
+
+fn Ownership.tdecl(self, t: Int) -> Int = self.p.types[t].decl
+
+fn Ownership.elemOf(self, t: Int) -> Int = self.p.types[t].elem
+
+fn Ownership.keyOf(self, t: Int) -> Int = self.p.types[t].key
+
+fn Ownership.pbind(self, prm: Int) -> Int = self.p.ast.params[prm].binding
+
+fn Ownership.ptype(self, prm: Int) -> Int = self.p.paramType(prm)
+
+fn Ownership.boxed(self, prm: Int) -> Bool = self.p.ast.params[prm].boxed
+
+fn Ownership.hasData(self, t: Int) -> Bool = self.p.hasData(t)
+
+fn Ownership.holdsContainers(self, t: Int) -> Bool = self.p.holdsContainers(t)
+
+fn Ownership.isBlockExpr(self, e: Int) -> Bool =
+    e >= 0 and self.p.ast.exprs[e].node is BlockExpr(_, _)
+
+fn Ownership.aOf(self, e: Int) -> Int = self.p.ast.aOf(e)
+
+fn Ownership.bOf(self, e: Int) -> Int = self.p.ast.bOf(e)
+
+fn Ownership.argsOf(self, e: Int) -> [Int] = self.p.ast.argsOf(e)
+
+fn Ownership.armsOf(self, e: Int) -> [Int] = self.p.ast.armsOf(e)
+
+fn Ownership.writtenArgs(self, e: Int) -> [Int] = self.p.ast.writtenArgs(e)
+
+// ---- the questions ----
+// fn T.f(var self) whose self is more than a few slots takes it by address
+pub fn Ownership.changesSelf(self, d: Int) -> Bool =
+    d >= 0 and len(self.p.ast.decls[d].params) > 0 and self.p.ast.params[self.p.ast.decls[d].params[0]].isVar
+
+pub fn Ownership.rootBinding(self, e: Int) -> Int {
+    var x = e
+    while self.p.ast.exprs[x].node is Field(_, _) | Index(_, _) {
+        x = self.aOf(x)
+    }
+    if self.p.ast.exprs[x].node is Name(_) {
+        self.p.ast.exprs[x].binding
+    } else {
+        -1
+    }
+}
+
+// a call of a function that changes the value it is called on
+pub fn Ownership.changesSelfCall(self, e: Int) -> Bool {
+    let x = self.p.ast.exprs[e]
+    x.node is Call(_, _, _, _, _, _) and x.builtin == 0 and x.callee < 0 and self.changesSelf(x.decl)
+}
+
+pub fn Ownership.needsCopy(self, e: Int) -> Bool {
+    if not self.ek(e) is Array | Map {
+        return false
+    }
+    if not self.p.ast.exprs[e].node is Name(_) | Field(_, _) | Index(_, _) {
+        return false
+    }
+    let b = self.rootBinding(e)
+    b >= 0 and (self.p.bindings[b].mutable or self.p.bindings[b].isParam)
+}
+
+pub fn Ownership.nameAliasesDeep(self, b: Int) -> Bool {
+    let x = self.p.bindings[b]
+    if x.deep or self.aliasDeep[b] {
+        return true
+    }
+    if x.capturedFrom >= 0 and (self.p.bindings[x.capturedFrom].deep or self.aliasDeep[x.capturedFrom]) {
+        return true
+    }
+    x.lazy and x.init >= 0 and self.aliasesDeep(x.init)
+}
+
+// may e's value share an array or a map with a deep var?
+// An argument (that may share containers with a var changed in place) of a call that changes its receiver (rooted at
+// selfRoot): copied first unless it is an array or map of another var whose elements hold no containers. Such an
+// array can change in the call only through the receiver, which is another var's own memory; and a parameter the
+// call keeps is copied when it is stored. Its arrays' arrays would not be.
+pub fn Ownership.sharedWithCall(self, e: Int, selfRoot: Int) -> Bool {
+    let root = self.rootBinding(e)
+    if root < 0 or root == selfRoot {
+        return true
+    }
+    let t = self.ty(e)
+    match self.tk(t) {
+        Array => self.holdsContainers(self.elemOf(t))
+        Map => self.holdsContainers(self.p.types[t].key) or self.holdsContainers(self.elemOf(t))
+        _ => true
+    }
+}
+
+pub fn Ownership.aliasesDeep(self, e: Int) -> Bool {
+    if e < 0 {
+        return false
+    }
+    let x = self.p.ast.exprs[e]
+    match x.node {
+        Name(_) => x.binding >= 0 and self.nameAliasesDeep(x.binding)
+        Field(t, _) => self.aliasesDeep(t)
+        Index(t, _) => self.aliasesDeep(t)
+        Try(v) => self.aliasesDeep(v)
+        With(t, _, _) => self.aliasesDeep(t)
+        Unary(_, v) => self.aliasesDeep(v)
+        Binary(_, l, r) => {
+            // a join of arrays (or texts, Bytes) is a new array: only elements that hold containers can be shared
+            if self.tk(x.ty) is Array | Text | Bytes {
+                return self.tk(x.ty) == Kind.Array
+                    and self.holdsContainers(self.elemOf(x.ty))
+                    and (self.aliasesDeep(l) or self.aliasesDeep(r))
+            }
+            self.aliasesDeep(l) or self.aliasesDeep(r)
+        }
+        Call(_, _, _, _, _, _) => {
+            for a in self.writtenArgs(e) {
+                if self.aliasesDeep(a) {
+                    return true
+                }
+            }
+            self.aliasesDeep(x.callee)
+        }
+        Match(_, arms, _) => {
+            for a in arms {
+                let body = self.p.ast.arms[a].body
+                if body >= 0 and not self.isBlockExpr(body) and self.aliasesDeep(body) {
+                    return true
+                }
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+// ---- borrowing: a let that reads a var's value shares it instead of copying it, when nothing it holds can change ----
+// `let ins = self.code[k]` copies what ins holds (its arrays and maps) so that a later change of self in place is not
+// seen through ins. The copy is needed only if, while ins lives (the rest of its block), an array or map of a type
+// ins can hold is changed in place through that var: directly (`self.items[j].parts[0] = r`, a push into one), or by a
+// var self function on it (each function's changes worked out once, over every function: changes). Pushing into the
+// array ins came from, or setting its elements, is no such change: ins has its own copy of the element's slots.
+// the array, map or Bytes a place's change writes into: the innermost one on its path (-1: the var's own slots)
+pub fn Ownership.changedContainer(self, target: Int) -> Int {
+    var x = target
+    while true {
+        let node = self.p.ast.exprs[x].node
+        if node is Index(t, _) {
+            let tt = self.ty(t)
+            if tt >= 0 and self.tk(tt) is Array | Map | Bytes {
+                return tt
+            }
+            x = t
+        } else if node is Field(t, _) {
+            x = t
+        } else {
+            return -1
+        }
+    }
+    -1
+}
+
+// the place a statement or an expression changes in place, rooted at a var: (its root, the container's type), and a
+// var self call's (its root, -1: see changes); (-1, -1) for none
+pub fn Ownership.changeAt(self, item: Int) -> (Int, Int) {
+    if item < 0 {
+        let st = self.p.ast.stmts[-1 - item]
+        if st.node is Assign(target, _, _) {
+            return (self.rootBinding(target), self.changedContainer(target))
+        }
+        return (-1, -1)
+    }
+    let x = self.p.ast.exprs[item]
+    if not x.node is Call(_, _, _, _, _, _) {
+        return (-1, -1)
+    }
+    let args = self.writtenArgs(item)
+    let receiver = if len(x.ordered) > 0 {
+        x.ordered[0]
+    } else if len(args) > 0 {
+        args[0]
+    } else {
+        -1
+    }
+    if receiver < 0 {
+        return (-1, -1)
+    }
+    if x.builtin == bPush or x.builtin == bPop or x.builtin == bRemove or x.builtin == bAdd {
+        let rt = self.ty(receiver)
+        return (self.rootBinding(receiver), if rt >= 0 and self.tk(rt) is Array | Map | Bytes { rt } else { -1 })
+    }
+    if x.builtin == 0
+        and x.callee < 0
+        and x.decl >= 0
+        and self.dl(x.decl).kind == DeclKind.Fn
+        and self.changesSelf(x.decl) {
+        return (self.rootBinding(receiver), -2)
+    }
+    (-1, -1)
+}
+
+// every var self function's changes in place, as container types: what it changes through self, and what the var self
+// functions it calls on self change (to a fixed point over all of them). Each body is read once: its own changes, and
+// the functions it calls on self; then the changes go up the calls until none grows.
+pub fn Ownership.makeChanges(var self) {
+    self.changesMade = true
+    let n = len(self.p.ast.decls)
+    let none: [Int] = []
+    self.changes = [none] * n
+    var fns: [Int] = []
+    var calls: [[Int]] = []
+    for d in self.p.decls {
+        let x = self.dl(d)
+        if x.kind != DeclKind.Fn or x.body < 0 or not self.changesSelf(d) or x.isTemplate {
+            continue
+        }
+        let me = self.pbind(x.params[0])
+        var own: [Int] = []
+        var callees: [Int] = []
+        for item in self.visitExpr(x.body, []) {
+            let (root, kind) = self.changeAt(item)
+            if root != me or kind == -1 {
+                continue
+            }
+            if kind == -2 {
+                let callee = self.p.ast.exprs[item].decl
+                if callee != d and not callees.contains(callee) {
+                    callees.push(callee)
+                }
+            } else if not own.contains(kind) {
+                own.push(kind)
+            }
+        }
+        self.changes[d] = own
+        fns.push(d)
+        calls.push(callees)
+    }
+    var again = true
+    while again {
+        again = false
+        for (i, d) in fns.enumerate() {
+            var set = self.changes[d]
+            for callee in calls[i] {
+                for t in self.changes[callee] {
+                    if not set.contains(t) {
+                        set.push(t)
+                    }
+                }
+            }
+            if len(set) != len(self.changes[d]) {
+                self.changes[d] = set
+                again = true
+            }
+        }
+    }
+}
+
+// the arrays, maps and Bytes a value of type t can hold (t itself among them), each type once
+pub fn Ownership.containersIn(self, t: Int, acc: [Int]) -> [Int] {
+    if t < 0 or acc.contains(t) {
+        return acc
+    }
+    var out = acc
+    match self.tk(t) {
+        Array | Bytes => {
+            out.push(t)
+            out = self.containersIn(self.elemOf(t), out)
+        }
+        Map => {
+            out.push(t)
+            out = self.containersIn(self.keyOf(t), out)
+            out = self.containersIn(self.elemOf(t), out)
+        }
+        Record => {
+            out.push(t) // (a mark: a record is gone through once)
+            for prm in self.dl(self.tdecl(t)).params {
+                out = self.containersIn(self.ptype(prm), out)
+            }
+        }
+        Enum => {
+            if self.hasData(t) {
+                out.push(t)
+                for fs in self.dl(self.tdecl(t)).caseFields {
+                    for prm in fs {
+                        out = self.containersIn(self.ptype(prm), out)
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+// let x = value (statement s of a block): value read out of a var, kept without a copy (see above): 0 copied, 1
+// borrowed (what x holds is the var's), 2 taken (the var's place is given a new value further on in the block, before
+// anything changes what x holds: then x is all that holds it, as a value just made)
+pub fn Ownership.borrows(var self, s: Int, value: Int) -> Int {
+    let x = self.p.ast.exprs[value]
+    if self.debug or not x.node is Field(_, _) | Index(_, _) or not (self.aliasesDeep(value) or self.needsCopy(value)) {
+        return 0
+    }
+    // a var's value, or a parameter's (which only a var self function's self changes: the scan finds that)
+    let root = self.rootBinding(value)
+    if root < 0 or not (self.p.bindings[root].mutable or self.p.bindings[root].isParam) or self.inBlock < 0 {
+        return 0
+    }
+    if not self.changesMade {
+        self.makeChanges()
+    }
+    self.summarizeBlock(self.inBlock)
+    let mine = self.p.ast.stmts[s].binding
+    let held = self.containersIn(self.ty(value), [])
+    let at = self.blockSays.stmtAt[s] ?? -1
+    var uses = -1 // what uses mine, worked out at the first change that could matter
+    var usedAt: [Int] = []
+    for c in self.blockSays.changes {
+        if c.at <= at {
+            continue
+        }
+        if c.kind == -4 {
+            if self.withinPlace(self.blockSays.retargets[c.callee], value) {
+                return 2 // the place given a new value: x takes what it held
+            }
+            continue
+        }
+        if c.root == -1 {
+            if c.kind == mine or c.kind == -3 {
+                return 0 // a function value that uses it, a deferred block: they may outlive the block
+            }
+            continue
+        }
+        if c.root != root {
+            continue
+        }
+        let changed = if c.kind == -2 { self.changes[c.callee] } else { [c.kind] }
+        if changed.any(t => held.contains(t)) {
+            if uses < 0 {
+                usedAt = self.usesOf(mine)
+                uses = len(usedAt)
+            }
+            let changeAt = self.blockSays.paths[self.blockSays.items[c.at]] ?? []
+            if usedAt.any(u => mayFollow(changeAt, self.blockSays.paths[u] ?? [])) {
+                return 0
+            }
+        }
+    }
+    1
+}
+
+// The items of the summarized block that use binding b, or a name made from it: a let, a for's or a pattern's name
+// whose value is read from one of those. (A var given what a borrowed name holds gets a copy: aliasDeep.)
+pub fn Ownership.usesOf(self, b: Int) -> [Int] {
+    var made: Set<Int> = [b]
+    var grew = true
+    while grew {
+        grew = false
+        for item in self.blockSays.items {
+            let (source, names) = self.namesFrom(item)
+            if len(names) == 0 or names.all(n => made.contains(n)) or not self.mentions(source, made) {
+                continue
+            }
+            for n in names {
+                if not made.contains(n) {
+                    made.add(n)
+                    grew = true
+                }
+            }
+        }
+    }
+    self.blockSays.items.filter(
+        i => i >= 0 and self.p.ast.exprs[i].node is Name(_) and made.contains(self.p.ast.exprs[i].binding),
+    ).toArray()
+}
+
+// what an item reads (an expression, or -1) and the names it gives a value to
+pub fn Ownership.namesFrom(self, item: Int) -> (Int, [Int]) {
+    let none: [Int] = []
+    if item < 0 {
+        let st = self.p.ast.stmts[-1 - item]
+        return match st.node {
+            Let(_, _, _, value, pattern, _) => (value, [st.binding] + self.patternNames(pattern))
+            For(_, pattern, iter, _) => (iter, [st.binding] + self.patternNames(pattern))
+            _ => (-1, none)
+        }
+    }
+    let x = self.p.ast.exprs[item].node
+    if x is Match(subject, arms, _) {
+        var names: [Int] = []
+        for a in arms {
+            names += self.patternNames(a)
+        }
+        return (subject, names)
+    }
+    if x is Is(value, pattern) {
+        return (value, self.patternNames(pattern))
+    }
+    (-1, none)
+}
+
+// the names a pattern (an arm) gives, inside its fields too
+pub fn Ownership.patternNames(self, a: Int) -> [Int] {
+    if a < 0 {
+        return []
+    }
+    let arm = self.p.ast.arms[a]
+    var out = arm.bindings.filter(n => n >= 0).toArray()
+    if arm.wholeBinding >= 0 {
+        out.push(arm.wholeBinding)
+    }
+    for sub in arm.subs {
+        out += self.patternNames(sub)
+    }
+    out
+}
+
+// whether expression e reads one of the names
+pub fn Ownership.mentions(self, e: Int, names: Set<Int>) -> Bool {
+    if e < 0 {
+        return false
+    }
+    var w = Walk()
+    w.expr(self, e)
+    w.out.any(i => i >= 0 and self.p.ast.exprs[i].node is Name(_) and names.contains(self.p.ast.exprs[i].binding))
+}
+
+// Where each expression and statement of a block is, as pairs: (0, i) the block's i-th statement, (1, k) the k-th
+// branch of an if or a match (then 0, else 1; an arm's guard and body its statements 0 and 1; the condition or the
+// subject comes before them, as (0, 0) before (0, 1)), (2, 0) a loop's body
+// (the while's condition too), (3, 0) a deferred block. Two items whose places part at different branches never run
+// one after the other; under a loop they may run in any order.
+pub type PathWalk { at: [Int: [Int]] = [:] }
+
+pub fn PathWalk.expr(var self, l: Ownership, e: Int, path: [Int]) {
+    if e < 0 {
+        return
+    }
+    let x = l.p.ast.exprs[e]
+    if x.node is If(c, then, other) {
+        // the condition first (0, 0), then one of the branches (0, 1)
+        self.at[e] = path + [0, 2]
+        self.expr(l, c, path + [0, 0])
+        self.block(l, then, path + [0, 1, 1, 0])
+        self.expr(l, other, path + [0, 1, 1, 1])
+        return
+    }
+    if x.node is Match(subject, arms, _) {
+        self.at[e] = path + [0, 2]
+        self.expr(l, subject, path + [0, 0])
+        for (k, a) in arms.enumerate() {
+            self.expr(l, l.p.ast.arms[a].guard, path + [0, 1, 1, k, 0, 0])
+            self.expr(l, l.p.ast.arms[a].body, path + [0, 1, 1, k, 0, 1])
+        }
+        return
+    }
+    // what an expression does (a change in place, a call) comes after its operands (0, 0), at (0, 1)
+    self.at[e] = path + [0, 1]
+    let inner = path + [0, 0]
+    self.expr(l, l.aOf(e), inner)
+    self.expr(l, l.bOf(e), inner)
+    if x.node is Lambda(_, body) {
+        self.expr(l, body, inner)
+    }
+    self.expr(l, x.callee, inner)
+    for a in l.writtenArgs(e) {
+        self.expr(l, a, inner)
+    }
+    for a in x.ordered {
+        self.expr(l, a, inner)
+    }
+    for a in l.armsOf(e) {
+        self.expr(l, l.p.ast.arms[a].guard, inner)
+        self.expr(l, l.p.ast.arms[a].body, inner)
+    }
+    if x.node is BlockExpr(block, _) {
+        self.block(l, block, inner)
+    }
+}
+
+pub fn PathWalk.block(var self, l: Ownership, b: Int, path: [Int]) {
+    if b < 0 {
+        return
+    }
+    for (i, s) in l.p.ast.blocks[b].stmts.enumerate() {
+        let here = path + [0, i]
+        self.at[-1 - s] = here
+        let st = l.p.ast.stmts[s]
+        match st.node {
+            Let(_, _, _, value, _, otherwise) => {
+                self.expr(l, value, here)
+                self.block(l, otherwise, here + [1, 0])
+            }
+            Assign(target, _, value) => {
+                // the value first (0, 0), then the place's operands (0, 1), then the write (0, 2)
+                self.at[-1 - s] = here + [0, 2]
+                self.expr(l, value, here + [0, 0])
+                self.expr(l, st.opValue, here + [0, 0])
+                self.expr(l, target, here + [0, 1])
+            }
+            ExprStmt(value) => self.expr(l, value, here)
+            For(_, _, iter, body) => {
+                self.expr(l, iter, here)
+                self.block(l, body, here + [2, 0])
+            }
+            While(cond, body) => {
+                self.expr(l, cond, here + [2, 0])
+                self.block(l, body, here + [2, 0])
+            }
+            Return(value) => self.expr(l, value, here)
+            Defer(body) => self.block(l, body, here + [3, 0])
+            _ => {}
+        }
+    }
+}
+
+// whether what is at place used may run after what is at place changed (both from PathWalk, in one block)
+pub fn mayFollow(changed: [Int], used: [Int]) -> Bool {
+    var d = 0
+    while d + 1 < len(changed) and d + 1 < len(used) and changed[d] == used[d] and changed[d + 1] == used[d + 1] {
+        if changed[d] == 2 {
+            return true // a loop around both: the use comes again after the change
+        }
+        d += 2
+    }
+    if d + 1 >= len(changed) or d + 1 >= len(used) or changed[d] != used[d] {
+        return true // one inside the other (one statement): either order
+    }
+    if changed[d] == 0 {
+        return used[d + 1] > changed[d + 1]
+    }
+    changed[d] != 1 // branches of one if or match: never both
+}
+
+// what a block's lets ask, worked out once for the block: each statement's place in its walk, and each change in
+// place (a container's type, or a var self call: -2 and its function) by its root, each name a lambda uses (root
+// -1, its binding) and each deferred block (root -1, kind -3)
+pub type Change { at: Int, root: Int, kind: Int, callee: Int = -1 }
+
+pub type BlockSays {
+    block: Int = -1
+    stmtAt: [Int: Int] = [:]
+    changes: [Change] = []
+    retargets: [Int] = []
+    items: [Int] = []
+    paths: [Int: [Int]] = [:]
+}
+
+pub fn Ownership.summarizeBlock(var self, b: Int) {
+    if self.blockSays.block == b {
+        return
+    }
+    var says = BlockSays(block: b)
+    var w = Walk()
+    w.block(self, b)
+    var pw = PathWalk()
+    pw.block(self, b, [])
+    says.paths = pw.at
+    says.items = w.out
+    for (i, item) in w.out.enumerate() {
+        if item < 0 {
+            says.stmtAt[-1 - item] = i
+            if self.p.ast.stmts[-1 - item].node is Defer(_) {
+                says.changes.push(Change(i, -1, -3))
+            }
+        } else if self.p.ast.exprs[item].node is Lambda(_, _) {
+            for inner in self.visitExpr(item, []) {
+                if inner >= 0 and self.p.ast.exprs[inner].binding >= 0 {
+                    says.changes.push(Change(i, -1, self.p.ast.exprs[inner].binding))
+                }
+            }
+        }
+        if item < 0
+            and self.p.ast.blocks[b].stmts.contains(-1 - item)
+            and self.p.ast.stmts[-1 - item].node is Assign(target, op, _)
+            and op == .Assign {
+            // a place of the block's own given a new value (kind -4; callee: which of retargets)
+            says.changes.push(Change(i, self.rootBinding(target), -4, len(says.retargets)))
+            says.retargets.push(target)
+        }
+        let (r, kind) = self.changeAt(item)
+        if r >= 0 and kind != -1 {
+            says.changes.push(Change(i, r, kind, if kind == -2 { self.p.ast.exprs[item].decl } else { -1 }))
+        }
+    }
+    self.blockSays = says
+}
+
+// place b is place a, or in it (a's fields): giving a a new value leaves b's old value to whoever took it
+pub fn Ownership.withinPlace(self, a: Int, b: Int) -> Bool {
+    if self.samePlace(a, b) {
+        return true
+    }
+    let y = self.p.ast.exprs[b].node
+    if y is Field(t, _) {
+        return self.withinPlace(a, t)
+    }
+    false
+}
+
+// the same place: the same var's binding through the same fields
+pub fn Ownership.samePlace(self, a: Int, b: Int) -> Bool {
+    let x = self.p.ast.exprs[a].node
+    let y = self.p.ast.exprs[b].node
+    if x is Name(_) and y is Name(_) {
+        return self.p.ast.exprs[a].binding >= 0 and self.p.ast.exprs[a].binding == self.p.ast.exprs[b].binding
+    }
+    if x is Field(ta, na) and y is Field(tb, nb) {
+        return na == nb and self.samePlace(ta, tb)
+    }
+    false
+}
+
+// Made just now, owned by nobody else.
+pub fn Ownership.isFresh(self, e: Int) -> Bool {
+    let x = self.p.ast.exprs[e]
+    if x.node is ArrayLit(_) | MapLit(_) | Range(_, _) {
+        return true
+    }
+    if x.node is Binary(_, _, _) and x.builtin == bFill {
+        return true
+    }
+    if not x.node is Call(_, _, _, _, _, _) or x.builtin == 0 {
+        return false
+    }
+    x.builtin is 23 | 24 | 25 | 30 | 39 | 35 | 45 | 46 | 56 | 57 | 58 | 64 | 65 | 74
+}
+
+pub fn Ownership.deepFresh(self, e: Int) -> Bool {
+    let x = self.p.ast.exprs[e]
+    if not self.holdsContainers(x.ty) {
+        return true
+    }
+    match x.node {
+        ArrayLit(items) => items.all(i => self.deepFresh(i))
+        MapLit(items) => items.all(i => self.deepFresh(i))
+        Call(_, _, _, _, _, _) => {
+            if x.builtin != 0 {
+                return self.isFresh(e) and self.tk(x.ty) == Kind.Array and not self.holdsContainers(self.elemOf(x.ty))
+            }
+            if x.decl < 0 or x.callee >= 0 or x.binding >= 0 or not self.dl(x.decl).kind is Type | Enum {
+                return false
+            }
+            x.ordered.all(o => self.deepFresh(o))
+        }
+        _ => false
+    }
+}
+
+pub fn Ownership.isJoin(self, e: Int) -> Bool {
+    let x = self.p.ast.exprs[e]
+    x.node is Binary(bop, _, _) and bop == .Plus and x.ty >= 0 and self.tk(x.ty) == Kind.Array
+}
+
+// A value of type t cannot reach a place in memory a var self call changes in place.
+pub fn Ownership.reachesNoPlace(self, t: Int) -> Bool {
+    match self.tk(t) {
+        Int | Float | Bool | Text | Bytes | Range => true
+        Record => {
+            let d = self.tdecl(t)
+            if d < 0 {
+                return false
+            }
+            let x = self.dl(d)
+            if x.isExtern or x.isInterface or x.cStruct {
+                return false
+            }
+            for prm in x.params {
+                if self.boxed(prm) or self.pbind(prm) < 0 or not self.reachesNoPlace(self.ptype(prm)) {
+                    return false
+                }
+            }
+            true
+        }
+        Enum => {
+            let d = self.tdecl(t)
+            if d < 0 {
+                return false
+            }
+            if self.hasData(t) {
+                for fs in self.dl(d).caseFields {
+                    for prm in fs {
+                        if self.boxed(prm) or not self.reachesNoPlace(self.ptype(prm)) {
+                            return false
+                        }
+                    }
+                }
+            }
+            true
+        }
+        _ => false
+    }
+}
+
+// Every expression and statement of a body, in turn (C's visitExpr): the expressions, in the order visited.
+// the nodes C's visitExpr goes over, in its order: expressions (their index) and statements (-1 - theirs)
+pub type Walk { out: [Int] = [] }
+
+pub fn Walk.expr(var self, l: Ownership, e: Int) {
+    if e < 0 {
+        return
+    }
+    self.out.push(e)
+    let x = l.p.ast.exprs[e]
+    self.expr(l, l.aOf(e))
+    self.expr(l, l.bOf(e))
+    if x.node is Lambda(_, body) {
+        self.expr(l, body)
+    }
+    if x.node is If(_, _, other) {
+        self.expr(l, other)
+    }
+    self.expr(l, x.callee)
+    for a in l.writtenArgs(e) {
+        self.expr(l, a)
+    }
+    for a in x.ordered {
+        self.expr(l, a)
+    }
+    for a in l.armsOf(e) {
+        self.expr(l, l.p.ast.arms[a].guard)
+        self.expr(l, l.p.ast.arms[a].body)
+    }
+    if x.node is If(_, then, _) {
+        self.block(l, then)
+    }
+    if x.node is BlockExpr(block, _) {
+        self.block(l, block)
+    }
+}
+
+pub fn Walk.block(var self, l: Ownership, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in l.p.ast.blocks[b].stmts {
+        self.out.push(-1 - s)
+        let st = l.p.ast.stmts[s]
+        match st.node {
+            Let(_, _, _, value, _, otherwise) => {
+                self.expr(l, value)
+                self.block(l, otherwise)
+            }
+            Assign(target, _, value) => {
+                self.expr(l, target)
+                self.expr(l, value)
+                self.expr(l, st.opValue)
+            }
+            ExprStmt(value) => self.expr(l, value)
+            For(_, _, iter, body) => {
+                self.expr(l, iter)
+                self.block(l, body)
+            }
+            While(cond, body) => {
+                self.expr(l, cond)
+                self.block(l, body)
+            }
+            Return(value) => self.expr(l, value)
+            Defer(body) => self.block(l, body)
+            _ => {}
+        }
+    }
+}
+
+pub fn Ownership.visitExpr(self, e: Int, start: [Int]) -> [Int] {
+    var w = Walk(start)
+    w.expr(self, e)
+    w.out
+}
+
+// p.f(...) of a var self function: the var p's binding, through fields, or -1
+pub fn Ownership.selfCallOn(self, e: Int) -> Int {
+    let x = self.p.ast.exprs[e]
+    if not x.node is Call(_, _, _, _, _, _)
+        or x.builtin != 0
+        or x.callee >= 0
+        or x.decl < 0
+        or self.dl(x.decl).kind != DeclKind.Fn
+        or not self.changesSelf(x.decl) {
+        return -1
+    }
+    let args = self.argsOf(e)
+    var r = if len(x.ordered) > 0 {
+        x.ordered[0]
+    } else if len(args) > 0 {
+        args[0]
+    } else {
+        -1
+    }
+    while r >= 0 and self.p.ast.exprs[r].node is Field(t, _) {
+        r = t
+    }
+    if r >= 0 and self.p.ast.exprs[r].node is Name(_) {
+        self.p.ast.exprs[r].binding
+    } else {
+        -1
+    }
+}
+
+// ---- loops that make things: their memory back at the end of a turn ----
+pub fn Ownership.holdsMemory(self, t: Int) -> Bool {
+    match self.tk(t) {
+        Text | Bytes | Array | Map | Fn => true
+        Record if self.dl(self.tdecl(t)).isInterface => true
+        // (its value's copy)
+        Record => {
+            for prm in self.dl(self.tdecl(t)).params {
+                if self.boxed(prm) or self.holdsMemory(self.ptype(prm)) {
+                    return true
+                }
+            }
+            false
+        }
+        Enum => {
+            if not self.hasData(t) {
+                return false
+            }
+            for fs in self.dl(self.tdecl(t)).caseFields {
+                for prm in fs {
+                    if self.boxed(prm) or self.holdsMemory(self.ptype(prm)) {
+                        return true
+                    }
+                }
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+// the vars a loop's body changes, and the names it makes itself
+pub type Scan { roots: [Int] = [], inside: [Int] = [], changed: [Int] = [] }
+
+pub fn addTo(list: [Int], b: Int) -> [Int] =
+    if b < 0 or list.contains(b) { list } else { list + [b] }
+
+pub fn Scan.expr(var self, l: Ownership, e: Int) {
+    if e < 0 {
+        return
+    }
+    let x = l.p.ast.exprs[e]
+    let args = l.writtenArgs(e)
+    if x.node is Call(_, _, _, _, _, _) and (x.builtin is 38 | 110 | 66 | 87 or l.changesSelfCall(e)) and len(args) > 0 {
+        let root = l.rootBinding(args[0])
+        self.roots = addTo(self.roots, root)
+        if not x.builtin is 38 | 110 or not l.p.ast.exprs[args[0]].node is Name(_) {
+            self.changed = addTo(self.changed, root)
+        }
+    }
+    self.expr(l, l.aOf(e))
+    self.expr(l, l.bOf(e))
+    if x.node is Lambda(_, body) {
+        self.expr(l, body)
+    }
+    if x.node is If(_, _, other) {
+        self.expr(l, other)
+    }
+    for a in args {
+        self.expr(l, a)
+    }
+    for a in l.armsOf(e) {
+        let arm = l.p.ast.arms[a]
+        self.expr(l, arm.guard)
+        self.expr(l, arm.body)
+        for b in arm.bindings {
+            self.inside = addTo(self.inside, b)
+        }
+        self.inside = addTo(self.inside, arm.wholeBinding)
+    }
+    if x.node is If(_, then, _) {
+        self.block(l, then)
+    }
+    if x.node is BlockExpr(block, _) {
+        self.block(l, block)
+    }
+}
+
+pub fn Scan.block(var self, l: Ownership, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in l.p.ast.blocks[b].stmts {
+        let st = l.p.ast.stmts[s]
+        if st.node is Assign(target, _, _) {
+            let root = l.rootBinding(target)
+            self.roots = addTo(self.roots, root)
+            let inPlace = l.p.ast.exprs[target].node is Index(arr, _)
+                and l.p.ast.exprs[arr].node is Name(_)
+                and l.ty(arr) >= 0
+                and l.ek(arr) == Kind.Array
+            if not inPlace {
+                self.changed = addTo(self.changed, root)
+            }
+        }
+        self.inside = addTo(self.inside, st.binding)
+        match st.node {
+            Let(_, _, _, value, pattern, otherwise) => {
+                if pattern >= 0 {
+                    for pb in l.p.ast.arms[pattern].bindings {
+                        self.inside = addTo(self.inside, pb)
+                    }
+                }
+                self.expr(l, value)
+                self.block(l, otherwise)
+            }
+            Assign(target, _, value) => {
+                self.expr(l, value)
+                self.expr(l, target)
+            }
+            ExprStmt(value) => self.expr(l, value)
+            For(_, pattern, iter, body) => {
+                if pattern >= 0 {
+                    for pb in l.p.ast.arms[pattern].bindings {
+                        self.inside = addTo(self.inside, pb)
+                    }
+                }
+                self.expr(l, iter)
+                self.block(l, body)
+            }
+            While(cond, body) => {
+                self.expr(l, cond)
+                self.block(l, body)
+            }
+            Return(value) => self.expr(l, value)
+            Defer(body) => self.block(l, body)
+            _ => {}
+        }
+    }
+}
+
+pub fn Ownership.scanLoop(self, body: Int) -> Scan {
+    var s = Scan()
+    s.block(self, body)
+    s
+}
+
+// xs += ys, or xs = xs + ys with xs a var's own name: the array ys (else -1)
+pub fn Ownership.appended(self, s: Int) -> Int {
+    let st = self.p.ast.stmts[s]
+    let Assign(target, op, value) = st.node else {
+        return -1
+    }
+    let tt = self.ty(target)
+    if tt < 0 or self.tk(tt) != Kind.Array {
+        return -1
+    }
+    let sum = if op == .PlusEq {
+        st.opValue
+    } else if op == .Assign {
+        value
+    } else {
+        -1
+    }
+    if sum < 0 {
+        return -1
+    }
+    let sx = self.p.ast.exprs[sum]
+    let Binary(sop, l, r) = sx.node else {
+        return -1
+    }
+    if sop != .Plus or sx.decl >= 0 or self.ty(r) < 0 or self.ek(r) != Kind.Array {
+        return -1
+    }
+    if op == .Assign {
+        let tx = self.p.ast.exprs[target]
+        let lx = self.p.ast.exprs[l]
+        if not tx.node is Name(_) or not lx.node is Name(_) or lx.binding != tx.binding {
+            return -1
+        }
+    }
+    r
+}
+
+// ---- deep aliasing, worked out once: what each binding a pattern, a for or a let makes may share ----
+// Every function's body, in the order its code is made, so that a binding is decided before the expressions after it
+// read it: a pattern's names alias deep when what it matches does; a for's when what it goes over does; a let's that
+// borrows a var's value when it borrows (and takes nothing of its own).
+pub fn Ownership.decideAliases(var self) {
+    self.aliasDeep = [false] * len(self.p.bindings)
+    self.borrowed = [0] * len(self.p.ast.stmts)
+    for d in self.p.decls {
+        let x = self.p.ast.decls[d]
+        if x.body >= 0 and not x.isTemplate {
+            self.aliasExpr(x.body)
+        }
+    }
+}
+
+// the names an arm binds (its sub-patterns' and alternatives' too): deep or not. (The tree is read in place, not
+// into lets: this function changes self, so a let of an arm would be a copy of its arrays.)
+fn Ownership.aliasArm(var self, a: Int, deep: Bool) {
+    if a < 0 {
+        return
+    }
+    if self.p.ast.arms[a].wholeBinding >= 0 {
+        self.aliasDeep[self.p.ast.arms[a].wholeBinding] = deep
+    }
+    for k in 0..len(self.p.ast.arms[a].bindings) {
+        let b = self.p.ast.arms[a].bindings[k]
+        if b >= 0 {
+            self.aliasDeep[b] = deep
+        }
+    }
+    for k in 0..len(self.p.ast.arms[a].subs) {
+        self.aliasArm(self.p.ast.arms[a].subs[k], deep)
+    }
+    for k in 0..len(self.p.ast.arms[a].alternatives) {
+        self.aliasArm(self.p.ast.arms[a].alternatives[k], deep)
+    }
+}
+
+fn Ownership.aliasExpr(var self, e: Int) {
+    if e < 0 {
+        return
+    }
+    match self.p.ast.exprs[e].node {
+        Match(subject, _, _) => {
+            self.aliasExpr(subject)
+            let deep = self.aliasesDeep(subject)
+            let n = len(self.armsOf(e))
+            for k in 0..n {
+                let a = self.armsOf(e)[k]
+                self.aliasArm(a, deep)
+                self.aliasExpr(self.p.ast.arms[a].guard)
+                self.aliasExpr(self.p.ast.arms[a].body)
+            }
+        }
+        Is(value, arm) => {
+            self.aliasExpr(value)
+            self.aliasArm(arm, self.aliasesDeep(value))
+            self.aliasExpr(self.p.ast.arms[arm].guard)
+        }
+        If(cond, then, otherwise) => {
+            self.aliasExpr(cond)
+            self.aliasBlock(then)
+            self.aliasExpr(otherwise)
+        }
+        BlockExpr(block, _) => self.aliasBlock(block)
+        Lambda(_, body) => self.aliasExpr(body)
+        _ => {
+            self.aliasExpr(self.aOf(e))
+            self.aliasExpr(self.bOf(e))
+            self.aliasExpr(self.p.ast.exprs[e].callee)
+            // a call's values once each: by parameter (defaults too) when the checker put them in order
+            let ordered = len(self.p.ast.exprs[e].ordered) > 0
+            let n = if ordered {
+                len(self.p.ast.exprs[e].ordered)
+            } else {
+                len(self.argsOf(e))
+            }
+            for k in 0..n {
+                self.aliasExpr(if ordered {
+                    self.p.ast.exprs[e].ordered[k]
+                } else {
+                    self.argsOf(e)[k]
+                })
+            }
+        }
+    }
+}
+
+fn Ownership.aliasBlock(var self, b: Int) {
+    if b < 0 {
+        return
+    }
+    let outer = self.inBlock
+    self.inBlock = b
+    for i in 0..len(self.p.ast.blocks[b].stmts) {
+        let s = self.p.ast.blocks[b].stmts[i]
+        let bnd = self.p.ast.stmts[s].binding
+        match self.p.ast.stmts[s].node {
+            Let(mutable, _, _, value, pattern, otherwise) => {
+                // a let that may borrow is decided before its value is gone through: the value's own blocks would
+                // take the place of this block's summary, which borrows reads
+                if pattern < 0
+                    and bnd >= 0
+                    and not mutable
+                    and not self.p.bindings[bnd].lazy
+                    and not self.tk(self.ty(value)) is Range | Iter {
+                    let kind = self.borrows(s, value)
+                    self.borrowed[s] = kind
+                    self.aliasDeep[bnd] = kind == 1
+                }
+                self.aliasExpr(value)
+                if pattern >= 0 {
+                    self.aliasArm(pattern, self.aliasesDeep(value))
+                }
+                self.aliasBlock(otherwise)
+            }
+            Assign(target, _, value) => {
+                self.aliasExpr(target)
+                self.aliasExpr(value)
+                self.aliasExpr(self.p.ast.stmts[s].opValue)
+            }
+            ExprStmt(value) => self.aliasExpr(value)
+            For(_, pattern, iter, body) => {
+                self.aliasExpr(iter)
+                let deep = self.aliasesDeep(iter)
+                if pattern >= 0 {
+                    self.aliasArm(pattern, deep)
+                } else if bnd >= 0 {
+                    self.aliasDeep[bnd] = deep
+                }
+                self.aliasBlock(body)
+            }
+            While(cond, body) => {
+                self.aliasExpr(cond)
+                self.aliasBlock(body)
+            }
+            Return(value) => self.aliasExpr(value)
+            Defer(body) => self.aliasBlock(body)
+            _ => {}
+        }
+    }
+    self.inBlock = outer
+}

@@ -72,10 +72,10 @@ in the release notes.
 
 | Target | Status |
 | --- | --- |
-| `x86_64-windows` | supported: the test suite runs on it for every change |
-| `x86_64-linux` (glibc, musl) | supported: the test suite runs on it for every release |
-| `arm64-linux` | supported: the test suite runs on it for every release |
-| `x86_64-macos`, `arm64-macos` | built by `quark build --target`; not yet run on every release |
+| `x86_64-windows` | supported: CI builds the compiler and runs the test suite on it for every change |
+| `x86_64-linux` (glibc, musl) | supported: the same, for every change (glibc) |
+| `arm64-linux` | supported: the same, for every change (glibc) |
+| `x86_64-macos`, `arm64-macos` | supported: the same, for every change |
 | `arm64-windows` | built by `quark build --target`; not yet run on every release |
 | `wasm32` | `quark build --target wasm32`: what the language has without the system (no files, processes, network) |
 

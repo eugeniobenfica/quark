@@ -1,6 +1,6 @@
 name: Linux
 
-# Tier 1 on x86-64, Tier 2 on ARM64. Builds Quark with the latest release's compiler for the machine, to the fixed
+# Tier 1, x86-64 and ARM64. Builds Quark with the latest release's compiler for the machine, to the fixed
 # point, and runs the whole test suite with it.
 on:
   push:

@@ -89,14 +89,14 @@ The [tour](docs/TUTORIAL.md) goes from here to a small HTTP server in ten steps.
 | :--- | :--- | :---: |
 | **Windows** x86-64 | PE executables, Windows 10 and 11 | Tier 1 |
 | **Linux** x86-64 | ELF, glibc or musl | Tier 1 |
-| **macOS** Apple silicon, Intel | Mach-O, ad-hoc signed | Tier 2 |
-| **Linux** ARM64 | ELF, glibc or musl | Tier 2 |
+| **Linux** ARM64 | ELF, glibc or musl | Tier 1 |
+| **macOS** Apple silicon, Intel | Mach-O, ad-hoc signed | Tier 1 |
 | **Windows** ARM64 | PE | Tier 2 |
 | **WebAssembly** | `quark build --target wasm32`: the language without the system | Tier 2 |
 
-**Tier 1**: supported. Every change is built and its whole test suite runs on it, by CI and by hand.<br>
-**Tier 2**: experimental. Built by `quark build --target` on every release; macOS and Linux ARM64 also built and
-tested by CI, Windows ARM64 and WebAssembly not run by any test yet.
+**Tier 1**: supported. Every change builds the compiler on it to the fixed point and runs the whole test suite
+there, in CI.<br>
+**Tier 2**: experimental. Built by `quark build --target` on every release, not yet run by any test.
 
 ## Download
 

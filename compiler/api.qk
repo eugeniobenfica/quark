@@ -501,18 +501,23 @@ fn compileNow(vm: Int, name: Int, text: Int, n: Int) -> Int {
     let fns = calloc(fnWords * (count + 1), 8)
     setWord(m, mFns, fns)
     var k = 0
+    var listed = 0
     for at in p.decls {
         let d = p.ast.decls[at]
         if d.kind != DeclKind.Fn or d.isExtern and d.body < 0 or d.isTemplate or d.inlineOnly {
             continue
         }
         let f = ir.fns[k]
+        if d.builtin {
+            k += 1 // the language's own (compiler/prelude.qk): in the code, not one of the module's functions
+            continue
+        }
         var kinds: Bytes = []
         for v in f.params {
             kinds.push(f.kinds[v])
         }
         let resultKinds = if f.resultCount > 0 { p.slotKinds(d.retType) } else { "" }
-        let e = fns + 8 * fnWords * k
+        let e = fns + 8 * fnWords * listed
         setWord(e, fName, cText(d.name))
         setWord(e, fSignature, cText(signatureOf(p, d)))
         setWord(e, fKinds, cText((Text(kinds) ?? "") + resultKinds))
@@ -520,8 +525,9 @@ fn compileNow(vm: Int, name: Int, text: Int, n: Int) -> Int {
         setWord(e, fResults, f.resultCount)
         setWord(e, fAt, mc.fnAt[k])
         k += 1
+        listed += 1
     }
-    setWord(m, mCount, k)
+    setWord(m, mCount, listed)
     m
 }
 

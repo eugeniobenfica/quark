@@ -20,7 +20,7 @@ for a in "$@"; do
     esac
 done
 case "$(uname -s)" in
-MINGW* | MSYS* | CYGWIN*) main=compiler/main.qk LIBS="-lm -lwinmm" ;;
+MINGW* | MSYS* | CYGWIN*) main=compiler/main.qk LIBS="-lm -lwinmm -lws2_32" ;;
 Darwin) main=compiler/mainmacos.qk LIBS="-lm -lpthread -ldl" ;;
 *) main=compiler/mainlinux.qk LIBS="-lm -lpthread -ldl" ;;
 esac

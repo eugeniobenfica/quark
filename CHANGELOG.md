@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.1
+
+Fixes found by the first runs of the CI on every platform.
+
+- **System V (Linux and macOS on x86-64).** C may change every xmm register, while Quark's own calls keep
+  xmm8-15: around each call into C all eight now wait in the frame, whole, not only the ones the calling function
+  uses. Before, a caller's Float in one of them could come back changed (the 0.9.0 compiler for x86-64 Linux failed
+  on its own build).
+- **libquark on Windows** is linked with `ws2_32` (its sockets).
+- **The C API's module table** (`qkModule*`) lists the module's functions only, not the language's own
+  (`compiler/prelude.qk`).
+
 ## 0.9.0
 
 The first public release: the language, its compiler written in Quark, and what the 1.0 will keep stable

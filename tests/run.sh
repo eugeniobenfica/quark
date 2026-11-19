@@ -317,7 +317,7 @@ if "$Q" run bench/mandelbrot.qk --profile 2>&1 | grep -qE "samples|no samples"; 
 # on macOS yet)
 CCX=${CC:-gcc}
 if [ ! -f "$(dirname "$Q")/libquark.a" ]; then CCX=no-libquark; fi
-case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) CLIBS="-lm -lwinmm" ;; *) CLIBS="-lm -lpthread -ldl" ;; esac
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) CLIBS="-lm -lwinmm -lws2_32" ;; *) CLIBS="-lm -lpthread -ldl" ;; esac
 if command -v "$CCX" > /dev/null 2>&1; then
     if "$Q" object tests/object/demo.qk -o "$tmp/demo.o" --symbol demo && "$CCX" -Iinclude tests/object/host.c "$tmp/demo.o" "$(dirname "$Q")/libquark.a" $CLIBS -o "$tmp/objhost"; then
         if "$tmp/objhost" 2>&1 | tr -d '\r' | cmp -s - tests/object/host.out; then ok; else bad "quark object"; fi

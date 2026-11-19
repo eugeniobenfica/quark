@@ -3,7 +3,8 @@
 //
 // Registers: the most used virtual registers (loops weigh 8x per level) own a register while they are alive
 // (linear scan): rbx, rsi, rdi, r12-r15 for ints, xmm6-xmm15 for floats (System V: rbx, r12-r15, and xmm8-xmm15,
-// saved around calls into C, which may change every xmm), and r10, r9, r8, xmm1-xmm5 for values no call crosses;
+// all eight saved around each call into C, which may change every xmm), and r10, r9, r8, xmm1-xmm5 for values no
+// call crosses;
 // the rest live in the frame. rax, rcx, rdx, r11 and xmm0 are scratch.
 //
 // Calls between Quark functions (and of the runtime's, and std.machine's): the first five slots of the arguments go in
@@ -588,23 +589,14 @@ fn X64.markPanicFrame(var self) {
     self.rm(true, opMovStore, rbp, r11, 0)
 }
 
-// System V: C may change every xmm, so the callee-saved ones that hold a value still needed after the call wait in
-// the frame. save: before the call (true), after it (false).
+// System V: C may change every xmm, while Quark's calls keep xmm8-15, so all eight wait out the call in the frame,
+// whole (128 bits): this function's values and its callers' alike. save: before the call (true), after it (false).
 fn X64.spillAcrossC(var self, save: Bool) {
     if not self.sysv {
         return
     }
-    for v in 0..len(self.home) {
-        if self.home[v] < 16 + self.xmmFirst or self.first[v] >= self.at or self.last[v] <= self.at {
-            continue
-        }
-        let x = self.home[v] - 16
-        let disp = -(self.slotBase + 8 * (self.spillBase + x - self.xmmFirst + 1))
-        self.sseRM(0xF2, false, if save {
-            0x11 // movsd
-        } else {
-            0x10
-        }, x, rbp, disp)
+    for i in 0..8 {
+        self.movups(save, self.xmmFirst + i, rbp, -(self.slotBase + 8 * (self.spillBase + 2 * i + 2)))
     }
 }
 
@@ -1854,7 +1846,7 @@ fn X64.allocate(var self, f: IrFn) -> (Int, Int, Int) {
     self.home = home
     self.spillBase = slots
     if self.sysv {
-        slots += 8 // xmm8-15 across calls into C
+        slots += 16 // xmm8-15 across calls into C
     }
     self.first = first
     self.last = last

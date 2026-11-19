@@ -2,8 +2,9 @@
 // classes [a-z_] and [^0-9], the escapes \d \w \s (and \D \W \S, outside classes), \b \B (a word's edge
 // or not), \n \t \r and \ before any other character for that character, ^ and $ (the text's start and end),
 // x* x+ x? x{n} x{n,} x{n,m} (as many as can be; with ? after, as few), x|y, groups ( ) whose text a match
-// keeps, and (?: ) that keeps none. The first match is the leftmost, and among those the one the pattern
-// prefers. A search takes time in step with the text's length times the pattern's, never more.
+// keeps, and (?: ) that keeps none. A character is a code point: . and a class match one, however many
+// bytes it takes. The first match is the leftmost, and among those the one the pattern prefers. A search
+// takes time in step with the text's length times the pattern's, never more.
 pub type Regex { pattern: Text, groups: Int, prog: [Inst] }
 
 // where a match is (bytes, as t[start..end] slices it), its text, and each group's ("" when it took no part)
@@ -11,35 +12,27 @@ pub type Match { start: Int, end: Int, text: Text, groups: [Text] }
 
 // the pattern, ready to search with, or why it is not one
 pub fn regex(pattern: Text) -> Regex! {
-    let cs = chars(pattern)
-    let p = parseAlt(cs, 0, 0)?
-    if p.at < len(cs) {
+    var p = Parser(pattern.codePoints(), 0, 0)
+    let node = p.alt()?
+    if p.at < len(p.cs) {
         return Err("regex: a ) without its (, at character {p.at}")
     }
-    let start: [Inst] = [Inst.Split(3, 1), Inst.Set([], true), Inst.Jump(0)] // anywhere: skip a character, or begin here
-    Regex(pattern, p.groups, start + emit(Node.Group(0, p.node), len(start)) + [Inst.Done])
+    let start: [Inst] = [.Split(3, 1), .Set([], true), .Jump(0)] // anywhere: skip a character, or begin here
+    Regex(pattern, p.groups, start + emit(.Group(0, node), len(start)) + [Inst.Done])
 }
 
 // whether the whole text matches
-pub fn Regex.matches(self, text: Text) -> Bool = len(search(self, chars(text), false, true)) > 0
+pub fn Regex.matches(self, text: Text) -> Bool = len(search(self, text.bytes(), false, true)) > 0
 
 // the first match, or None
 pub fn Regex.find(self, text: Text) -> Match? {
-    let cs = chars(text)
-    let found = search(self, cs, false, false)
-    if len(found) == 0 {
-        None
-    } else {
-        matchOf(text, offsets(cs), found[0])
-    }
+    let found = search(self, text.bytes(), false, false)
+    if len(found) == 0 { None } else { matchOf(text, found[0]) }
 }
 
 // every match, one after the other, from the first
-pub fn Regex.findAll(self, text: Text) -> [Match] {
-    let cs = chars(text)
-    let at = offsets(cs)
-    search(self, cs, true, false).map(slots => matchOf(text, at, slots)).toArray()
-}
+pub fn Regex.findAll(self, text: Text) -> [Match] =
+    search(self, text.bytes(), true, false).map(slots => matchOf(text, slots)).toArray()
 
 // the text with every match replaced: $0 in the replacement is the match, $1 to $9 its groups, $$ a $
 pub fn Regex.replaceAll(self, text: Text, replacement: Text) -> Text =
@@ -50,7 +43,7 @@ pub fn Regex.replaceEach(self, text: Text, f: (Match) -> Text) -> Text {
     var out = ""
     var last = 0
     for m in self.findAll(text) {
-        out = out + text[last..m.start] + f(m)
+        out += text[last..m.start] + f(m)
         last = m.end
     }
     out + text[last..]
@@ -70,12 +63,12 @@ pub fn Regex.split(self, text: Text) -> [Text] {
     parts
 }
 
-// a range of characters, low and high included
-type Span { low: Text, high: Text }
+// a range of code points, low and high included
+type Span { low: Int, high: Int }
 
 // the pattern as a tree
 enum Node {
-    Lit(c: Text)
+    Lit(c: Int)
     Set(spans: [Span], negated: Bool)
     Start
     Finish
@@ -86,10 +79,10 @@ enum Node {
     Repeat(inner: Node, low: Int, high: Int, greedy: Bool)
 }
 
-// the pattern as a program: Split goes on at first and, if that fails, at second; Save keeps where a group
-// starts or ends
+// the pattern as a program over code points: Split goes on at first and, if that fails, at second; Save
+// keeps where a group starts or ends
 enum Inst {
-    Char(c: Text)
+    Char(c: Int)
     Set(spans: [Span], negated: Bool)
     Start
     Finish
@@ -100,267 +93,280 @@ enum Inst {
     Done
 }
 
-// what parsing has made so far: the tree, where it stopped, how many groups it has seen
-type Parsed { node: Node, at: Int, groups: Int }
-
 // a step of the search still to try (slot below 0), or a slot to set back when the search comes back past it
 type Job { pc: Int, at: Int, slot: Int }
 
-fn parseAlt(cs: [Text], at: Int, groups: Int) -> Parsed! {
-    var p = parseCat(cs, at, groups)?
-    var options = [p.node]
-    while p.at < len(cs) and cs[p.at] == "|" {
-        p = parseCat(cs, p.at + 1, p.groups)?
-        options.push(p.node)
+// where parsing is: the pattern's code points, how many are read, how many groups it has seen
+type Parser { cs: [Int], at: Int, groups: Int }
+
+// the code point k after where parsing is, -1 past the end
+fn Parser.ahead(self, k: Int) -> Int = self.cs.get(self.at + k) ?? -1
+
+fn Parser.alt(var self) -> Node! {
+    var options = [self.cat()?]
+    while self.ahead(0) == '|' {
+        self.at += 1
+        options.push(self.cat()?)
     }
-    if len(options) == 1 {
-        p
-    } else {
-        Parsed(Node.Alt(options), p.at, p.groups)
-    }
+    if len(options) == 1 { options[0] } else { Node.Alt(options) }
 }
 
-fn parseCat(cs: [Text], from: Int, groups: Int) -> Parsed! {
+fn Parser.cat(var self) -> Node! {
     var items: [Node] = []
-    var at = from
-    var seen = groups
-    while at < len(cs) and cs[at] != "|" and cs[at] != ")" {
-        let p = parseRepeat(cs, at, seen)?
-        items.push(p.node)
-        at = p.at
-        seen = p.groups
+    while self.at < len(self.cs) and self.ahead(0) != '|' and self.ahead(0) != ')' {
+        items.push(self.repeat()?)
     }
-    Parsed(if len(items) == 1 { items[0] } else { Node.Cat(items) }, at, seen)
+    if len(items) == 1 { items[0] } else { Node.Cat(items) }
 }
 
-fn parseRepeat(cs: [Text], from: Int, groups: Int) -> Parsed! {
-    let p = parseAtom(cs, from, groups)?
-    var node = p.node
-    var at = p.at
-    while at < len(cs) {
-        let c = cs[at]
-        let count: (Int, Int, Int)? = match c {
-            "*" => Some((0, -1, at + 1))
-            "+" => Some((1, -1, at + 1))
-            "?" => Some((0, 1, at + 1))
-            "\{" => readCount(cs, at + 1)
-            _ => None
-        }
-        let Some((low, high, next)) = count else {
-            break
-        }
-        let fixed = match node {
-            Start => true
-            Finish => true
-            Edge(_) => true
-            _ => false
-        }
-        if fixed {
-            return Err("regex: nothing to repeat before \"{c}\", at character {at}")
+fn Parser.repeat(var self) -> Node! {
+    var node = self.atom()?
+    while self.at < len(self.cs) {
+        let at = self.at
+        let (low, high) = self.count() ?? break
+        if node is Start | Finish | Edge(_) {
+            return Err("regex: nothing to repeat before \"{char(self.cs[at])}\", at character {at}")
         }
         if high >= 0 and high < low or high > 1000 or low > 1000 {
             return Err("regex: a count from 0 to 1000, the smaller first, at character {at}")
         }
-        let lazy = next < len(cs) and cs[next] == "?"
-        node = Node.Repeat(node, low, high, not lazy)
-        at = if lazy { next + 1 } else { next }
+        let lazy = self.ahead(0) == '?'
+        if lazy {
+            self.at += 1
+        }
+        node = .Repeat(node, low, high, not lazy)
     }
-    Parsed(node, at, p.groups)
+    node
 }
 
-// {n}, {n,} or {n,m} after the {: (n, m or -1 for no end, where it ends), or None when it is not a count
-fn readCount(cs: [Text], from: Int) -> (Int, Int, Int)? {
-    let (low, afterLow) = digits(cs, from)?
-    if afterLow < len(cs) and cs[afterLow] == "\}" {
-        return (low, low, afterLow + 1)
+// * + ? {n} {n,} {n,m}: how many (m -1 for no end), parsing past it; or None, parsing where it was
+fn Parser.count(var self) -> (Int, Int)? {
+    let at = self.at
+    self.at += 1
+    let count: (Int, Int)? = match self.cs[at] {
+        '*' => Some((0, -1))
+        '+' => Some((1, -1))
+        '?' => Some((0, 1))
+        '{' => self.bounds()
+        _ => None
     }
-    if afterLow >= len(cs) or cs[afterLow] != "," {
+    if count is None {
+        self.at = at
+    }
+    count
+}
+
+// n}, n,} or n,m} after a {
+fn Parser.bounds(var self) -> (Int, Int)? {
+    let low = self.number()?
+    if self.ahead(0) == ',' {
+        self.at += 1
+        if self.ahead(0) == '}' {
+            self.at += 1
+            return (low, -1)
+        }
+        let high = self.number()?
+        return if self.ahead(0) == '}' {
+            self.at += 1
+            (low, high)
+        } else {
+            None
+        }
+    }
+    if self.ahead(0) != '}' {
         return None
     }
-    if afterLow + 1 < len(cs) and cs[afterLow + 1] == "\}" {
-        return (low, -1, afterLow + 2)
-    }
-    let (high, afterHigh) = digits(cs, afterLow + 1)?
-    if afterHigh < len(cs) and cs[afterHigh] == "\}" {
-        (low, high, afterHigh + 1)
-    } else {
-        None
-    }
+    self.at += 1
+    (low, low)
 }
 
-fn digits(cs: [Text], from: Int) -> (Int, Int)? {
-    var at = from
+fn Parser.number(var self) -> Int? {
+    let from = self.at
     var n = 0
-    while at < len(cs) and contains("0123456789", cs[at]) and n <= 100_000 {
-        n = n * 10 + (parseInt(cs[at]) ?? 0)
-        at += 1
+    while self.ahead(0) is '0'..='9' and n <= 100_000 {
+        n = n * 10 + self.ahead(0) - '0'
+        self.at += 1
     }
-    if at == from { None } else { (n, at) }
+    if self.at == from { None } else { n }
 }
 
-fn parseAtom(cs: [Text], at: Int, groups: Int) -> Parsed! {
-    let c = cs[at]
-    if c == "(" {
-        let keeps = not (at + 2 < len(cs) and cs[at + 1] == "?" and cs[at + 2] == ":")
-        let inner = parseAlt(cs, if keeps { at + 1 } else { at + 3 }, if keeps { groups + 1 } else { groups })?
-        if inner.at >= len(cs) {
+fn Parser.atom(var self) -> Node! {
+    let at = self.at
+    let c = self.cs[at]
+    self.at += 1
+    if c == '(' {
+        let keeps = not (self.ahead(0) == '?' and self.ahead(1) == ':')
+        if keeps {
+            self.groups += 1
+        } else {
+            self.at += 2
+        }
+        let index = self.groups
+        let inner = self.alt()?
+        if self.at >= len(self.cs) {
             return Err("regex: a ( without its ), at character {at}")
         }
-        let node = if keeps { Node.Group(groups + 1, inner.node) } else { inner.node }
-        return Parsed(node, inner.at + 1, inner.groups)
+        self.at += 1
+        return if keeps { Node.Group(index, inner) } else { inner }
     }
-    if c == "[" {
-        return parseClass(cs, at + 1, groups)
+    if c == '[' {
+        return self.class()
     }
-    if c == "\\" {
-        if at + 1 >= len(cs) {
-            return Err("regex: a \\ at the end")
+    if c == '\\' {
+        let e = self.ahead(0)
+        if e < 0 {
+            return Err(r"regex: a \ at the end")
         }
-        let e = cs[at + 1]
-        let node = if e == "b" or e == "B" {
-            Node.Edge(e == "b")
+        self.at += 1
+        return if e == 'b' or e == 'B' {
+            Node.Edge(e == 'b')
         } else {
             escapeSet(e) ?? Node.Lit(escapeChar(e))
         }
-        return Parsed(node, at + 2, groups)
     }
-    if c == "*" or c == "+" or c == "?" {
-        return Err("regex: nothing to repeat before \"{c}\", at character {at}")
+    if c == '*' or c == '+' or c == '?' {
+        return Err("regex: nothing to repeat before \"{char(c)}\", at character {at}")
     }
-    let node = match c {
-        "." => Node.Set([Span("\n", "\n")], true)
-        "^" => Node.Start
-        "$" => Node.Finish
-        _ => Node.Lit(c)
+    let node: Node = match c {
+        '.' => .Set([Span('\n', '\n')], true)
+        '^' => .Start
+        '$' => .Finish
+        _ => .Lit(c)
     }
-    Parsed(node, at + 1, groups)
+    node
 }
 
 // [...] after its [: the ranges and characters in it, up to its ]
-fn parseClass(cs: [Text], from: Int, groups: Int) -> Parsed! {
-    let negated = from < len(cs) and cs[from] == "^"
-    var at = if negated { from + 1 } else { from }
+fn Parser.class(var self) -> Node! {
+    let from = self.at
+    let negated = self.ahead(0) == '^'
+    if negated {
+        self.at += 1
+    }
     var spans: [Span] = []
     var first = true
-    while at < len(cs) and (cs[at] != "]" or first) {
+    while self.at < len(self.cs) and (self.ahead(0) != ']' or first) {
         first = false
-        var low = cs[at]
-        if low == "\\" and at + 1 < len(cs) {
-            match escapeSet(cs[at + 1]) {
+        var low = self.ahead(0)
+        if low == '\\' and self.ahead(1) >= 0 {
+            match escapeSet(self.ahead(1)) {
                 Some(Set(more, out)) => {
                     if out {
-                        return Err("regex: \\{cs[at + 1]} inside [ ], at character {at}: write [^...] instead")
+                        return Err(
+                            "regex: \\{char(self.ahead(1))} inside [ ], at character {self.at}: write [^...] instead",
+                        )
                     }
-                    spans = spans + more
-                    at += 2
+                    spans += more
+                    self.at += 2
                     continue
                 }
                 _ => {
-                    low = escapeChar(cs[at + 1])
-                    at += 1
+                    low = escapeChar(self.ahead(1))
+                    self.at += 1
                 }
             }
         }
-        at += 1
+        self.at += 1
         var high = low
-        if at + 1 < len(cs) and cs[at] == "-" and cs[at + 1] != "]" {
-            high = cs[at + 1]
-            at += 2
-            if high == "\\" and at < len(cs) {
-                high = escapeChar(cs[at])
-                at += 1
+        if self.ahead(0) == '-' and self.ahead(1) != ']' and self.ahead(1) >= 0 {
+            high = self.ahead(1)
+            self.at += 2
+            if high == '\\' and self.ahead(0) >= 0 {
+                high = escapeChar(self.ahead(0))
+                self.at += 1
             }
             if high < low {
-                return Err("regex: the range {low}-{high} goes backwards, at character {at}")
+                return Err("regex: the range {char(low)}-{char(high)} goes backwards, at character {self.at}")
             }
         }
         spans.push(Span(low, high))
     }
-    if at >= len(cs) {
+    if self.at >= len(self.cs) {
         return Err("regex: a [ without its ], at character {from - 1}")
     }
-    Parsed(Node.Set(spans, negated), at + 1, groups)
+    self.at += 1
+    Node.Set(spans, negated)
 }
 
 // \d \w \s and \D \W \S: digits, a word's characters, spaces
-fn escapeSet(e: Text) -> Node? = match e {
-    "d" => Node.Set(digitSpans(), false)
-    "D" => Node.Set(digitSpans(), true)
-    "w" => Node.Set(wordSpans(), false)
-    "W" => Node.Set(wordSpans(), true)
-    "s" => Node.Set(spaceSpans(), false)
-    "S" => Node.Set(spaceSpans(), true)
+fn escapeSet(e: Int) -> Node? = match e {
+    'd' => .Set(digitSpans(), false)
+    'D' => .Set(digitSpans(), true)
+    'w' => .Set(wordSpans(), false)
+    'W' => .Set(wordSpans(), true)
+    's' => .Set(spaceSpans(), false)
+    'S' => .Set(spaceSpans(), true)
     _ => None
 }
 
-fn escapeChar(e: Text) -> Text = match e {
-    "n" => "\n"
-    "t" => "\t"
-    "r" => "\r"
+fn escapeChar(e: Int) -> Int = match e {
+    'n' => '\n'
+    't' => '\t'
+    'r' => '\r'
     _ => e
 }
 
-fn digitSpans() -> [Span] = [Span("0", "9")]
+fn digitSpans() -> [Span] = [Span('0', '9')]
 
-fn wordSpans() -> [Span] = [Span("a", "z"), Span("A", "Z"), Span("0", "9"), Span("_", "_")]
+fn wordSpans() -> [Span] = [Span('a', 'z'), Span('A', 'Z'), Span('0', '9'), Span('_', '_')]
 
-fn spaceSpans() -> [Span] = [Span(" ", " "), Span("\t", "\t"), Span("\n", "\n"), Span("\r", "\r")]
+fn spaceSpans() -> [Span] = [Span(' ', ' '), Span('\t', '\t'), Span('\n', '\n'), Span('\r', '\r')]
 
 // the program for the node, to go at base in the whole program
 fn emit(node: Node, base: Int) -> [Inst] {
     var p: [Inst] = []
     match node {
-        Lit(c) => p.push(Inst.Char(c))
-        Set(spans, negated) => p.push(Inst.Set(spans, negated))
-        Start => p.push(Inst.Start)
-        Finish => p.push(Inst.Finish)
-        Edge(word) => p.push(Inst.Edge(word))
+        Lit(c) => p.push(.Char(c))
+        Set(spans, negated) => p.push(.Set(spans, negated))
+        Start => p.push(.Start)
+        Finish => p.push(.Finish)
+        Edge(word) => p.push(.Edge(word))
         Group(i, inner) => {
-            p.push(Inst.Save(2 * i))
-            p = p + emit(inner, base + len(p))
-            p.push(Inst.Save(2 * i + 1))
+            p.push(.Save(2 * i))
+            p += emit(inner, base + len(p))
+            p.push(.Save(2 * i + 1))
         }
         Cat(items) => {
             for item in items {
-                p = p + emit(item, base + len(p))
+                p += emit(item, base + len(p))
             }
         }
         Alt(options) => {
             var ends: [Int] = []
-            for option, k in options {
+            for (k, option) in options.enumerate() {
                 if k == len(options) - 1 {
-                    p = p + emit(option, base + len(p))
+                    p += emit(option, base + len(p))
                 } else {
                     let split = len(p)
-                    p.push(Inst.Done)
-                    p = p + emit(option, base + len(p))
+                    p.push(.Done)
+                    p += emit(option, base + len(p))
                     ends.push(len(p))
-                    p.push(Inst.Done)
-                    p[split] = Inst.Split(base + split + 1, base + len(p))
+                    p.push(.Done)
+                    p[split] = .Split(base + split + 1, base + len(p))
                 }
             }
             for e in ends {
-                p[e] = Inst.Jump(base + len(p))
+                p[e] = .Jump(base + len(p))
             }
         }
         Repeat(inner, low, high, greedy) => {
             for i in 0..low {
-                p = p + emit(inner, base + len(p))
+                p += emit(inner, base + len(p))
             }
             var forks: [Int] = []
             for i in 0..(if high < 0 { 1 } else { high - low }) {
                 forks.push(len(p))
-                p.push(Inst.Done)
-                p = p + emit(inner, base + len(p))
+                p.push(.Done)
+                p += emit(inner, base + len(p))
                 if high < 0 {
-                    p.push(Inst.Jump(base + forks[0]))
+                    p.push(.Jump(base + forks[0]))
                 }
             }
             for f in forks {
                 p[f] = if greedy {
-                    Inst.Split(base + f + 1, base + len(p))
+                    .Split(base + f + 1, base + len(p))
                 } else {
-                    Inst.Split(base + len(p), base + f + 1)
+                    .Split(base + len(p), base + f + 1)
                 }
             }
         }
@@ -368,20 +374,20 @@ fn emit(node: Node, base: Int) -> [Inst] {
     p
 }
 
-// the slots (the match's start and end, as character indexes, then each group's) of the first match, or of
-// every match when all; whole: only one that is all the text. A step (an instruction at a character) that
-// was tried once and came to nothing never matches, so it is never tried again: that keeps the search
-// linear.
-fn search(r: Regex, cs: [Text], all: Bool, whole: Bool) -> [[Int]] {
-    let n = len(cs)
+// the slots (the match's start and end, as byte offsets, then each group's) of the first match, or of every
+// match when all; whole: only one that is all the text. The bytes are UTF-8, and a step over a character
+// reads one code point. A step (an instruction at a byte) that was tried once and came to nothing never
+// matches, so it is never tried again: that keeps the search linear.
+fn search(r: Regex, bs: Bytes, all: Bool, whole: Bool) -> [[Int]] {
+    let n = len(bs)
     let m = len(r.prog)
     let slots = 2 * (r.groups + 1)
-    var tried = fill(((n + 1) * m + 63) / 64, 0)
+    var tried = [0] * (((n + 1) * m + 63) / 64)
     var found: [[Int]] = []
     var jobs: [Job] = []
     var from = 0
     while from <= n {
-        var caps = fill(slots, -1)
+        var caps = [-1] * slots
         jobs = [Job(if whole { 3 } else { 0 }, from, -1)]
         var top = 1
         var matched = false
@@ -404,14 +410,14 @@ fn search(r: Regex, cs: [Text], all: Bool, whole: Bool) -> [[Int]] {
                 tried[k >> 6] = tried[k >> 6] | bit
                 match r.prog[pc] {
                     Char(c) => {
-                        going = sp < n and cs[sp] == c
+                        going = sp < n and codeAt(bs, sp) == c
                         pc += 1
-                        sp += 1
+                        sp += if going { width(bs[sp]) } else { 1 }
                     }
                     Set(spans, negated) => {
-                        going = sp < n and inSet(spans, cs[sp]) != negated
+                        going = sp < n and inSet(spans, codeAt(bs, sp)) != negated
                         pc += 1
-                        sp += 1
+                        sp += if going { width(bs[sp]) } else { 1 }
                     }
                     Start => {
                         going = sp == 0
@@ -422,7 +428,7 @@ fn search(r: Regex, cs: [Text], all: Bool, whole: Bool) -> [[Int]] {
                         pc += 1
                     }
                     Edge(word) => {
-                        going = ((sp > 0 and isWord(cs[sp - 1])) != (sp < n and isWord(cs[sp]))) == word
+                        going = ((sp > 0 and isWord(bs[sp - 1])) != (sp < n and isWord(bs[sp]))) == word
                         pc += 1
                     }
                     Split(first, second) => {
@@ -465,7 +471,7 @@ fn search(r: Regex, cs: [Text], all: Bool, whole: Bool) -> [[Int]] {
         }
         let end = caps[1]
         if end == caps[0] {
-            from = end + 1
+            from = end + (if end < n { width(bs[end]) } else { 1 })
         } else {
             from = end
             for pc in 0..m {
@@ -478,48 +484,62 @@ fn search(r: Regex, cs: [Text], all: Bool, whole: Bool) -> [[Int]] {
     found
 }
 
-fn inSet(spans: [Span], c: Text) -> Bool = spans.any(s => c >= s.low and c <= s.high)
-
-fn isWord(c: Text) -> Bool = inSet(wordSpans(), c)
-
-// each character's byte offset in the text, and the text's length last
-fn offsets(cs: [Text]) -> [Int] {
-    var at = [0]
-    for c, i in cs {
-        at.push(at[i] + len(c))
-    }
-    at
+// how many bytes the character whose first byte is b takes
+fn width(b: Int) -> Int = match b {
+    ..0x80 => 1
+    ..0xe0 => 2
+    ..0xf0 => 3
+    _ => 4
 }
 
-fn matchOf(text: Text, at: [Int], slots: [Int]) -> Match {
+// the code point whose bytes start at i
+fn codeAt(bs: Bytes, i: Int) -> Int {
+    let b = bs[i]
+    if b < 0x80 {
+        b
+    } else if b < 0xe0 {
+        b & 0x1f << 6 | bs[i + 1] & 0x3f
+    } else if b < 0xf0 {
+        b & 0x0f << 12 | bs[i + 1] & 0x3f << 6 | bs[i + 2] & 0x3f
+    } else {
+        b & 0x07 << 18 | bs[i + 1] & 0x3f << 12 | bs[i + 2] & 0x3f << 6 | bs[i + 3] & 0x3f
+    }
+}
+
+fn inSet(spans: [Span], c: Int) -> Bool = spans.any(s => c >= s.low and c <= s.high)
+
+// whether the byte is a word's (a word's characters are ASCII; no byte of a longer character is one)
+fn isWord(b: Int) -> Bool = b is 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'
+
+fn matchOf(text: Text, slots: [Int]) -> Match {
     let groups = (1..len(slots) / 2).map(g => if slots[2 * g] < 0 {
         ""
     } else {
-        text[at[slots[2 * g]]..at[slots[2 * g + 1]]]
+        text[slots[2 * g]..slots[2 * g + 1]]
     })
-    Match(at[slots[0]], at[slots[1]], text[at[slots[0]]..at[slots[1]]], groups)
+    Match(slots[0], slots[1], text[slots[0]..slots[1]], groups)
 }
 
 // the replacement with $0 to $9 put in
 fn expand(replacement: Text, m: Match) -> Text {
-    let cs = chars(replacement)
+    let bs = replacement.bytes()
     var out = ""
+    var last = 0
     var i = 0
-    while i < len(cs) {
-        let next = if i + 1 < len(cs) { cs[i + 1] } else { "" }
-        if cs[i] == "$" and next == "$" {
-            out = out + "$"
+    while i + 1 < len(bs) {
+        let next = bs[i + 1]
+        if bs[i] == '$' and (next == '$' or next is '0'..='9') {
+            let piece = match next {
+                '$' => "$"
+                '0' => m.text
+                _ => m.groups.get(next - '1') ?? ""
+            }
+            out += replacement[last..i] + piece
             i += 2
-        } else if cs[i] == "$" and next != "" and contains("0123456789", next) {
-            let g = parseInt(next) ?? 0
-            out = out + (if g == 0 {
-                m.text
-            } else if g <= len(m.groups) { m.groups[g - 1] } else { "" })
-            i += 2
+            last = i
         } else {
-            out = out + cs[i]
             i += 1
         }
     }
-    out
+    out + replacement[last..]
 }

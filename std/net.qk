@@ -1,0 +1,107 @@
+// TCP on the built-ins listen, accept, connect, readSocket, writeSocket and closeSocket: a socket read up to a
+// delimiter, a line at a time, a number of bytes, or to its end; texts written. Every read and write waits only the
+// task that makes it: run each connection in a task of its own (go(() => ...)), and runTasks() runs them all.
+//
+//     let server = listen("0.0.0.0", 8080)?
+//     go(() => {
+//         while accept(server) is Ok(c) {
+//             go(() => echo(conn(c)))
+//         }
+//     })
+//     runTasks()
+const part = 16384
+
+// a socket read with what came and was not used yet kept. closed: the other end closed it; error: why a read
+// stopped early ("" when none did)
+pub type Conn { socket: Socket, buffer: Bytes = [], closed: Bool = false, error: Text = "" }
+
+pub fn conn(socket: Socket) -> Conn = Conn(socket)
+
+// more bytes into the buffer; false when there will be no more (closed, or an error)
+fn Conn.fill(var self) -> Bool {
+    if self.closed or self.error != "" {
+        return false
+    }
+    match readSocket(self.socket, part) {
+        Ok(more) => {
+            if len(more) == 0 {
+                self.closed = true
+                return false
+            }
+            self.buffer = self.buffer + more
+            true
+        }
+        Err(why) => {
+            self.error = why
+            false
+        }
+    }
+}
+
+// the bytes up to the delimiter (not with it), the delimiter used up; None when there were no more first (what came
+// stays in the buffer)
+pub fn Conn.readUntil(var self, delimiter: Bytes) -> Bytes? {
+    var from = 0
+    while true {
+        var k = from
+        while k + len(delimiter) <= len(self.buffer) {
+            if self.buffer[k..k + len(delimiter)] == delimiter {
+                let got = self.buffer[..k]
+                self.buffer = self.buffer[k + len(delimiter)..]
+                return Some(got)
+            }
+            k += 1
+        }
+        from = max(0, len(self.buffer) - len(delimiter) + 1)
+        if not self.fill() {
+            return None
+        }
+    }
+    None
+}
+
+// the next line (it ends at \n, a \r before it let go; the last one may end where the bytes do); None at the end
+pub fn Conn.readLine(var self) -> Text? {
+    let b = self.readUntil([10]) ?? {
+        if len(self.buffer) == 0 {
+            return None
+        }
+        let last = self.buffer
+        self.buffer = []
+        last
+    }
+    let end = if len(b) > 0 and b[len(b) - 1] == 13 { len(b) - 1 } else { len(b) }
+    match Text(b[..end]) {
+        Ok(t) => Some(t)
+        Err(why) => {
+            self.error = "a line is not UTF-8: {why}"
+            None
+        }
+    }
+}
+
+// n bytes (fewer when there were no more first)
+pub fn Conn.readBytes(var self, n: Int) -> Bytes {
+    while len(self.buffer) < n and self.fill() {}
+    let k = min(n, len(self.buffer))
+    let got = self.buffer[..k]
+    self.buffer = self.buffer[k..]
+    got
+}
+
+// everything until the other end closes it
+pub fn Conn.readAll(var self) -> Bytes! {
+    while self.fill() {}
+    if self.error != "" {
+        return Err(self.error)
+    }
+    let got = self.buffer
+    self.buffer = []
+    Ok(got)
+}
+
+pub fn Conn.write(self, text: Text) -> Unit! = writeSocket(self.socket, text.bytes())
+
+pub fn Conn.writeBytes(self, bytes: Bytes) -> Unit! = writeSocket(self.socket, bytes)
+
+pub fn Conn.close(self) = closeSocket(self.socket)

@@ -1,0 +1,219 @@
+// HTTP/1.1 without TLS (http://, not https://): a server that runs each connection in a task of its own, and a
+// client. A request's and a response's body is read by its Content-Length (a chunked body, as servers send without
+// one, is read to the end of the connection); each connection serves one request (Connection: close).
+//
+//     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
+//     fn main() {
+//         serve("127.0.0.1", 8080, hello)? // never returns: each request in a task of its own
+//     }
+use std.net
+use std.encoding
+
+pub type Request {
+    method: Text
+    path: Text // without the query
+    query: [Text: Text] = [:] // ?a=1&b=two, decoded
+    headers: [Text: Text] = [:] // their names in lower case
+    body: Bytes = []
+}
+
+pub type Response {
+    status: Int = 200
+    headers: [Text: Text] = [:] // their names in lower case
+    body: Bytes = []
+}
+
+// the body as text (not UTF-8: "")
+pub fn Request.text(self) -> Text = Text(self.body) ?? ""
+
+pub fn Response.text(self) -> Text = Text(self.body) ?? ""
+
+// a response of text (text/plain; charset=utf-8)
+pub fn textResponse(body: Text, status: Int = 200) -> Response =
+    Response(status, ["content-type": "text/plain; charset=utf-8"], body.bytes())
+
+// a response of JSON's text (application/json)
+pub fn jsonResponse(body: Text, status: Int = 200) -> Response =
+    Response(status, ["content-type": "application/json"], body.bytes())
+
+fn reason(status: Int) -> Text = match status {
+    200 => "OK"
+    201 => "Created"
+    204 => "No Content"
+    301 => "Moved Permanently"
+    302 => "Found"
+    304 => "Not Modified"
+    400 => "Bad Request"
+    401 => "Unauthorized"
+    403 => "Forbidden"
+    404 => "Not Found"
+    405 => "Method Not Allowed"
+    500 => "Internal Server Error"
+    503 => "Service Unavailable"
+    _ => "Status"
+}
+
+// a=1&b=two%20words: decoded, + as a space
+pub fn parseQuery(text: Text) -> [Text: Text] {
+    var out: [Text: Text] = [:]
+    for pair in text.split("&") {
+        if pair == "" {
+            continue
+        }
+        let at = pair.indexOf("=")
+        let k = if at is Some(i) { pair[..i] } else { pair }
+        let v = if at is Some(i) { pair[i + 1..] } else { "" }
+        out[percentDecode(k, plus: true) ?? k] = percentDecode(v, plus: true) ?? v
+    }
+    out
+}
+
+// the header lines up to the empty one: the first line, and the headers by name (lower case)
+fn readHead(c: Conn) -> (Text, [Text: Text], Conn)! {
+    var cc = c
+    let Some(head) = cc.readUntil("\r\n\r\n".bytes()) else {
+        return Err(if cc.error != "" {
+            cc.error
+        } else {
+            "the connection closed before the headers ended"
+        })
+    }
+    let text = Text(head)?
+    let all = text.lines()
+    if len(all) == 0 {
+        return Err("no request line")
+    }
+    var headers: [Text: Text] = [:]
+    for line in all[1..] {
+        let at = line.indexOf(":") ?? -1
+        if at > 0 {
+            headers[line[..at].trim().lower()] = line[at + 1..].trim()
+        }
+    }
+    Ok((all[0], headers, cc))
+}
+
+// the body its headers say: Content-Length bytes, else what comes until the other end closes it
+fn readBody(c: Conn, headers: [Text: Text]) -> (Bytes, Conn)! {
+    var cc = c
+    if headers["content-length"] is Some(n) {
+        let count = n.parseInt().mapErr(why => "content-length: {why}")?
+        return Ok((cc.readBytes(count), cc))
+    }
+    if headers["transfer-encoding"] is Some(_) {
+        return Ok((cc.readAll()?, cc))
+    }
+    let none: Bytes = []
+    Ok((none, cc))
+}
+
+// the request a connection carries
+pub fn readRequest(c: Conn) -> (Request, Conn)! {
+    let (first, headers, c1) = readHead(c)?
+    let parts = first.split(" ")
+    if len(parts) < 3 or not parts[2].startsWith("HTTP/") {
+        return Err("not an HTTP request line: {first}")
+    }
+    let target = parts[1]
+    let at = target.indexOf("?")
+    let path = if at is Some(i) { target[..i] } else { target }
+    let query = if at is Some(i) { parseQuery(target[i + 1..]) } else { [:] }
+    let (body, c2) = readBody(c1, headers)?
+    Ok((Request(parts[0], percentDecode(path) ?? path, query, headers, body), c2))
+}
+
+fn head(first: Text, headers: [Text: Text], body: Bytes) -> Bytes {
+    var out = first + "\r\n"
+    for (k, v) in headers {
+        if k != "content-length" and k != "connection" {
+            out += "{k}: {v}\r\n"
+        }
+    }
+    out += "content-length: {len(body)}\r\nconnection: close\r\n\r\n"
+    out.bytes() + body
+}
+
+// the response, written
+pub fn writeResponse(c: Conn, r: Response) -> Unit! =
+    c.writeBytes(head("HTTP/1.1 {r.status} {reason(r.status)}", r.headers, r.body))
+
+// one connection: its request read, the handler's response written, the connection closed (a request that cannot
+// be read: 400)
+pub fn handleConnection(socket: Socket, handler: effect (Request) -> Response) {
+    let c = conn(socket)
+    match readRequest(c) {
+        Ok((request, c2)) => {
+            let _ = writeResponse(c2, handler(request))
+        }
+        Err(why) => {
+            let _ = writeResponse(c, textResponse("bad request: {why}", status: 400))
+        }
+    }
+    c.close()
+}
+
+// a server on host:port: each connection in a task of its own, the handler called for each request. It runs until
+// the program ends (Err when it cannot listen).
+pub fn serve(host: Text, port: Int, handler: effect (Request) -> Response) -> Unit! {
+    let server = listen(host, port)?
+    go(() => {
+        while accept(server) is Ok(socket) {
+            go(() => handleConnection(socket, handler))
+        }
+    })
+    runTasks()
+    Ok(())
+}
+
+// http://host[:port]/path?query: (host, port, the path with its query)
+pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
+    if url.startsWith("https://") {
+        return Err("https is not supported (no TLS): {url}")
+    }
+    if not url.startsWith("http://") {
+        return Err("not an http:// URL: {url}")
+    }
+    let rest = url[7..]
+    let slash = rest.indexOf("/")
+    let authority = if slash is Some(i) { rest[..i] } else { rest }
+    let target = if slash is Some(i) { rest[i..] } else { "/" }
+    let colon = authority.indexOf(":")
+    if colon is Some(i) {
+        let port = authority[i + 1..].parseInt().mapErr(why => "the port: {why}")?
+        return Ok((authority[..i], port, target))
+    }
+    Ok((authority, 80, target))
+}
+
+// a request to url: its method, its headers (names in lower case) and its body; the response
+pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
+    let (host, port, target) = parseUrl(url)?
+    let socket = connect(host, port)?
+    let c = conn(socket)
+    var all = headers
+    all["host"] = if port == 80 { host } else { "{host}:{port}" }
+    let sent = c.writeBytes(head("{method} {target} HTTP/1.1", all, body))
+    if sent is Err(why) {
+        c.close()
+        return Err(why)
+    }
+    let read = readHead(c)
+    if read is Err(why) {
+        c.close()
+        return Err(why)
+    }
+    let (first, got, c1) = read ?? panic("read")
+    let parts = first.split(" ")
+    let status = if len(parts) >= 2 { parts[1].parseInt() ?? 0 } else { 0 }
+    let b = readBody(c1, got)
+    c1.close()
+    let (responseBody, _) = b?
+    Ok(Response(status, got, responseBody))
+}
+
+// GET url
+pub fn get(url: Text) -> Response! = request("GET", url)
+
+// POST url with a body
+pub fn post(url: Text, body: Bytes, contentType: Text = "application/octet-stream") -> Response! =
+    request("POST", url, body, ["content-type": contentType])

@@ -1,0 +1,119 @@
+// Files a part at a time, on the built-ins openFile, readChunk, writeChunk, seekFile and closeFile: a file read line
+// by line however big it is, copied, its size; each File closed by whoever opened it.
+//
+//     var lines = lineReader(openFile("big.log", "r")?)
+//     while lines.next() is Some(line) { ... }
+//     lines.close()
+//     if lines.error != "" { ... } // why it stopped early, if it did
+const chunk = 65536
+
+// a file read a line at a time (lines end at \n; a \r before it is let go; the last one may end at the end).
+// error: why the lines stopped before the file's end ("" when they did not)
+pub type LineReader {
+    file: File
+    buffer: Bytes = []
+    at: Int = 0
+    ended: Bool = false
+    error: Text = ""
+}
+
+pub fn lineReader(file: File) -> LineReader = LineReader(file)
+
+// the next line; None at the end (or at an error: then error says it)
+pub fn LineReader.next(var self) -> Text? {
+    while self.error == "" {
+        var k = self.at
+        while k < len(self.buffer) and self.buffer[k] != '\n' {
+            k += 1
+        }
+        if k < len(self.buffer) or self.ended {
+            if k >= len(self.buffer) and self.at >= len(self.buffer) {
+                return None
+            }
+            var end = k
+            if end > self.at and self.buffer[end - 1] == '\r' {
+                end -= 1
+            }
+            let line = Text(self.buffer[self.at..end])
+            self.at = min(k + 1, len(self.buffer))
+            if line is Err(why) {
+                self.error = "a line is not UTF-8: {why}"
+                return None
+            }
+            return Some(line ?? "")
+        }
+        // more: what is left kept, the next part after it
+        match readChunk(self.file, chunk) {
+            Ok(more) => {
+                self.buffer = self.buffer[self.at..] + more
+                self.at = 0
+                if len(more) == 0 {
+                    self.ended = true
+                }
+            }
+            Err(why) => {
+                self.error = why
+            }
+        }
+    }
+    None
+}
+
+pub fn LineReader.close(self) = closeFile(self.file)
+
+// the file's size in bytes
+pub fn fileSize(path: Text) -> Int! {
+    let f = openFile(path, "r")?
+    let size = seekFile(f, 0, 2)
+    closeFile(f)
+    size
+}
+
+// from's bytes into to (made, or written over), a part at a time
+pub fn copyFile(from: Text, to: Text) -> Unit! {
+    let a = openFile(from, "r")?
+    let b = openFile(to, "w")
+    if b is Err(why) {
+        closeFile(a)
+        return Err(why)
+    }
+    let out = b ?? panic("opened")
+    var failed = ""
+    while failed == "" {
+        let part = readChunk(a, chunk)
+        if part is Err(why) {
+            failed = why
+        } else {
+            let bytes = part ?? []
+            if len(bytes) == 0 {
+                break
+            }
+            if writeChunk(out, bytes) is Err(why) {
+                failed = why
+            }
+        }
+    }
+    closeFile(a)
+    closeFile(out)
+    if failed != "" { Err(failed) } else { Ok(()) }
+}
+
+// every file under a folder, at any depth (its folders' names not in it), each path from the folder given:
+// sorted, so the same tree gives the same list. Err when a folder cannot be read.
+pub fn walkFiles(folder: Text) -> [Text]! {
+    var out: [Text] = []
+    var pending = [folder]
+    while pending.pop() is Some(dir) {
+        var names = listDir(dir)?
+        names = names.sorted()
+        for name in names {
+            let path = if dir.endsWith("/") { dir + name } else { dir + "/" + name }
+            if listDir(path) is Ok(_) {
+                pending.push(path)
+            } else {
+                out.push(path)
+            }
+        }
+    }
+    Ok(out.sorted())
+}

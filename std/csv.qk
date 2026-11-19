@@ -1,0 +1,125 @@
+// CSV as RFC 4180 has it: rows of fields split by a separator (a comma, or another byte), a field in double quotes
+// when it holds the separator, a quote ("" inside) or a line break, rows ending at \n or \r\n. Read whole
+// (parseCsv) or written (toCsv); a first row of names makes records of maps (csvRecords).
+//
+//     let rows = parseCsv(readFile("data.csv")?)?
+//     for r in csvRecords(rows) { print(r["name"] ?? "?") }
+// the rows of a CSV text (the last line break, if any, ends the last row); Err says where it stops being CSV
+pub fn parseCsv(text: Text, separator: Int = ',') -> [[Text]]! {
+    let b = text.bytes()
+    var rows: [[Text]] = []
+    var row: [Text] = []
+    var field: Bytes = []
+    var i = 0
+    var quoted = false
+    var line = 1
+    var rowStarted = false
+    while i < len(b) {
+        let c = b[i]
+        if quoted {
+            if c == '"' {
+                if i + 1 < len(b) and b[i + 1] == '"' {
+                    field.push('"')
+                    i += 2
+                    continue
+                }
+                quoted = false
+                i += 1
+                if i < len(b) and b[i] != separator and b[i] != '\n' and b[i] != '\r' {
+                    return Err("line {line}: a quoted field goes on after its closing quote")
+                }
+                continue
+            }
+            if c == '\n' {
+                line += 1
+            }
+            field.push(c)
+            i += 1
+            continue
+        }
+        if c == '"' and len(field) == 0 {
+            quoted = true
+            rowStarted = true
+            i += 1
+            continue
+        }
+        if c == separator {
+            row.push(Text(field) ?? "")
+            field = []
+            rowStarted = true
+            i += 1
+            continue
+        }
+        if c == '\r' and i + 1 < len(b) and b[i + 1] == '\n' {
+            i += 1
+            continue
+        }
+        if c == '\n' {
+            row.push(Text(field) ?? "")
+            rows.push(row)
+            row = []
+            field = []
+            rowStarted = false
+            line += 1
+            i += 1
+            continue
+        }
+        field.push(c)
+        rowStarted = true
+        i += 1
+    }
+    if quoted {
+        return Err("line {line}: a quoted field is not closed")
+    }
+    if rowStarted or len(field) > 0 or len(row) > 0 {
+        row.push(Text(field) ?? "")
+        rows.push(row)
+    }
+    Ok(rows)
+}
+
+fn needsQuotes(t: Text, separator: Int) -> Bool =
+    t.bytes().any(c => c == separator or c == '"' or c == '\n' or c == '\r')
+
+// a field as CSV writes it: in quotes (its quotes doubled) when it must be
+pub fn csvField(t: Text, separator: Int = ',') -> Text = if needsQuotes(t, separator) {
+    "\"" + t.replace("\"", "\"\"") + "\""
+} else {
+    t
+}
+
+// the rows as CSV text, each row ending with \n
+pub fn toCsv(rows: [[Text]], separator: Int = ',') -> Text {
+    var out = ""
+    let sep = char(separator)
+    for row in rows {
+        for (i, f) in row.enumerate() {
+            if i > 0 {
+                out += sep
+            }
+            out += csvField(f, separator)
+        }
+        out += "\n"
+    }
+    out
+}
+
+// the rows after the first, each a map from the first row's names to its fields (a row with fewer fields: those
+// names left out)
+pub fn csvRecords(rows: [[Text]]) -> [[Text: Text]] {
+    if len(rows) == 0 {
+        return []
+    }
+    let names = rows[0]
+    var out: [[Text: Text]] = []
+    for row in rows[1..] {
+        var r: [Text: Text] = [:]
+        for (i, f) in row.enumerate() {
+            if i < len(names) {
+                r[names[i]] = f
+            }
+        }
+        out.push(r)
+    }
+    out
+}

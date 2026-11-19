@@ -1,5 +1,6 @@
-// Dates and times in UTC, on the Gregorian calendar: from and to the seconds time() gives, weekdays, days
-// added, and ISO 8601 text both ways (2026-11-13, 2026-11-13T09:30:05.250Z).
+// Dates and times in UTC, on the Gregorian calendar: from and to the seconds unixTime() gives, weekdays, days
+// added, and ISO 8601 text both ways (2026-11-13, 2026-11-13T09:30:05.250Z); and the local time, by the system's
+// time zone (localOffset).
 pub type Date { year: Int, month: Int, day: Int }
 
 // a moment to the millisecond, in UTC
@@ -15,7 +16,7 @@ pub type DateTime {
 
 pub enum Weekday { Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday }
 
-// the moment that many seconds after 1970-01-01T00:00:00Z: utc(time()) is now
+// the moment that many seconds after 1970-01-01T00:00:00Z: utc(unixTime()) is now
 pub fn utc(seconds: Float) -> DateTime {
     let ms = round(seconds * 1000)
     let d = dateOfDays(ms / 86_400_000)
@@ -57,31 +58,31 @@ pub fn Date.isValid(self) -> Bool =
     self.month >= 1 and self.month <= 12 and self.day >= 1 and self.day <= daysInMonth(self.year, self.month)
 
 pub fn Date.weekday(self) -> Weekday = match (self.days() + 3) % 7 {
-    0 => Weekday.Monday
-    1 => Weekday.Tuesday
-    2 => Weekday.Wednesday
-    3 => Weekday.Thursday
-    4 => Weekday.Friday
-    5 => Weekday.Saturday
-    _ => Weekday.Sunday
+    0 => .Monday
+    1 => .Tuesday
+    2 => .Wednesday
+    3 => .Thursday
+    4 => .Friday
+    5 => .Saturday
+    _ => .Sunday
 }
 
 // the date n days later (earlier, for n below 0)
-pub fn Date.addDays(self, n: Int) -> Date = dateOfDays(self.days() + n)
+pub fn Date.addDays(self, n: Int) -> Self = dateOfDays(self.days() + n)
 
 // the same day n months later, or the month's last day when it has fewer: 01-31 plus a month is 02-28
-pub fn Date.addMonths(self, n: Int) -> Date {
+pub fn Date.addMonths(self, n: Int) -> Self {
     let m = self.year * 12 + self.month - 1 + n
     let year = m / 12
     let month = m % 12 + 1
-    Date(year, month, min(self.day, daysInMonth(year, month)))
+    Self(year, month, min(self.day, daysInMonth(year, month)))
 }
 
 // the moment at that time of the day: Date(2026, 11, 13).at(9, 30)
 pub fn Date.at(self, hour: Int, minute: Int, second: Int = 0, millisecond: Int = 0) -> DateTime =
     DateTime(self.year, self.month, self.day, hour, minute, second, millisecond)
 
-pub fn Date.compare(self, b: Date) -> Int = self.days() - b.days()
+pub fn Date.compare(self, b: Self) -> Int = self.days() - b.days()
 
 // as ISO 8601: 2026-11-13
 pub fn Date.toIso(self) -> Text =
@@ -89,19 +90,19 @@ pub fn Date.toIso(self) -> Text =
 
 pub fn DateTime.date(self) -> Date = Date(self.year, self.month, self.day)
 
-// the seconds from 1970-01-01T00:00:00Z to it, as time() gives them
+// the seconds from 1970-01-01T00:00:00Z to it, as unixTime() gives them
 pub fn DateTime.seconds(self) -> Float = toFloat(self.milliseconds()) / 1000
 
 pub fn DateTime.weekday(self) -> Weekday = self.date().weekday()
 
-pub fn DateTime.addSeconds(self, s: Float) -> DateTime = utc(self.seconds() + s)
+pub fn DateTime.addSeconds(self, s: Float) -> Self = utc(self.seconds() + s)
 
-pub fn DateTime.addDays(self, n: Int) -> DateTime {
+pub fn DateTime.addDays(self, n: Int) -> Self {
     let d = self.date().addDays(n)
     self with { year: d.year, month: d.month, day: d.day }
 }
 
-pub fn DateTime.compare(self, b: DateTime) -> Int = self.milliseconds() - b.milliseconds()
+pub fn DateTime.compare(self, b: Self) -> Int = self.milliseconds() - b.milliseconds()
 
 // as ISO 8601 in UTC: 2026-11-13T09:30:05Z, with .250 before the Z when there are milliseconds
 pub fn DateTime.toIso(self) -> Text {
@@ -115,10 +116,10 @@ pub fn DateTime.toIso(self) -> Text {
 
 // an ISO 8601 date, YYYY-MM-DD, or why it is not one
 pub fn parseDate(text: Text) -> Date! {
-    let cs = chars(trim(text))
-    let d = readDate(cs, text)?
-    if len(cs) > 10 {
-        return Err("date: \"{cs[10]}\" after the date in \"{text}\"")
+    let t = text.trim()
+    let d = readDate(t.bytes(), text)?
+    if len(t) > 10 {
+        return Err("date: \"{charAt(t, 10)}\" after the date in \"{text}\"")
     }
     d
 }
@@ -127,84 +128,85 @@ pub fn parseDate(text: Text) -> Date! {
 // (+02:00, -0530) after it if it has them; the time may follow a space instead of the T, and a date alone is
 // its midnight. Without Z or an offset it is taken as UTC; with an offset it is turned to UTC.
 pub fn parseDateTime(text: Text) -> DateTime! {
-    let cs = chars(trim(text))
-    let d = readDate(cs, text)?
-    if len(cs) == 10 {
+    let t = text.trim()
+    let b = t.bytes()
+    let d = readDate(b, text)?
+    if len(b) == 10 {
         return d.at(0, 0)
     }
-    if not contains("Tt ", cs[10]) {
+    if not b[10] is 'T' | 't' | ' ' {
         return Err("date: a T before the time in \"{text}\"")
     }
-    let hour = number(cs, 11, 2) ?? -1
-    let minute = if len(cs) > 13 and cs[13] == ":" {
-        number(cs, 14, 2) ?? -1
-    } else {
-        -1
-    }
+    let hour = number(b, 11, 2) ?? -1
+    let minute = if b.get(13) == ':' { number(b, 14, 2) ?? -1 } else { -1 }
     if hour < 0 or hour > 23 or minute < 0 or minute > 59 {
         return Err("date: expected the time as hh:mm in \"{text}\"")
     }
     var at = 16
     var second = 0
     var ms = 0
-    if at < len(cs) and cs[at] == ":" {
-        second = number(cs, at + 1, 2) ?? -1
+    if b.get(at) == ':' {
+        second = number(b, at + 1, 2) ?? -1
         if second < 0 or second > 59 {
             return Err("date: expected seconds (00 to 59) after hh:mm in \"{text}\"")
         }
         at += 3
-        if at < len(cs) and (cs[at] == "." or cs[at] == ",") {
+        if at < len(b) and b[at] is '.' | ',' {
             at += 1
             var scale = 100
-            while at < len(cs) and contains("0123456789", cs[at]) {
-                ms += (parseInt(cs[at]) ?? 0) * scale
+            while at < len(b) and b[at] is '0'..='9' {
+                ms += (b[at] - '0') * scale
                 scale /= 10
                 at += 1
             }
         }
     }
     let moment = d.at(hour, minute, second, ms)
-    if at == len(cs) {
+    if at == len(b) {
         return moment
     }
-    if (cs[at] == "Z" or cs[at] == "z") and at + 1 == len(cs) {
+    if b[at] is 'Z' | 'z' and at + 1 == len(b) {
         return moment
     }
-    if cs[at] == "+" or cs[at] == "-" {
-        let sign = if cs[at] == "+" { 1 } else { -1 }
-        let oh = number(cs, at + 1, 2) ?? -1
-        let colon = at + 3 < len(cs) and cs[at + 3] == ":"
-        let om = if at + 3 == len(cs) {
+    if b[at] is '+' | '-' {
+        let sign = if b[at] == '+' { 1 } else { -1 }
+        let oh = number(b, at + 1, 2) ?? -1
+        let colon = b.get(at + 3) == ':'
+        let om = if at + 3 == len(b) {
             0
         } else {
-            number(cs, at + (if colon { 4 } else { 3 }), 2) ?? -1
+            number(b, at + (if colon { 4 } else { 3 }), 2) ?? -1
         }
-        let end = if at + 3 == len(cs) {
+        let end = if at + 3 == len(b) {
             at + 3
-        } else if colon { at + 6 } else { at + 5 }
-        if oh >= 0 and oh <= 23 and om >= 0 and om <= 59 and end == len(cs) {
+        } else if colon {
+            at + 6
+        } else {
+            at + 5
+        }
+        if oh >= 0 and oh <= 23 and om >= 0 and om <= 59 and end == len(b) {
             return moment.addSeconds(toFloat(-sign * (oh * 3600 + om * 60)))
         }
     }
-    Err("date: \"{join(cs[at..], "")}\" is not Z or an offset (+hh:mm) in \"{text}\"")
+    Err("date: \"{t[at..]}\" is not Z or an offset (+hh:mm) in \"{text}\"")
 }
 
 fn DateTime.milliseconds(self) -> Int =
-    self.date().days() * 86_400_000 + self.hour * 3_600_000 + self.minute * 60_000 + self.second * 1000 + self.millisecond
+    self.date().days() * 86_400_000
+        + self.hour * 3_600_000
+        + self.minute * 60_000
+        + self.second * 1000
+        + self.millisecond
 
-fn readDate(cs: [Text], text: Text) -> Date! {
-    let y = number(cs, 0, 4)
-    let m = if len(cs) > 4 and cs[4] == "-" { number(cs, 5, 2) } else { None }
-    let d = if len(cs) > 7 and cs[7] == "-" { number(cs, 8, 2) } else { None }
-    let Some(year) = y else {
-        return Err("date: expected YYYY-MM-DD, found \"{text}\"")
-    }
-    let Some(month) = m else {
-        return Err("date: expected YYYY-MM-DD, found \"{text}\"")
-    }
-    let Some(day) = d else {
-        return Err("date: expected YYYY-MM-DD, found \"{text}\"")
-    }
+// the date at the start of the bytes (the text's, for a message)
+fn readDate(b: Bytes, text: Text) -> Date! {
+    let y = number(b, 0, 4)
+    let m = if b.get(4) == '-' { number(b, 5, 2) } else { None }
+    let d = if b.get(7) == '-' { number(b, 8, 2) } else { None }
+    let missing = "date: expected YYYY-MM-DD, found \"{text}\""
+    let year = y ?? return Err(missing)
+    let month = m ?? return Err(missing)
+    let day = d ?? return Err(missing)
     let date = Date(year, month, day)
     if not date.isValid() {
         return Err("date: {date.toIso()} is not a day of the calendar")
@@ -212,24 +214,36 @@ fn readDate(cs: [Text], text: Text) -> Date! {
     date
 }
 
-// the n digits at cs[at..] as a number, or None
-fn number(cs: [Text], at: Int, n: Int) -> Int? {
-    if at + n > len(cs) {
+// the n digits at b[at..] as a number, or None
+fn number(b: Bytes, at: Int, n: Int) -> Int? {
+    if at + n > len(b) {
         return None
     }
     var v = 0
-    for c in cs[at..at + n] {
-        if not contains("0123456789", c) {
+    for c in b[at..at + n] {
+        if c < '0' or c > '9' {
             return None
         }
-        v = v * 10 + (parseInt(c) ?? 0)
+        v = v * 10 + c - '0'
     }
     v
 }
 
+// the character that starts at byte i, for a message
+fn charAt(t: Text, i: Int) -> Text = char(t[i..].codePoints().first() ?? 0)
+
 // n's digits, with zeros in front to make at least the width
 fn padded(n: Int, width: Int) -> Text {
-    let t = toText(abs(n))
+    let t = abs(n).toText()
     let sign = if n < 0 { "-" } else { "" }
-    sign + repeat("0", max(0, width - len(t))) + t
+    sign + "0" * max(0, width - len(t)) + t
 }
+
+// now, in UTC
+pub fn now() -> DateTime = utc(unixTime())
+
+// the local date and time at that moment, by the system's time zone (its daylight saving time too)
+pub fn local(seconds: Float) -> DateTime = utc(seconds + toFloat(localOffset(seconds)))
+
+// now, in local time
+pub fn localNow() -> DateTime = local(unixTime())

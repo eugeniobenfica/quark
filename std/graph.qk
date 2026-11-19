@@ -1,0 +1,140 @@
+// A program's graph as a Quark value: the types of Quark Graph Notation (QGN), what quark graph writes. A program
+// takes a graph as it is, a constant of these types:
+//
+//     use std.graph
+//
+//     const shapes: Graph = Graph(quark: 1, decls: [
+//         Decl(kind: "fn", name: "area", ...),
+//     ])
+//
+// Every field has a value when it is left out, so a record says only what it has. A node's inputs are pins: a wire
+// from another node (Pin(node: 3)), a value typed in (Pin(value: "1.0", of: "Float")), an enum's case (Pin(case:
+// "Color.Red")) or a function (Pin(function: "square")). JSON (quark graph --json) says the same with the keys as
+// written here, but for those Quark keeps as words: typeName is "type", function "fn", otherwise "else", mutable
+// "var", effects "effect", isInterface "interface", isPub "pub".
+// the whole program: its declarations, and the comment after the last one
+pub type Graph { quark: Int = 1, decls: [Decl] = [], closing: Text = "" }
+
+// A declaration: kind "fn", "type", "interface", "enum", "const", "use", "extern type", "test". A function's
+// parameters, result type and nodes; its form "expr" (= result) or "block" (body); a type's fields, an enum's cases.
+pub type Decl {
+    kind: Text = ""
+    name: Text = ""
+    comment: Text = ""
+    trailing: Text = ""
+    alias: Text = ""
+    isPub: Bool = false
+    opaque: Bool = false
+    effects: Bool = false
+    effectDeclared: Bool = false
+    isInterface: Bool = false
+    variadic: Bool = false
+    externSymbol: Text = ""
+    library: Text = ""
+    typeParams: [Text] = []
+    params: [Param] = []
+    returns: Text = ""
+    annotation: Text = ""
+    form: Text = ""
+    result: Pin = Pin()
+    body: Block = Block()
+    nodes: [Node] = []
+    fields: [Field] = []
+    cases: [Case] = []
+    functions: [Text] = []
+    memberComments: [Note] = []
+}
+
+// A node: an expression that is not a plain value, a let, a statement. Its key names it while its place is the
+// same, its hash says what it is, its inputs are its pins; uid and pos are a layout's (quark graph --layout).
+pub type Node {
+    id: Int = 0
+    kind: Text = ""
+    key: Text = ""
+    uid: Text = ""
+    hash: Text = ""
+    line: Int = 0
+    pos: [Float] = []
+    typeName: Text = ""
+    name: Text = ""
+    op: Text = ""
+    function: Text = ""
+    qualifier: Text = ""
+    field: Text = ""
+    annotation: Text = ""
+    pattern: Text = ""
+    comment: Text = ""
+    trailing: Text = ""
+    blank: Bool = false
+    effects: Bool = false
+    method: Bool = false
+    dotted: Bool = false
+    jump: Bool = false
+    chain: Bool = false
+    multiline: Bool = false
+    open: Text = ""
+    elseIf: Int = 0
+    wholeId: Int = 0
+    inputs: [Pin] = []
+    params: [Param] = []
+    binds: [Bind] = []
+    alternatives: [Alt] = []
+    arms: [Arm] = []
+    names: [Text] = []
+    parts: [Text] = []
+    formats: [Text] = []
+    body: Block = Block()
+    block: Block = Block()
+    then: Block = Block()
+    otherwise: Block = Block()
+}
+
+// what goes into a pin: a node's value, a value typed in (its text, and of what type), a case, a function
+pub type Pin {
+    node: Int = 0
+    value: Text = ""
+    of: Text = ""
+    name: Text = ""
+    case: Text = ""
+    function: Text = ""
+}
+
+// the statements of a block (their nodes' ids, in order), and the comment before its end
+pub type Block { stmts: [Int] = [], closing: Text = "" }
+
+pub type Param {
+    id: Int = 0
+    name: Text = ""
+    typeName: Text = ""
+    key: Text = ""
+    mutable: Bool = false
+    default: Pin = Pin()
+}
+
+pub type Field { name: Text = "", typeName: Text = "", default: Pin = Pin() }
+pub type Case { name: Text = "", fields: [Field] = [] }
+
+// a match's arm: its pattern (with alternatives), the names it binds, a guard, its value or block
+pub type Arm {
+    pattern: Text = ""
+    binds: [Bind] = []
+    alternatives: [Alt] = []
+    wholeId: Int = 0
+    guard: Pin = Pin()
+    value: Pin = Pin()
+    block: Block = Block()
+    comment: Text = ""
+}
+
+pub type Bind {
+    id: Int = 0
+    name: Text = ""
+    pattern: Text = ""
+    binds: [Bind] = []
+    alternatives: [Alt] = []
+}
+
+pub type Alt { pattern: Text = "", binds: [Bind] = [] }
+
+// a field's (an enum case's) comments: the lines above it, and the one after it
+pub type Note { above: Text = "", after: Text? = None }

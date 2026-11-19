@@ -1,0 +1,144 @@
+// A program's command line read by what it takes: flags (--verbose, -v), options with a value (--out file,
+// --out=file, -o file, -ofile), short flags together (-vq), the rest positional (all of it after --), and the usage
+// text written from the same list.
+//
+//     let spec = [flag("verbose", short: "v", help: "say more"), option("out", short: "o", default: "a.txt")]
+//     let given = parseArgs(args(), spec)?
+//     if given.has("verbose") { ... }
+//     let out = given.value("out") ?? "a.txt"
+// one thing the command line may say: a flag, or an option with a value
+pub type Arg {
+    name: Text
+    short: Text = "" // one letter, or none
+    help: Text = ""
+    takesValue: Bool = false
+    default: Text? = None // an option's value when it is not given
+}
+
+// a flag: there or not (--name, -s)
+pub fn flag(name: Text, short: Text = "", help: Text = "") -> Arg = Arg(name, short, help)
+
+// an option with a value (--name value, --name=value, -s value, -svalue)
+pub fn option(name: Text, short: Text = "", help: Text = "", default: Text? = None) -> Arg =
+    Arg(name, short, help, takesValue: true, default: default)
+
+// what the command line said
+pub type Args { flags: Set<Text> = [], values: [Text: Text] = [:], positional: [Text] = [] }
+
+// the flag was given
+pub fn Args.has(self, name: Text) -> Bool = self.flags.contains(name)
+
+// the option's value (its default when it was not given)
+pub fn Args.value(self, name: Text) -> Text? = self.values[name]
+
+// the option's value as an Int: Err when it was not given (and has no default) or is not a number
+pub fn Args.int(self, name: Text) -> Int! {
+    let Some(v) = self.values[name] else {
+        return Err("--{name} was not given")
+    }
+    v.parseInt().mapErr(why => "--{name}: {why}")
+}
+
+fn byName(spec: [Arg], name: Text) -> Arg? = spec.first(a => a.name == name)
+
+fn byShort(spec: [Arg], letter: Text) -> Arg? = spec.first(a => a.short != "" and a.short == letter)
+
+// args read by spec (args(): what the program was given); Err says what was wrong, for the user to read
+pub fn parseArgs(given: [Text], spec: [Arg]) -> Args! {
+    var out = Args()
+    for a in spec {
+        if a.default is Some(d) {
+            out.values[a.name] = d
+        }
+    }
+    var i = 0
+    var rest = false
+    while i < len(given) {
+        let word = given[i]
+        i += 1
+        if rest or word == "-" or not word.startsWith("-") {
+            out.positional.push(word)
+            continue
+        }
+        if word == "--" {
+            rest = true
+            continue
+        }
+        if word.startsWith("--") {
+            let body = word[2..]
+            let at = body.indexOf("=")
+            let name = if at is Some(k) { body[..k] } else { body }
+            let Some(a) = byName(spec, name) else {
+                return Err("unknown option --{name}")
+            }
+            if not a.takesValue {
+                if at != None {
+                    return Err("--{name} takes no value")
+                }
+                out.flags.add(name)
+                continue
+            }
+            if at is Some(k) {
+                out.values[name] = body[k + 1..]
+            } else if i < len(given) {
+                out.values[name] = given[i]
+                i += 1
+            } else {
+                return Err("--{name} needs a value")
+            }
+            continue
+        }
+        // -v, -vq (flags together), -o value, -ovalue
+        var k = 1
+        while k < len(word) {
+            let letter = word[k..k + 1]
+            let Some(a) = byShort(spec, letter) else {
+                return Err("unknown option -{letter}")
+            }
+            if not a.takesValue {
+                out.flags.add(a.name)
+                k += 1
+                continue
+            }
+            if k + 1 < len(word) {
+                out.values[a.name] = word[k + 1..]
+            } else if i < len(given) {
+                out.values[a.name] = given[i]
+                i += 1
+            } else {
+                return Err("-{letter} (--{a.name}) needs a value")
+            }
+            k = len(word)
+        }
+    }
+    Ok(out)
+}
+
+// the usage text: the program's line, then each flag and option with its help
+pub fn usage(program: Text, spec: [Arg], positional: Text = "") -> Text {
+    var out = "usage: {program}" + (if len(spec) > 0 { " [options]" } else { "" })
+    if positional != "" {
+        out += " " + positional
+    }
+    var lefts: [Text] = []
+    for a in spec {
+        var left = if a.short != "" {
+            "-{a.short}, --{a.name}"
+        } else {
+            "    --{a.name}"
+        }
+        if a.takesValue {
+            left += " VALUE"
+        }
+        lefts.push(left)
+    }
+    let width = lefts.fold(0, (w, l) => max(w, len(l)))
+    for (i, a) in spec.enumerate() {
+        var help = a.help
+        if a.default is Some(d) {
+            help += (if help != "" { " " } else { "" }) + "(default: {d})"
+        }
+        out += "\n  " + lefts[i] + (if help != "" { " " * (width - len(lefts[i]) + 2) + help } else { "" })
+    }
+    out
+}

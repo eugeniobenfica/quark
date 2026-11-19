@@ -1,0 +1,162 @@
+// Bytes written as text and read back: base64 (RFC 4648, the standard alphabet and the URL one), hex, and the
+// percent-encoding of URLs (RFC 3986).
+const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const urlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+const hexDigits = "0123456789abcdef"
+
+fn encode64(b: Bytes, letters: Bytes, pad: Bool) -> Text {
+    var out: Bytes = []
+    var i = 0
+    while i + 3 <= len(b) {
+        let n = b[i] << 16 | b[i + 1] << 8 | b[i + 2]
+        out.push(letters[n >> 18 & 63])
+        out.push(letters[n >> 12 & 63])
+        out.push(letters[n >> 6 & 63])
+        out.push(letters[n & 63])
+        i += 3
+    }
+    let rest = len(b) - i
+    if rest > 0 {
+        let n = b[i] << 16 | (if rest == 2 { b[i + 1] << 8 } else { 0 })
+        out.push(letters[n >> 18 & 63])
+        out.push(letters[n >> 12 & 63])
+        if rest == 2 {
+            out.push(letters[n >> 6 & 63])
+        } else if pad {
+            out.push('=')
+        }
+        if pad {
+            out.push('=')
+        }
+    }
+    Text(out) ?? ""
+}
+
+// b in base64, padded with = to a multiple of 4 letters
+pub fn base64(b: Bytes) -> Text = encode64(b, alphabet.bytes(), true)
+
+// b in base64 with the URL alphabet (- and _ for + and /), without padding: what URLs and JWTs carry
+pub fn base64Url(b: Bytes) -> Text = encode64(b, urlAlphabet.bytes(), false)
+
+fn sextet(c: Int) -> Int = match c {
+    'A'..='Z' => c - 'A'
+    'a'..='z' => c - 'a' + 26
+    '0'..='9' => c - '0' + 52
+    '+' | '-' => 62
+    '/' | '_' => 63
+    _ => -1
+}
+
+// the bytes base64 text says, in either alphabet, padded or not (spaces and line breaks between letters are let be)
+pub fn fromBase64(text: Text) -> Bytes! {
+    var out: Bytes = []
+    var bits = 0
+    var count = 0
+    var ended = false
+    for (i, c) in text.bytes().enumerate() {
+        if c is ' ' | '\n' | '\r' | '\t' {
+            continue
+        }
+        if c == '=' {
+            ended = true
+            continue
+        }
+        let v = sextet(c)
+        if v < 0 or ended {
+            return Err("not base64: byte {i} is {if v < 0 { "'{char(c)}'" } else { "past the padding" }}")
+        }
+        bits = (bits << 6 | v) & 0xFFFFFF
+        count += 6
+        if count >= 8 {
+            count -= 8
+            out.push(bits >> count & 255)
+        }
+    }
+    if count >= 6 {
+        return Err("not base64: one letter too many at the end")
+    }
+    Ok(out)
+}
+
+// b as two hex digits a byte, lower case
+pub fn hex(b: Bytes) -> Text {
+    let digits = hexDigits.bytes()
+    var out: Bytes = []
+    for x in b {
+        out.push(digits[x >> 4])
+        out.push(digits[x & 15])
+    }
+    Text(out) ?? ""
+}
+
+fn nibble(c: Int) -> Int = match c {
+    '0'..='9' => c - '0'
+    'a'..='f' => c - 'a' + 10
+    'A'..='F' => c - 'A' + 10
+    _ => -1
+}
+
+// the bytes hex digits say (either case), two a byte
+pub fn fromHex(text: Text) -> Bytes! {
+    let b = text.bytes()
+    if len(b) % 2 != 0 {
+        return Err("not hex: an odd number of digits ({len(b)})")
+    }
+    var out: Bytes = []
+    var i = 0
+    while i < len(b) {
+        let hi = nibble(b[i])
+        let lo = nibble(b[i + 1])
+        if hi < 0 or lo < 0 {
+            let at = if hi < 0 { i } else { i + 1 }
+            return Err("not hex: byte {at} is '{char(b[at])}'")
+        }
+        out.push(hi * 16 + lo)
+        i += 2
+    }
+    Ok(out)
+}
+
+fn unreserved(c: Int) -> Bool = c is 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' | '_' | '~'
+
+// text as a URL's part carries it: every byte but A-Z a-z 0-9 - . _ ~ as %XX (UTF-8 bytes each)
+pub fn percentEncode(text: Text) -> Text {
+    let digits = "0123456789ABCDEF".bytes()
+    var out: Bytes = []
+    for c in text.bytes() {
+        if unreserved(c) {
+            out.push(c)
+        } else {
+            out.push('%')
+            out.push(digits[c >> 4])
+            out.push(digits[c & 15])
+        }
+    }
+    Text(out) ?? ""
+}
+
+// a URL's part read back: %XX a byte; plus: true reads + as a space (a form's fields)
+pub fn percentDecode(text: Text, plus: Bool = false) -> Text! {
+    let b = text.bytes()
+    var out: Bytes = []
+    var i = 0
+    while i < len(b) {
+        let c = b[i]
+        if c == '%' {
+            if i + 2 >= len(b) {
+                return Err("a % at byte {i} with no two hex digits after it")
+            }
+            let hi = nibble(b[i + 1])
+            let lo = nibble(b[i + 2])
+            if hi < 0 or lo < 0 {
+                return Err("a % at byte {i} with no two hex digits after it")
+            }
+            out.push(hi * 16 + lo)
+            i += 3
+        } else {
+            out.push(if plus and c == '+' { ' ' } else { c })
+            i += 1
+        }
+    }
+    Text(out).mapErr(why => "the bytes it says are not UTF-8: {why}")
+}

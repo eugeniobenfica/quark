@@ -6,15 +6,16 @@ pub enum Json {
     Str(s: Text)
     List(items: [Json])
     Object(fields: [Text: Json])
+    Integer(n: Int)
+    NumberText(digits: Text)
 }
 
 // the text, as JSON's value, or why it is not JSON
 pub fn parseJson(text: Text) -> Json! {
-    let cs = chars(text)
-    let (value, at) = readValue(cs, skip(cs, 0))?
-    let end = skip(cs, at)
-    if end < len(cs) {
-        return Err("JSON: \"{cs[end]}\" after the value, at character {end}")
+    let (value, at) = readValue(text, skip(text, 0))?
+    let end = skip(text, at)
+    if end < len(text) {
+        return Err("JSON: {shown(text, end)} after the value, at byte {end}")
     }
     value
 }
@@ -23,10 +24,12 @@ pub fn parseJson(text: Text) -> Json! {
 pub fn toJson(j: Json) -> Text = match j {
     Null => "null"
     Bool(b) => if b { "true" } else { "false" }
-    Num(n) => if n == floor(n) and abs(n) < 1e15 { "{floor(n)}" } else { "{n}" }
+    Num(n) => if abs(n) < 1e15 and n == floor(n) { "{floor(n)}" } else { "{n}" }
     Str(s) => quote(s)
-    List(items) => "[" + items.map(toJson).toArray().join(",") + "]"
-    Object(fields) => "\{" + fields.map(e => quote(e.key) + ":" + toJson(e.value)).toArray().join(",") + "\}"
+    List(items) => "[" + items.map(toJson).join(",") + "]"
+    Object(fields) => "\{" + fields.map(e => quote(e.key) + ":" + toJson(e.value)).join(",") + "\}"
+    Integer(n) => "{n}"
+    NumberText(digits) => digits
 }
 
 // a field of an object, or None
@@ -38,6 +41,14 @@ pub fn Json.field(self, name: Text) -> Json? = match self {
 // the number in it, or None
 pub fn Json.number(self) -> Float? = match self {
     Num(n) => n
+    Integer(n) => toFloat(n)
+    NumberText(digits) => digits.parseFloat() ?? return None
+    _ => None
+}
+
+pub fn Json.integer(self) -> Int? = match self {
+    Integer(n) => n
+    NumberText(digits) => digits.parseInt() ?? return None
     _ => None
 }
 
@@ -47,142 +58,246 @@ pub fn Json.text(self) -> Text? = match self {
     _ => None
 }
 
+// a text in quotes, with what JSON escapes escaped (every piece between them goes in whole)
 fn quote(s: Text) -> Text {
     var out = "\""
-    for c in chars(s) {
-        out = out + (match c {
-            "\"" => "\\\""
-            "\\" => "\\\\"
-            "\n" => "\\n"
-            "\t" => "\\t"
-            "\r" => "\\r"
-            _ => c
-        })
+    var from = 0
+    for (i, c) in s.bytes().enumerate() {
+        let escaped = match c {
+            '"' => "\\\""
+            '\\' => r"\\"
+            '\n' => r"\n"
+            '\t' => r"\t"
+            '\r' => r"\r"
+            0x08 => r"\b"
+            0x0c => r"\f"
+            0..=0x1f => r"\u00" + hexDigit(c / 16) + hexDigit(c % 16)
+            _ => ""
+        }
+        if escaped != "" {
+            out += s[from..i] + escaped
+            from = i + 1
+        }
     }
-    out + "\""
+    out + s[from..] + "\""
 }
 
-fn skip(cs: [Text], from: Int) -> Int {
+fn hexDigit(n: Int) -> Text = "0123456789abcdef"[n..n + 1]
+
+fn hex(n: Int) -> Text = (0..4).map(k => hexDigit(n >> (12 - 4 * k) & 15)).join("")
+
+// the character at a byte, for a message
+fn shown(t: Text, at: Int) -> Text {
+    let c = t.bytes()[at]
+    if c >= 0x20 and c < 0x7f { "\"{char(c)}\"" } else { "byte {c}" }
+}
+
+fn skip(t: Text, from: Int) -> Int {
+    let b = t.bytes()
     var i = from
-    while i < len(cs) and (cs[i] == " " or cs[i] == "\n" or cs[i] == "\t" or cs[i] == "\r") {
+    while i < len(b) and b[i] is ' ' | '\n' | '\t' | '\r' {
         i += 1
     }
     i
 }
 
-fn readValue(cs: [Text], at: Int) -> (Json, Int)! {
-    if at >= len(cs) {
+fn readValue(t: Text, at: Int) -> (Json, Int)! {
+    if at >= len(t) {
         return Err("JSON: the text ends where a value should be")
     }
-    let c = cs[at]
-    if c == "\{" {
-        return readObject(cs, at + 1)
-    }
-    if c == "[" {
-        return readList(cs, at + 1)
-    }
-    if c == "\"" {
-        let (s, next) = readText(cs, at + 1)?
-        return (Json.Str(s), next)
-    }
-    if word(cs, at, "true") {
-        return (Json.Bool(true), at + 4)
-    }
-    if word(cs, at, "false") {
-        return (Json.Bool(false), at + 5)
-    }
-    if word(cs, at, "null") {
-        return (Json.Null, at + 4)
-    }
-    readNumber(cs, at)
-}
-
-fn word(cs: [Text], at: Int, w: Text) -> Bool =
-    at + len(w) <= len(cs) and join(cs[at..at + len(w)], "") == w
-
-fn readNumber(cs: [Text], at: Int) -> (Json, Int)! {
-    var i = at
-    while i < len(cs) and contains("-+0123456789.eE", cs[i]) {
-        i += 1
-    }
-    let digits = join(cs[at..i], "")
-    let Some(n) = parseFloat(digits) else {
-        return Err("JSON: \"{if i < len(cs) { cs[i] } else { digits }}\" is not a value, at character {at}")
-    }
-    (Json.Num(n), i)
-}
-
-fn readText(cs: [Text], from: Int) -> (Text, Int)! {
-    var out = ""
-    var i = from
-    while i < len(cs) and cs[i] != "\"" {
-        if cs[i] == "\\" and i + 1 < len(cs) {
-            i += 1
-            out = out + (match cs[i] {
-                "n" => "\n"
-                "t" => "\t"
-                "r" => "\r"
-                _ => cs[i]
-            })
-        } else {
-            out = out + cs[i]
+    match t.bytes()[at] {
+        '{' => readObject(t, at + 1)
+        '[' => readList(t, at + 1)
+        '"' => {
+            let (s, next) = readText(t, at + 1)?
+            (Json.Str(s), next)
         }
-        i += 1
+        't' if word(t, at, "true") => (Json.Bool(true), at + 4)
+        'f' if word(t, at, "false") => (Json.Bool(false), at + 5)
+        'n' if word(t, at, "null") => (Json.Null, at + 4)
+        _ => readNumber(t, at)
     }
-    if i >= len(cs) {
-        return Err("JSON: a text that never ends, from character {from - 1}")
-    }
-    (out, i + 1)
 }
 
-fn readList(cs: [Text], from: Int) -> (Json, Int)! {
+fn word(t: Text, at: Int, w: Text) -> Bool =
+    at + len(w) <= len(t) and t.bytes()[at..at + len(w)] == w.bytes()
+
+fn digit(b: Bytes, at: Int) -> Bool = at < len(b) and b[at] is '0'..='9'
+
+fn readNumber(t: Text, at: Int) -> (Json, Int)! {
+    let b = t.bytes()
+    var i = at
+    if b[i] == '-' {
+        i += 1
+    }
+    if not digit(b, i) {
+        return Err("JSON: {shown(t, at)} is not a value, at byte {at}")
+    }
+    if b[i] == '0' {
+        i += 1
+    } else {
+        while digit(b, i) {
+            i += 1
+        }
+    }
+    if i < len(b) and b[i] == '.' {
+        i += 1
+        if not digit(b, i) {
+            return Err("JSON: expected a fraction digit at byte {i}")
+        }
+        while digit(b, i) {
+            i += 1
+        }
+    }
+    if i < len(b) and b[i] is 'e' | 'E' {
+        i += 1
+        if i < len(b) and b[i] is '+' | '-' {
+            i += 1
+        }
+        if not digit(b, i) {
+            return Err("JSON: expected an exponent digit at byte {i}")
+        }
+        while digit(b, i) {
+            i += 1
+        }
+    }
+    let digits = t[at..i]
+    if digits != "-0" and digits.parseInt() is Ok(n) {
+        return (Json.Integer(n), i)
+    }
+    (Json.NumberText(digits), i)
+}
+
+// four hex digits at a byte (A), or None
+fn hex4(b: Bytes, at: Int) -> Int? {
+    if at + 4 > len(b) {
+        return None
+    }
+    var n = 0
+    for c in b[at..at + 4] {
+        let d = match c {
+            '0'..='9' => c - '0'
+            'a'..='f' => c - 'a' + 10
+            'A'..='F' => c - 'A' + 10
+            _ => return None
+        }
+        n = n * 16 + d
+    }
+    n
+}
+
+// a text's characters, to its closing quote: the pieces between escapes go in whole (one with none is a slice)
+fn readText(t: Text, from: Int) -> (Text, Int)! {
+    let b = t.bytes()
+    var out = ""
+    var piece = from
+    var i = from
+    while i < len(b) and b[i] != '"' {
+        let c = b[i]
+        if c < 0x20 {
+            return Err("JSON: a control character (byte {c}) in a text, at byte {i}: it is written escaped")
+        }
+        if c != '\\' {
+            i += 1
+            continue
+        }
+        out += t[piece..i]
+        if i + 1 >= len(b) {
+            break
+        }
+        let e = b[i + 1]
+        i += 2
+        out += match e {
+            '"' => "\""
+            '\\' => "\\"
+            '/' => "/"
+            'b' => "\x08"
+            'f' => "\x0c"
+            'n' => "\n"
+            'r' => "\r"
+            't' => "\t"
+            'u' => {
+                var cp = hex4(b, i) ?? return Err("JSON: \\u takes four hex digits, at byte {i - 2}")
+                i += 4
+                if cp >= 0xd800
+                    and cp < 0xdc00
+                    and i + 6 <= len(b)
+                    and b[i] == '\\'
+                    and b[i + 1] == 'u'
+                    and hex4(b, i + 2) is Some(low)
+                    and low >= 0xdc00
+                    and low < 0xe000 {
+                    cp = 0x10000 + (cp - 0xd800) * 0x400 + (low - 0xdc00) // a surrogate pair: one character
+                    i += 6
+                }
+                if cp >= 0xd800 and cp < 0xe000 {
+                    return Err("JSON: half of a surrogate pair (\\u{hex(cp)}), at byte {i - 6}")
+                }
+                char(cp)
+            }
+            _ => return Err("JSON: {shown(t, i - 1)} after a backslash is not an escape, at byte {i - 2}")
+        }
+        piece = i
+    }
+    if i >= len(b) {
+        return Err("JSON: a text that never ends, from byte {from - 1}")
+    }
+    if piece == from {
+        return (t[from..i], i + 1) // no escape: the same memory
+    }
+    (out + t[piece..i], i + 1)
+}
+
+fn readList(t: Text, from: Int) -> (Json, Int)! {
+    let b = t.bytes()
     var items: [Json] = []
-    var i = skip(cs, from)
-    if i < len(cs) and cs[i] == "]" {
+    var i = skip(t, from)
+    if i < len(b) and b[i] == ']' {
         return (Json.List(items), i + 1)
     }
     while true {
-        let (item, next) = readValue(cs, skip(cs, i))?
+        let (item, next) = readValue(t, skip(t, i))?
         items.push(item)
-        i = skip(cs, next)
-        if i < len(cs) and cs[i] == "," {
+        i = skip(t, next)
+        if i < len(b) and b[i] == ',' {
             i += 1
         } else {
             break
         }
     }
-    if i >= len(cs) or cs[i] != "]" {
-        return Err("JSON: a list without its ], at character {i}")
+    if i >= len(b) or b[i] != ']' {
+        return Err("JSON: a list without its ], at byte {i}")
     }
     (Json.List(items), i + 1)
 }
 
-fn readObject(cs: [Text], from: Int) -> (Json, Int)! {
+fn readObject(t: Text, from: Int) -> (Json, Int)! {
+    let b = t.bytes()
     var fields: [Text: Json] = [:]
-    var i = skip(cs, from)
-    if i < len(cs) and cs[i] == "\}" {
+    var i = skip(t, from)
+    if i < len(b) and b[i] == '}' {
         return (Json.Object(fields), i + 1)
     }
     while true {
-        if i >= len(cs) or cs[i] != "\"" {
-            return Err("JSON: a field's name in quotes, at character {i}")
+        if i >= len(b) or b[i] != '"' {
+            return Err("JSON: a field's name in quotes, at byte {i}")
         }
-        let (name, afterName) = readText(cs, i + 1)?
-        i = skip(cs, afterName)
-        if i >= len(cs) or cs[i] != ":" {
-            return Err("JSON: a : after \"{name}\", at character {i}")
+        let (name, afterName) = readText(t, i + 1)?
+        i = skip(t, afterName)
+        if i >= len(b) or b[i] != ':' {
+            return Err("JSON: a : after \"{name}\", at byte {i}")
         }
-        let (value, next) = readValue(cs, skip(cs, i + 1))?
+        let (value, next) = readValue(t, skip(t, i + 1))?
         fields[name] = value
-        i = skip(cs, next)
-        if i < len(cs) and cs[i] == "," {
-            i = skip(cs, i + 1)
+        i = skip(t, next)
+        if i < len(b) and b[i] == ',' {
+            i = skip(t, i + 1)
         } else {
             break
         }
     }
-    if i >= len(cs) or cs[i] != "\}" {
-        return Err("JSON: an object without its \}, at character {i}")
+    if i >= len(b) or b[i] != '}' {
+        return Err("JSON: an object without its \}, at byte {i}")
     }
     (Json.Object(fields), i + 1)
 }

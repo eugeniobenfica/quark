@@ -1,0 +1,27 @@
+// The machine itself: what only the compiler can give the runtime written in Quark (use std.machine as machine).
+// switchStack saves the registers a function keeps across calls, and the stack pointer, into save; loads them from
+// load, and goes on where load was saved (a task's stack switch). docs/LANGUAGE.md, "C", says what each word holds.
+pub extern effect fn switchStack(save: Pointer<Int64>, load: Pointer<Int64>)
+
+// The calling function's frame address (rbp on x86-64, x29 on ARM64): where a panic's calls are walked from.
+pub extern effect fn frame() -> Pointer<UInt8>
+
+// What the processor has, as bits: 1 AVX, 2 AVX2, 4 SSE4.2 (0 on ARM64).
+pub extern fn cpu() -> Int
+
+// Where a text's bytes are: its first slot, with no code.
+pub extern fn address(t: Text) -> Int64
+
+// The machine's context: a register of its own (x86-64's r15, ARM64's x28) the runtime keeps its thread's state's
+// address in; 0 until it is set on this way in from C (every way in from C makes it 0).
+pub extern effect fn context() -> Int64
+
+// The context register given c.
+pub extern effect fn setContext(c: Int64)
+
+// Each runtime function's address (its Quark function, qk_<name>), by its number, into table.
+pub extern effect fn fillRuntime(table: Pointer<Int64>)
+
+// Calls the C function at f with four integer arguments (the platform's C call), and gives its integer result: how
+// the runtime enters loaded code (its trampoline) and leaves it (the escape back to it).
+pub extern effect fn call(f: Pointer<UInt8>, a: Int64, b: Int64, c: Int64, d: Int64) -> Int64

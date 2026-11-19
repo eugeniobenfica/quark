@@ -339,12 +339,22 @@ pub extern effect fn rtGo(f: Int64, env: Int64) as "qk_go" {
 fn backgroundRound(line: Int) -> Bool {
     let g = globals()
     let now = osNow()
+    // sleeps over by now wake in the order they end (a late round finds several over): only the first to end this
+    // round, the others the next
+    var first = 0.0
+    for k in 0..word(g, gBackgroundCount) {
+        let t = word(word(g, gTasks), word(word(g, gBackground), k))
+        let wake = if t != 0 and ready(t, now) { floatAt(t, tWakeAt) } else { 0.0 }
+        if wake != 0.0 and (first == 0.0 or wake < first) {
+            first = wake
+        }
+    }
     var stepped = false
     var i = 0
     while i < word(g, gBackgroundCount) {
         let n = word(word(g, gBackground), i)
         let t = word(word(g, gTasks), n) // (read each time: a task that runs may make others, and the list grow)
-        if t != 0 and ready(t, now) {
+        if t != 0 and ready(t, now) and floatAt(t, tWakeAt) <= first {
             stepped = true
             let _ = rtStep(n, line)
         }

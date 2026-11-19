@@ -9,6 +9,22 @@ use imagecli
 extern effect fn mmap(p: Int64, n: UInt64, prot: Int32, flags: Int32, fd: Int32, offset: Int64) -> Int64
 extern effect fn mprotect(p: Int64, n: UInt64, prot: Int32) -> Int32
 extern effect fn dlsym(h: Int64, name: CText) -> Int64
+extern effect fn nsGetExecutablePath(out: Pointer<UInt8>, size: Pointer<UInt32>) -> Int32 as "_NSGetExecutablePath"
+
+// this executable's path (what the caches it keeps are made by)
+fn selfPath() -> Text {
+    let room = Pointer<UInt8>(malloc(4096))
+    let size = Pointer<UInt32>(malloc(4))
+    size[0] = 4096
+    if nsGetExecutablePath(room, size) != 0 {
+        return ""
+    }
+    var n = 0
+    while n < 4096 and room[n] != 0 {
+        n += 1
+    }
+    Text(room, n)
+}
 
 fn mapMemory(n: Int) -> Int {
     let p = mmap(0, n, 3, 4098, -1, 0) // read, write; MAP_PRIVATE | MAP_ANON
@@ -30,4 +46,4 @@ fn protectCode(p: Int, n: Int) -> Bool {
 fn cFunction(name: Text) -> Int = dlsym(-2, name) // RTLD_DEFAULT: libSystem, and what the process has loaded
 
 // Apple Silicon: machine.cpu() has no x86-64 features to give
-fn main() -> Int = cliMain(Host(.Macos, mapMemory, protectCode, cFunction, machine.cpu() == 0))
+fn main() -> Int = cliMain(Host(.Macos, mapMemory, protectCode, cFunction, machine.cpu() == 0, selfPath()))

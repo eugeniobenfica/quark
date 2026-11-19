@@ -1,0 +1,37 @@
+name: Checks
+
+# What ordinary tests do not find: generated programs that must print the same in every way the compiler runs them
+# (tools/difftest.qk), mutated programs that must never crash the front end and must format stably
+# (tools/fuzz.qk), and the compiler's own sources in canonical form. On every change, and longer every night.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+jobs:
+  checks:
+    name: Differential, fuzz, canonical
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      COUNT: ${{ github.event_name == 'schedule' && '3000' || '300' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern quark-x86_64-linux --dir boot && chmod 755 boot/quark-x86_64-linux
+      - name: Build
+        run: QUARK=boot/quark-x86_64-linux ./build.sh
+      - name: Differential testing
+        run: build/quark.exe run tools/difftest.qk -- build/quark.exe $COUNT 1
+      - name: Fuzzing
+        run: build/quark.exe run tools/fuzz.qk -- build/quark.exe $((COUNT * 2)) 1
+      - name: The compiler in canonical form
+        run: |
+          bad=0
+          for f in compiler/*.qk compiler/runtime/*.qk tools/*.qk; do
+            case $f in compiler/stdlib.qk) continue ;; esac
+            build/quark.exe fmt "$f" | cmp -s - "$f" || { echo "not in canonical form: $f"; bad=1; }
+          done
+          exit $bad

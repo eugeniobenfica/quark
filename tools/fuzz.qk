@@ -1,0 +1,158 @@
+// Fuzzing the front end: the programs of the tests, changed at random (lines dropped, doubled or swapped, a piece cut,
+// bytes put in), given to quark check, quark fmt and the graph's round trip. Whatever the input, the compiler must
+// answer (exit 0, 1 or 2: never a crash), quark fmt must be stable (its text formatted again is the same), and a
+// program that checks must come back from its graph as quark fmt writes it. A case that fails is kept, with its seed.
+//   quark run tools/fuzz.qk -- QUARK [COUNT] [FIRST_SEED]
+type Rng { s: Int }
+
+fn Rng.next(var self) -> Int {
+    var x = self.s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    self.s = x
+    x *% 2685821657736338717 & 0x7FFFFFFFFFFFFFFF
+}
+
+fn Rng.below(var self, n: Int) -> Int = if n <= 0 { 0 } else { self.next() % n }
+
+const pieces = [
+    "{", "}",
+    "(",
+    ")",
+    "[",
+    "]",
+    ",",
+    ".",
+    "?",
+    "!",
+    "=>",
+    "->",
+    "..",
+    "|",
+    "\"",
+    "'",
+    "fn",
+    "let",
+    "match",
+    "_",
+    "\n",
+    " ",
+]
+
+// one change of the text
+fn Rng.mutate(var self, text: Text) -> Text {
+    var lines = text.split("\n")
+    if len(lines) == 0 {
+        return text
+    }
+    let at = self.below(len(lines))
+    match self.below(6) {
+        0 => {
+            lines = lines[..at] + lines[at + 1..]
+        }
+        1 => {
+            lines = lines[..at] + [lines[at]] + lines[at..]
+        }
+        2 => {
+            let other = self.below(len(lines))
+            let a = lines[at]
+            lines[at] = lines[other]
+            lines[other] = a
+        }
+        3 => {
+            let l = lines[at]
+            let b = l.bytes()
+            if len(b) > 1 {
+                let i = self.below(len(b))
+                let j = i + self.below(len(b) - i)
+                lines[at] = Text(b[..i] + b[j..]) ?? l
+            }
+        }
+        _ => {
+            let l = lines[at]
+            let b = l.bytes()
+            let i = self.below(len(b) + 1)
+            lines[at] = (Text(b[..i]) ?? "") + pieces[self.below(len(pieces))] + (Text(b[i..]) ?? "")
+        }
+    }
+    lines.join("\n")
+}
+
+// the command run: its status and output; a status past 2 is a crash
+fn call(quark: Text, args: [Text]) -> Process {
+    runProcess(quark, args) ?? Process(99, "", "could not start {quark}")
+}
+
+fn main() {
+    let given = args()
+    if len(given) < 1 {
+        printErr("usage: quark run tools/fuzz.qk -- QUARK [COUNT] [FIRST_SEED]")
+        exit(2)
+    }
+    let quark = given[0]
+    let count = if len(given) > 1 { given[1].parseInt() ?? 200 } else { 200 }
+    let first = if len(given) > 2 { given[2].parseInt() ?? 1 } else { 1 }
+    let sources = (listDir("tests/run")?).filter(n => n.endsWith(".qk")).sorted().toArray()
+    let dir = (env("TEMP") ?? env("TMPDIR") ?? "/tmp") + "/quark-fuzz"
+    let _ = makeDir(dir)
+    var failed = 0
+    for seed in first..first + count {
+        var g = Rng(seed *% 6364136223846793005 +% 1442695040888963407)
+        let name = sources[g.below(len(sources))]
+        var text = readFile("tests/run/" + name)?
+        for _ in 0..g.below(3) + 1 {
+            text = g.mutate(text)
+        }
+        let path = "{dir}/f{seed}.qk"
+        writeFile(path, text)?
+        var why = ""
+        let checked = call(quark, ["check", path])
+        if checked.status > 2 {
+            why = "quark check crashed ({checked.status}): {checked.err}"
+        }
+        let formatted = call(quark, ["fmt", path])
+        if why == "" and formatted.status > 2 {
+            why = "quark fmt crashed ({formatted.status}): {formatted.err}"
+        }
+        if why == "" and formatted.status == 0 {
+            // stable: the canonical text, formatted again, is itself
+            let again = "{dir}/f{seed}.fmt.qk"
+            writeFile(again, formatted.out)?
+            let twice = call(quark, ["fmt", again])
+            if twice.status > 2 {
+                why = "quark fmt crashed on its own output ({twice.status})"
+            } else if twice.status == 0 and twice.out != formatted.out {
+                why = "quark fmt is not stable: its output formatted again differs"
+            }
+            let _ = removePath(again)
+        }
+        if why == "" and checked.status == 0 {
+            // the graph's round trip gives the canonical text back
+            let graph = call(quark, ["graph", path])
+            if graph.status > 2 {
+                why = "quark graph crashed ({graph.status})"
+            } else if graph.status == 0 {
+                let qgn = "{dir}/f{seed}.qgn"
+                writeFile(qgn, graph.out)?
+                let back = call(quark, ["text", qgn])
+                if back.status > 2 {
+                    why = "quark text crashed ({back.status})"
+                } else if back.status == 0 and formatted.status == 0 and back.out != formatted.out {
+                    why = "the graph's round trip gives another text than quark fmt"
+                }
+                let _ = removePath(qgn)
+            }
+        }
+        if why != "" {
+            failed += 1
+            print("seed {seed} ({name}): {why} ({path})")
+        } else {
+            let _ = removePath(path)
+        }
+    }
+    print("fuzz: {count} cases, {failed} failed")
+    if failed > 0 {
+        exit(1)
+    }
+}

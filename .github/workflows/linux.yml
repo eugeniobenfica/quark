@@ -1,0 +1,33 @@
+name: Linux
+
+# Tier 1 on x86-64, Tier 2 on ARM64. Builds Quark with the latest release's compiler for the machine, to the fixed
+# point, and runs the whole test suite with it.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            os: ubuntu-latest
+            quark: quark-x86_64-linux
+          - arch: ARM64
+            os: ubuntu-24.04-arm
+            quark: quark-arm64-linux
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern ${{ matrix.quark }} --dir boot && chmod 755 boot/${{ matrix.quark }}
+      - name: Build (to the fixed point)
+        run: QUARK=boot/${{ matrix.quark }} ./build.sh --check
+      - name: Test
+        run: bash tests/run.sh build/quark.exe

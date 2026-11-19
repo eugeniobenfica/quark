@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <!-- Quark's mark: three nodes, joined. A program is text and a graph of nodes; three, as a quark comes. -->
+  <g stroke="#14B8A6" stroke-width="7" stroke-linecap="round" fill="none">
+    <line x1="48" y1="20" x2="22" y2="70"/>
+    <line x1="48" y1="20" x2="74" y2="70"/>
+    <line x1="22" y1="70" x2="74" y2="70"/>
+  </g>
+  <circle cx="48" cy="20" r="11" fill="#14B8A6"/>
+  <circle cx="22" cy="70" r="11" fill="#14B8A6"/>
+  <circle cx="74" cy="70" r="11" fill="#5EEAD4"/>
+</svg>

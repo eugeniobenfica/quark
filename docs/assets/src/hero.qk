@@ -1,0 +1,25 @@
+type Order { item: Text, qty: Int, price: Float }
+
+fn parse(line: Text) -> Order! {
+    let f = line.split(",")
+    if len(f) != 3 {
+        return Err("expected item,qty,price: {line}")
+    }
+    Ok(Order(f[0], f[1].parseInt()?, f[2].parseFloat()?))
+}
+
+fn main() {
+    let lines = ["tea,3,4.5", "cake,2,12.0", "jam,x,3.0"]
+    var total = 0.0
+    var byItem: [Text: Int] = [:]
+    for line in lines {
+        match parse(line) {
+            Ok(o) => {
+                total += toFloat(o.qty) * o.price
+                byItem[o.item] = (byItem[o.item] ?? 0) + o.qty
+            }
+            Err(why) => print("skipped:", why)
+        }
+    }
+    print("total {total:.2}", byItem)
+}

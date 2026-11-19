@@ -1,0 +1,33 @@
+name: macOS
+
+# Tier 2. Builds Quark with the latest release's compiler for the machine (Apple silicon and Intel), to the fixed
+# point, and runs the whole test suite with it (no libquark on macOS yet, so no C hosts).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: Apple silicon
+            os: macos-14
+            quark: quark-arm64-macos
+          - arch: Intel
+            os: macos-13
+            quark: quark-x86_64-macos
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern ${{ matrix.quark }} --dir boot && chmod 755 boot/${{ matrix.quark }}
+      - name: Build (to the fixed point)
+        run: QUARK=boot/${{ matrix.quark }} ./build.sh --check
+      - name: Test
+        run: bash tests/run.sh build/quark.exe

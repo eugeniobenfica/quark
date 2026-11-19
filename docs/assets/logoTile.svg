@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- The mark on its dark tile, so that it reads on light and dark pages alike -->
+  <rect width="128" height="128" rx="28" fill="#141417"/>
+  <g transform="translate(16 18)">
+    <g stroke="#14B8A6" stroke-width="7" stroke-linecap="round" fill="none">
+      <line x1="48" y1="20" x2="22" y2="70"/>
+      <line x1="48" y1="20" x2="74" y2="70"/>
+      <line x1="22" y1="70" x2="74" y2="70"/>
+    </g>
+    <circle cx="48" cy="20" r="11" fill="#14B8A6"/>
+    <circle cx="22" cy="70" r="11" fill="#14B8A6"/>
+    <circle cx="74" cy="70" r="11" fill="#5EEAD4"/>
+  </g>
+</svg>

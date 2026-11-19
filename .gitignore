@@ -1,2 +1,4 @@
 build/
 *.exe
+.claude/
+code.bin

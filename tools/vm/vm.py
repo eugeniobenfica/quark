@@ -2,7 +2,10 @@
 console. QK_ARCH picks the processor: aarch64 (the default: ARM64) or x86_64 (System V, as on Linux PCs).
 
   python tools/vm/vm.py boot        start QEMU, log in, bring up the network, install gcc (minutes)
-  python tools/vm/vm.py test        copy the repository in, build it, run tests/run.sh
+  python tools/vm/vm.py test        copy the repository in with a quark for the VM (made here: quark build
+                                    --target ...-linux --libc musl, by QUARK or build/quark.exe), build it with that
+                                    one (build.sh --check: stage1, build/quark.exe, stage3 the same bytes), run
+                                    tests/run.sh with build/quark.exe
   python tools/vm/vm.py run "cmd"   run a shell command in the VM, print its output, exit with its status
   python tools/vm/vm.py stop
 
@@ -30,6 +33,7 @@ HTTP = 8766 if ARCH == "aarch64" else 8767
 QEMU = os.environ.get("QEMU", r"C:\msys64\ucrt64\bin\qemu-system-%s.exe" % ARCH)
 FW = os.environ.get("EDK2_FW", r"C:\msys64\ucrt64\share\qemu\edk2-aarch64-code.fd")
 ALPINE = "v3.24"
+MEMORY = os.environ.get("QK_VM_MEMORY", "8192")  # MB: the compiler's --release build of itself takes about 4 GB
 
 
 def connect(timeout=5.0):
@@ -71,7 +75,7 @@ def boot():
                    "-device", "virtio-scsi-pci", "-device", "scsi-cd,drive=cd"]
     else:
         machine = ["-M", "q35", "-cpu", "max", "-cdrom", iso, "-boot", "d"]
-    args = [QEMU] + machine + ["-smp", "4", "-m", "3072",
+    args = [QEMU] + machine + ["-smp", "4", "-m", MEMORY,
             "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
             "-display", "none", "-monitor", "none",
             "-serial", "tcp:127.0.0.1:%d,server=on,wait=on" % PORT]
@@ -79,6 +83,9 @@ def boot():
     subprocess.Popen(args, stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=flags,
                      start_new_session=os.name != "nt")
     s = connect(30)
+    if ARCH != "aarch64":  # ISOLINUX: the kernel's console on the serial line, not the screen
+        read_until(s, r"boot:", 120)
+        s.sendall(b"virt console=ttyS0,115200\n")
     read_until(s, r"login:", 900)
     s.sendall(b"root\n")
     read_until(s, r"# ", 60)
@@ -112,11 +119,19 @@ def run(cmd, timeout=3600):
 
 
 def test():
-    """The repository into the VM (through a one-request HTTP server), then the build and every test."""
+    """The repository into the VM (through a one-request HTTP server) with a quark for it, then the build and every
+    test."""
+    host = os.environ.get("QUARK", os.path.join(REPO, "build", "quark.exe"))
+    boot = os.path.join(REPO, "build", "vm", "quark-%s" % ARCH)
+    os.makedirs(os.path.dirname(boot), exist_ok=True)
+    target = "arm64-linux" if ARCH == "aarch64" else "x86_64-linux"
+    subprocess.check_call([host, "build", os.path.join(REPO, "compiler", "mainlinux.qk"), "--target", target,
+                           "--libc", "musl", "-o", boot], stdout=subprocess.DEVNULL)
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode="w") as t:
-        for part in ["build.sh", "include", "src", "tests", "examples", "bench", "docs", "std"]:
+        for part in ["build.sh", "include", "compiler", "tools/libquark.sh", "tests", "examples", "bench", "docs", "std"]:
             t.add(os.path.join(REPO, part), arcname=part)
+        t.add(boot, arcname="quark-boot")
     body = data.getvalue()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -133,7 +148,10 @@ def test():
     threading.Thread(target=server.handle_request, daemon=True).start()
     run("stty -echo; rm -rf /root/q && mkdir -p /root/q && cd /root/q && wget -q -O - http://10.0.2.2:%d/ | tar -x && echo copied" % HTTP, 300)
     server.server_close()
-    return run("cd /root/q && bash build.sh 2>&1 | grep -E ' error' ; bash tests/run.sh 2>&1 | tail -20", 3600)
+    return run("cd /root/q && chmod 755 quark-boot && QUARK=./quark-boot bash build.sh --check > /root/build.txt 2>&1; s=$?; "
+               "grep -E 'error|warning|stage|quark:|fixed|libquark|Killed' "
+               "/root/build.txt | head -30; [ $s = 0 ] && sha256sum build/quark.exe build/stage3/quark.exe build/libquark.a && "
+               "bash tests/run.sh > /root/out.txt 2>&1; grep -E '^FAIL|passed' /root/out.txt | head -80", 4 * 3600)
 
 
 def stop():

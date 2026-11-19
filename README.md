@@ -1,291 +1,180 @@
-# Quark
+<div align="center">
 
-A small, general-purpose compiled language whose programs are also node graphs. It is lean, as fast
-as C where it counts, and depends on nothing.
+<br>
+
+<img src="docs/assets/logoTile.svg" width="72" alt="quark">
+
+<h1>quark</h1>
+
+<p><b>Text and graph. Native code. Nothing else.</b></p>
+
+<a href="https://github.com/eugeniobenfica/quark/releases/latest"><img src="https://img.shields.io/badge/version-0.9.0-14B8A6?style=flat-square&labelColor=141417" alt="Version 0.9.0"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-14B8A6?style=flat-square&labelColor=141417" alt="MIT license"></a>
+<a href="#principles"><img src="https://img.shields.io/badge/written_in-Quark,_no_dependencies-14B8A6?style=flat-square&labelColor=141417" alt="Written in Quark, no dependencies"></a>
+<br>
+<a href="https://github.com/eugeniobenfica/quark/actions/workflows/windows.yml"><img src="https://img.shields.io/github/actions/workflow/status/eugeniobenfica/quark/windows.yml?style=flat-square&labelColor=141417&label=Windows" alt="Windows"></a>
+<a href="https://github.com/eugeniobenfica/quark/actions/workflows/linux.yml"><img src="https://img.shields.io/github/actions/workflow/status/eugeniobenfica/quark/linux.yml?style=flat-square&labelColor=141417&label=Linux" alt="Linux"></a>
+<a href="https://github.com/eugeniobenfica/quark/actions/workflows/macos.yml"><img src="https://img.shields.io/github/actions/workflow/status/eugeniobenfica/quark/macos.yml?style=flat-square&labelColor=141417&label=macOS" alt="macOS"></a>
+<a href="https://github.com/eugeniobenfica/quark/actions/workflows/checks.yml"><img src="https://img.shields.io/github/actions/workflow/status/eugeniobenfica/quark/checks.yml?style=flat-square&labelColor=141417&label=Checks" alt="Checks"></a>
+
+<p>
+<a href="#quick-start">Quick start</a> &nbsp;·&nbsp;
+<a href="#download">Download</a> &nbsp;·&nbsp;
+<a href="#building">Building</a> &nbsp;·&nbsp;
+<a href="#documentation">Documentation</a> &nbsp;·&nbsp;
+<a href="CHANGELOG.md">Changelog</a>
+</p>
+
+</div>
+
+<br>
+
+quark is a general-purpose compiled language whose programs are also node graphs. A program is written as text,
+checked with inferred static types, and compiled straight to x86-64 or ARM64 machine code by a compiler written in
+Quark itself, with no C compiler, linker or runtime to install. The same program can be turned into a graph of
+nodes and back into text, so tools can read, edit, compare and merge it by node rather than by line.
+
+> **Made for** programs that want to be fast and small without ceremony: command-line tools, servers, data
+> processing, scripts embedded in a C or C++ application.<br>
+> **Not** a garbage-collected VM, a JavaScript target or a 1.0 yet: the language is settling
+> ([what stays stable](docs/STABILITY.md)), and no TLS for `https://` yet.
+
+<div align="center">
+<br>
+<img src="docs/assets/hero.png" width="920" alt="A Quark program that parses orders, beside the terminal where it was run and built">
+<p><sub>A program, run, and built into an executable (<a href="docs/assets/src/hero.py">how this picture is made</a>).</sub></p>
+</div>
+
+## What is inside
+
+| | |
+| :--- | :--- |
+| **Language** | Inferred static types, records, enums with data, exhaustive `match`, `T?` and `T!` instead of null and exceptions, generics, interfaces, closures, inferred effects |
+| **Speed** | Native code from a quick tier (the compiler builds itself in about 2 s) and an optimizing one (`--release`: SSA, inlining, SIMD loops); faster than C on 4 of 8 benchmarks, within 11% on 2 more |
+| **Memory** | An arena per call and a collection per loop: no garbage collector pauses, no reference counting, values that never change behind your back |
+| **Concurrency** | Tasks (`go`, channels) that wait only on their own socket; `parallelMap` and `parallelFold` on every core |
+| **C** | Calls C with no adapter (`extern fn`), C calls Quark, `quark bind` reads a C header; embeds in C and C++ as a library |
+| **Graph** | `quark graph` writes a program as nodes (QGN or JSON), `quark text` writes it back, `quark diff` and `quark merge` work by node |
+| **Tools** | `fmt` (one canonical layout), `test`, `lsp` (a language server), `dap` and `debug`, `doc`, `repl`, `bind`, `get` (packages) |
+| **Library** | `json`, `http` (server and client), `net`, `files`, `csv`, `regex`, `time`, `math`, `collections`, `encoding`, `hash`, `args`, `path`, `testing` |
+
+## Quick start
+
+**1. Get the compiler** for your machine from the [latest release](https://github.com/eugeniobenfica/quark/releases/latest)
+and put it on your `PATH` as `quark` (`quark.exe` on Windows).
+
+**2. Write a program.**
 
 ```quark
-type Vec2 { x: Float, y: Float }
-
-fn Vec2.plus(self, b: Vec2) -> Vec2 = Vec2(self.x + b.x, self.y + b.y)
-
-fn Vec2.length(self) -> Float = sqrt(self.x * self.x + self.y * self.y)
-
-fn parsePoint(line: Text) -> Vec2! {
-    let xy = words(line)
-    if len(xy) != 2 {
-        return Err("expected two numbers: {line}")
-    }
-    Vec2(parseFloat(xy[0]) ?? 0, parseFloat(xy[1]) ?? 0)
-}
-
+// hello.qk
 fn main() {
-    var steps: [Vec2] = []
-    for line in lines(readFile("points.txt")?) {
-        steps.push(parsePoint(line)?)
-    }
-    let end = steps.fold(Vec2(0, 0), (sum, step) => sum + step)
-    print("{len(steps)} steps, ending at ({end.x:.1}, {end.y:.1}), {end.length():.2} away")
+    let words = "the quick brown fox jumps over the lazy dog the end".words()
+    let counts = words.countBy(w => w)
+    print("{len(words)} words, 'the' {counts["the"] ?? 0} times")
 }
 ```
 
-```text
-quark run hello.qk -- a b   compiled to x86-64 or ARM64 in under a millisecond, then run (args() is [a, b])
-quark build hello.qk        a standalone executable: runs anywhere, needs nothing
-quark test hello.qk         runs its test "..." { } blocks
-quark fmt hello.qk          the one canonical layout
-quark lsp                   a language server: errors, types on hover and inline, definition, references, rename
-quark repl                  declarations and expressions, line by line
-quark object hello.qk       an object file a C host links (no code made while running: iOS, consoles), any target
-quark debug hello.qk        breakpoints, stepping, the names' values
-quark run hello.qk --trace  the last value of every node, for node editors
-quark graph hello.qk        the same program as a node graph (JSON)
-quark text hello.json       ... and back, to the same text
-quark diff a.qk b.qk        what changed, by node key (added, removed, changed inputs, moved)
-quark merge base a b        a three-way merge by node key; conflicts named by key
-```
-
-**Ready to embed.** A C program links `build/libquark.a`, gives Quark its API as `extern fn`s, and
-calls scripts and node graphs: see [docs/EMBEDDING.md](docs/EMBEDDING.md). An application, an
-editor, a server, a tool or any other C program can use it as its scripting language.
-
-## The idea
-
-- **Elegant.** 26 keywords. camelCase for values and PascalCase for types, enforced. One canonical
-  layout. Values that never change behind your back. See [docs/LANGUAGE.md](docs/LANGUAGE.md).
-- **Whole.** Inferred static types, and:
-  - records with `with` copies, compared with `==` field by field;
-  - generic records and enums (`type Pair<A, B>`, `enum Tree<T>`), and types that hold themselves
-    (trees, lists, expressions);
-  - functions of a type (`fn Vec2.length(self)`, called `v.length()`), and operators through them:
-    `fn Vec2.plus` makes `a + b` work, `fn Version.compare` makes `<` and `sort` work;
-  - interfaces (`type Speaker { fn speak() -> Text }`): any type with those functions goes into one;
-  - enums whose cases carry data, taken apart by `match`, with patterns for ranges (`90..`),
-    texts (`"quit"`) and guards (`Some(n) if n > 0`);
-  - optionals (`T?`) and results (`T!`, an error with a message), with `??`, `?` that passes a
-    failure on, `let Some(x) = ... else { return }`, and `x == None`; `Never` for what never comes
-    back (`exit`, `panic`), so `x ?? panic("...")` works anywhere;
-  - generic functions (`fn top<T>(...)`) and functions that take functions (`f: (T) -> Int`), both
-    specialized where they are used, so they cost nothing; and functions kept as values, in a `let`,
-    a field or a map (`onPress: (Int) -> Int`), for callbacks;
-  - arrays that grow (`push`) and join (`xs + ys`), maps (`[Text: Int]`, loop sources of
-    `Entry(key, value)` too), slices (`xs[2..]`, `t[..3]`);
-  - UTF-8 text that joins, compares, interpolates and formats (`"{x:.2}"`), splits, searches,
-    replaces and parses, with `upper` / `lower` that know accents, Greek and Cyrillic;
-  - files that use files (`use geometry`, `pub fn ...`), and packages from git repositories
-    (`quark.toml`, `quark get`, `use geom.shapes`), locked by commit and content hash;
-  - `parallelMap`: a pure function on every element, on all the processor's threads;
-  - take, skip, countBy, mean, sort and sortBy (either way: `descending: true`), reverse, first, last,
-    count, minBy, maxBy, contains, indexOf, join;
-  - constants, named and default arguments;
-  - files, folders, the environment, standard input and output, the command line, exit codes;
-  - tests (`test "..." { assert(...) }`, run by `quark test`).
-
-  The compiler works out which functions change the world (print, files, the clock, a host function
-  marked `effect`...), the way it works out types: nothing is written, and nothing is paid when the
-  program runs. Everything else is pure and can be fused, cached or run in parallel, and an editor
-  can tell actions from data at a glance.
-- **Fast.** Quark compiles to machine code itself, with no C compiler, no LLVM and no interpreter. A
-  pipeline (`map`, `filter`, `fold`...) becomes one fused loop. Lambdas and small
-  functions are inlined. Records live in registers.
-- **Lean on memory.** Allocating is a pointer bump in an arena. A loop that makes garbage on every
-  turn gives it back as it goes, keeping only what its variables hold: no collector, no pauses, and
-  a long-running program stays small.
-- **A node graph.** Every `let` is a named node and every call a node with input pins. The order of
-  statements is the execution wire. Text → graph → text gives back the same text, comments included.
-  This is checked for every file by the tests.
-- **No dependencies.** `quark.exe` is a few hundred KB of C11. It parses, checks, compiles and runs
-  programs in memory, and writes standalone executables.
-
-## Speed
-
-Each benchmark runs the same work in Quark, in C compiled with `gcc -O2` (gcc 16), and in Lua 5.4 (a
-common embedded scripting language). Quark runs it twice: as `quark run` compiles it by default (the
-quick tier, a fraction of a millisecond), and with `--release` (the optimizing tier). Measured on Windows
-x64 with AVX2, best of seven:
-
-| | C (gcc -O2) | **Quark** | **Quark --release** | Lua 5.4 |
-| --- | --- | --- | --- | --- |
-| Counting: 82,944 rows of three values counted four ways into 256 buckets, 200 times ([counting.qk](bench/counting.qk)) | 29.1 ms | 35.3 ms | **31.3 ms** | 915 ms |
-| Mandelbrot, 1000 × 1000, 100 steps ([mandelbrot.qk](bench/mandelbrot.qk)) | 32.6 ms | 35.4 ms | **34.6 ms** | 256 ms |
-| Pipelines: 200,000 Ints and Floats through `filter` / `map` / `sum`, 300 times ([pipeline.qk](bench/pipeline.qk)) | 118.8 ms | 251.6 ms | **33.8 ms** | |
-
-The quick tier is within 9–21% of optimized C on the first two, the release tier within 6–8%, and on
-fused pipelines the release tier is 3.5× faster than gcc -O2 (SIMD lanes; 65.6 ms on SSE without AVX).
-Both check every array index and round integer division down, which the C code does not, and both give
-the same results (Float sums keep their order). Compiling takes about 0.2 ms, or 0.2–1 ms with
-`--release`.
-
-Where the speed comes from:
-
-- **Loops fuse.** `map` / `filter` / `fold` / `sum` become one machine loop with the test at
-  the bottom, and loop tops are aligned.
-- **Small functions are inlined**, block bodies with `return`s included. Lambdas always are, and so
-  are functions that take functions; generic functions get a copy per type.
-- **Registers.** A linear-scan allocator weighs loops more. Values that no call crosses go to
-  volatile registers, so nothing is saved for them. Records live in registers, and their
-  operators (`a + b` through `Vec2.plus`) inline to plain float instructions.
-- **The optimizer:**
-  - constants are folded;
-  - common subexpressions are computed once (`i * 3` for the three loads `xs[i * 3]`, `xs[i * 3 + 1]`, `xs[i * 3 + 2]`);
-  - copies are folded into the instruction that computes them;
-  - unused code is dropped;
-  - float constants are hoisted and int constants become immediates.
-- **Instruction choice:**
-  - division by a constant becomes a multiplication by a magic number;
-  - `x / d` and `x % d` share one;
-  - `x * 3` becomes one `lea`, and `x * 2.0` becomes `x + x`;
-  - `counts[k] += 1` becomes one `add [mem], 1`;
-  - a compare and its branch become one instruction pair;
-  - conversions go straight to their register, without the false dependency of `cvtsi2sd`;
-  - three-operand AVX is used when the processor has it (`--no-avx` for one that does not).
-- **Error paths** (bounds, division by zero, budget) sit out of line, so loops fall through.
-- **Memory only where it is made.** A loop that allocates nothing (all the benchmarks' hot loops)
-  carries no memory bookkeeping at all.
-
-The release tier (`--release`, `qkVmRelease`; [src/release.c](src/release.c)) adds, on the IR in SSA form:
-
-- **escape analysis:** a small record or array that never leaves its function is not allocated, its
-  fields live in registers;
-- **devirtualization:** a call through an interface whose concrete type is known is a direct call;
-- **range analysis:** every Int's interval, narrowed by the branches that test it; bounds checks that
-  cannot fail are dropped (`rows[r * 3 + 2]` with `r < len(rows) / 3` too), and so are repeated ones and
-  the sign fix-ups and zero checks of divisions whose operands cannot be negative;
-- **loop-invariant code motion** and **strength reduction** (`i * 3` becomes a value of its own, added
-  to as `i` is), and `[b + (i + 1) * 8]` addressing folded;
-- **SIMD:** a fused `map` / `filter` / `sum` / `len` pipeline on Ints or Floats runs 4 lanes at a time
-  (AVX2) or 2 (SSE2/SSE4.2, ARM64 NEON), the rest one at a time. Float sums add the lanes in order, so
-  the result is the one the quick tier gives;
-- **block layout:** a loop's exits (a `return` inside it) move out of line.
-
-Next steps for speed:
-
-- unboxed small element types (`[Byte]`, `[Float32]`);
-- threads for `map` and `fold`;
-- more registers for values: the backends keep six as scratch, which is what the counting benchmark's
-  remaining gap is mostly about (a graph-coloring allocator gains little until they are freed).
-
-## Build
-
-The compiler is C11 with no library beyond the C runtime. Any C compiler builds it, but Quark
-programs never need one.
+**3. Run it, or build it.**
 
 ```bash
-./build.sh            # build/libquark.a, build/quark.exe, build/host.exe (or build.bat with MSYS2)
-tests/run.sh          # programs, errors, panics, canonical text, graph round trips, quark build, tests, the language server, System V calls, the host, WebAssembly
+quark run hello.qk          # 11 words, 'the' 3 times
+quark build hello.qk        # hello.exe (or ./hello): one file, nothing else to install
 ```
 
-## Embedding
+The [tour](docs/TUTORIAL.md) goes from here to a small HTTP server in ten steps.
 
-```c
-QkVm* vm = qkVmNew();
-qkVmPrelude(vm, "extern type Item\n"
-                "extern effect fn moveBy(i: Item, dx: Float, dy: Float)\n");
-qkVmHost(vm, "moveBy", (void*)moveBy);               // void moveBy(int64_t i, double dx, double dy)
-QkModule* m = qkCompile(vm, "item.qk", text, len);   // NULL: qkDiagnosticAt says why
-QkValue args[2] = {{.i = id}, {.f = 1.0 / 60}};
-if (!qkCall(m, qkFind(m, "tick"), args, 2, NULL, 0))
-    puts(qkLastError(vm));                            // a script's panic never ends the host
+## Platforms
+
+| | Compiler and programs | Support |
+| :--- | :--- | :---: |
+| **Windows** x86-64 | PE executables, Windows 10 and 11 | Tier 1 |
+| **Linux** x86-64 | ELF, glibc or musl | Tier 1 |
+| **macOS** Apple silicon, Intel | Mach-O, ad-hoc signed | Tier 2 |
+| **Linux** ARM64 | ELF, glibc or musl | Tier 2 |
+| **Windows** ARM64 | PE | Tier 2 |
+| **WebAssembly** | `quark build --target wasm32`: the language without the system | Tier 2 |
+
+**Tier 1**: supported. Every change is built and its whole test suite runs on it, by CI and by hand.<br>
+**Tier 2**: experimental. Built by `quark build --target` on every release; macOS and Linux ARM64 also built and
+tested by CI, Windows ARM64 and WebAssembly not run by any test yet.
+
+## Download
+
+| Platform | File |
+| :--- | :--- |
+| **Windows** x86-64 | [quark-x86_64-windows.exe](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-x86_64-windows.exe) |
+| **Windows** ARM64 | [quark-arm64-windows.exe](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-arm64-windows.exe) |
+| **Linux** x86-64 | [quark-x86_64-linux](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-x86_64-linux) (glibc), [quark-x86_64-linux-musl](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-x86_64-linux-musl) |
+| **Linux** ARM64 | [quark-arm64-linux](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-arm64-linux) (glibc), [quark-arm64-linux-musl](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-arm64-linux-musl) |
+| **macOS** | [quark-arm64-macos](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-arm64-macos) (Apple silicon), [quark-x86_64-macos](https://github.com/eugeniobenfica/quark/releases/latest/download/quark-x86_64-macos) (Intel) |
+
+Each is the whole compiler, standard library and runtime in one file. Checksums are in `SHA256SUMS`.
+
+## Building
+
+```bash
+QUARK=path/to/quark ./build.sh --check
+bash tests/run.sh build/quark.exe
 ```
 
-The API covers:
+Quark is built by a Quark compiler (a release's): it builds the compiler in `compiler/` once (stage 1), that one
+builds it again (`build/quark.exe`), and `--check` has it build itself a third time and compares the bytes. With
+`gcc` present it also links the C hosts the tests use. [Bootstrapping](docs/BOOTSTRAP.md) has the details.
 
-- host functions with any number of arguments, struct results, text and handles;
-- a budget per call, and panics that stop the call instead of the host, with the calls they went
-  through;
-- an arena per machine, and hot reload (compile, swap the module);
-- graphs both ways, with `"pos"` from a layout file and errors keyed to nodes;
-- a catalog of every node an editor can offer;
-- capabilities: what each program may call (`qkVmCapabilities(vm, "Item.* print")`), checked before
-  it runs, so a third-party plugin can be given less than the application's own scripts.
+<details>
+<summary><b>What is where</b></summary>
+<br>
 
-[`examples/host/host.c`](examples/host/host.c) is a small application whose items run scripts; it uses
-all of it, and the tests check its output.
+```
+compiler/            the compiler, in Quark: parser, checker, lowering, optimizer, x86-64 and ARM64 backends,
+                     PE, ELF and Mach-O writers, the language server, the graph tools
+compiler/runtime/    the runtime, in Quark: memory, texts, maps, tasks, threads, each system's calls
+compiler/prelude.qk  the built-ins every program sees, written in Quark
+std/                 the standard library
+include/quark.h      the C API for hosts that embed Quark
+tests/               the test suite (tests/run.sh), its programs and their expected output
+examples/, bench/    example programs and the benchmarks against C
+tools/               releases, benchmarks, libquark, the Linux VMs
+docs/                the language, the tour, embedding, stability, memory, bootstrapping
+```
+</details>
 
-## Inside
+## Quality
 
-| File | |
-| --- | --- |
-| `src/lexer.c` | text → tokens; names are camelCase / PascalCase; line breaks end statements |
-| `src/parser.c` | tokens → syntax tree, comments attached |
-| `src/check.c` | types (inferred), conversions, which loops fuse; generic functions and functions that take functions made into instances |
-| `src/clone.c` | copies of a syntax tree: a template's body for each instance |
-| `src/lower.c` | tree → register IR: fused loops, inlining, values as 8-byte slots, loops that give memory back |
-| `src/opt.c` | constants folded, common subexpressions, shared divisions, copies folded, dead code dropped |
-| `src/x64.c` | IR → x86-64 bytes: linear scan, SSE / AVX encoding, magic division, Windows x64 and System V calls, no assembler |
-| `src/arm64.c` | IR → ARM64 words: the same linear scan over x9-x15 / x19-x28 and d8-d31, AAPCS64 calls (records back in x0-x1, d0-d3 or through x8) |
-| `src/wasm.c` | IR → a WebAssembly module: registers as locals, jumps as nested blocks and one dispatch loop, call sites for panics |
-| `src/wasm.js` | the WebAssembly loader, written beside each module: its runtime (print, texts, maps, files, panics), for Node.js and browsers |
-| `src/runtime.c` | what compiled code calls: print, text, maps, the arena and its loop collections, files, panics with their calls; the loader |
-| `src/format.c` | the canonical text |
-| `src/graph.c` | node graph (JSON) out and in |
-| `src/collab.c` | versions side by side: diffs and three-way merges by node key |
-| `src/api.c` | the embedding API (`include/quark.h`): machines, preludes, host functions, calls, catalog |
-| `src/lsp.c` | the language server |
-| `src/module.c` | `use`: the files a program names, read and joined to it |
-| `src/package.c` | packages: `quark.toml` and `quark.lock` (a TOML subset), `quark get` (the system git), SHA-256 of a package's files, `use pkg.module` |
-| `src/main.c` | the command line; executables carry their machine code at their end |
-| `examples/host/` | a small host application: its prelude, an item's script, the C host |
+- **The compiler builds itself, to the same bytes.** Every change is checked by a three-stage bootstrap whose last
+  two stages must be identical.
+- **Nearly a thousand tests.** Programs and their exact output in both tiers, errors and their messages, panics,
+  C calls in each calling convention, the graph's round trip, the language server, the debugger, the docs' examples.
+- **Differential and fuzz testing.** Generated programs run in the quick tier, the optimizing tier and with and
+  without AVX must agree; the parser, the formatter and the graph round trip are fed mutated programs on every change.
 
-There are two backends, and the build picks the one of the processor it is built on:
+## Principles
 
-- **x86-64**, for two calling conventions: Windows x64, and System V (Linux, macOS on Intel). The
-  System V code is tested on Windows by calling the runtime through adapters (`quark run --abi sysv`)
-  and a host whose functions use GCC's `sysv_abi`.
-- **ARM64** (Linux, macOS on Apple Silicon, Android, Raspberry Pi), with AAPCS64 calls. Every test
-  passes on ARM64 Linux, run in an emulated machine by `tools/arm64/vm.py` (QEMU and Alpine Linux:
-  `boot`, then `test`). On Apple Silicon the code goes into `MAP_JIT` memory; that path is written but
-  not yet run on a Mac.
+- **No dependencies.** The compiler, the runtime and the library are written here, in Quark. The system's C
+  library is the only thing a program calls that is not Quark.
+- **One way to write each thing.** `quark fmt` writes the canonical layout, and the language has one form for each
+  construct.
+- **Text and graph are the same program.** Anything a program says survives the trip to a graph and back.
+- **Fast by default.** Values are copied only when they must be, memory goes when a call or a loop's turn ends, and
+  the common paths are measured against C.
 
-And one for the browser:
+## Documentation
 
-- **WebAssembly** (wasm32): `quark build file.qk --target wasm32 [-o file.wasm]` writes the module
-  and `file.js`, its loader (`node file.js [args]`, or `Quark.run(bytes, {write, args})` in a page). The
-  module comes from the same IR; its runtime is the loader's JavaScript, imported (`rt`), working on the
-  module's memory with the native layouts (there is no C compiler to Wasm here, and a host that runs
-  Wasm has JavaScript anyway). Every `tests/run` program but `tasks.qk` passes, and every panic says what
-  the native one says, its stack of calls included (taken from the engine's stack trace: each frame's
-  offset finds its call site in the module's `quark` section). Not yet: tasks (`spawn`, `step`, `yield`,
-  `wait` need a stack of their own), the debugger, threads (`parallelMap` runs its elements one after
-  the other), giving memory back (the arena only grows; a program's memory goes when it ends). `sin`,
-  `cos`, `exp`... are the engine's, and may differ from the C library's in the last digit.
-  `tests/wasm/run.sh` runs the programs with Node.js, or, without it, all at once in a headless Edge or
-  Chrome.
+| | |
+| :--- | :--- |
+| [A tour of Quark](docs/TUTORIAL.md) | From a first program to a server, in ten steps. |
+| [The language](docs/LANGUAGE.md) | Everything: types, built-ins, the standard library, C, memory, tasks, the tools. |
+| [Embedding](docs/EMBEDDING.md) | Quark inside a C or C++ program: `quark.h` and libquark. |
+| [Stability](docs/STABILITY.md) | What is promised to keep working, and how things change. |
+| [Memory](docs/MEMORY.md) | The arena, the loops' collection, and why not reference counting. |
+| [Bootstrapping](docs/BOOTSTRAP.md) | How the compiler builds itself. |
+| [Relatório](docs/RELATORIO.md), [Plano](docs/PLANO.md) | The project's state and plan, in Portuguese. |
 
-`quark code file.qk -o code.bin` writes the raw machine code and each function's offset, for a
-disassembler (`objdump -D -b binary -m aarch64` or `-m i386:x86-64`).
+## License
 
-## Status and next steps
+MIT. See [LICENSE](LICENSE).
 
-Done:
-
-- the language and a native compiler;
-- text with formats, optionals and results with `?`, `let ... else` and `==`, enums with data,
-  patterns with ranges, texts and guards, `with`, constants, named and default arguments, arrays,
-  maps, slices, interfaces, `Never`, and effects (inferred);
-- generic functions and generic types, by specialization; types that hold themselves;
-- functions that take functions (inlined), and functions kept as values (called through);
-- functions of a type, user-defined operators and order;
-- files that use files (`use`, `pub`), and packages (`quark.toml`, `quark.lock`, `quark get`);
-- a standard library for UTF-8 text, arrays, maps, files, folders, the environment and the command
-  line;
-- memory that loops give back as they go, and an arena per machine;
-- `parallelMap` on the processor's threads;
-- the formatter, node graphs both ways (for external node editors), tests (`quark test`), a language server
-  (`quark lsp`), and panics that name the calls they went through, too-deep recursion included;
-- standalone executables;
-- the embedding API, with host functions, capabilities, safe calls, hot reload, node keys and layout,
-  and the catalog;
-- two backends: x86-64 (Windows x64 and System V calls) and ARM64 (AAPCS64), every test passing on
-  both;
-- a WebAssembly backend for the browser and Node.js (`--target wasm32`), every program but tasks passing.
-
-Next:
-
-1. Run on Apple machines: the Mach-O objects link with LLVM's linker and their loads land on their table,
-   but the runtime has not yet been built and run on a Mac.
-2. Windows on ARM.
-3. `fold` across threads, SIMD for `map`, small element types (`[Byte]`, `[Float32]`).
-4. WebAssembly: tasks (through the engine's stack switching), loops that give memory back.
-
-Node editors are tools of their own, outside the language: they read and write the files quark gives them
-(`quark graph`, `quark text`, `quark catalog`, `quark diff`, `quark merge`, `--layout`, `--trace`).
+<div align="center">
+<img src="docs/assets/logoTile.svg" width="40" alt="">
+<p><sub><b>Text and graph. Native code. Nothing else.</b></sub></p>
+</div>

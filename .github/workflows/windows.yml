@@ -1,0 +1,31 @@
+name: Windows
+
+# Tier 1. Builds Quark with the latest release's compiler (stage 1, then build/quark.exe, then the fixed point: a
+# third build must be the same bytes), and runs the whole test suite with it, in MSYS2's UCRT64 for gcc (the C hosts
+# the tests link) and the shell tools the suite uses.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows x86-64
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-github-cli diffutils
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern quark-x86_64-windows.exe --dir boot
+      - name: Build (to the fixed point)
+        run: QUARK=boot/quark-x86_64-windows.exe ./build.sh --check
+      - name: Test
+        run: bash tests/run.sh build/quark.exe

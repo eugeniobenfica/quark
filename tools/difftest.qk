@@ -1,0 +1,135 @@
+// Differential testing: programs made at random (a seed each), each run in every way the compiler has (the quick
+// tier, the optimizing tier, the optimizing tier without AVX, and on Windows the System V convention), and what they
+// print and how they end must be the same every time. A program that differs is kept, with its seed.
+//   quark run tools/difftest.qk -- QUARK [COUNT] [FIRST_SEED]
+// QUARK: the compiler to test (build/quark.exe); COUNT programs (100), from FIRST_SEED (1). Exit 1 when one differs.
+// a small, fast generator of its own (xorshift64*): the same seed, the same program on every machine
+type Rng { s: Int }
+
+fn Rng.next(var self) -> Int {
+    var x = self.s
+    x = x ^ x >> 12
+    x = x ^ x << 25
+    x = x ^ x >> 27
+    self.s = x
+    x *% 2685821657736338717 & 0x7FFFFFFFFFFFFFFF
+}
+
+fn Rng.below(var self, n: Int) -> Int = self.next() % n
+
+fn Rng.pick(var self, xs: [Text]) -> Text = xs[self.below(len(xs))]
+
+const intOps = ["+%", "-%", "*%", "&", "|", "^"]
+const compares = ["<", "<=", ">", ">=", "==", "!="]
+
+// an Int expression of the names given, depth at most d
+fn Rng.intExpr(var self, names: [Text], fns: Int, d: Int) -> Text {
+    let k = if d <= 0 { self.below(2) } else { self.below(9) }
+    match k {
+        0 => "{self.below(200) - 100}"
+        1 => names[self.below(len(names))]
+        2 | 3 => "({self.intExpr(names, fns, d - 1)} {self.pick(intOps)} {self.intExpr(names, fns, d - 1)})"
+        4 => "(if {self.intExpr(names, fns, d - 1)} {self.pick(compares)} {self.intExpr(names, fns, d - 1)} \{ {self.intExpr(names, fns, d - 1)} \} else \{ {self.intExpr(names, fns, d - 1)} \})"
+        5 => if fns > 0 {
+            "f{self.below(fns)}({self.intExpr(names, fns, d - 1)}, {self.intExpr(names, fns, d - 1)})"
+        } else {
+            "{self.below(50)}"
+        }
+        6 => "(({self.intExpr(names, fns, d - 1)}) >> {self.below(8)})"
+        7 => "min({self.intExpr(names, fns, d - 1)}, {self.intExpr(names, fns, d - 1)})"
+        _ => "abs({self.intExpr(names, fns, d - 1)} % 1000)"
+    }
+}
+
+// a statement inside main's loop over i, with xs (an array), m (a map), t (a text), acc and r (a record)
+fn Rng.stmt(var self, fns: Int) -> Text {
+    let names = ["i", "acc", "len(xs)", "r.a", "r.b"]
+    match self.below(9) {
+        0 => "acc = acc +% {self.intExpr(names, fns, 2)}"
+        1 => "xs.push({self.intExpr(names, fns, 2)} % 997)"
+        2 => "if len(xs) > 0 \{ xs[i % len(xs)] = {self.intExpr(names, fns, 2)} \}"
+        3 => "m[{self.intExpr(names, fns, 1)} % 17] = {self.intExpr(names, fns, 2)}"
+        4 => "acc = acc ^ (m[i % 17] ?? {self.below(9)})"
+        5 => "r = r with \{ a: {self.intExpr(names, fns, 2)} \}"
+        6 => "if i % {self.below(5) + 2} == 0 \{ t += \"{self.below(10)}\" \}"
+        7 => "acc = acc +% xs.filter(x => x % {self.below(4) + 2} == 0).map(x => x *% {self.below(7)}).sum()"
+        _ => "r = R(r.b, {self.intExpr(names, fns, 2)})"
+    }
+}
+
+fn program(seed: Int) -> Text {
+    var g = Rng(seed *% 6364136223846793005 +% 1442695040888963407)
+    if g.s == 0 {
+        g.s = 1
+    }
+    var out = "// made by tools/difftest.qk, seed {seed}\ntype R \{ a: Int, b: Int \}\n\n"
+    let fns = g.below(4)
+    for k in 0..fns {
+        out += "fn f{k}(a: Int, b: Int) -> Int = {g.intExpr(["a", "b"], k, 3)}\n\n"
+    }
+    out += "fn main() \{\n    var xs: [Int] = []\n    var m: [Int: Int] = [:]\n    var t = \"\"\n    var acc = 0\n    var r = R(1, 2)\n"
+    out += "    for i in 0..{g.below(300) + 1} \{\n"
+    for _ in 0..g.below(6) + 1 {
+        out += "        " + g.stmt(fns) + "\n"
+    }
+    out += "    \}\n"
+    out += "    print(acc, len(xs), xs.sum(), len(m), t, r)\n"
+    out += "    print(xs.sorted().take(5).toArray(), m.keys().sorted().toArray())\n\}\n"
+    out
+}
+
+fn ran(quark: Text, path: Text, flags: [Text]) -> Text {
+    match runProcess(quark, ["run", path] + flags) {
+        Ok(p) => "status {p.status}\n{p.out}{p.err}"
+        Err(why) => "could not run: {why}"
+    }
+}
+
+fn main() {
+    let given = args()
+    if len(given) < 1 {
+        printErr("usage: quark run tools/difftest.qk -- QUARK [COUNT] [FIRST_SEED]")
+        exit(2)
+    }
+    let quark = given[0]
+    let count = if len(given) > 1 { given[1].parseInt() ?? 100 } else { 100 }
+    let first = if len(given) > 2 { given[2].parseInt() ?? 1 } else { 1 }
+    let dir = (env("TEMP") ?? env("TMPDIR") ?? "/tmp") + "/quark-difftest"
+    let _ = makeDir(dir)
+    var ways: [[Text]] = [[], ["--release"], ["--release", "--no-avx"]]
+    if env("OS") == Some("Windows_NT") {
+        ways.push(["--abi", "sysv"])
+    }
+    var differ = 0
+    for seed in first..first + count {
+        let path = "{dir}/p{seed}.qk"
+        writeFile(path, program(seed))?
+        let base = ran(quark, path, ways[0])
+        if not base.startsWith("status 0") {
+            // every program made here compiles and ends well: one that does not is the generator's fault, or the
+            // compiler's
+            print("seed {seed}: the quick tier did not run it: {base}")
+            differ += 1
+            continue
+        }
+        var same = true
+        for w in ways[1..] {
+            let other = ran(quark, path, w)
+            if other != base {
+                print("seed {seed}: {w} differs from the quick tier ({path})")
+                print("  quick:   {base}")
+                print("  {w}: {other}")
+                same = false
+            }
+        }
+        if same {
+            let _ = removePath(path)
+        } else {
+            differ += 1
+        }
+    }
+    print("difftest: {count} programs, {differ} differ")
+    if differ > 0 {
+        exit(1)
+    }
+}

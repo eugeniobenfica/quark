@@ -7,6 +7,14 @@ run time and no other library. The complete working example is
 [`examples/host/host.c`](../examples/host/host.c), a small application whose items run scripts. Its
 output is checked by the tests.
 
+The library is Quark written in Quark: the compiler and the runtime ([`compiler/api.qk`](../compiler/api.qk) is
+this API, each function a `pub extern fn`), compiled by Quark into one object and written as an archive, with no C
+compiler and no `ar` (`./build.sh` makes it with `bash tools/libquark.sh build/libquark.a`; `QK_TARGET=arm64-linux`
+or `x86_64-linux` makes one for another machine). A host links it with its system's libraries:
+`gcc host.c build/libquark.a -lm -lwinmm` on Windows, `-lm -lpthread -ldl` on Linux. The compiler runs on a thread
+of its own with a 256 MB stack, so a host's own stack size does not matter. `tests/run.sh` checks the hosts of the
+repository with it. There is no libquark for macOS yet.
+
 ## The machine and the host's API
 
 ```c
@@ -22,26 +30,27 @@ The **prelude** is Quark text that every program compiled by this machine sees. 
 describes its API, in the language itself:
 
 ```quark
-extern type Item                                    // a handle: the host's, never made by a script
-type Point { x: Float, y: Float }                   // a record the host and its scripts share
-extern fn position(i: Item) -> Point
-extern effect fn moveBy(i: Item, dx: Float, dy: Float)    // effect: it changes the world
+extern type Item // a handle: the host's, never made by a script
+type Point { x: Float, y: Float } // a record the host and its scripts share
+extern effect fn position(i: Item) -> Point
+extern effect fn moveBy(i: Item, dx: Float, dy: Float) // effect: it changes the world
 extern effect fn setColor(i: Item, r: Float, g: Float, b: Float, a: Float)
 extern effect fn note(i: Item, message: Text)
-extern fn flag(name: Text) -> Bool
+extern effect fn flag(name: Text) -> Bool
 ```
 
-Mark `effect` every host function that changes something (writes, sends, moves, draws). The host's
-functions have no body for Quark to look into, so this is the one place effects are written: a script's
-own functions are worked out from what they call. A function that calls `moveBy` has effects, a lambda
-given to `map` may not call it, and a node editor shows the call as an action on the execution wire.
-Functions that only read (`position`, `flag`) stay pure.
+Mark `effect` on host functions that change something or read changing state, such as `position` and
+`flag` in this example. The compiler uses that declaration as the host contract. Calls to those
+functions follow the execution wire in the graph and cannot run from a pure pipeline lambda.
+An unmarked host function must depend only on its inputs, for example a calculation on a snapshot.
 
 A prelude can also hold records, enums and ordinary functions that the host wants to share with
 every script, such as `fn Point.plus(self, b: Point)` so that scripts can write `a + b`. A host function
-can belong to a type too: `extern fn Item.position(self) -> Point` is called `item.position()`, and the
+can belong to a type too: `extern effect fn Item.position(self) -> Point` is called `item.position()`, and the
 host registers it as `"Item.position"`. Its declarations are never printed or put in graphs, because they belong to the host,
 but they are in the catalog (see below).
+The syntax `extern effect fn readItem() -> Item as "read_item"` registers the binding under
+`"read_item"` while callers use `readItem()`. Capability checks use the registered symbol.
 
 ## Values cross as slots
 
@@ -54,7 +63,8 @@ Every value is a few 8-byte slots (`QkValue`: `.i`, `.f`, `.p`), in order:
 | `Text` | 2 | `const char*` (the bytes, not 0-terminated), `int64_t` (the length) |
 | `[T]` | 2 | `const void*` (the elements, each T's slots), `int64_t` (the count) |
 | `[K: V]` | 1 | a pointer to the runtime's map (pass it back to Quark; do not read it) |
-| `T?`, `T!` | 1 + T's, 3 + T's | the case (0: `None` / `Err`, 1: `Some` / `Ok`), then each case's data |
+| `T?`, `T!` | 1 + T's; 1 + the message's 2 or T's | the case (0: `None` / `Err`, 1: `Some` / `Ok`), then that case's data from the second slot (a Float `Ok` after the message's two: a slot keeps its kind) |
+| an enum with data | 1 + its largest case's | the case, then its data: the cases share slots, each where the kinds of its slots agree with the others' (`qkSlotKinds` tells) |
 | a record | its fields' slots | one argument per slot (`Point { x: Float, y: Float }`: two `double`s) |
 
 A host function returns nothing, one slot (`int64_t` or `double`; a `Bool` is an `int64_t` 0 or
@@ -65,12 +75,48 @@ the hidden pointer. Either way the C side is the same:
 
 ```c
 typedef struct Point { double x, y; } Point;
-static Point position(int64_t i) { ... }                     // extern fn position(i: Item) -> Point
+static Point position(int64_t i) { ... }                     // extern effect fn position(i: Item) -> Point
 static void note(int64_t i, const char* s, int64_t n) { ... } // extern effect fn note(i: Item, message: Text)
 ```
 
 There is no limit on the number of arguments: past the registers they go on the stack, as the
 convention says.
+
+## C's types, and C's libraries beside the host's
+
+A host function may also be declared with C's own types ([LANGUAGE.md](LANGUAGE.md#c)): then its C function is
+the one its header already has, with no slot layout to follow. Quark's own types keep the layout above, and both
+mix in one declaration.
+
+```quark
+extern type Window
+extern type Rect { x: Int32, y: Int32, width: Int32, height: Int32 }
+extern effect fn setVolume(w: Window, level: Float32)
+extern effect fn title(w: Window) -> CText
+extern effect fn bounds(w: Window) -> Rect
+```
+
+```c
+void setVolume(int64_t w, float level);
+const char* title(int64_t w);           /* copied into the program's memory when it comes back */
+Rect bounds(int64_t w);                 /* Rect as C lays it out, returned as the platform's C does */
+```
+
+Where each `extern fn`'s function comes from, when a module is compiled (`qkCompile`) or linked
+(`qkModuleStatic`):
+
+- without `in`, the host's registration (`qkVmHost`) when there is one: it wins. Else the C library the process
+  links (on Windows `ucrtbase.dll`, then `msvcrt.dll`), so a prelude may declare `extern fn strlen(text: CText)
+  -> UInt64` and register nothing. Neither: "extern fn f has no function in this host (qkVmHost), nor in the C
+  library".
+- with `in "lib"`, that library, always (`extern fn cosf(x: Float32) -> Float32 in "m"`): a host's registration
+  of the same name does not apply.
+
+Capabilities (below) name C's functions by symbol, as they name the host's.
+
+The other way, `quark object` exports each `pub extern fn` of the program under its name: a C function C links
+against and calls directly, with C's types and structs, once `qkModuleStatic` has given the object its table.
+`tests/object/cexport.c` is such a program.
 
 ## Compiling and calling
 
@@ -121,7 +167,7 @@ thread that called Quark, so the host's process never crashes on it.
 
 `qkVmCapabilities(vm, list)` says what the programs the machine compiles from then on may reach outside
 themselves: host functions by name (`"moveBy note"`), by prefix (`"Item.*"`, `"net*"`), and the
-built-in groups `print`, `files`, `env`, `args`, `exit`, `stdin`, `clock`. A program that calls
+built-in groups `print`, `files`, `process`, `net`, `env`, `args`, `exit`, `stdin`, `clock`, `random`, `tasks`. A program that calls
 anything else does not compile, and the diagnostic says what it called:
 
 ```text
@@ -143,6 +189,12 @@ the command line.
 - **State that lives across calls lives in the host.** The natural shape is a record the event
   returns: `fn tick(item: Item, mover: Mover, dt: Float) -> Mover`. The host keeps `Mover`'s slots
   per item.
+- **A task has an arena of its own** (`qkTaskStart`, or `spawn` in a script), freed with the task (`qkTaskEnd`; a
+  spawned one when it ends), with the machine's memory limit. A live task does not stop the machine's arena from being reset
+  when the next outermost call starts, nor a call's loops from giving memory back. What a task holds is its
+  own, with one exception a host must know: the arguments `qkTaskStart` passes are used as they are, so a
+  text or an array among them must stay valid as long as the task runs: the host's own memory (a
+  `static` or `malloc` buffer), not a text an earlier call returned (that goes when the next call starts).
 
 ## Files a program uses
 
@@ -154,9 +206,9 @@ it: the file system by default; a host that keeps its scripts in a pack or in me
 ## Tasks
 
 `qkTaskStart(m, fn, args, n)` makes a task of a function that gives nothing, and `qkTaskResume(t)` runs
-it until it calls `yield()` or `wait(seconds)`, or ends: 1 it gave its turn back, 0 it is done, -1 it
+it until it calls `yield()` or `sleep(seconds)`, or ends: 1 it gave its turn back, 0 it is done, -1 it
 stopped (`qkLastError`). Resume it whenever the host is ready for its next step (a request answered,
-a timer, an event); `qkTaskEnd` frees it. Each task has its own stack, so a script yields from wherever
+a timer, an event); `qkTaskEnd` frees it. Each task has its own stack (and arena: see Memory), so a script yields from wherever
 it is.
 
 ```c
@@ -185,7 +237,7 @@ cannot be loaded again for the others. `tests/object/host.c` is a host that link
 
 ## Overflow and memory
 
-`qkVmChecked(vm, true)` makes Int `+ - *` past their limits stop the call (a development build, say);
+Int `+ - *` past their limits stop the call, as in every program (`+% -% *%` wrap around);
 `qkVmMemoryLimit(vm, bytes)` stops a call whose program holds more memory than that.
 
 ## The optimizing tier
@@ -211,8 +263,8 @@ Scripts keep no state between calls, so the new module goes on exactly where the
 | | |
 | --- | --- |
 | `qkTextToGraph(vm, text, n, layout)` | the program as nodes (JSON, see [LANGUAGE.md](LANGUAGE.md#the-node-graph)); `layout` (`{"key": [x, y]}`) adds `"pos"` to those nodes |
-| `qkGraphToText(vm, json, n)` | the canonical text of a graph |
-| `qkCompileGraph(vm, name, json, n)` | compiles a graph; each diagnostic's `key` names the node it is about (`tick/@3`) |
+| `qkGraphToText(vm, json, n)` | the canonical text of a graph (JSON, or Quark Graph Notation) |
+| `qkCompileGraph(vm, name, json, n)` | compiles a graph (JSON or QGN); each diagnostic's `key` names the node it is about (`tick/@3`) |
 | `qkFormatText(vm, text, n)` | the canonical text |
 | `qkCatalog(vm, text, n)` | every node an editor can offer: the built-ins with their pins, the operators, the statements, the prelude's externs and types, and the program's own functions and types. Every pin has a `"shape"`, its type as data (`{"kind": "loop", "element": {"kind": "param", "name": "T"}}`), and every function a `"result"` shape: see [LANGUAGE.md](LANGUAGE.md#the-node-graph) |
 | `qkDiff(vm, a, an, b, bn, json)` | what changed from a to b, by node key: `changed main/n: input 0: 10 -> 12` lines, or JSON (`{"changes": [...]}`); `""` when they are the same |

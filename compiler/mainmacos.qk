@@ -46,4 +46,5 @@ fn protectCode(p: Int, n: Int) -> Bool {
 fn cFunction(name: Text) -> Int = dlsym(-2, name) // RTLD_DEFAULT: libSystem, and what the process has loaded
 
 // Apple Silicon: machine.cpu() has no x86-64 features to give
-fn main() -> Int = cliMain(Host(.Macos, mapMemory, protectCode, cFunction, machine.cpu() == 0, selfPath()))
+fn main() -> Int =
+    cliMain(Host(.Macos, mapMemory, protectCode, cFunction, machine.cpu() == 0, selfPath()))

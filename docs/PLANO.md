@@ -48,6 +48,21 @@ Sem isto as fases seguintes são arriscadas demais. Tudo aqui é pequeno.
 | A6. Assinatura no Windows | `quark.exe` assinado; orientação para executáveis gerados | um Windows 11 com Smart App Control roda o release |
 | A7. Forma canônica na suíte | `compiler/` e `std/` conferidos com cache por conteúdo | não é mais passo manual |
 
+> **Estado em 19/11/2026.**
+> - **A1. Feito.** O repositório é [github.com/eugeniobenfica/quark](https://github.com/eugeniobenfica/quark), público, com licença MIT. Os commits estão por área e há tags `v0.9.0`, `v0.9.1` e `v0.9.2`.
+> - **A2. Feito.** O release 0.9.2 traz os 8 compiladores e o `SHA256SUMS`. Cada workflow baixa o último release e vai até o ponto fixo. Depois roda a suíte inteira:
+>   - Windows x86-64, Linux x86-64 e Linux ARM64: verdes;
+>   - macOS: Apple silicon e Intel, nas imagens `macos-15`.
+>
+>   A primeira rodada em Linux x86-64 achou um erro real do System V, corrigido no 0.9.1 e no 0.9.2. C pode mudar todos os registradores xmm, e as chamadas do próprio Quark preservam xmm8-15. Mas só os valores da função que chamava C eram salvos, não os de quem a chamou. O compilador 0.9.0 para Linux falhava no próprio build.
+> - **A3. Feito.** `tools/difftest.qk` gera programas e compara o tier rápido com `--release`, `--no-avx` e `--abi sysv`. Roda na CI a cada mudança (300 programas) e toda noite (3000).
+> - **A4. Feito.** `tools/fuzz.qk` muta os programas de `tests/run` e confere três coisas: `check`, a estabilidade do `fmt` e a ida e volta texto ↔ QGN. Roda na CI. `quark bind` ainda não entra.
+> - **A5. Feito.** A suíte confere `runtimeCount` contra `runtimeNames`.
+> - **A6. Não dá para fazer daqui.** Assinar exige um certificado de assinatura de código, e o Smart App Control só confia em executáveis assinados ou de boa reputação. O caminho é o Azure Trusted Signing, ou um certificado OV/EV, assinando os `.exe` do release na CI. Esse passo depende do dono do projeto. Para os executáveis gerados, a orientação é:
+>   - `quark run` roda na memória, sem criar executável;
+>   - quem distribui assina o seu executável.
+> - **A7. Feito.** O workflow Checks confere a forma canônica de `compiler/`, `compiler/runtime/` e `tools/`.
+
 ## 3. Fase B: refatorações estruturais
 
 São as propostas grandes. Cada uma diz por que vale o custo.

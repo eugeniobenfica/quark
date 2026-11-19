@@ -45,4 +45,4 @@ fixes() { send '{"jsonrpc": "2.0", "id": '$1', "method": "textDocument/codeActio
 } > /tmp/lspassist.bin
 # the answers, without the diagnostics (session.sh has those) and the names every completion offers
 "$Q" lsp < /tmp/lspassist.bin | tr -d '\r' | sed 's/Content-Length: [0-9]*//' | grep -v '^$' | grep -v publishDiagnostics |
-    sed 's/, {"label": "[a-zA-Z0-9]*", "kind": \(14\|3\|22\|13\)}//g'
+    sed -E 's/, [{]"label": "[a-zA-Z0-9]*", "kind": (14|3|22|13)[}]//g'

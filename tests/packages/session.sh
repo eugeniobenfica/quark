@@ -3,6 +3,8 @@
 # the errors: not fetched, hash mismatch, a cycle, a package asked for twice, a missing tag.
 #   tests/packages/session.sh path/to/quark.exe     (its output is tests/packages/session.out)
 Q=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+# sed in place, the same with GNU's sed and BSD's (macOS)
+sedIn() { sed "$1" "$2" > "$2.new" && mv "$2.new" "$2"; }
 work=$(mktemp -d)
 cd "$work" || exit 1
 # git as on a clean machine, with fixed dates: the same commits, so the same output, everywhere
@@ -80,19 +82,19 @@ git -C geom tag -f v1.0 HEAD~1 > /dev/null
 
 say "quark.lock's hash is not what the commit holds"
 cp app/quark.lock lock.saved
-sed -i 's/hash = "sha256-0/hash = "sha256-f/; s/hash = "sha256-\([1-9a-f]\)/hash = "sha256-0/' app/quark.lock
+sedIn 's/hash = "sha256-0/hash = "sha256-f/; s/hash = "sha256-\([1-9a-f]\)/hash = "sha256-0/' app/quark.lock
 quark get app
 cp lock.saved app/quark.lock
 
 say "quark.toml asks for another tag, not fetched yet"
-sed -i 's/tag = "v1.0"/tag = "v2.0"/' app/quark.toml
+sedIn 's/tag = "v1.0"/tag = "v2.0"/' app/quark.toml
 quark run app/main.qk
 say "quark get: util asks for geom v1.0, the app for v2.0"
 quark get app
-sed -i 's/tag = "v2.0"/tag = "v9"/' app/quark.toml
+sedIn 's/tag = "v2.0"/tag = "v9"/' app/quark.toml
 say "a tag that is not there"
 quark get app
-sed -i 's/tag = "v9"/tag = "v1.0"/' app/quark.toml
+sedIn 's/tag = "v9"/tag = "v1.0"/' app/quark.toml
 
 say "a file next to main.qk with a package's name"
 printf 'pub fn other() -> Int = 1\n' > app/util.qk
@@ -103,7 +105,7 @@ say "a cycle: util needs app"
 printf '[package]\nname = "util"\nversion = "0.4.0"\n\n[dependencies]\ngeom = { git = "../geom", tag = "v1.0" }\napp = { git = "../app", tag = "v1" }\n' > util/quark.toml
 commit util two
 (cd app && git init -q -b main && git add -A && git commit -q -m app && git tag v1)
-sed -i "s/rev = \"$rev\"/rev = \"$(git -C util rev-parse --short=10 HEAD)\"/" app/quark.toml
+sedIn "s/rev = \"$rev\"/rev = \"$(git -C util rev-parse --short=10 HEAD)\"/" app/quark.toml
 quark get app
 
 say "a manifest with a mistake"

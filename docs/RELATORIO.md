@@ -162,6 +162,13 @@ chamadas ao runtime a cada palavra.
 
 **Bloqueiam um 1.0**
 
+> Itens 1 a 3 resolvidos em 19/11/2026 (fase A do [PLANO](PLANO.md)):
+> - o código está no git, em github.com/eugeniobenfica/quark;
+> - o release 0.9.2 está publicado;
+> - a CI roda a suíte inteira em Windows, Linux x86-64, Linux ARM64 e macOS.
+>
+> O item 5 (assinatura) depende de um certificado.
+
 1. **Nada está no git.** A pasta `compiler/` inteira aparece como não rastreada e `src/` (a semente em C) como
    apagada: 320 arquivos pendentes desde a remoção da semente. Hoje a única cópia é esta pasta (e o OneDrive).
    É o maior risco do projeto e o mais barato de resolver.

@@ -7695,6 +7695,11 @@ pub extern effect fn osCloseSocketImpl(s: Int64) as "qkosCloseSocket" {
 
 // items: (socket, write, ready) each; ready 1 for those that are (an error or a hang-up too: the next call says it)
 pub extern effect fn osPollImpl(items: Int64, count: Int64, ms: Int64) -> Int64 as "qkosPoll" {
+    if count == 0 and ms >= 0 {
+        // only a wait: macOS's poll of no descriptors does not wait reliably
+        let _ = usleep(1000 * ms)
+        return 0
+    }
     let fds = calloc(if count > 0 {
         count // pollfd: the fd, then events and revents (shorts)
     } else {

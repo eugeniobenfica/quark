@@ -5,6 +5,12 @@
 cd "$(dirname "$0")/.."
 Q=${1:-build/quark.exe}
 tmp=$(mktemp -d)
+# sed in place, the same with GNU's sed and BSD's (macOS)
+sedIn() { sed "$1" "$2" > "$2.new" && mv "$2.new" "$2"; }
+# timeout where there is one (GNU's, or Homebrew's gtimeout); elsewhere the command runs without a limit
+if ! command -v timeout > /dev/null 2>&1; then
+    if command -v gtimeout > /dev/null 2>&1; then timeout() { gtimeout "$@"; }; else timeout() { shift; "$@"; }; fi
+fi
 pass=0
 fail=0
 ok() { pass=$((pass + 1)); }
@@ -299,7 +305,7 @@ kept=$(QUARK_CACHE=on "$Q" run "$tmp/kept.qk" --release --time 2> "$tmp/keptTime
 all=$(grep -o "([0-9]* of [0-9]* functions kept" "$tmp/keptTime.txt" | awk '{print ($1 == "(" $3) ? "all" : "some"}')
 printf 'fn opening(n: Int) -> Text = "a new one {n}"\n\n' > "$tmp/kept2.qk"
 cat "$tmp/kept.qk" >> "$tmp/kept2.qk"
-sed -i 's/print(greet(2), total(\[1, 2, 3\]))/print(opening(1), greet(2), total([1, 2, 3]))/' "$tmp/kept2.qk"
+sedIn 's/print(greet(2), total(\[1, 2, 3\]))/print(opening(1), greet(2), total([1, 2, 3]))/' "$tmp/kept2.qk"
 mv "$tmp/kept2.qk" "$tmp/kept.qk"
 edited=$(QUARK_CACHE=on "$Q" run "$tmp/kept.qk" --release --time 2> "$tmp/keptTime2.txt")
 some=$(grep -o "(\([0-9]*\) of" "$tmp/keptTime2.txt" | tr -d '(' | awk '{print $1}')

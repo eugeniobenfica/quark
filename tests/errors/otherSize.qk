@@ -1,0 +1,7 @@
+// error: has no function "size": write len(x)
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    let n = xs.size()
+    print(x, xs)
+}

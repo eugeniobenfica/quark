@@ -1,0 +1,7 @@
+// error: there is no null: write None
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    let y = null
+    print(x, xs)
+}

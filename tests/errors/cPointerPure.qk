@@ -1,0 +1,5 @@
+// error: reading through a pointer has effects
+fn main() {
+    let p = Pointer<Int32>(0)
+    print([0, 1].map(i => p[i]))
+}

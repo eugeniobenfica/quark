@@ -1,0 +1,8 @@
+// error: Self names the type a function belongs to: use it in fn Type.name(self, ...)
+type Point { x: Int, y: Int }
+
+fn origin() -> Self = Point(0, 0)
+
+fn main() {
+    print(origin().x)
+}

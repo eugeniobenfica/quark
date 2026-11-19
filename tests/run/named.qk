@@ -1,6 +1,6 @@
-// Built-ins take named values, in their order; get gives None outside the array; count() counts.
+// Built-ins take named values, in their order; get gives None outside the array; len counts.
 fn main() {
     let xs = [3, 1, 2]
-    print(split("a,b", separator: ","), xs.sort(descending: true), clamp(5, low: 0, high: 3))
-    print(xs.get(1), xs.get(3), xs.get(-1), ["a", "b"].get(0), xs.count(), xs.map(x => x * 2).count())
+    print("a,b".split(separator: ","), xs.sorted(descending: true), clamp(5, low: 0, high: 3))
+    print(xs.get(1), xs.get(3), xs.get(-1), ["a", "b"].get(0), len(xs), xs.map(x => x * 2).len())
 }

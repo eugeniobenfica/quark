@@ -1,0 +1,44 @@
+// parallelMap giving values that hold memory: texts, arrays, maps, boxed cases, made by each thread (literals among
+// them) and copied out of its memory when it is done.
+enum Tree { Leaf(value: Int), Node(left: Tree, right: Tree) }
+type Report { n: Int, name: Text, digits: [Int], counts: [Text: Int], tree: Tree, empty: [Text] }
+
+fn build(depth: Int, at: Int) -> Tree = if depth == 0 {
+    .Leaf(at)
+} else {
+    .Node(build(depth - 1, 2 * at), build(depth - 1, 2 * at + 1))
+}
+
+fn total(t: Tree) -> Int = match t {
+    Leaf(v) => v
+    Node(l, r) => total(l) + total(r)
+}
+
+fn report(n: Int) -> Report {
+    var digits: [Int] = []
+    var x = n
+    while x > 0 {
+        digits.push(x % 10)
+        x /= 10
+    }
+    var counts: [Text: Int] = [:]
+    for d in digits {
+        let key = if d % 2 == 0 { "even" } else { "odd" }
+        counts[key] = (counts[key] ?? 0) + 1
+    }
+    let name = if n % 3 == 0 { "fizz" } else { "n" + n.toText() }
+    Report(n, name, digits, counts, build(n % 4, 1), [])
+}
+
+fn main() {
+    let reports = (1..5_001).parallelMap(report)
+    let same = (1..5_001).map(report)
+    print(len(reports), reports == same)
+    print(reports[0].name, reports[2].name, reports[4999].digits, reports[4999].counts["even"] ?? 0)
+    print(reports.map(r => total(r.tree)).sum(), reports.count(r => r.name == "fizz"), len(reports[7].empty))
+    let words = ["alpha", "beta", "gamma", "delta"].parallelMap(w => w.upper() + "!")
+    print(words.join(" "))
+    var grown = reports[10].digits
+    grown.push(7)
+    print(grown, reports[10].digits)
+}

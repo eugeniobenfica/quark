@@ -1,0 +1,7 @@
+// error: Color has no case Bleu: did you mean .Blue?
+enum Color { Red, Blue }
+
+fn main() {
+    let c: Color = .Bleu
+    print(c)
+}

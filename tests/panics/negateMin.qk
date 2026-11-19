@@ -1,0 +1,7 @@
+// panic: an Int went past its limits (overflow; +% -% *% wrap around)
+fn negate(n: Int) -> Int = -n
+
+fn main() {
+    let low = -9223372036854775807 - 1
+    print(negate(low))
+}

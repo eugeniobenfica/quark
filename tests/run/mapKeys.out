@@ -1,0 +1,11 @@
+2 half zero again -
+30 34
+4 30 2 0
+2 1
+7 false
+a -
+2 [0.5, -0.0]
+Shape.Circle(radius: 1.5) 1
+Shape.Rect(w: 2, h: 3) 2
+Shape.Named(name: box) 30
+Shape.Empty 4

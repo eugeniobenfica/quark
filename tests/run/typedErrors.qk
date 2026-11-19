@@ -1,20 +1,18 @@
 // Results whose error is a type of its own: an enum the caller takes apart, passed on by ?.
 enum ParseError { Empty, NotANumber(text: Text), TooBig(n: Int) }
 
-fn parseAge(t: Text) -> Int!ParseError {
-    if len(trim(t)) == 0 {
-        return Err(ParseError.Empty)
+fn parseAge(t: Text) -> Int ! ParseError {
+    if len(t.trim()) == 0 {
+        return Err(.Empty)
     }
-    let Some(n) = parseInt(trim(t)) else {
-        return Err(ParseError.NotANumber(t))
-    }
+    let n = t.trim().parseInt() ?? return Err(.NotANumber(t))
     if n > 150 {
-        return Err(ParseError.TooBig(n))
+        return Err(.TooBig(n))
     }
     n
 }
 
-fn sumAges(texts: [Text]) -> Int!ParseError {
+fn sumAges(texts: [Text]) -> Int ! ParseError {
     var total = 0
     for t in texts {
         total += parseAge(t)?

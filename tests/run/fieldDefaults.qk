@@ -1,0 +1,22 @@
+// Fields with defaults: left out where the record is made, as parameters with defaults are.
+const basePort = 8000
+
+type Server {
+    host: Text = "localhost"
+    port: Int = basePort + 80
+    tags: [Text] = []
+    secure: Bool = false
+}
+
+type Point { x: Float = 0, y: Float = 0 }
+enum Mode { Fast, Careful }
+type Job { name: Text, mode: Mode = .Careful, tries: Int = 3 }
+
+fn Point.moved(self, dx: Float) -> Self = self with { x: self.x + dx }
+
+fn main() {
+    print(Server(), Server(port: 9000), Server("example.org", tags: ["web"], secure: true))
+    print(Point(), Point(y: 2).moved(1), Point(1, 2) == Point(x: 1, y: 2))
+    let jobs = [Job("build"), Job("test", .Fast), Job("ship", tries: 1)]
+    print(jobs.map(j => "{j.name}:{j.mode}:{j.tries}"))
+}

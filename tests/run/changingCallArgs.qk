@@ -1,0 +1,41 @@
+// What a call that changes its receiver is given is the value as it was: what it keeps does not see the caller's
+// later changes in place (of an array, of the arrays in one), and a value taken from the receiver itself does not
+// change while the call changes the receiver.
+type Keeper { kept: [[Int]] = [], last: [Int] = [], nested: [[[Int]]] = [] }
+
+fn Keeper.keep(var self, xs: [Int]) {
+    self.last = xs
+    self.kept.push(xs)
+}
+
+fn Keeper.keepNested(var self, xss: [[Int]]) {
+    self.nested.push(xss)
+}
+
+fn Keeper.fromItself(var self, xs: [Int]) -> [Int] {
+    self.last[0] = 99
+    self.last.push(7)
+    xs
+}
+
+type Holder { items: [Int] = [], rows: [[Int]] = [] }
+
+fn Holder.run(var self) -> Keeper {
+    var k = Keeper()
+    for i in 0..3 {
+        k.keep(self.items)
+        k.keepNested(self.rows)
+        self.items[0] += 10
+        self.rows[0][0] += 100
+    }
+    k
+}
+
+fn main() {
+    var h = Holder([1, 2], [[0, 5], [6]])
+    var k = h.run()
+    print(k.kept, k.last, h.items)
+    print(k.nested, h.rows)
+    let seen = k.fromItself(k.last)
+    print(seen, k.last)
+}

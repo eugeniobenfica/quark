@@ -1,0 +1,7 @@
+// error: a C function value keeps nothing: this lambda uses limit from around it
+extern effect fn qsort(base: Pointer<Int64>, count: UInt64, size: UInt64, compare: extern (Pointer<Int64>, Pointer<Int64>) -> Int32)
+
+fn main() {
+    let limit = 3
+    qsort(Pointer<Int64>(0), 0, 8, (a, b) => a[0] - b[0] + limit)
+}

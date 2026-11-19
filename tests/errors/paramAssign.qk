@@ -1,0 +1,9 @@
+// error: "p" is a parameter (parameters never change): copy it into a var
+fn bump(p: Int) -> Int {
+    p = p + 1
+    p
+}
+
+fn main() {
+    print(bump(1))
+}

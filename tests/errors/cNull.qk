@@ -1,0 +1,6 @@
+// error: C's NULL is a Pointer<T>? or a CText? that is None
+extern fn twice(n: Int32?) -> Int32
+
+fn main() {
+    print(twice(2))
+}

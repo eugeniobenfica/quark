@@ -1,0 +1,6 @@
+// error: Int32 is one of C's types: it is written in extern declarations
+fn half(n: Int32) -> Int = n / 2
+
+fn main() {
+    print(half(4))
+}

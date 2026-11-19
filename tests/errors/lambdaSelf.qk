@@ -1,0 +1,5 @@
+// error: fact is not made yet inside its own lambda: a function that calls itself is a fn of its own
+fn main() {
+    let fact: (Int) -> Int = n => if n == 0 { 1 } else { n * fact(n - 1) }
+    print(fact(5))
+}

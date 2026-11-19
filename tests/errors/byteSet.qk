@@ -1,0 +1,6 @@
+// error: a byte of Bytes is not set in place
+fn main() {
+    var b: Bytes = [1, 2]
+    b[0] = 3
+    print(b)
+}

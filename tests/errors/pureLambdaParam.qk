@@ -1,0 +1,11 @@
+// error: a lambda given to apply is pure: it cannot change seen
+fn apply(xs: [Int], f: (Int) -> Int) -> [Int] = xs.map(f)
+
+fn main() {
+    var seen: [Int] = []
+    let ys = apply([1, 2], x => {
+        seen.push(x)
+        x
+    })
+    print(ys, seen)
+}

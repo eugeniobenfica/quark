@@ -1,0 +1,4 @@
+// error: print is built in: it is called, not kept as a value
+fn main() {
+    let f = print
+}

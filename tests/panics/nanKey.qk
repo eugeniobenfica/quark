@@ -1,0 +1,7 @@
+// panic: NaN cannot be a map's key
+fn main() {
+    var m: [Float: Int] = [1.0: 1]
+    let zero = 0.0
+    print(m[zero / zero] ?? -1)
+    m[zero / zero] = 2
+}

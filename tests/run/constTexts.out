@@ -1,0 +1,8 @@
+[3.0, 4.0] hello solo [none, few 1, many 7]
+AÇÃO été  [a, b, , c] many+words [true, true, true, false] a+b+c x y
+2.5 10 0.3333333333333333 true [97, 241, 8364] 3 €a Bytes[0x61, 0xc3, 0xb1] [42, -1, -1] Err(not a number: "1.5.2") 2.25 Some(2) [true, false, true] one 1
+true true true
+true true true
+true true
+true true
+Err(too big for an Int: "99999999999999999999") Ok(7) Err(not a number: " 7") -1.0

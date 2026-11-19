@@ -1,0 +1,9 @@
+// error: parallelMap gives values without functions in them
+type Step { name: Text, run: (Int) -> Int }
+
+fn step(n: Int) -> Step = Step("x" + n.toText(), x => x + 1)
+
+fn main() {
+    let steps = [1, 2].parallelMap(step)
+    print(len(steps))
+}

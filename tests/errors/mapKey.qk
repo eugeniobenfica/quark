@@ -1,5 +1,5 @@
-// error: a map's key is an Int, a Text, a Bool, an enum's case or a record of two Ints, not Float
+// error: a map's key must support hashing and equality
 fn main() {
-    let m: [Float: Int] = [:]
+    let m: [[Int]: Int] = [:]
     print(m)
 }

@@ -1,0 +1,34 @@
+// Small things that work as written: a generic record made from [] takes the written type, t.0.1 reaches into
+// tuples of tuples, a lambda takes up to 16 values, print shows its values after making all of them.
+type Stack<T> { items: [T] }
+
+fn loud(name: Text) -> Text {
+    print("making", name)
+    name
+}
+
+fn main() {
+    var s: Stack<Int> = Stack([])
+    s = Stack(s.items + [1, 2])
+    print(s.items, len(s.items))
+    let t = ((1, 2), (3, (4, 5)))
+    print(t.0.1, t.1.0, t.1.1.1)
+    let sum16 = (a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Int, k: Int, l: Int, m: Int, n: Int, o: Int, p: Int) => a
+        + b
+        + c
+        + d
+        + e
+        + f
+        + g
+        + h
+        + i
+        + j
+        + k
+        + l
+        + m
+        + n
+        + o
+        + p
+    print(sum16(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+    print(loud("a"), loud("b"))
+}

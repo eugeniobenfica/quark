@@ -1,0 +1,6 @@
+// error: & | ^ << >> work on the bits of Ints, not Float and Int
+fn main() {
+    var f = 1.5
+    f <<= 1
+    print(f)
+}

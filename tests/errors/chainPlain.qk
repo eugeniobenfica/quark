@@ -1,0 +1,5 @@
+// error: ?. reads into an optional or a result, not Int
+fn main() {
+    let n = 3
+    print(n?.toFloat())
+}

@@ -1,0 +1,5 @@
+// panic: index 3 is outside the array (its length is 3)
+fn main() {
+    let b = "abc".bytes()
+    print(b[2], b[len(b)])
+}

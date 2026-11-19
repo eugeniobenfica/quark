@@ -1,0 +1,14 @@
+// Loops over arrays (4 elements at a time with --release) stop the program when a value goes past an Int's limits,
+// and only then: not for a value right at them, nor for one a filter left out; +% -% *% wrap around.
+fn main() {
+    var xs = (0..1000).toArray()
+    xs[10] = 9223372036854775807 - (999 * 1000 / 2 - 10) // the sum: exactly the largest Int
+    print(xs.sum(), xs.filter(k => k < 1000).sum())
+    xs[20] = 3074457345618258602 // times 3: the largest multiple of 3
+    print(xs
+        .filter(k => k < 3074457345618258603)
+        .map(k => k * 3)
+        .len())
+    print(xs.filter(k => k < 1000).map(k => k * 3 + 1).sum())
+    print(xs.map(k => k *% 3 +% 1).fold(0, (a, b) => a +% b), xs.map(k => k - 1).filter(k => k < 0).len())
+}

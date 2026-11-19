@@ -1,0 +1,11 @@
+// error: only self can be var
+type Counter { n: Int }
+
+fn Counter.add(var self, var k: Int) {
+    self.n += k
+}
+
+fn main() {
+    var c = Counter(0)
+    c.add(1)
+}

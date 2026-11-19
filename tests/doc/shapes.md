@@ -5,7 +5,7 @@
 ### interface Shaped
 
 ```quark
-pub type Shaped { fn area() -> Float }
+pub interface Shaped { fn area() -> Float }
 ```
 
 Anything with an area: a shape <of any kind> & size.

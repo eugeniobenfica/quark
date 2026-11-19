@@ -1,0 +1,3 @@
+Server(host: localhost, port: 8080, tags: [], secure: false) Server(host: localhost, port: 9000, tags: [], secure: false) Server(host: example.org, port: 8080, tags: [web], secure: true)
+Point(x: 0.0, y: 0.0) Point(x: 1.0, y: 2.0) true
+[build:Careful:3, test:Fast:3, ship:Careful:1]

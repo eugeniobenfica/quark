@@ -1,0 +1,192 @@
+// Changing a value where it is: var self functions, and places reached through fields, elements and map values.
+type Token { text: Text, kind: Int }
+type Parser { tokens: [Token], at: Int }
+
+// the next token, and the parser moves past it
+fn Parser.next(var self) -> Token? {
+    if self.at >= len(self.tokens) {
+        return None
+    }
+    self.at += 1
+    Some(self.tokens[self.at - 1])
+}
+
+fn Parser.peek(self) -> Text = if self.at < len(self.tokens) {
+    self.tokens[self.at].text
+} else {
+    ""
+}
+
+fn Parser.skip(var self, n: Int) {
+    defer {
+        self.at = min(self.at, len(self.tokens))
+    }
+    self.at += n
+}
+
+type Stack<T> { items: [T] }
+
+fn Stack.push(var self, x: T) {
+    self.items.push(x)
+}
+
+fn Stack.pop(var self) -> T? {
+    let n = len(self.items)
+    if n == 0 {
+        return None
+    }
+    let top = self.items[n - 1]
+    self.items = self.items[0..n - 1]
+    Some(top)
+}
+
+enum Light { On, Off }
+
+fn Light.toggle(var self) {
+    self = match self {
+        On => .Off
+        Off => .On
+    }
+}
+
+type Counter { n: Int }
+
+fn Counter.countDown(var self, k: Int) {
+    if k == 0 {
+        return
+    }
+    self.n += 1
+    self.countDown(k - 1)
+}
+
+type Sym { name: Text, uses: Int }
+type Table { syms: [Sym], byName: [Text: Int], seen: Set<Text> }
+
+fn Table.add(var self, name: Text) {
+    self.byName[name] = len(self.syms)
+    self.syms.push(Sym(name, 0))
+    self.seen.add(name)
+}
+
+fn Table.touch(var self, name: Text) {
+    let at = self.byName[name] ?? return
+    self.syms[at].uses += 1
+}
+
+type Box { items: [Int], tag: Text }
+
+fn Box.addAll(var self, xs: [Int]) {
+    for x in xs {
+        self.items.push(x)
+    }
+}
+
+type Game { table: Table, counter: Counter, boxes: [Box] }
+
+fn rowsOf(g: [[Int]]) -> [[Int]] = g
+
+enum Shape { Circle(radius: Float), Rect(width: Float, height: Float), Empty }
+type Item { name: Text, shape: Shape, count: Int }
+
+fn main() {
+    // records pushed one after another (the optimizing tier once put the second where the third goes)
+    var items: [Item] = []
+    items.push(Item("plate", .Circle(1.0), 4))
+    items.push(Item("tray", .Rect(2.0, 3.0), 2))
+    items.push(Item("void", .Empty, 0))
+    print(items)
+
+    // a parser's state, moved by its own functions
+    var p = Parser([Token("fn", 1), Token("main", 2), Token("(", 3), Token(")", 4)], 0)
+    let first = p.next() ?? Token("", 0)
+    p.skip(1)
+    print(first.text, p.peek(), p.at)
+    p.skip(10)
+    print(p.at, p.next())
+    var kinds = 0
+    p.at = 0
+    while p.next() is Some(t) {
+        kinds += t.kind
+    }
+    print(kinds)
+
+    // generic, enum and recursive ones
+    var s: Stack<Text> = Stack([])
+    s.push("a")
+    s.push("b")
+    print(s.pop(), s.pop(), s.pop(), s)
+    var light = Light.On
+    light.toggle()
+    print(light)
+    var c = Counter(0)
+    c.countDown(500)
+    print(c.n)
+
+    // places through fields, elements and map values
+    var t = Table([], [:], [])
+    for name in ["x", "y", "z"] {
+        t.add(name)
+    }
+    for i in 0..10 {
+        t.touch(["x", "y", "z", "w"][i % 4])
+    }
+    t.syms[2].uses *= 10
+    print(t.syms, len(t.seen))
+    var grid = [[0] * 4] * 3
+    for i in 0..3 {
+        for j in 0..4 {
+            grid[i][j] = i * 10 + j
+        }
+    }
+    grid[2][3] += 100
+    print(grid)
+    var groups: [Text: [Int]] = [:]
+    for w in ["odd", "even"] {
+        groups[w] = []
+    }
+    for i in 0..7 {
+        groups[if i % 2 == 0 { "even" } else { "odd" }].push(i)
+    }
+    groups["odd"][0] = -1
+    print(groups)
+    var g = Game(Table([], [:], []), Counter(0), [Box([1], "a")])
+    g.table.add("q")
+    g.table.touch("q")
+    g.counter.countDown(3)
+    g.boxes[0].addAll([2, 3])
+    g.boxes[0].items.push(4)
+    g.boxes.push(Box([], "b"))
+    g.boxes[1].tag = "c"
+    print(g.table.syms, g.counter, g.boxes)
+
+    // still values: copies are their own, and a let never changes
+    var a = Box([1, 2, 3], "a")
+    var b = a
+    b.items[0] = 100
+    let frozen = b
+    b.items.push(4)
+    b.addAll(b.items)
+    print(a.items, frozen.items, b.items)
+    var rows = [[1, 2], [3, 4]]
+    let before = rows
+    let given = rowsOf(rows)
+    var kept: [[Int]] = []
+    for r in rows {
+        kept.push(r)
+    }
+    let firstRow = rows[0]
+    rows[0][0] = 9
+    rows[1].push(5)
+    print(before, given, kept, firstRow, rows)
+
+    // many turns that make things: the loop's memory comes back, the changes stay
+    var words: Table = Table([], [:], [])
+    for i in 0..200000 {
+        let name = "w{i % 500}"
+        if not words.seen.contains(name) {
+            words.add(name)
+        }
+        words.touch(name)
+    }
+    print(len(words.syms), words.syms[499], words.syms.map(x => x.uses).sum())
+}

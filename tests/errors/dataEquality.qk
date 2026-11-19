@@ -1,6 +1,6 @@
 // error: carries data: compare it with match
-enum Shape { Polygon(points: [Float]), Empty }
+enum Action { Run(f: () -> Int), Stop }
 
 fn main() {
-    print(Shape.Polygon([1, 2]) == Shape.Empty)
+    print(Action.Run(() => 1) == Action.Stop)
 }

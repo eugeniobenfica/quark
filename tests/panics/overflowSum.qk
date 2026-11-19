@@ -1,0 +1,5 @@
+// panic: an Int went past its limits (overflow; +% -% *% wrap around)
+fn main() {
+    let xs = (0..1000).map(i => if i == 10 { 9223372036854775807 - 1000 } else { i })
+    print(xs.sum())
+}

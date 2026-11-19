@@ -1,0 +1,62 @@
+use std.json
+
+interface Reader { fn read() -> Int }
+type Value { number: Int }
+type Batch { values: [Int] }
+enum Failure { Missing, Invalid }
+
+const seed = start(0x0a)
+
+fn start(n: Int) -> Value {
+    let mask = 0b11
+    Value(n | mask)
+}
+
+fn Value.read(self) -> Int = self.number
+
+fn Batch.items(self) -> [Int] = self.values
+
+fn checked(n: Int) -> Int {
+    assert(n != 0)
+    n
+}
+
+fn missing() -> Unit ! Failure = Err(Failure.Missing)
+
+pub effect fn logValue(value: Int) {
+    print(value)
+}
+
+fn main() {
+    let reader: Reader = seed
+    logValue(reader.read())
+    let _ = missing()
+    let values = [1, 0].map(checked)
+    print(values.first())
+    print(values.first())
+    print([0].map(checked).take(0).first())
+    for (index, value) in [4, 6, 7].skip(1).enumerate() {
+        print(index, value)
+    }
+    for (key, value) in ["a": 3, "b": 5] {
+        print(key, value)
+    }
+    let batch = Batch([2, 3])
+    for value in batch {
+        print(value)
+    }
+    print(batch.map(x => x * 2).sum())
+    let answer = match true {
+        true => "yes"
+        false => "no"
+    }
+    let status = match Failure.Missing {
+        Missing | Invalid => "failed"
+    }
+    print(answer, status, len("ação"), len("ação".codePoints()))
+    print(toJson(parseJson("9007199254740993")?), toJson(parseJson("1e30")?))
+    print(toJson(parseJson("18446744073709551616")?), toJson(parseJson("-0")?))
+    let big = parseJson("9007199254740993")?
+    print(big.integer())
+    let _ = writeFile("build/no/such/file", "") ?? ()
+}

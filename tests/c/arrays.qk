@@ -1,0 +1,26 @@
+// Arrays of C's types, given to C: C's array (its first element's address), each element as C lays it out.
+extern fn memcmp(a: [UInt8], b: [UInt8], count: UInt64) -> Int32
+extern fn strlen(text: [Int8]) -> UInt64
+extern effect fn malloc(size: UInt64) -> Pointer<UInt8>?
+extern effect fn free(p: Pointer<UInt8>)
+extern effect fn copyFloats(to: Pointer<Float32>, from: [Float32], bytes: UInt64) -> Pointer<Float32> as "memcpy"
+extern effect fn copyTexts(to: Pointer<CText>, from: [CText], bytes: UInt64) -> Pointer<CText> as "memcpy"
+extern type Point { x: Int16, y: Float32 }
+extern effect fn copyPoints(to: Pointer<Point>, from: [Point], bytes: UInt64) -> Pointer<Point> as "memcpy"
+
+fn main() {
+    // UInt8: each element's low 8 bits (300 is 44)
+    print(memcmp([1, 2, 3], [1, 2, 4], 3) < 0, memcmp([1, 2, 300], [1, 2, 44], 3) == 0)
+    print(strlen(['h', 'i', 0, 'x']))
+    let room = malloc(64) ?? panic("out of memory")
+    let floats = Pointer<Float32>(room)
+    let _ = copyFloats(floats, [1.5, 2.25, -3.0, 0.1], 16)
+    print(floats[0], floats[1], floats[2], floats[3] == 0.1)
+    let texts = Pointer<CText>(room)
+    let _ = copyTexts(texts, ["zero-ended", "copies"], 16)
+    print(texts[0], texts[1])
+    let points = Pointer<Point>(room)
+    let _ = copyPoints(points, [Point(1, 0.5), Point(-2, 1.5)], 16)
+    print(points[0], points[1])
+    free(room)
+}

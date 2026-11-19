@@ -10,4 +10,5 @@ fn main() {
     }
     let v = geo.Vec2(1, 2) + geo.Vec2(3, 4) // its operators work through the alias
     print(v, area(3), geo.Shape.Circle(2))
+    print("a circle of {geo.area(geo.Shape.Circle(1))}") // interpolation sees the alias too
 }

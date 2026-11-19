@@ -1,0 +1,9 @@
+// error: a function value takes copies of the names it uses: count cannot change inside it
+fn main() {
+    var count = 0
+    let next: () -> Int = () => {
+        count = count + 1
+        count
+    }
+    print(next())
+}

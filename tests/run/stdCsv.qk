@@ -1,0 +1,28 @@
+// std.csv (RFC 4180: quotes, doubled quotes, separators and line breaks inside quotes, \r\n) and std.files'
+// walkFiles (every file under a folder, sorted).
+use std.csv
+use std.files
+
+fn main() {
+    let text = "name,age,note\r\nAna,31,\"likes \"\"tea\"\", and cake\"\nBia,27,\"two\nlines\"\nCaio,40,"
+    let rows = parseCsv(text)?
+    print(len(rows), rows[1], rows[2][2], rows[3])
+    for r in csvRecords(rows) {
+        print(r["name"] ?? "?", r["age"] ?? "?", len(r["note"] ?? ""))
+    }
+    print(toCsv([["a", "b,c"], ["say \"hi\"", "x\ny"]]))
+    print(parseCsv("a;b\n1;2", separator: ';'), parseCsv("\"open"), parseCsv("\"a\"b"), parseCsv(""))
+    let dir = (env("TEMP") ?? env("TMPDIR") ?? "/tmp") + "/quark-walk"
+    makeDir(dir + "/b/c")?
+    writeFile(dir + "/a.txt", "1")?
+    writeFile(dir + "/b/x.txt", "2")?
+    writeFile(dir + "/b/c/y.txt", "3")?
+    let files = walkFiles(dir)?
+    print(files.map(f => f[len(dir)..]).toArray())
+    for f in files.reversed() {
+        removePath(f)?
+    }
+    removePath(dir + "/b/c")?
+    removePath(dir + "/b")?
+    removePath(dir)?
+}

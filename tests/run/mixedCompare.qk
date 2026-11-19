@@ -1,0 +1,38 @@
+// An Int and a Float compare as numbers, exactly: the Int is not rounded to a Float first. NaN is unordered.
+fn sign(x: Float) -> Text = match x {
+    ..0 => "negative"
+    0 => "zero"
+    9007199254740993 => "2^53 + 1"
+    9223372036854775807 => "the largest Int"
+    _ => "positive"
+}
+
+fn main() {
+    let big = 9007199254740993
+    let near = 9007199254740992.0
+    print(big == near, big != near, big > near, big >= near, big < near, near < big, near == big)
+    let n = 3
+    print(n < 3.5, n == 3.0, 2.5 < n, n <= 3.0, n >= 3.0, -n > -3.5)
+    let nan = 0.0 / 0.0
+    print(n == nan, n != nan, n < nan, n >= nan, nan > n)
+    let top = 9223372036854775807
+    let bottom = -9223372036854775807 - 1
+    print(
+        top < 9223372036854775807.0,
+        top == 9223372036854775807.0,
+        bottom == -9223372036854775808.0,
+        bottom > -1.0e300,
+    )
+    print(1.0e300 > top, 0.5 > 0, -0.0 == 0)
+    print(
+        sign(-0.5),
+        sign(0.0),
+        sign(near),
+        sign(9007199254740994.0),
+        sign(2.5),
+        sign(nan),
+        sign(9223372036854775808.0),
+    )
+    let xs = [1.5, 2.0, 2.5, 3.0]
+    print(xs.filter(x => x > n - 1), xs.map(x => x == 2).count(b => b))
+}

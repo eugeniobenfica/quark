@@ -1,0 +1,4 @@
+// error: invalid octal integer literal
+fn main() {
+    print(0o19)
+}

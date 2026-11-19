@@ -1,0 +1,5 @@
+// error: return inside a lambda: a lambda is one expression
+fn main() {
+    let xs = [1, 2, 3].map(x => if x > 1 { x } else { return 0 })
+    print(xs)
+}

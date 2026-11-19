@@ -1,0 +1,129 @@
+// A place in a var self given the value of a var self call on the same self: the call's own changes to self come
+// back, then the value goes into the place (resolve is too big to inline: a real call; small selves in registers,
+// large ones by address, on every tier).
+type Inner { hint: Int, b: Int }
+type Small { c: Inner, n: Int }
+type Large { c: Inner, a: Inner, items: [Int], n: Int, name: Text }
+
+fn Small.resolve(var self, t: Int) -> Int {
+    self.n += 1
+    if t < -1000 {
+        self.c.b = self.c.b * 2 + self.n - 0
+        self.c.b = self.c.b * 3 + self.n - 1
+        self.c.b = self.c.b * 4 + self.n - 2
+        self.c.b = self.c.b * 5 + self.n - 3
+        self.c.b = self.c.b * 6 + self.n - 4
+        self.c.b = self.c.b * 7 + self.n - 5
+        self.c.b = self.c.b * 8 + self.n - 6
+        self.c.b = self.c.b * 9 + self.n - 7
+        self.c.b = self.c.b * 10 + self.n - 8
+        self.c.b = self.c.b * 11 + self.n - 9
+        self.c.b = self.c.b * 12 + self.n - 10
+        self.c.b = self.c.b * 13 + self.n - 11
+        self.c.b = self.c.b * 14 + self.n - 12
+        self.c.b = self.c.b * 15 + self.n - 13
+    }
+    if t > 0 {
+        return self.resolve(t - 1) + 10
+    }
+    self.c.b += 100
+    self.n
+}
+
+fn Small.bump(var self) -> Int {
+    self.n += 1
+    if self.n > 1000 {
+        return self.resolve(3)
+    }
+    self.n
+}
+
+fn Small.run(var self, t: Int) {
+    self.c.hint = self.resolve(t)
+    self.c.b += self.bump()
+    self.n = self.bump() * 2
+}
+
+fn Large.resolve(var self, t: Int) -> Int {
+    self.n += 1
+    if t < -1000 {
+        self.a.b = self.a.b * 2 + self.n - 0
+        self.a.b = self.a.b * 3 + self.n - 1
+        self.a.b = self.a.b * 4 + self.n - 2
+        self.a.b = self.a.b * 5 + self.n - 3
+        self.a.b = self.a.b * 6 + self.n - 4
+        self.a.b = self.a.b * 7 + self.n - 5
+        self.a.b = self.a.b * 8 + self.n - 6
+        self.a.b = self.a.b * 9 + self.n - 7
+        self.a.b = self.a.b * 10 + self.n - 8
+        self.a.b = self.a.b * 11 + self.n - 9
+        self.a.b = self.a.b * 12 + self.n - 10
+        self.a.b = self.a.b * 13 + self.n - 11
+        self.a.b = self.a.b * 14 + self.n - 12
+        self.a.b = self.a.b * 15 + self.n - 13
+    }
+    if t > 0 {
+        return self.resolve(t - 1) + 10
+    }
+    self.a.b += 100
+    self.items.push(self.n)
+    self.n
+}
+
+fn Large.next(var self) -> Int {
+    self.n += 1
+    if self.n > 1000 {
+        return self.resolve(3)
+    }
+    self.n
+}
+
+fn Large.run(var self, t: Int) {
+    self.c.hint = self.resolve(t)
+    self.items[0] = self.next()
+    self.a.b += self.next()
+    self.name = "{self.resolve(1)}"
+    self.c.b = self.resolve(0)
+}
+
+fn main() {
+    var s = Small(Inner(0, 0), 0)
+    s.run(2)
+    print(s.c.hint, s.c.b, s.n)
+    s.c.hint = s.resolve(1)
+    print(s.c.hint, s.c.b, s.n)
+    var l = Large(Inner(0, 0), Inner(0, 0), [], 0, "")
+    l.run(2)
+    print(l.c.hint, l.c.b, l.a.b, l.items, l.n, l.name)
+    var ls = [l, l]
+    ls[1].c.hint = ls[1].resolve(1)
+    print(ls[1].c.hint, ls[1].n, ls[0].n, ls[1].items)
+    tail()
+}
+
+// a value read from self next to a call that changes self: self as the call left it (an index, an operand, an
+// argument, a field of a record made)
+type Pair { a: Int, b: Int }
+
+fn Large.add(var self, x: Int) -> Int {
+    self.items.push(x)
+    if x < -1000 {
+        return self.resolve(3)
+    }
+    len(self.items) - 1
+}
+
+fn Large.at(self, i: Int) -> Int = self.items[i]
+
+fn Large.order(var self) -> Text {
+    let one = self.items[self.add(70)]
+    let two = self.n + self.next()
+    let three = self.at(self.add(80))
+    let four = Pair(len(self.items), self.add(90))
+    "{one} {two} {three} {four.a} {four.b} {len(self.items)}"
+}
+
+fn tail() {
+    var l = Large(Inner(0, 0), Inner(0, 0), [1], 5, "")
+    print(l.order(), l.items)
+}

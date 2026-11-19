@@ -6,7 +6,7 @@ type Job { name: Text, cost: Int }
 fn Job.compare(self, b: Job) -> Int = self.cost - b.cost
 
 fn main() {
-    var q: Queue<Int> = Queue.Empty
+    var q: Queue<Int> = .Empty
     print(q.isEmpty(), q.front(), q.popFront().size())
     for i in 1..6 {
         q = q.pushBack(i)
@@ -30,12 +30,12 @@ fn main() {
     let h = heapOf([5, 1, 4, 1, 3, 9, 2])
     print(h.top(), h.size(), h.toArray(), h.pop().pop().top(), h.top())
     print(heapOf(["pear", "fig", "apple"]).toArray(), h.merge(heapOf([0, 7])).toArray())
-    var jobs: Heap<Job> = Heap.Empty
+    var jobs: Heap<Job> = .Empty
     jobs = jobs.push(Job("build", 30)).push(Job("test", 10)).push(Job("ship", 50))
     print((jobs.top() ?? Job("none", 0)).name, jobs.toArray().map(j => j.name))
     let ranked = heapOf([Keyed(3.5, "c"), Keyed(1.0, "a"), Keyed(2.0, "b")])
     print(ranked.toArray().map(k => k.value), (ranked.top() ?? Keyed(0.0, "")).value)
-    var many: Heap<Int> = Heap.Empty
+    var many: Heap<Int> = .Empty
     for i in 0..10_000 {
         many = many.push(i * 7919 % 10_007)
     }

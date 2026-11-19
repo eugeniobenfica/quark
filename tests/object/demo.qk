@@ -5,7 +5,7 @@ fn area(w: Float, h: Float) -> Float = w * h * hostScale()
 
 fn greet(times: Int) {
     for i in 0..times {
-        print("hello {i} from an object file, {upper("ação")}")
+        print("hello {i} from an object file, {"ação".upper()}")
     }
 }
 

@@ -1,0 +1,26 @@
+// A literal takes the types it lacks ([], [:], None, .Case) from where it goes: a parameter, a function's result, a
+// return, a block's last value, a tuple's place, an element of a list or map.
+enum Color { Red, Green }
+
+fn tally(m: [Text: Color]) -> Int = m.count(e => e.value == .Red)
+
+fn pair() -> ([Int], Int) = ([], 0)
+
+fn named(first: Int, colors: [Color] = []) -> Int = first + len(colors)
+
+fn early(n: Int) -> ([Text], Color?) {
+    if n > 0 {
+        return ([], None)
+    }
+    (["x"], .Green)
+}
+
+fn table() -> [Text: ([Int], Color)] = ["a": ([], .Red), "b": ([1, 2], .Green)]
+
+fn main() {
+    print(tally(["a": .Red, "b": .Green, "c": .Red]), pair(), named(1, colors: [.Red, .Green]))
+    let (xs, n) = pair()
+    print(xs, n, early(1), early(0))
+    let rows: [([Int], Color?)] = [([], None), ([3], .Red)]
+    print(rows, table()["a"] ?? ([9], .Green))
+}

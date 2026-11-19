@@ -1,0 +1,4 @@
+// error: and above are not UTF-8 in a text
+fn main() {
+    print("caf\xe9")
+}

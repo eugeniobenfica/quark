@@ -1,0 +1,11 @@
+[7, 100, 50, -1] [5, 2, 20, 40, -7] [yes, no] [3, 7]
+[1, 10, 12, 20, 21, 23, 30, 31, 32, 34] [[0, 0, -1, 2, -2, 50, 99], [1], [0, 0]] [Ok(42), Err(not a number: "x")] [Some(5), None] [111, 4999950000]
+0=a 1=b 2=c  [x: 3, y: 1, z: 1] p2q1 p:2 q:1 [3, 469] [[0, 0, 0], [0, -1, 2], [0, 2, 4]] Counter(n: 5, seen: [3, 4, 5]) [abc-d, none] [1, 2, 3] [Err(not a number: "1234567890123456789012345678901234567890…"), Err(not a number: "short")]
+true true
+true true true
+true true true
+true true true
+true true true true
+true true
+true Err(not a number: "1.2.301234567890123456789012345678901234…")
+Err(not a number: "ñ012345678901234567890123456789012345678…")

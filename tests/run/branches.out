@@ -1,0 +1,4 @@
+Ok(2) Err(Fault.Bad(why: odd)) Ok(1) Err(Fault.Bad(why: not zero))
+Err(Fault.Zero) Err(Fault.Bad(why: two)) Ok(7) Ok(12)
+1 2 3 0 -1
+Ok(())

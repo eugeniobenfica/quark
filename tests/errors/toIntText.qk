@@ -1,0 +1,7 @@
+// error: parseInt(t) reads an Int from a text
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    let n = toInt("3")
+    print(x, xs)
+}

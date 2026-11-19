@@ -1,0 +1,6 @@
+// error: expected Int, found Text
+fn main() {
+    let n = 3
+    let s: Int = r"{n}"
+    print(s)
+}

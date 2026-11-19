@@ -1,0 +1,59 @@
+// tests/bind/shapes.h, as Quark declares it (quark bind; C's long is 32 bits: Windows).
+pub const bits = 4
+pub const version = "2.1"
+pub const maxPoints = 16
+pub const scale = 2.5
+pub const mask = 255
+pub const circle = 0
+pub const square = 4
+pub const both = 4
+
+pub extern type Point { x: Float64, y: Float64 }
+pub extern type Canvas
+
+pub extern type Style {
+    rgba0: UInt8
+    rgba1: UInt8
+    rgba2: UInt8
+    rgba3: UInt8
+    name: CText?
+    at: Point
+    kind: Int32
+    weight: Int32
+}
+
+pub extern type Ops {
+    compare: (extern (Pointer<UInt8>, Pointer<UInt8>) -> Int32)?
+    draw: (extern (Pointer<Canvas>, Int32) -> Unit)?
+}
+
+pub extern type Value // a union: used through Pointer<Value>
+pub extern type Flags // not laid out here (bit fields, long arrays or types Quark has none for): used through Pointer<Flags>
+pub extern effect fn open(title: CText?, width: UInt64, height: UInt64) -> Pointer<Canvas>? in "shapes" as "shapes_open"
+pub extern effect fn close(canvas: Pointer<Canvas>?) in "shapes" as "shapes_close"
+
+pub extern effect fn draw(
+    canvas: Pointer<Canvas>?,
+    style: Pointer<Style>?,
+    points: Pointer<Point>?,
+    count: UInt64,
+) -> Int32 in "shapes" as "shapes_draw"
+
+pub extern effect fn middle(a: Point, b: Point) -> Point in "shapes" as "shapes_middle"
+
+pub extern effect fn sort(
+    points: Pointer<Point>?,
+    count: UInt64,
+    compare: (extern (Pointer<UInt8>, Pointer<UInt8>) -> Int32)?,
+) in "shapes" as "shapes_sort"
+
+pub extern effect fn read(canvas: Pointer<Canvas>?, out: Pointer<UInt8>?, room: UInt32) -> UInt32 in "shapes" as "shapes_read"
+pub extern effect fn shapesLog(format: CText?, ...) -> Int32 in "shapes" as "shapes_log"
+pub extern effect fn name(kind: Int32) -> CText? in "shapes" as "shapes_name"
+pub extern effect fn defaultCompare() -> (extern (Pointer<UInt8>, Pointer<UInt8>) -> Int32)? in "shapes" as "shapes_default_compare"
+pub extern effect fn opsOf(canvas: Pointer<Canvas>?) -> Pointer<Ops>? in "shapes" as "shapes_ops_of"
+
+// Not written (3):
+//   shapes_count: a variable of the library (only functions are called)
+//   shapes_set: a struct C does not lay out here, by value (parameter 2)
+//   shapes_print: a va_list (parameter 2)

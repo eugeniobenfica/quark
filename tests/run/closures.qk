@@ -8,7 +8,7 @@ fn compose(f: (Int) -> Int, g: (Int) -> Int) -> (Int) -> Int = x => g(f(x))
 fn counterFrom(start: Int) -> () -> Int = () => start * 10
 
 fn makeButtons(names: [Text]) -> [Button] =
-    names.map(n => Button(n, () => "pressed {upper(n)}")).toArray()
+    names.map(n => Button(n, () => "pressed {n.upper()}")).toArray()
 
 fn main() {
     let add2 = adder(2)

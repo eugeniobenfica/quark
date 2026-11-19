@@ -16,7 +16,7 @@ fn area(s: Shape) -> Float = match s {
 }
 
 fn find(names: [Text], wanted: Text) -> Int? {
-    for name, i in names {
+    for (i, name) in names.enumerate() {
         if name == wanted {
             return i
         }
@@ -47,7 +47,7 @@ fn main() {
         None => print("missing")
     }
     let joined = names[0] + " & " + names[2]
-    print(joined, len(joined), "abc" < "abd", "b" == "b", toText(2.5) + "!", "{true} {Shape.Empty}")
+    print(joined, len(joined), "abc" < "abd", "b" == "b", 2.5.toText() + "!", "{true} {Shape.Empty}")
     var squares: [Int] = []
     for i in 0..10 {
         squares.push(i * i)
@@ -58,4 +58,8 @@ fn main() {
         total += len(names[i])
     }
     print(total, "escapes: \{braces\} {"inner {1 + 1}"}")
+    var grown = [1, 2]
+    grown += [3]
+    grown += (4..6).map(x => x * 10)
+    print(grown)
 }

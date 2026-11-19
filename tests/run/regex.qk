@@ -2,7 +2,7 @@
 use std.regex
 
 fn show(m: Match?) -> Text = match m {
-    Some(x) => "{x.start}..{x.end} \"{x.text}\" [" + join(x.groups, ", ") + "]"
+    Some(x) => "{x.start}..{x.end} \"{x.text}\" [" + x.groups.join(", ") + "]"
     None => "none"
 }
 
@@ -12,7 +12,27 @@ fn check(p: Text) -> Text = match regex(p) {
 }
 
 fn main() {
-    let cases = [("a+b", "xxaabyab"), ("colou?r", "the color and colour"), ("^\\d\{3\}-\\d\{4\}$", "555-1234"), ("[a-c]+", "zzabcabz"), ("[^a-z ]+", "hello WORLD 42"), ("(\\w+)@(\\w+)\\.com", "write to ana@mail.com today"), ("<.+>", "<a><b>"), ("<.+?>", "<a><b>"), ("(?:ab)+", "xabababy"), ("cat|dog|bird", "hotdog"), ("\\bis\\b", "this island is"), ("x*", "abc"), ("(a)|(b)", "b"), ("é+", "caféé!"), ("a\{2,3\}", "aaaa"), ("a\{2,\}", "caaaaat"), ("\\s+$", "trailing   "), ("[\\d.]+", "pi is 3.14"), ("a.c", "a\nc abc")]
+    let cases = [
+        ("a+b", "xxaabyab"),
+        ("colou?r", "the color and colour"),
+        (r"^\d{3}-\d{4}$", "555-1234"),
+        ("[a-c]+", "zzabcabz"),
+        ("[^a-z ]+", "hello WORLD 42"),
+        (r"(\w+)@(\w+)\.com", "write to ana@mail.com today"),
+        ("<.+>", "<a><b>"),
+        ("<.+?>", "<a><b>"),
+        ("(?:ab)+", "xabababy"),
+        ("cat|dog|bird", "hotdog"),
+        (r"\bis\b", "this island is"),
+        ("x*", "abc"),
+        ("(a)|(b)", "b"),
+        ("é+", "caféé!"),
+        (r"a{2,3}", "aaaa"),
+        (r"a{2,}", "caaaaat"),
+        (r"\s+$", "trailing   "),
+        (r"[\d.]+", "pi is 3.14"),
+        ("a.c", "a\nc abc"),
+    ]
     for c in cases {
         let (p, text) = c
         let r = regex(p)?
@@ -20,14 +40,24 @@ fn main() {
     }
     let word = regex("[A-Za-z]+")?
     print(word.findAll("one, two; three!").map(m => m.text), word.matches("hello"), word.matches("hello!"))
-    print(regex("a*")?.findAll("baaac").map(m => "{m.start}:{m.text}"))
-    let date = regex("(\\d\{4\})-(\\d\{2\})-(\\d\{2\})")?
+    let stars = regex("a*")?
+    print(stars.findAll("baaac").map(m => "{m.start}:{m.text}"))
+    let date = regex(r"(\d{4})-(\d{2})-(\d{2})")?
     print(date.replaceAll("from 2026-11-13 to 2027-01-02", "$3/$2/$1"), date.replaceAll("2026-11-13", "$$$0"))
-    print(word.replaceEach("make it loud", m => upper(m.text)), regex(",\\s*")?.split("a, b,c,   d"))
-    print(show(regex("(a|ab)(c|bcd)(d*)")?.find("abcd")), regex("^$")?.matches(""), regex("^a|b$")?.findAll("ab").len())
+    let commas = regex(r",\s*")?
+    print(word.replaceEach("make it loud", m => m.text.upper()), commas.split("a, b,c,   d"))
+    let (groups, empty, ends) = (regex("(a|ab)(c|bcd)(d*)")?, regex("^$")?, regex("^a|b$")?)
+    print(show(groups.find("abcd")), empty.matches(""), ends.findAll("ab").len())
     let slow = regex("(a*)*b")?
-    print(slow.matches(repeat("a", 5000)), slow.matches(repeat("a", 5000) + "b"))
-    for bad in ["a(b", "a)b", "[abc", "*a", "a\{3,1\}", "x\\", "[z-a]", "[\\D]", "^*"] {
+    print(slow.matches("a" * 5000), slow.matches("a" * 5000 + "b"))
+    // a character is a code point, however many bytes it takes; offsets are bytes
+    for (p, t) in [("[à-ü]+", "naïve café"), ("a.c", "aéc a€c"), (r"€{2}", "€€€"), ("[^a]", "😀a")] {
+        let r = regex(p)?
+        print(p, "|", r.findAll(t).map(m => "{m.start}..{m.end} {m.text}"))
+    }
+    let xs = regex("x*")?
+    print(xs.findAll("é😀").map(m => m.start))
+    for bad in ["a(b", "a)b", "[abc", "*a", r"a{3,1}", r"x\", "[z-a]", r"[\D]", "^*"] {
         print(bad, "|", check(bad))
     }
 }

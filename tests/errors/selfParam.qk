@@ -1,0 +1,13 @@
+// error: next changes its value: "p" is a parameter (parameters never change)
+type Parser { at: Int }
+
+fn Parser.next(var self) -> Int {
+    self.at += 1
+    self.at
+}
+
+fn peekNext(p: Parser) -> Int = p.next()
+
+fn main() {
+    print(peekNext(Parser(0)))
+}

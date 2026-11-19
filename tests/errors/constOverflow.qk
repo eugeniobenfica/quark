@@ -1,0 +1,7 @@
+// error: an Int went past its limits
+const top = 9223372036854775807
+const past = top + 1
+
+fn main() {
+    print(past)
+}

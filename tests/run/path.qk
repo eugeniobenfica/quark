@@ -2,7 +2,13 @@
 use std.path
 
 fn main() {
-    print(joinPath("a/b", "c.txt"), joinPath("a/b/", "c"), joinPath("a", "/etc"), joinPath("C:\\x", "y"), joinPath("", "z"))
+    print(
+        joinPath("a/b", "c.txt"),
+        joinPath("a/b/", "c"),
+        joinPath("a", "/etc"),
+        joinPath("C:\\x", "y"),
+        joinPath("", "z"),
+    )
     for p in ["a/./b/../c/", "/../x//y/.", "../../a", "a/..", "", "C:\\Users\\..\\Temp\\", "C:x\\..\\..", "./"] {
         print("\"{p}\" -> \"{normalize(p)}\"", pathParts(p))
     }

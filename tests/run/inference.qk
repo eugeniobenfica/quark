@@ -1,0 +1,42 @@
+// A generic function's types are told from the values given, as deep as the types go: through tuples, maps,
+// sets, optionals, typed results, generic types and functions.
+type Pair<A, B> { first: A, second: B }
+
+fn heaviest<T>(xs: [(T, Int)]) -> T {
+    var best = xs[0]
+    for x in xs {
+        if x.1 > best.1 {
+            best = x
+        }
+    }
+    best.0
+}
+
+fn firstKey<K, V>(m: [K: [V]]) -> K? = m.keys().first()
+
+fn anyOf<T>(s: Set<T>) -> T? = s.first()
+
+fn unwrapAll<T>(xs: [T?]) -> [T] = xs.filter(x => x != None).map(x => x ?? panic("no"))
+
+fn orElse<T, E>(r: T ! E, f: T) -> T = r ?? f
+
+fn swapAll<A, B>(ps: [Pair<A, B>]) -> [Pair<B, A>] = ps.map(p => Pair(p.second, p.first))
+
+fn apply<T, R>(f: (T) -> R, x: T) -> R = f(x)
+
+fn deep<T>(xs: [[(Text, T?)]]) -> T? = xs[0][0].1
+
+enum E { Bad }
+
+fn main() {
+    print(heaviest([("a", 2), ("b", 5)]))
+    print(firstKey(["x": [1, 2]]))
+    let s: Set<Int> = [3, 4]
+    print(anyOf(s))
+    print(unwrapAll([Some(1), None, Some(3)]))
+    let r: Int ! E = Err(.Bad)
+    print(orElse(r, 7))
+    print(swapAll([Pair(1, "one")])[0].first)
+    print(apply(x => x * 2, 21))
+    print(deep([[("k", Some(2.5))]]))
+}

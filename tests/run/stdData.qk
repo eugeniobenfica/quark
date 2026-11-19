@@ -1,0 +1,29 @@
+// std.encoding, std.hash and std.args: bytes as text and back, hashes against their published values, a command
+// line read by what it takes.
+use std.encoding
+use std.hash
+use std.args
+
+fn main() {
+    let b = "Quark fala com C".bytes()
+    print(base64(b), base64Url([0xfb, 0xff]), Text(fromBase64(base64(b)) ?? []) ?? "?")
+    print(fromBase64("SGVsbG8"), fromBase64("SGVsbG8=!"), hex([0, 15, 255, 16]), fromHex("00FfA0"), fromHex("0g"))
+    print(percentEncode("a b/ç?x=1&y"), percentDecode("a%20b%2F%C3%A7+c", plus: true), percentDecode("%2"))
+    print(crc32("123456789".bytes()), crc32("456789".bytes(), from: crc32("123".bytes())), fnv1a("a".bytes()))
+    print(sha256Hex(""))
+    print(sha256Hex("abc"))
+    print(sha256Hex("a" * 1000))
+    print(hex(hmacSha256("key".bytes(), "The quick brown fox jumps over the lazy dog".bytes())))
+    let spec = [
+        flag("verbose", short: "v", help: "say more"),
+        flag("quiet", short: "q"),
+        option("out", short: "o", help: "where to write", default: Some("a.txt")),
+        option("count", short: "n", help: "how many"),
+    ]
+    let a = parseArgs(["-vq", "in.txt", "--out=x.bin", "-n", "12", "--", "-not-an-option"], spec)?
+    print(a.has("verbose"), a.has("quiet"), a.value("out"), a.int("count"), a.positional)
+    let c = parseArgs(["-ofile", "--count", "z"], spec)?
+    print(c.value("out"), c.int("count"), c.has("verbose"), parseArgs([], spec)?.int("count"))
+    print(parseArgs(["--nope"], spec), parseArgs(["-o"], spec), parseArgs(["--verbose=1"], spec))
+    print(usage("tool", spec, positional: "FILE..."))
+}

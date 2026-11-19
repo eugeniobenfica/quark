@@ -1,0 +1,4 @@
+// error: division by zero
+const invalid = 1 / zero()
+
+fn zero() -> Int = 0

@@ -1,0 +1,42 @@
+// return, break and continue are values of type Never: they fit wherever a value goes
+fn parse(t: Text) -> Int! {
+    let n = t.parseInt() ?? return Err("not a number: {t}")
+    n * 2
+}
+
+fn pick(x: Int) -> Int = match x {
+    0 => 1
+    _ => return x * 10
+}
+
+fn firstBig(xs: [Int]) -> Int {
+    var i = 0
+    var found = -1
+    while true {
+        let x = xs.get(i) ?? break
+        i += 1
+        let big = if x >= 10 { x } else { continue }
+        found = big
+        break
+    }
+    found
+}
+
+fn sumUntilNegative(xs: [Int]) -> Int {
+    var total = 0
+    for x in xs {
+        total += match x {
+            0 => continue
+            ..0 => break
+            _ => x
+        }
+    }
+    total
+}
+
+fn main() {
+    print(parse("21"), parse("x"))
+    print(pick(0), pick(3))
+    print(firstBig([1, 2, 30, 4]), firstBig([1]))
+    print(sumUntilNegative([1, 0, 2, 3, -1, 100]))
+}

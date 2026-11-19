@@ -2,5 +2,5 @@
 type P { x: Int }
 
 fn main() {
-    print(sort([P(2), P(1)]))
+    print(sorted([P(2), P(1)]))
 }

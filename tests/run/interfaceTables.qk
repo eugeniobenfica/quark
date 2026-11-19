@@ -1,0 +1,51 @@
+// An interface value is (its value's copy, its type's table of functions): in arrays, maps, records and
+// closures, made by the thousand in a loop that gives its memory back, the same calls go to the same functions.
+type Dog { name: Text }
+type Counter { start: Int, step: Int }
+type Kennel { best: Speaker, all: [Speaker] }
+interface Speaker { fn speak() -> Text, fn loud(times: Int) -> Text }
+interface Nothing {}
+
+fn Dog.speak(self) -> Text = "woof {self.name}"
+
+fn Dog.loud(self, times: Int) -> Text = "WOOF " * times + self.name
+
+fn Counter.speak(self) -> Text = "count {self.start}"
+
+fn Counter.loud(self, times: Int) -> Text = "{self.start + self.step * times}"
+
+fn chorus(all: [Speaker]) -> Text = all.map(s => s.speak()).join(", ")
+
+fn later(s: Speaker) -> () -> Text = () => s.loud(2)
+
+fn adder(k: Int) -> (Int) -> Int = x => x + k
+
+fn main() {
+    let pets: [Speaker] = [Dog("rex"), Counter(1, 10), Dog("fido")]
+    print(chorus(pets), pets[1].loud(3))
+    let k = Kennel(Dog("max"), pets)
+    print(k.best.speak(), len(k.all), k)
+    var byName: [Text: Speaker] = [:]
+    byName["c"] = Counter(5, 5)
+    byName["d"] = Dog("lou")
+    print((byName["c"] ?? pets[0]).loud(2), (byName["d"] ?? pets[0]).speak())
+    let say = later(Dog("kit"))
+    let f = pets[0].speak
+    print(say(), f())
+    var made: [Speaker] = []
+    var total = 0
+    for i in 0..200000 {
+        let s: Speaker = if i % 2 == 0 { Dog("d{i}") } else { Counter(i, 1) }
+        total += len(s.speak())
+        if i % 50000 == 0 {
+            made.push(s)
+        }
+    }
+    print(total, chorus(made))
+    let n: Nothing = Dog("quiet")
+    print(n)
+    var ops: [Text: (Int) -> Int] = [:] // closures in a map: two slots each, as an interface's
+    ops["a"] = adder(1)
+    ops["b"] = adder(100)
+    print((ops["a"] ?? adder(0))(5), (ops["b"] ?? adder(0))(5))
+}

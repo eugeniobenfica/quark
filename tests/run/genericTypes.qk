@@ -6,11 +6,11 @@ type Stack<T> { items: [T] }
 fn Pair.swap(self) -> Pair<B, A> = Pair(self.second, self.first)
 
 fn insert<T>(t: Tree<T>, v: T) -> Tree<T> = match t {
-    Leaf => Tree.Node(Tree.Leaf, v, Tree.Leaf)
+    Leaf => .Node(.Leaf, v, .Leaf)
     Node(l, x, r) => if v < x {
-        Tree.Node(insert(l, v), x, r)
+        .Node(insert(l, v), x, r)
     } else {
-        Tree.Node(l, x, insert(r, v))
+        .Node(l, x, insert(r, v))
     }
 }
 
@@ -29,13 +29,13 @@ fn Stack.push(self, x: T) -> Stack<T> = Stack(self.items + [x])
 fn main() {
     let p = Pair(1, "one")
     print(p, p.swap(), p.first + 1, p.second)
-    var t: Tree<Int> = Tree.Leaf
+    var t: Tree<Int> = .Leaf
     for v in [5, 2, 8, 1, 9, 3] {
         t = insert(t, v)
     }
     print(inOrder(t), depth(t))
-    var words: Tree<Text> = Tree.Leaf
-    for w in split("pear apple fig", " ") {
+    var words: Tree<Text> = .Leaf
+    for w in "pear apple fig".split(" ") {
         words = insert(words, w)
     }
     print(inOrder(words))
@@ -43,4 +43,16 @@ fn main() {
     print(s.items, len(s.items))
     let pairs = [Pair("a", 1), Pair("b", 2)]
     print(pairs.map(q => q.second).sum(), pairs[1] == Pair("b", 2))
+    print(evenPlaces([1, 2, 3, 4, 5]), evenPlaces(["a", "b"]))
+}
+
+// a generic function whose loop takes its elements apart: (i, x) is in reach before its instances are made
+fn evenPlaces<T>(xs: [T]) -> [T] {
+    var out: [T] = []
+    for (i, x) in xs.enumerate() {
+        if i % 2 == 0 {
+            out.push(x)
+        }
+    }
+    out
 }

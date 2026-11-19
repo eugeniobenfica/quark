@@ -1,4 +1,13 @@
-// A text built one piece at a time grows in place: a million pieces cost what a million bytes do.
+// A text built one piece at a time grows in place: a million pieces cost what a million bytes do, whatever the
+// pieces are made of and wherever the text is kept (a var, s += t, a field a var self function changes, a place).
+type Emitter { out: Text, lines: Int }
+type Module { name: Text, code: Emitter }
+
+fn Emitter.emit(var self, line: Text) {
+    self.out = self.out + line + "\n"
+    self.lines += 1
+}
+
 fn main() {
     var s = ""
     for i in 0..1_000_000 {
@@ -13,4 +22,24 @@ fn main() {
         u = u + w + " "
     }
     print(len(s), t, keep, other, u + "!", s[0..3])
+    var asm = ""
+    for i in 0..200_000 {
+        asm = asm + "mov r{i % 16}, {i}\n"
+    }
+    var more = ""
+    for i in 0..200_000 {
+        more += "{i},"
+    }
+    let before = more
+    more += "end"
+    var e = Emitter("", 0)
+    for i in 0..100_000 {
+        e.emit("push {i}")
+    }
+    var units = [Module("main", Emitter("", 0))]
+    for i in 0..100_000 {
+        units[0].code.out = units[0].code.out + "{i};"
+    }
+    print(len(asm), asm[0..10] == "mov r0, 0\n", len(more), len(before), before.endsWith("199999,"))
+    print(len(e.out), e.lines, len(units[0].code.out), units[0].code.out.startsWith("0;1;2;"))
 }

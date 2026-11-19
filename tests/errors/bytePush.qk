@@ -1,0 +1,6 @@
+// error: a byte is 0 to 255, not -1
+fn main() {
+    var b: Bytes = []
+    b.push(-1)
+    print(b)
+}

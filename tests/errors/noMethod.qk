@@ -1,0 +1,8 @@
+// error: Point has no function "lenght": did you mean "length"?
+type Point { x: Int, y: Int }
+
+fn Point.length(self) -> Int = self.x + self.y
+
+fn main() {
+    print(Point(1, 2).lenght())
+}

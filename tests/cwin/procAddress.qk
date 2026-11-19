@@ -1,0 +1,20 @@
+// A C function value C gives back (Windows): GetProcAddress finds abs in the C library; Quark keeps it, passes it on
+// and calls it, and asks again for one that is not there (None).
+extern effect fn getModuleHandle(name: CText?) -> Pointer<UInt8>? in "kernel32" as "GetModuleHandleA"
+extern effect fn loadLibrary(name: CText) -> Pointer<UInt8>? in "kernel32" as "LoadLibraryA"
+extern effect fn getProcAddress(module: Pointer<UInt8>, name: CText) -> (extern (Int32) -> Int32)? in "kernel32" as "GetProcAddress"
+
+fn sumWith(f: extern (Int32) -> Int32, xs: [Int]) -> Int {
+    var total = 0
+    for x in xs {
+        total += f(x)
+    }
+    total
+}
+
+fn main() {
+    let crt = loadLibrary("ucrtbase.dll") ?? panic("no ucrtbase")
+    let abs = getProcAddress(crt, "abs") ?? panic("no abs")
+    print(abs(-7), abs(5), sumWith(abs, [-1, 2, -3]))
+    print(getProcAddress(crt, "quarkSurelyMissing") == None, getModuleHandle(None) != None)
+}

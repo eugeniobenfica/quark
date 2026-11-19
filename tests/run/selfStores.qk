@@ -1,0 +1,106 @@
+// Stores into a var self's fields (arrays of arrays, maps of arrays) next to calls that change self, with a
+// self kept in memory (more than four slots) and one in registers; and records holding maps of arrays, copied.
+type Big { h: [[Int]], cnt: [Int: Int], n: Int, m: Int, o: Int }
+type Small { h: [[Int]], cnt: [Int: Int] }
+type R { m: [Int: [Int]], n: Int }
+type Holder { rs: [R], r: R, k: Int, a: Int, b: Int }
+
+fn Big.add(var self, k: Int, x: Int) -> Int {
+    self.h[k].push(x)
+    self.cnt[k] = (self.cnt[k] ?? 0) + 100
+    self.n += 1
+    for i in 0..x % 3 {
+        self.m += i
+    }
+    len(self.h[k])
+}
+
+fn Big.run(var self) {
+    self.h[0] += [self.add(0, 5)]
+    self.h[0] += [1, self.add(0, 8), self.add(1, 9)]
+    self.h[1] += [self.add(0, 10)]
+    for i in 0..2 {
+        self.h[0] += [self.add(0, 20 + i)]
+        self.h[1] += [i, self.add(1, 30 + i)]
+        self.cnt[i] = (self.cnt[i] ?? 0) + 1
+    }
+    self.cnt[0] = self.add(0, 6) + (self.cnt[0] ?? 0)
+    self.n += self.add(1, 7)
+    print(self.h, self.cnt, self.n, self.m)
+}
+
+fn Small.add(var self, k: Int, x: Int) -> Int {
+    self.h[k].push(x)
+    self.cnt[k] = (self.cnt[k] ?? 0) + 100
+    len(self.h[k])
+}
+
+fn Small.run(var self) {
+    self.h[0] += [self.add(0, 5)]
+    self.h[0] += [1, self.add(0, 8), self.add(1, 9)]
+    for i in 0..2 {
+        self.h[1] += [i, self.add(1, 30 + i)]
+        self.cnt[i] = (self.cnt[i] ?? 0) + 1
+    }
+    self.cnt[0] = self.add(0, 6) + (self.cnt[0] ?? 0)
+    print(self.h, self.cnt)
+}
+
+fn Holder.snap(var self) -> R {
+    var c = self.r
+    c.m[100] = [1]
+    self.r.m[200] = [2]
+    c
+}
+
+fn main() {
+    let none: [Int] = []
+    var b = Big([none, none], [:], 0, 0, 0)
+    b.run()
+    var s = Small([none, none], [:])
+    s.run()
+
+    var r = R([:], 0)
+    for i in 0..50 {
+        r.m[i] = [i, i]
+    }
+    r.m.remove(3)
+    r.m.remove(10)
+    var copy = r
+    copy.m[1] = [9]
+    var h = Holder([r, copy], r, 0, 0, 0)
+    let c = h.snap()
+    var c2 = c
+    c2.m[0] = []
+    var rs = h.rs
+    rs[0].m[0] = [42]
+    print(
+        len(r.m),
+        len(copy.m),
+        len(c.m),
+        len(c2.m),
+        r.m[0],
+        copy.m[1],
+        rs[0].m[0],
+        h.rs[0].m[0],
+        c.m[0],
+        c2.m[0],
+        h.r.m[200],
+    )
+
+    var keep: [R] = []
+    var w = R([:], 0)
+    for i in 0..20000 {
+        w.m[i % 300] = [i, i + 1, i + 2]
+        if i % 7 == 0 {
+            w.m.remove(i * 13 % 300)
+        }
+        var d = w
+        d.m[i] = [1]
+        if i % 1000 == 0 {
+            keep.push(d)
+        }
+        w.n += len(d.m[i] ?? [])
+    }
+    print(w.n, len(w.m), keep.map(k => len(k.m)).sum(), w.m[299])
+}

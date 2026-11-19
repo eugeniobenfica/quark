@@ -1,0 +1,10 @@
+// panic: division by zero
+extern effect fn qsort(base: Pointer<Int64>, count: UInt64, size: UInt64, compare: extern (Pointer<Int64>, Pointer<Int64>) -> Int32)
+extern effect fn calloc(count: UInt64, size: UInt64) -> Pointer<Int64>?
+
+fn ratio(a: Pointer<Int64>, b: Pointer<Int64>) -> Int = a[0] / b[0] // stops inside qsort, and the program with it
+
+fn main() {
+    let p = calloc(2, 8) ?? panic("out of memory")
+    qsort(p, 2, 8, ratio)
+}

@@ -1,0 +1,35 @@
+// A lexer over bytes: a var self cursor, nested alternatives and character ranges in patterns, an early
+// return inside an inlined loop (a loop top right after another label), defaults in fields.
+type Server { host: Text = "localhost", port: Int = 8080 }
+enum Token { Word(text: Text), Number(value: Int), End }
+type Lexer { text: Bytes, at: Int = 0 }
+
+fn Lexer.next(var self) -> Token {
+    while self.text.get(self.at) is Some(' ' | '\n') {
+        self.at += 1
+    }
+    let c = self.text.get(self.at) ?? return .End
+    let start = self.at
+    if c is '0'..='9' {
+        var n = 0
+        while self.text.get(self.at) is Some(d) and d is '0'..='9' {
+            n = n * 10 + d - '0'
+            self.at += 1
+        }
+        return .Number(n)
+    }
+    while self.text.get(self.at) is Some('a'..='z') {
+        self.at += 1
+    }
+    .Word(Text(self.text[start..self.at]) ?? "?")
+}
+
+fn main() {
+    var lexer = Lexer("port 8080\n  listen tcp 443".bytes())
+    var token = lexer.next()
+    while token != .End {
+        print(token)
+        token = lexer.next()
+    }
+    print(Server(port: 9000))
+}

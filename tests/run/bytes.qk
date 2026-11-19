@@ -1,0 +1,38 @@
+// Bytes: raw bytes, held as a text is (no copy from t.bytes()), checked 0..255, in loops, slices, maps and ==.
+type Packet { kind: Int, body: Bytes }
+
+fn checksum(b: Bytes) -> Int = b.fold(0, (acc, x) => (acc + x) % 256)
+
+fn main() {
+    let t = "héllo"
+    let b = t.bytes()
+    print(len(b), b, b[1], b[1..3], b.get(9), Text(b))
+    print(Text(b[0..2]), Text([0xff, 0x41]))
+    var out: Bytes = []
+    for i in 0..1000 {
+        out.push(i % 256)
+    }
+    print(len(out), out[255], out[999], checksum(out))
+    let magic: Bytes = [0x7f, 'E', 'L', 'F']
+    print(magic, magic == [0x7f, 0x45, 0x4c, 0x46], magic != b, magic < b, magic + [0])
+    let mixed: Bytes = b.map(x => x ^ 0x5a)
+    print(b.map(x => x ^ 0x5a).sum(), Text(mixed.map(x => x ^ 0x5a)) ?? "?")
+    for (i, x) in magic.enumerate() {
+        print(i, x)
+    }
+    print(b.filter(x => x > 127).toArray(), b.count(x => x == 'l'), b.contains('o'), b.indexOf('l'), b.max())
+    var p = Packet(1, [])
+    p.body.push(9)
+    p.body += [8, 7]
+    print(p, len(p.body))
+    let seen: [Bytes: Text] = [magic: "elf", "png".bytes(): "png"]
+    print(seen[[0x7f, 0x45, 0x4c, 0x46]] ?? "none", seen["png".bytes()] ?? "none", len(seen))
+    print([b, magic].sorted(), [magic, magic].toSet())
+    var big: Bytes = []
+    for i in 0..300_000 {
+        big.push(i & 255)
+    }
+    print(len(big), big[299_999], big[1..4])
+    let empty: Bytes = []
+    print(empty, len(empty), Text(empty))
+}

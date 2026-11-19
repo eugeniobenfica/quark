@@ -1,0 +1,8 @@
+true true
+one
+two
+ made
+
+Bytes[0x00, 0xff, 0x0a, 0xc3] Err(cannot read build/filesTest/a/b/raw.bin: it is not UTF-8 text (byte 1): readBytes reads any file) true [new.txt, notes.txt, raw.bin]
+true true
+false false

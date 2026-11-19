@@ -1,0 +1,6 @@
+[HELLO FROM ANA / BYE ANA, HELLO FROM BIA / BYE BIA, HELLO FROM CAIO / BYE CAIO]
+200 POST 6 bytes: a body
+200 text/plain; charset=utf-8 hello, Ana Lu
+200 text/plain; charset=utf-8 hello, world
+404 text/plain; charset=utf-8 no page /x
+Err(https is not supported (no TLS): https://example.com) Ok((h, 8080, /a?b=1)) true

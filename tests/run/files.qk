@@ -1,0 +1,24 @@
+// Files: folders made (with the ones above them) and removed, text appended, any bytes read and written.
+fn main() {
+    let top = "build/filesTest"
+    let dir = top + "/a/b"
+    makeDir(dir)?
+    makeDir(dir)?
+    print(pathExists(dir), pathExists(top + "/a"))
+    let notes = dir + "/notes.txt"
+    writeFile(notes, "one\n")?
+    appendFile(notes, "two\n")?
+    appendFile(dir + "/new.txt", "made\n")?
+    print(readFile(notes)?, readFile(dir + "/new.txt")?)
+    let raw = dir + "/raw.bin"
+    writeBytes(raw, [0, 255, 10, 0xc3])?
+    print(readBytes(raw)?, readFile(raw), pathExists(raw), listDir(dir)?)
+    print(removePath(top + "/a") is Err(_), removePath(top + "/nothing") is Err(_))
+    for name in listDir(dir)? {
+        removePath(dir + "/" + name)?
+    }
+    removePath(dir)?
+    removePath(top + "/a")?
+    removePath(top)?
+    print(pathExists(notes), pathExists(top))
+}

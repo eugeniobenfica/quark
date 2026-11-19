@@ -1,0 +1,46 @@
+// xs += ys and xs = xs + ys grow a var's array in place, as push does: building one a slice at a time is linear.
+type Holder { items: [Text], rows: [[Int]] }
+
+fn main() {
+    var xs: [Int] = []
+    for i in 0..300_000 {
+        xs += [i, -i]
+    }
+    print(len(xs), xs[599_998], xs[599_999])
+    var ys: [Int] = []
+    for i in 0..300_000 {
+        ys = ys + [i]
+    }
+    print(len(ys), ys.sum())
+    // a field, and an element: read, grown, written back
+    var h = Holder([], [[], [1]])
+    for i in 0..50_000 {
+        h.items += ["a{i}", "b"]
+        h.rows[1] += [i]
+    }
+    print(len(h.items), h.items[99_998], len(h.rows[1]), h.rows[0])
+    // what shared the array before keeps what it had
+    var zs = [1, 2]
+    let before = zs
+    zs += zs
+    zs = zs + zs
+    print(zs, before)
+    // texts made in the loop, kept by a var from before it
+    var names: [Text] = []
+    for i in 0..200_000 {
+        names += ["n{i}"]
+    }
+    print(len(names), names[199_999])
+    // pop takes the last value off, in place: a stack costs nothing more than its pushes
+    var stack = [1, 2, 3]
+    let kept = stack
+    print(stack.pop(), stack, kept)
+    stack.push(7)
+    while stack.pop() is Some(x) {
+        print(x)
+    }
+    print(stack.pop(), stack, kept)
+    h.rows[1] = [5, 6]
+    var b: Bytes = [1, 2]
+    print(h.rows[1].pop(), h.rows, b.pop(), b)
+}

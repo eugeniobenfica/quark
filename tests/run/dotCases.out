@@ -1,0 +1,11 @@
+Grade.A Grade.B Grade.C
+[3.0, 4.0, 0.0]
+9.0
+4
+true true
+Some(Grade.B)
+Grade.A
+Ok(1) Err(Problem.Missing) Err(Problem.Bad(line: -2))
+8.0 12.0
+[Some(Shape.Circle(radius: 2.0)), None] Err(Problem.Bad(line: 7)) true
+[Grade.A: 2, Grade.C: 1] [[Shape.Empty], [Shape.Square(side: 1.0)]] [dot: Shape.Circle(radius: 0.5)] 2

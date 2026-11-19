@@ -1,0 +1,4 @@
+// error: is not a Unicode code point
+fn main() {
+    print('\u{D800}')
+}

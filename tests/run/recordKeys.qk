@@ -9,17 +9,17 @@ fn main() {
     var grid: [Cell: Tile] = [:]
     for y in 0..3 {
         for x in 0..3 {
-            grid[Cell(x, y)] = if x == 1 and y == 1 { Tile.Door } else { Tile.Floor }
+            grid[Cell(x, y)] = if x == 1 and y == 1 { .Door } else { .Floor }
         }
     }
-    grid[Cell(2, 2)] = Tile.Wall
-    print(len(grid), grid[Cell(1, 1)], grid[Cell(5, 5)], contains(grid, Cell(2, 2)))
-    let around = neighbours(Cell(1, 1)).count(n => contains(grid, n))
+    grid[Cell(2, 2)] = .Wall
+    print(len(grid), grid[Cell(1, 1)], grid[Cell(5, 5)], grid.contains(Cell(2, 2)))
+    let around = neighbours(Cell(1, 1)).count(n => grid.contains(n))
     var seen: [(Int, Int): Int] = [:]
     for i in 0..10 {
         seen[(i % 3, i % 2)] = (seen[(i % 3, i % 2)] ?? 0) + 1
     }
-    print(around, len(seen), seen[(0, 0)], keys(seen)[0])
+    print(around, len(seen), seen[(0, 0)], seen.keys()[0])
     grid.remove(Cell(0, 0))
-    print(len(grid), keys(grid)[0])
+    print(len(grid), grid.keys()[0])
 }

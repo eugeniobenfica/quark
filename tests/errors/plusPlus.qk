@@ -1,0 +1,7 @@
+// error: there is no ++: write x += 1
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    x++
+    print(x, xs)
+}

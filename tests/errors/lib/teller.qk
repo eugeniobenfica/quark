@@ -1,0 +1,1 @@
+pub fn balanceOf(a: Account) -> Int = 0

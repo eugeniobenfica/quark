@@ -1,0 +1,37 @@
+// Int arithmetic past an Int's limits stops the program; +% -% *% (and +%= -%= *%=) wrap around instead: for
+// hashes, random generators, unsigned arithmetic. The same in constants, worked out when the program is compiled.
+const top = 9223372036854775807
+const wrapped = top +% 1
+const fnvPrime = 1099511628211
+
+fn fnv(t: Text) -> Int {
+    var h = -3750763034362895579
+    for b in t.bytes() {
+        h = (h ^ b) *% fnvPrime
+    }
+    h
+}
+
+fn lcg(seed: Int, n: Int) -> [Int] {
+    var x = seed
+    var out: [Int] = []
+    for _ in 0..n {
+        x = x *% 6364136223846793005 +% 1442695040888963407
+        out.push(x >> 60 & 15)
+    }
+    out
+}
+
+fn main() {
+    print(wrapped, top +% 1 == wrapped, wrapped -% 1 == top, top *% 2, -top -% 2)
+    var h = 1
+    for _ in 0..70 {
+        h *%= 3
+    }
+    var s = top
+    s +%= top
+    s -%= -5
+    print(h, s, fnv("quark"), fnv(""), lcg(42, 8))
+    let n = 2 * 3 - 4 // plain arithmetic in range: as always
+    print(n, abs(-top), -(-top), top - 1 + 1)
+}

@@ -1,8 +1,8 @@
 // Text is UTF-8: upper and lower know accents, Greek and Cyrillic; slices never cut a character.
 fn main() {
     let t = "ação Ÿes ÿ Straße Ελλάδα Привет ĳ 🙂"
-    print(upper(t))
-    print(lower(upper(t)))
+    print(t.upper())
+    print(t.upper().lower())
     print("[{"ação":6}]", t[0..1], t[0..5])
-    print(len(t), len(chars(t)), chars("ñandú").reverse().join(""))
+    print(len(t), len(t.codePoints()), "ñandú".codePoints().map(char).reversed().join(""))
 }

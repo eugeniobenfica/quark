@@ -1,0 +1,25 @@
+// Functions C calls by their names: quark object exports each pub extern fn, with C's types and C's calls.
+extern type Vec2 { x: Float32, y: Float32 }
+extern type Box { min: Vec2, max: Vec2, id: Int64 }
+extern fn hostLength(v: Vec2) -> Float32
+
+pub extern fn add(a: Int32, b: Int32) -> Int32 = a + b
+
+pub extern fn scaled(v: Vec2, k: Float64) -> Vec2 = Vec2(v.x * k, v.y * k)
+
+pub extern fn grown(b: Box, by: Float32) -> Box =
+    Box(Vec2(b.min.x - by, b.min.y - by), Vec2(b.max.x + by, b.max.y + by), b.id + 1)
+
+pub extern fn greeting(name: CText) -> CText = "hello, {name}"
+
+pub extern fn addAll(values: Pointer<Int32>, count: Int64) -> Int64 as "sum" {
+    var all = 0
+    for i in 0..count {
+        all += values[i]
+    }
+    all
+}
+
+pub extern fn length(v: Vec2) -> Float32 = hostLength(v) // C to Quark to C, a struct by value each way
+
+pub extern fn quarkLength(x: Float32, y: Float32) -> Float32 as "quark_length" = length(Vec2(x, y))

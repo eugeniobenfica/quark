@@ -1,0 +1,10 @@
+// error: speak is a function of the type the value has: an interface's functions are never set
+type Dog { name: Text }
+interface Speaker { fn speak() -> Text }
+
+fn Dog.speak(self) -> Text = "woof"
+
+fn main() {
+    var s: Speaker = Dog("rex")
+    s.speak = () => "hacked"
+}

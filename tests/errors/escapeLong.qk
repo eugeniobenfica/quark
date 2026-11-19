@@ -1,0 +1,4 @@
+// error: \u takes 1 to 6 hex digits in braces
+fn main() {
+    print("\u{110000000}")
+}

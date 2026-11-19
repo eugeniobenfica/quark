@@ -1,0 +1,69 @@
+// Constants worked out when compiling take values apart (match arms, let-else, is with names) and use the pure text
+// built-ins; each gives what the same code gives when it runs.
+enum Shape { Circle(radius: Float), Square(side: Float) }
+
+fn area(s: Shape) -> Float = match s {
+    Circle(r) => 3.0 * r * r
+    Square(side) => side * side
+}
+
+fn firstWord(t: Text) -> Text {
+    let Some(at) = t.indexOf(" ") else {
+        return t
+    }
+    t[0..at]
+}
+
+fn sizeOf(n: Int) -> Text = match n {
+    0 => "none"
+    k if k > 2 => "many {k}"
+    k => "few {k}"
+}
+
+fn number(t: Text) -> Int {
+    if t.parseInt() is Ok(n) and n > 0 {
+        return n
+    }
+    -1
+}
+
+const areas = [area(.Circle(1.0)), area(.Square(2.0))]
+const word = firstWord("hello world")
+const lone = firstWord("solo")
+const sizes = [sizeOf(0), sizeOf(1), sizeOf(7)]
+const loud = "ação".upper() + " ÉTÉ ".lower()
+const parts = "a,b,,c".split(",")
+const joined = "  many   words ".split("").join("+")
+const checks = ["quark".startsWith("qu"), "quark".endsWith("rk"), "quark".contains("ua"), "quark".contains("x")]
+const swapped = "a-b-c".replace("-", "+")
+const trimmed = "  x y  ".trim()
+const shown = 2.5.toText() + " " + 10.toText() + " {1.0 / 3.0} {true}"
+const codes = "añ€".codePoints()
+const cpCount = len("añ€".codePoints())
+const euro = char(0x20AC) + char('a')
+const raw = bytes("añ")
+const parsed = [number("42"), number("x"), number("-3")]
+const bad = "1.5.2".parseFloat()
+const good = "2.25".parseFloat() ?? 0.0
+const where = "quark".indexOf("ar")
+const mixed = [3 < 3.5, 9007199254740993 == 9007199254740992.0, 2 >= 2.0]
+
+const pair = match (1, "one") {
+    (n, name) if n > 0 => "{name} {n}"
+    _ => "other"
+}
+
+fn main() {
+    print(areas, word, lone, sizes)
+    print(loud, parts, joined, checks, swapped, trimmed)
+    print(shown, codes, cpCount, euro, raw, parsed, bad, good, where, mixed, pair)
+    print(
+        word == firstWord("hello world"),
+        sizes == [sizeOf(0), sizeOf(1), sizeOf(7)],
+        loud == "ação".upper() + " ÉTÉ ".lower(),
+    )
+    print(parts == "a,b,,c".split(","), joined == "  many   words ".split("").join("+"), raw == bytes("añ"))
+    print(shown == 2.5.toText() + " " + 10.toText() + " {1.0 / 3.0} {true}", bad == "1.5.2".parseFloat())
+    print(parsed == [number("42"), number("x"), number("-3")], where == "quark".indexOf("ar"))
+    print("99999999999999999999".parseInt(), "+7".parseInt(), " 7".parseInt(), "x".parseFloat() ?? -1.0)
+}

@@ -1,0 +1,6 @@
+// error: this result is discarded
+fn close() -> Unit! = Ok(())
+
+fn main() {
+    close()
+}

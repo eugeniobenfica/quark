@@ -1,0 +1,5 @@
+true true
+2
+1.5 2.25 -3.0 false
+zero-ended copies
+Point(x: 1, y: 0.5) Point(x: -2, y: 1.5)

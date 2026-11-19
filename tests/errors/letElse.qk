@@ -1,6 +1,6 @@
-// error: the else of let Some(...) must leave
+// error: the else of let Ok(...) must leave
 fn main() {
-    let Some(n) = parseInt("3") else {
+    let Ok(n) = parseInt("3") else {
         print("no")
     }
     print(n)

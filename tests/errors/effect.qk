@@ -1,4 +1,4 @@
-// error: even has effects: a lambda cannot have any
+// error: even has effects: this lambda must be pure
 fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
 
 fn odd(n: Int) -> Bool {

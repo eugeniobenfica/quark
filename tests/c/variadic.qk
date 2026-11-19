@@ -1,0 +1,16 @@
+// C's variadic functions: the parameters, then ... (each value as C's variadic arguments take it).
+extern effect fn sprintf(out: Pointer<UInt8>, format: CText, ...) -> Int32
+extern effect fn malloc(size: UInt64) -> Pointer<UInt8>?
+extern effect fn free(p: Pointer<UInt8>)
+
+fn main() {
+    let buf = malloc(256) ?? panic("out of memory")
+    let n = sprintf(buf, "%s has %lld items at %.2f, %d%c", "the cart", 3, 9.5, 42, 'x')
+    print(n, Text(buf, -1))
+    let k = sprintf(buf, "%g %g %g %g %g %g %g %g %g %g", 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5)
+    print(k, Text(buf, -1))
+    let mixed = sprintf(buf, "%lld %g %lld %g %lld %g %lld %g", 1, 1.25, 2, 2.25, 3, 3.25, 4, 4.25)
+    print(mixed, Text(buf, -1))
+    print(sprintf(buf, "plain"), Text(buf, -1), sprintf(buf, "%p", buf) > 0)
+    free(buf)
+}

@@ -1,0 +1,41 @@
+[50, 30, 80, 10, 90, 20] [5, 3, 1, 9] 296 14.5 [true, false, true, false] [Some(8), None, Some(2), Some(5), Some(2)] [4, 6, 28, 1, 9, 3] [4.666666666666667, 4.0, -1.0, 7.25]
+[4: 3, 3: 2, 5: 1] [fig, apple, apple, plum] [[1, 2, 3, 5, 8, 9], [9, 8, 5, 3, 2, 1], [2, 9, 1, 8, 3, 5], [3, 9, 1, 5, 8, 2], [1, 2, 3, 5, 8, 9]] [[apple, fig, fig, kiwi, pear, plum], [fig, fig, pear, kiwi, plum, apple], [fig, plum, kiwi, apple, fig, pear]] [true, false, true] [Some(2), None, Some(1)] [[0, 1, 2], [9, 2], [4, 9, 16], []] [21, 42, 63, 84]
+[0pear, 1fig, 2apple, 3kiwi, 4plum, 5fig] [5, 208, 409] [pear-fig-apple-kiwi-plum-fig, PEARFIGAPPLEKIWIPLUMFIG, 1+2+3] Set(pear, fig, apple, kiwi, plum) [10, 24, 7, 7] [6, 4, 9, 2, 10, 3] [4, 8702, 7] [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] 4:3,3:2,5:1
+Set(3, 1, 2) Set(0, 2, 4, 6, 8) [Set(3, 1, 2, 0, 4, 6, 8), Set(2), Set(3, 1), Set(0, 4, 6, 8)] [3, 7] [true, false, true] [21, 7, 14] Set(b, c) [true, false]
+[15, 7, 20, -2, 36, 12] [184, 8, 306] [[3, 1, 2], []] [pear, plum] [8, 8, 81, 12, 36, -1, 8, 9] [6, 9] woof rex / meow x9 / woof fido 2
+Point(x: 1, y: 20) (1, one, 2.5) 1 one 2.5 5 [a1, b2, c3] [(x, 10)] [[k, j], [x]] [1, 2] [true, false, true]
+[Vec(x: 1.5, y: 2.5), Vec(x: -1.0, y: 1.0)] [Vec(x: 1.0, y: 1.0), Vec(x: 0.0, y: 2.0), Vec(x: 3.0, y: 0.0)] [true, false] [3.0, 4.0, 0.0] [Circle(radius: 1.5), Dot, [Shape.Square(side: 2.0)], Green, [Color.Blue]] [0, 2] [[5, 3, 8, 1, 9, 2], Point(x: 1, y: 2), (1, one, 2.5), [Some(1), None], [a: [1]], Set(3, 1, 2), Ok(2), [1.5, 2.0]] [3.14,     7|,    2.500|,   añ|, -1.0]
+[4.0, 3.5, 3.5, 2.5, 1.0, 2.5, -1.0] [2, 3, 3, -2, -3, 4, 10, 0, 3] [ababab, , a|b|c, one|two||three] [Ok(hé), Err(not UTF-8: byte 0 is not part of a character), Ok(hi)] [[7, 7, 7], [2, -1]] [Err(bad: not a number: "x"), Ok(12)] [1, 2, 30, -1] [a: 1, c: 3, d: 4]
+true true true
+true true
+true
+true
+true true
+true
+true
+true true
+true true
+true
+true true
+true true
+true true
+true true true
+true true true
+true true
+true true true
+true
+true true true
+true true true
+true true true
+true true
+true true true
+true true
+true true
+true true
+true
+true
+true
+true
+true
+true true
+true true true

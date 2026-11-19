@@ -1,0 +1,6 @@
+// Says each of its arguments in brackets (tests/run/process.qk runs it).
+fn main() {
+    for a in args() {
+        print("[{a}]")
+    }
+}

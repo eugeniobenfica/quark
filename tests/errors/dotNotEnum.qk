@@ -1,0 +1,7 @@
+// error: expected Int, found .Red (a case of an enum)
+enum Color { Red, Green }
+
+fn main() {
+    let x: Int = .Red
+    print(x)
+}

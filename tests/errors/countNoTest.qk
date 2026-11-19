@@ -1,0 +1,4 @@
+// error: count takes a test: xs.count(x => ...)
+fn main() {
+    print([1, 2, 3].count())
+}

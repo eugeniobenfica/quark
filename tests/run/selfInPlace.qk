@@ -1,0 +1,105 @@
+// A var self of more than a few slots is passed by address: the caller's place changes in place, on every tier.
+type Cur {
+    src: [Int]
+    pos: Int
+    line: Int
+    names: [Text]
+    seen: [Text: Int]
+    depth: Int
+    note: Text
+}
+
+type Holder { label: Text, cur: Cur, count: Int }
+
+fn newCur(text: Text) -> Cur = Cur(text.bytes(), 0, 1, [], [:], 0, "")
+
+fn Cur.next(var self) -> Int {
+    if self.pos >= len(self.src) {
+        return -1
+    }
+    let c = self.src[self.pos]
+    self.pos += 1
+    if c == 10 {
+        self.line += 1
+    }
+    c
+}
+
+// a loop that makes memory, with self among what it keeps
+fn Cur.words(var self) -> Int {
+    var n = 0
+    while self.pos < len(self.src) {
+        var w = ""
+        while self.pos < len(self.src) and self.src[self.pos] != 32 and self.src[self.pos] != 10 {
+            w = w + "{self.src[self.pos] - 96}."
+            self.pos += 1
+        }
+        if len(w) > 0 {
+            self.names.push(w)
+            self.seen[w] = (self.seen[w] ?? 0) + 1
+            n += 1
+        }
+        let _ = self.next()
+    }
+    n
+}
+
+// backtracking: self saved, changed, put back
+fn Cur.tryWord(var self, want: Int) -> Bool {
+    let saved = self
+    if self.next() == want {
+        return true
+    }
+    self = saved
+    false
+}
+
+fn Cur.deep(var self, n: Int) -> Int {
+    if n == 0 {
+        return self.depth
+    }
+    self.depth += 1
+    let r = self.deep(n - 1)
+    self.note = self.note + "{n}"
+    r
+}
+
+fn describe(c: Cur) -> Text = "{c.pos}/{len(c.src)} line {c.line} {len(c.names)} names {c.note}"
+
+fn Cur.show(var self) -> Text {
+    let f = (x: Int) => x + self.pos
+    self.pos += 0
+    "{describe(self)} {f(100)}"
+}
+
+// another value that holds the array the place is in: self is changed as if copied in and out
+fn Cur.absorb(var self, all: [Cur]) -> Int {
+    self.pos = 99
+    all[0].pos
+}
+
+fn main() {
+    var c = newCur("ab cd\nab ef")
+    print(c.next(), c.next(), c.pos)
+    print(c.tryWord(120), c.pos, c.tryWord(32), c.pos)
+    print(c.words(), c.names, c.seen["ab"] ?? 0, c.line)
+    var xs = [newCur("x y"), newCur("zz")]
+    print(xs[1].words(), xs[1].names, xs[0].pos, xs[1].pos)
+    print(xs[0].absorb(xs), xs[0].pos)
+    var m = ["k": newCur("q\nr")]
+    print(m["k"].next(), m["k"].next(), (m["k"] ?? newCur("")).line)
+    var h = Holder("h", newCur("one two three"), 0)
+    print(h.cur.words(), h.cur.names, h.label)
+    print(c.deep(5), c.depth, c.note)
+    print(c.show())
+    var many: [Cur] = []
+    for i in 0..2000 {
+        many.push(newCur("w{i} v{i}"))
+        let _ = many[i].words()
+    }
+    var total = 0
+    for k in many {
+        total += len(k.names) + (k.seen["v"] ?? 0)
+    }
+    print(total, many[1999].names)
+}

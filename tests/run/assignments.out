@@ -1,0 +1,6 @@
+14 511 8
+11 [2, 3, 4]
+45
+true
+Err(ConfigError.Bad(length: 5)) Ok(3)
+Ok(4) Err(4)

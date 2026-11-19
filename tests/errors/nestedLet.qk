@@ -1,0 +1,7 @@
+// error: "t" is a let (it never changes); declare it with var to change it
+type Table { counts: [Int] }
+
+fn main() {
+    let t = Table([1, 2])
+    t.counts[0] = 5
+}

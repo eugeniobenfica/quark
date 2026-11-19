@@ -7,8 +7,24 @@ const name = "q" + "uark"
 const title = "{name} v{base / 3}"
 const big = if base > 5 { "big" } else { "small" }
 
+// match, is, ??, min, max, abs and arrays joined work out too
+const joined = table + [20]
+const graded = grade(85)
+const isLetter = 'q' is 'a'..='z'
+const fallback = Some(3) ?? 0
+const bounds = (min(1, 2.5), max(-4, abs(-7)))
+
+enum Grade { A, B, C }
+
+fn grade(n: Int) -> Grade = match n {
+    90.. => .A
+    80..90 => .B
+    _ => .C
+}
+
 fn main() {
     var t = table
     t[0] = 99
     print(scale, table, t, floats, title, big, len(name), table.sum())
+    print(joined, graded, isLetter, fallback, bounds)
 }

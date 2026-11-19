@@ -1,0 +1,13 @@
+// runProcess: a program run to its end, its status and what it wrote (here quark itself, from the repository's root).
+fn main() {
+    let me = runProcess("build/quark.exe", ["fmt", "tests/run/process.qk"])?
+    print(me.status, me.out == readFile("tests/run/process.qk")?, me.err)
+    let echo = runProcess(
+        "build/quark.exe",
+        ["run", "tests/run/lib/echo.qk", "--", "two words", "q\"uote", "", r"back\slash\"],
+    )?
+    print(echo.status, echo.out)
+    let bad = runProcess("build/quark.exe", ["check", "tests/errors/byteSet.qk"])?
+    print(bad.status, len(bad.out), bad.err.contains("is not set in place"))
+    print(runProcess("no-such-program-anywhere", []) is Err(_))
+}

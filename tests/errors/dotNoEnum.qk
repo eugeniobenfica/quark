@@ -1,0 +1,7 @@
+// error: .Red needs an enum to go into here: write Color.Red
+enum Color { Red, Green }
+
+fn main() {
+    let c = .Red
+    print(c)
+}

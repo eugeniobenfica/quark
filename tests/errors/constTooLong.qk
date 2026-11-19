@@ -1,0 +1,8 @@
+// error: constant f40 takes too long to work out when the program is compiled
+fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+
+const f40 = fib(40)
+
+fn main() {
+    print(f40)
+}

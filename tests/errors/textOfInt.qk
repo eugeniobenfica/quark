@@ -1,0 +1,7 @@
+// error: Text(b) reads Bytes as UTF-8 text, not Int: toText(x)
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    let t = Text(x)
+    print(x, xs)
+}

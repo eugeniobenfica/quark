@@ -1,0 +1,7 @@
+// error: there is no &&: write and
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    if x == 1 && true { x = 2 }
+    print(x, xs)
+}

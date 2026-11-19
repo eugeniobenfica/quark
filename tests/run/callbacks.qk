@@ -1,0 +1,88 @@
+// A parameter typed effect (T) -> R takes a lambda with effects (put in where it is called: no closure, no call);
+// a function that takes functions may call itself (its functions are then given as function values).
+enum Tree<T> { Leaf, Node(left: Tree<T>, value: T, right: Tree<T>) }
+
+fn each<T>(xs: [T], f: effect (T) -> Unit) {
+    for x in xs {
+        f(x)
+    }
+}
+
+fn twice(f: effect () -> Int) -> Int = f() + f()
+
+fn show(n: Int) {
+    print("n = {n}")
+}
+
+fn total(xs: [Int]) -> Int {
+    var sum = 0
+    each(xs, x => {
+        sum += x
+    })
+    sum
+}
+
+fn mapTree<T, R>(t: Tree<T>, f: (T) -> R) -> Tree<R> = match t {
+    Leaf => .Leaf
+    Node(l, v, r) => .Node(mapTree(l, f), f(v), mapTree(r, f))
+}
+
+fn sumTree(t: Tree<Int>) -> Int = match t {
+    Leaf => 0
+    Node(l, v, r) => sumTree(l) + v + sumTree(r)
+}
+
+fn walk<T>(t: Tree<T>, visit: effect (T) -> Unit) {
+    match t {
+        Leaf => {}
+        Node(l, v, r) => {
+            walk(l, visit)
+            visit(v)
+            walk(r, visit)
+        }
+    }
+}
+
+fn isEven(n: Int, f: (Int) -> Int) -> Bool = if n == 0 { true } else { isOdd(n - 1, f) }
+
+fn isOdd(n: Int, f: (Int) -> Int) -> Bool = if n == 0 { false } else { isEven(f(n) - 1, f) }
+
+fn scaled(n: Int, f: (Int) -> Int) -> Int =
+    if n == 0 { 0 } else { f(n) + scaled(n - 1, x => f(x) * 10) }
+
+fn countDown<T>(xs: [T], n: Int) -> Int = if n == 0 { len(xs) } else { countDown(xs, n - 1) }
+
+fn down(n: Int) {
+    if n > 0 {
+        print("down {n}")
+        down(n - 1)
+    }
+}
+
+fn main() {
+    each(["a", "b"], name => print(name))
+    each([1, 2], show)
+    print(total([1, 2, 3]), [1, 2].map(x => twice(() => x)).toArray())
+    print(twice(() => {
+        print("called")
+        1
+    }))
+    let t: Tree<Int> = .Node(.Node(.Leaf, 1, .Leaf), 2, .Node(.Leaf, 3, .Leaf))
+    let k = 5
+    print(sumTree(mapTree(t, x => x * k)))
+    walk(t, v => print("visit {v}"))
+    walk(mapTree(t, x => "<{x}>"), v => print(v))
+    print(isEven(10, x => x), isOdd(7, x => x), scaled(3, x => x), countDown([1, 2], 3))
+    down(2)
+    var m: [Int: Int] = [:]
+    for i in 0..6 {
+        m[i] = i
+    }
+    var seen: [Int] = []
+    for (key, _) in m {
+        // the loop goes over the map as it was when it began
+        m.remove(key + 1)
+        seen.push(key)
+    }
+    print(seen, m)
+}

@@ -1,0 +1,6 @@
+// error: Account is opaque outside its module
+use lib.accounts
+
+fn main() {
+    print(open().balance)
+}

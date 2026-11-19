@@ -1,0 +1,25 @@
+// A loop that only pushes into a var from before it needs no collection (its array's old rooms are less than it
+// holds); a loop around it that starts the var again does collect, so 16 MB are enough.
+fn main() {
+    var row: [Int] = []
+    var total = 0
+    for i in 0..20_000 {
+        row = []
+        for j in 0..1000 {
+            row.push(j)
+        }
+        total += len(row)
+    }
+    var kept: [Int] = []
+    for i in 0..20_000 {
+        var inner: [Int] = []
+        var k = 0
+        while k < 1000 {
+            inner.push(k)
+            k += 1
+        }
+        kept.push(len(inner))
+        inner[0] = 5
+    }
+    print(total, len(kept))
+}

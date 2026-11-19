@@ -1,0 +1,80 @@
+// TCP and HTTP in one program: a server whose connections each run in a task of their own, clients in tasks too,
+// every read and write waiting only on its own socket; std.http's server and client; the errors connect gives.
+use std.net
+use std.http
+
+fn shout(s: Socket) {
+    var c = conn(s)
+    while c.readLine() is Some(line) {
+        let _ = c.write(line.upper() + "\n")
+    }
+    c.close()
+}
+
+fn route(r: Request) -> Response = match r.path {
+    "/hello" => textResponse("hello, {r.query["name"] ?? "world"}")
+    "/echo" => textResponse("{r.method} {len(r.body)} bytes: {r.text()}")
+    _ => textResponse("no page {r.path}", status: 404)
+}
+
+fn main() {
+    let server = listen("127.0.0.1", 47911)?
+    go(() => {
+        for _ in 0..3 {
+            let s = accept(server) ?? panic("accept")
+            go(() => shout(s))
+        }
+    })
+    let answers = channel()
+    for name in ["ana", "bia", "caio"] {
+        go(() => {
+            var c = conn(connect("127.0.0.1", 47911) ?? panic("connect"))
+            let _ = c.write("hello from {name}\nbye {name}\n")
+            let first = c.readLine() ?? "?"
+            let second = c.readLine() ?? "?"
+            c.close()
+            send(answers, "{first} / {second}")
+        })
+    }
+    runTasks()
+    closeSocket(server)
+    closeChannel(answers)
+    var said: [Text] = []
+    while receive(answers) is Some(a) {
+        said.push(a)
+    }
+    print(said.sorted())
+    let web = listen("127.0.0.1", 47912)?
+    go(() => {
+        for _ in 0..4 {
+            let s = accept(web) ?? panic("accept")
+            go(() => handleConnection(s, route))
+        }
+    })
+    let out = channel()
+    for path in ["/hello?name=Ana%20Lu", "/hello", "/x"] {
+        go(() => {
+            send(out, match get("http://127.0.0.1:47912{path}") {
+                Ok(r) => "{r.status} {r.headers["content-type"] ?? "?"} {r.text()}"
+                Err(why) => "error: {why}"
+            })
+        })
+    }
+    go(() => {
+        send(out, match post("http://127.0.0.1:47912/echo", "a body".bytes(), contentType: "text/plain") {
+            Ok(r) => "{r.status} {r.text()}"
+            Err(why) => "error: {why}"
+        })
+    })
+    runTasks()
+    closeSocket(web)
+    closeChannel(out)
+    var pages: [Text] = []
+    while receive(out) is Some(p) {
+        pages.push(p)
+    }
+    for p in pages.sorted() {
+        print(p)
+    }
+    print(get("https://example.com"), parseUrl("http://h:8080/a?b=1"), connect("127.0.0.1", 47913) is Err(_))
+}

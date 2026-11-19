@@ -1,0 +1,6 @@
+Token.Word(text: port)
+Token.Number(value: 8080)
+Token.Word(text: listen)
+Token.Word(text: tcp)
+Token.Number(value: 443)
+Server(host: localhost, port: 9000)

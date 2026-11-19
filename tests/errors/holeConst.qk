@@ -1,0 +1,2 @@
+// error: a hole (_) was reached
+const limit: Int = _

@@ -1,0 +1,7 @@
+// panic: no key "pear" in the map
+fn main() {
+    var groups: [Text: [Int]] = ["apple": [1]]
+    groups["apple"].push(2)
+    groups["pear"].push(3)
+    print(groups)
+}

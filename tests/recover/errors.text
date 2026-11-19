@@ -1,0 +1,15 @@
+// Syntax errors: each is said, and what could be read is still a program (a hole where a statement could not be read,
+// a declaration left out when its own lines could not be).
+fn half(n: Int) -> Int {
+    _
+    _
+    a / 2
+}
+
+fn ok(n: Int) -> Int = n + 1
+
+fn main() {
+    print(ok(1))
+    _
+    print(s)
+}

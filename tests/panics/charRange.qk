@@ -1,0 +1,5 @@
+// panic: 55296 is not a Unicode code point
+fn main() {
+    let cp = 0xd7ff
+    print(char(cp), char(cp + 1))
+}

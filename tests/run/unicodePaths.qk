@@ -1,0 +1,21 @@
+// Names that are not ASCII (UTF-8 everywhere, the wide functions on Windows): files and folders made, read, listed and
+// removed; a program run from such a folder, given such arguments.
+fn main() {
+    let top = "build/dados ação"
+    let dir = top + "/ü €"
+    makeDir(dir)?
+    let file = dir + "/ação ü €.txt"
+    writeFile(file, "olá\n")?
+    appendFile(file, "mundo\n")?
+    print(pathExists(dir), pathExists(file), readFile(file)?, len(readBytes(file)?))
+    let program = dir + "/eco ç.qk"
+    writeFile(program, "fn main() \{\n    for a in args() \{\n        print(\"[\{a\}]\")\n    \}\n\}\n")?
+    print(listDir(dir)?)
+    let run = runProcess("build/quark.exe", ["run", program, "--", "ação", "ü €", "日本"])?
+    print(run.status, run.out, run.err)
+    removePath(file)?
+    removePath(program)?
+    removePath(dir)?
+    removePath(top)?
+    print(pathExists(file), pathExists(top))
+}

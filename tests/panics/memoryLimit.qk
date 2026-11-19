@@ -1,0 +1,8 @@
+// panic: the program used more memory than it is given (32 MB)
+// flags: --memory 32
+fn main() {
+    var xs: [Text] = []
+    while true {
+        xs.push("x" * 1000)
+    }
+}

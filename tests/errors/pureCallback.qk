@@ -1,0 +1,10 @@
+// error: print has effects: this lambda must be pure
+fn each<T>(xs: [T], f: (T) -> Unit) {
+    for x in xs {
+        f(x)
+    }
+}
+
+fn main() {
+    each([1], x => print(x))
+}

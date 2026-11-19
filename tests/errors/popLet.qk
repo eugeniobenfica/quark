@@ -1,0 +1,7 @@
+// error: pop changes its value: xs must be a var
+fn main() {
+    var x = 1
+    let xs = [1, 2]
+    let v = xs.pop()
+    print(x, xs)
+}

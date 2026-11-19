@@ -1,0 +1,4 @@
+// error: the Text goes first: what is repeated, then how many times
+fn main() {
+    print(3 * "ab")
+}

@@ -34,7 +34,7 @@ fn main() {
         let (n, name) = pair
         print(n, name)
     }
-    let Some((a, b)) = first(pairs) else {
+    let Some((a, b)) = pairs.first() else {
         return
     }
     print(a, b)

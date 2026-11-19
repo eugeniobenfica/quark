@@ -1,0 +1,6 @@
+// panic: an Int went past its limits (overflow; +% -% *% wrap around)
+fn main() {
+    var xs = (0..1000).toArray()
+    xs[500] = 3074457345618258603 // times 3: past the limits, in a loop --release does 4 at a time
+    print(xs.map(k => k * 3 + 1).len())
+}

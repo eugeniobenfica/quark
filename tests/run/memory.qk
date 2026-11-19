@@ -23,7 +23,7 @@ fn main() {
     for round in 0..40 {
         var inner = ""
         for i in 0..5000 {
-            let t = "{round}:{i}:" + repeat("x", i % 7)
+            let t = "{round}:{i}:" + "x" * (i % 7)
             inner = t[0..min(len(t), 6)]
             turns += 1
         }
@@ -31,9 +31,9 @@ fn main() {
         entries.push(e)
         latest = e with { score: e.score + 1 }
         shape = if round % 2 == 0 {
-            Shape.Label("round {round}")
+            .Label("round {round}")
         } else {
-            Shape.Path([round, round + 1, round + 2])
+            .Path([round, round + 1, round + 2])
         }
         let key = "r{round % 4}"
         byFirst[key] = (byFirst[key] ?? []).map(x => x + 1).toArray()
@@ -53,5 +53,5 @@ fn main() {
     }
     print(turns, len(entries), entries[0], entries[39].tags, latest)
     print(shape, byFirst, len(parts), parts[30], text)
-    print(entries.map(e => e.score).sum(), entries.all(e => len(e.tags) == 3), sort(keys(byFirst)))
+    print(entries.map(e => e.score).sum(), entries.all(e => len(e.tags) == 3), byFirst.keys().sorted())
 }

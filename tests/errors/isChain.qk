@@ -1,0 +1,5 @@
+// error: comparisons do not chain
+fn main() {
+    let x: Int? = None
+    print(x is None == true)
+}

@@ -1,0 +1,41 @@
+// Map keys: any value == compares that holds no array or map: Floats (-0.0 is 0.0; NaN cannot be a key), texts in
+// tuples and records of any size, cases with data, trees through boxes. Hashed by their type, field by field.
+type Point { x: Float, y: Float }
+enum Shape { Circle(radius: Float), Rect(w: Int, h: Int), Named(name: Text), Empty }
+type Person { name: Text, city: Text, age: Int, tags: (Text, Bool) }
+enum Tree { Leaf(value: Int), Node(left: Tree, right: Tree) }
+
+fn main() {
+    var byFloat: [Float: Text] = [:]
+    byFloat[0.5] = "half"
+    byFloat[-0.0] = "zero"
+    byFloat[0.0] = "zero again"
+    print(len(byFloat), byFloat[0.5] ?? "-", byFloat[0.0] ?? "-", byFloat[1.0] ?? "-")
+    var pairs: [(Text, Int): Int] = [:]
+    for i in 0..1000 {
+        let k = ("k{i % 10}", i % 3)
+        pairs[k] = (pairs[k] ?? 0) + 1
+    }
+    print(len(pairs), pairs[("k3", 0)] ?? -1)
+    var shapes: [Shape: Int] = [:]
+    shapes[.Circle(radius: 1.5)] = 1
+    shapes[.Rect(w: 2, h: 3)] = 2
+    shapes[.Named(name: "box")] = 3
+    shapes[.Empty] = 4
+    shapes[.Named(name: "b" + "ox")] = 30
+    print(len(shapes), shapes[.Named(name: "box")] ?? 0, shapes[.Rect(w: 2, h: 3)] ?? 0, shapes[.Rect(w: 3, h: 2)] ?? 0)
+    var people: [Person: Int] = [:]
+    people[Person("Ana", "Rio", 30, ("x", true))] = 1
+    people[Person("Ana", "Rio", 30, ("x", false))] = 2
+    print(len(people), people[Person("Ana", "Rio", 30, ("x", true))] ?? 0)
+    var points: [Point: Int] = [:]
+    points[Point(1.0, 2.0)] = 7
+    print(points[Point(1.0, 2.0)] ?? 0, points.contains(Point(2.0, 1.0)))
+    let trees: [Tree: Text] = [Tree.Node(.Leaf(1), .Leaf(2)): "a", Tree.Leaf(3): "b"]
+    print(trees[.Node(.Leaf(1), .Leaf(2))] ?? "-", trees[.Node(.Leaf(2), .Leaf(1))] ?? "-")
+    let seen = [(1.5, "a"), (1.5, "a"), (2.5, "b")].toSet()
+    print(len(seen), byFloat.keys())
+    for (k, v) in shapes {
+        print(k, v)
+    }
+}

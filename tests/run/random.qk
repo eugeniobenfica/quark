@@ -5,7 +5,7 @@ fn main() {
     for i in 0..10 {
         rolls.push(randomInt(1, 7))
     }
-    var counts = fill(6, 0)
+    var counts = [0] * 6
     var sum = 0.0
     for i in 0..60_000 {
         counts[randomInt(0, 6)] += 1

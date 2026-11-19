@@ -1,0 +1,6 @@
+// error: break outside a loop
+fn main() {
+    let x: Int? = None
+    let y = x ?? break
+    print(y)
+}

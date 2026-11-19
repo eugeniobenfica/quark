@@ -1,0 +1,5 @@
+// error: a character literal holds one character
+fn main() {
+    let c = 'ab'
+    print(c)
+}

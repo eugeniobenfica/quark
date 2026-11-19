@@ -1,0 +1,6 @@
+// error: ..= is for patterns
+fn main() {
+    for i in 0..=3 {
+        print(i)
+    }
+}

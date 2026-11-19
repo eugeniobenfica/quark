@@ -1,0 +1,23 @@
+// Optional chaining: a?.rest reads on into what a holds, or is the None (the Err) it holds; never a T??.
+type Address { city: Text, zip: Text? }
+type User { name: Text, address: Address? }
+enum Fault { Missing(what: Text) }
+
+fn find(users: [User], name: Text) -> User? = users.first(u => u.name == name)
+
+fn checked(text: Text) -> Int ! Fault = text.parseInt() ?? return Err(.Missing(text))
+
+fn main() {
+    let users = [User("ana", Address("Lisboa", "1000")), User("bia", None)]
+    print(find(users, "ana")?.address?.city ?? "?", find(users, "bia")?.address?.city ?? "?")
+    print(find(users, "ana")?.address?.zip, find(users, "caio")?.name.len(), find(users, "bia")?.name.len())
+    print("41".parseInt()?.toFloat(), "x".parseInt()?.toFloat(), checked("7")?.toFloat(), checked("y")?.toFloat())
+    print(
+        -5.abs(),
+        -2.5.abs() + 1,
+        -(5.abs()),
+        [3, 1, 2].sorted(),
+        [3, 1, 2].sorted(descending: true),
+        [1, 2].reversed(),
+    )
+}

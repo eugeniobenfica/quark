@@ -1,0 +1,31 @@
+// parallelFold: each thread folds its part from the start, and the parts are combined in order.
+type Words { count: Int, letters: Int }
+
+fn steps(n: Int) -> Int {
+    var x = n
+    var count = 0
+    while x != 1 {
+        x = if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+        count += 1
+    }
+    count
+}
+
+const small = [1, 2, 3, 4].parallelFold(0, (a, x) => a + x)
+
+fn main() {
+    let xs = (1..200_001).toArray()
+    print(xs.parallelFold(0, (total, x) => total + x), xs.sum())
+    let longest = xs.parallelFold(0, (best, n) => max(best, steps(n)), (a, b) => max(a, b))
+    print(longest, longest == xs.map(steps).max())
+    let ws = ["alpha", "be", "gamma", "delta"] * 500
+    print(
+        ws.parallelFold(
+            Words(0, 0),
+            (w, t) => Words(w.count + 1, w.letters + len(t)),
+            (a, b) => Words(a.count + b.count, a.letters + b.letters),
+        ),
+    )
+    let none: [Int] = []
+    print(none.parallelFold(7, (a, x) => a + x), [5].parallelFold(2, (a, x) => a * x), small)
+}

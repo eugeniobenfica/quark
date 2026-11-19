@@ -1,0 +1,80 @@
+// C function values kept, passed on and called from Quark: a Quark function made one (its C entry), one held in a C
+// struct's field, one given to C and called back by it, one optional.
+extern type Ops {
+    scale: Int32
+    apply: extern (Int32) -> Int32
+    mix: extern (Float64, Int32) -> Float64
+}
+
+// fields C may leave NULL: None
+extern type Hooks {
+    before: (extern (Int32) -> Int32)?
+    name: CText?
+    data: Pointer<Int32>?
+    after: (extern (Int32) -> Int32)?
+}
+
+extern effect fn qsort(
+    base: Pointer<Int32>,
+    count: UInt64,
+    size: UInt64,
+    compare: extern (Pointer<Int32>, Pointer<Int32>) -> Int32,
+)
+
+extern effect fn malloc(size: UInt64) -> Pointer<Int32>?
+extern effect fn free(p: Pointer<Int32>)
+
+fn twice(n: Int) -> Int = 2 * n
+
+fn mix(x: Float, n: Int) -> Float = x * toFloat(n) + 0.5
+
+fn ascending(a: Pointer<Int32>, b: Pointer<Int32>) -> Int = a[0] - b[0]
+
+// a C function value given in, called here
+fn applyAll(f: extern (Int32) -> Int32, xs: [Int]) -> [Int] {
+    var out: [Int] = []
+    for x in xs {
+        out.push(f(x))
+    }
+    out
+}
+
+fn sortWith(compare: extern (Pointer<Int32>, Pointer<Int32>) -> Int32, xs: [Int]) -> [Int] {
+    let p = malloc(8 * len(xs)) ?? panic("no memory")
+    for (i, x) in xs.enumerate() {
+        p[i] = x
+    }
+    qsort(p, len(xs), 4, compare)
+    var out: [Int] = []
+    for i in 0..len(xs) {
+        out.push(p[i])
+    }
+    free(p)
+    out
+}
+
+fn main() {
+    let f: extern (Int32) -> Int32 = twice
+    print(f(21), applyAll(f, [1, 2, 3]))
+    let ops = Ops(3, twice, mix)
+    print(ops.scale, ops.apply(ops.scale), ops.mix(1.5, 4))
+    let compare: extern (Pointer<Int32>, Pointer<Int32>) -> Int32 = ascending
+    print(sortWith(compare, [5, -2, 9, 0]))
+    let maybe: (extern (Int32) -> Int32)? = Some(f)
+    if maybe is Some(g) {
+        print(g(-8))
+    }
+    let none: (extern (Int32) -> Int32)? = None
+    print(none == None, (maybe ?? f)(50))
+    // through C's memory: a struct written and read back, NULL fields None
+    let room = malloc(32) ?? panic("no memory")
+    let hooks = Pointer<Hooks>(room)
+    hooks[0] = Hooks(f, None, None, None)
+    let h = hooks[0]
+    print(h.before == None, h.name == None, h.data == None, h.after == None, (h.before ?? f)(4))
+    hooks[0].after = Some(f)
+    hooks[0].name = Some("hooked")
+    let after = hooks[0].after ?? panic("NULL")
+    print(after(5), hooks[0].name ?? "?", hooks[0].before != None)
+    free(room)
+}

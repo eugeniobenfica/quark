@@ -1,12 +1,12 @@
 open 1
 close 1
-1 open 2
+open 2
   inner done
 close 2
-20
+1 20
 parsed 4
-Some(5) parsed x
-None
+parsed x
+Ok(5) Err(not a number: "x")
 turn 0
 turn 0 ends
 turn 1 ends

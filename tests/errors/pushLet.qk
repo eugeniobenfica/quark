@@ -1,0 +1,7 @@
+// error: push changes its value: t must be a var
+type Table { names: [Text] }
+
+fn main() {
+    let t = Table([])
+    t.names.push("a")
+}

@@ -31,12 +31,16 @@ fn main() {
     print(sum == total, sum)
     let csv = "name,score\nana, 7\nbia,x\ncarla,10\n"
     var scores = 0
-    for row in split(trim(csv), "\n") {
-        let cells = split(row, ",")
-        scores += parseInt(trim(cells[1])) ?? 0
+    for row in csv.trim().split("\n") {
+        let cells = row.split(",")
+        scores += cells[1].trim().parseInt() ?? 0
     }
-    print(scores, split("  many   words here ", ""), parseFloat("1e3"), parseFloat("1.5.2"), parseInt("-12"))
+    print(scores, "  many   words here ".split(""), "1e3".parseFloat(), "1.5.2".parseFloat(), "-12".parseInt())
     let path = "build/types-test.txt"
-    print(writeFile(path, csv), (readFile(path) ?? "") == csv, readFile("build/no/such/file") ?? "none")
+    let wrote = match writeFile(path, csv) {
+        Ok(_) => true
+        Err(_) => false
+    }
+    print(wrote, (readFile(path) ?? "") == csv, readFile("build/no/such/file") ?? "none")
     print(len(args()))
 }

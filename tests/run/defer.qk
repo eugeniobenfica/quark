@@ -13,11 +13,11 @@ fn work(n: Int) -> Int {
     n
 }
 
-fn parse(t: Text) -> Int? {
+fn parse(t: Text) -> Int! {
     defer {
         print("parsed {t}")
     }
-    let v = parseInt(t)?
+    let v = t.parseInt()?
     v + 1
 }
 

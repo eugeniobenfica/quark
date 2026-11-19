@@ -1,0 +1,89 @@
+// C, Quark's neighbour: functions of the C library every program links, and of libm, called with C's own types.
+extern fn strlen(text: CText) -> UInt64
+extern fn strchr(text: CText, c: Int32) -> CText?
+extern fn atoi(text: CText) -> Int32
+extern fn llabs(n: Int64) -> Int64
+extern effect fn getenv(name: CText) -> CText?
+extern effect fn malloc(size: UInt64) -> Pointer<UInt8>?
+extern effect fn free(p: Pointer<UInt8>)
+extern effect fn memcpy(to: Pointer<UInt8>, from: Pointer<UInt8>, count: UInt64) -> Pointer<UInt8>
+extern effect fn memset(to: Pointer<UInt8>, value: Int32, count: UInt64) -> Pointer<UInt8>
+
+extern effect fn qsort(
+    base: Pointer<Int64>,
+    count: UInt64,
+    size: UInt64,
+    compare: extern (Pointer<Int64>, Pointer<Int64>) -> Int32,
+)
+
+extern fn cSqrt(x: Float64) -> Float64 in "m" as "sqrt"
+extern fn sqrtf(x: Float32) -> Float32 in "m"
+extern fn floorf(x: Float32) -> Float32 in "m"
+extern fn cAbs(n: Int32) -> Int32 as "abs"
+extern type DivT { quot: Int32, rem: Int32 }
+extern type LLDivT { quot: Int64, rem: Int64 }
+extern fn div(n: Int32, d: Int32) -> DivT
+extern fn lldiv(n: Int64, d: Int64) -> LLDivT
+extern type Mixed { tag: UInt8, small: Int16, wide: Float64, ratio: Float32, next: Pointer<Mixed> }
+
+fn compareInts(a: Pointer<Int64>, b: Pointer<Int64>) -> Int = a[0] - b[0]
+
+fn main() {
+    // texts: a zero-ended copy going in, a copy of the bytes coming back
+    print(strlen("héllo"), strchr("quark", 'a') ?? "-", strchr("quark", 'z') ?? "none", atoi("  -42x"))
+    // numbers: C's int is 32 bits, so 2^32 - 5 crosses as -5
+    print(cAbs(-7), cAbs(4_294_967_291), llabs(-9_000_000_000), cAbs(-3))
+    print(getenv("QUARK_SURELY_NOT_SET") == None)
+    // libm: a double, and a float (rounded on the way in and widened on the way out)
+    print(cSqrt(2), sqrtf(2), floorf(-2.5))
+    // structs by value: 8 bytes (in a register everywhere), 16 bytes (two registers, or through memory on Windows)
+    print(div(17, 5), lldiv(-9_000_000_001, 1_000_000_000))
+    let r = div(-17, 5)
+    print(r.quot, r.rem)
+    // C's memory: written and read through pointers of each width
+    let p = malloc(64) ?? panic("out of memory")
+    let _ = memset(p, 0, 64)
+    p[0] = 300
+    p[1] = 'h'
+    print(p[0], p[1], p[0] + p[1])
+    let words = Pointer<UInt16>(p + 8)
+    words[0] = -1
+    words[1] = 65_537
+    print(words[0], words[1], Pointer<Int16>(words)[0])
+    let small = Pointer<Int8>(p + 16)
+    small[0] = 200
+    print(small[0], Pointer<UInt8>(small)[0])
+    let floats = Pointer<Float32>(p + 24)
+    floats[0] = 0.1
+    floats[1] = 3
+    floats[1] += 0.5
+    print(floats[0], floats[1])
+    let ints = Pointer<Int32>(p + 32)
+    ints[0] = 2_147_483_647
+    ints[0] += 1
+    print(ints[0], Pointer<UInt32>(ints)[0])
+    // texts and bytes out of C's memory, copied
+    let _ = memcpy(p + 40, Pointer<UInt8>(p + 1), 1)
+    p[41] = 'i'
+    print(Text(p + 40, 2), Bytes(p, 2), len(Text(p + 40, -1)))
+    // a struct in C's memory: its fields where C has them
+    let m = Pointer<Mixed>(p)
+    m[0] = Mixed(tag: 7, small: -2, wide: 1.5, ratio: 0.25, next: m)
+    m[0].small -= 1
+    print(m[0].tag, m[0].small, m[0].wide, m[0].ratio, m[0].next == m, p[0], Pointer<Int16>(p)[1])
+    // pointers: equal by address, keys of a map, printed with it
+    var seen: [Pointer<UInt8>: Int] = [:]
+    seen[p] = 1
+    seen[p + 1] = 2
+    print(seen[p] ?? 0, seen[p + 1] ?? 0, p + 1 == p + 1, (p + 3).address - p.address, "{Pointer<UInt8>(255)}")
+    // a Quark function C calls: qsort's comparison
+    let numbers = Pointer<Int64>(p)
+    for (i, n) in [42, -7, 19, 0, 3].enumerate() {
+        numbers[i] = n
+    }
+    qsort(numbers, 5, 8, compareInts)
+    print(numbers[0], numbers[1], numbers[2], numbers[3], numbers[4])
+    qsort(numbers, 5, 8, (a, b) => b[0] - a[0]) // a lambda, when it keeps nothing from around it
+    print(numbers[0], numbers[4])
+    free(p)
+}

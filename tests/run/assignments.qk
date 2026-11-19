@@ -1,0 +1,43 @@
+// compound assignment for every operator, var destructuring, octal literals, mapErr
+enum ConfigError { Io(message: Text), Bad(length: Int) }
+
+fn load(path: Text) -> Text ! ConfigError {
+    let text = readFile(path).mapErr(e => .Io(e))?
+    text
+}
+
+fn number(t: Text) -> Int ! ConfigError {
+    let r: Int! = if t == "" { Err("empty") } else { Ok(3) }
+    let n = r.mapErr(e => .Bad(len(e)))?
+    n
+}
+
+fn main() {
+    var x = 0o17
+    x %= 4
+    x <<= 3
+    x |= 0b101
+    x ^= 1
+    x &= 0xff
+    x >>= 1
+    print(x, 0o777, 0o1_0)
+    var (a, b) = (1, [2, 3])
+    a += 10
+    b.push(4)
+    print(a, b)
+    var (lo, hi) = (0, 100)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if mid * mid < 2000 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    print(lo)
+    print(load("no/such/file") is Err(Io(_)))
+    print(number(""), number("x"))
+    let r: Int! = Ok(4)
+    let w: Int! = Err("four")
+    print(r.mapErr(e => len(e)), w.mapErr(len))
+}

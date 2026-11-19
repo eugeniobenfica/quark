@@ -1,0 +1,438 @@
+// Constants worked out when compiling run lambdas and every loop function, functions given functions, function values
+// and closures, sets, with, tuples, entries and the other pure built-ins; each gives what the same code gives when it runs.
+type Point { x: Int, y: Int }
+type Vec { x: Float, y: Float }
+type Button { label: Text, onPress: (Int) -> Int }
+type Dog { name: Text }
+type Cat { lives: Int }
+interface Speaker { fn speak() -> Text }
+enum Shape { Circle(radius: Float), Square(side: Float), Dot }
+enum Color { Red, Green, Blue }
+
+fn Vec.plus(self, b: Self) -> Self = Vec(self.x + b.x, self.y + b.y)
+
+fn Vec.negate(self) -> Self = Vec(-self.x, -self.y)
+
+fn Vec.compare(self, b: Self) -> Int {
+    let d = self.x * self.x + self.y * self.y - (b.x * b.x + b.y * b.y)
+    if d < 0.0 {
+        -1
+    } else if d > 0.0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn Dog.speak(self) -> Text = "woof {self.name}"
+
+fn Cat.speak(self) -> Text = "meow x{self.lives}"
+
+fn double(x: Int) -> Int = x * 2
+
+fn square(x: Int) -> Int = x * x
+
+fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))
+
+fn adder(k: Int) -> (Int) -> Int = x => x + k
+
+fn pick(big: Bool) -> (Int) -> Int = if big { square } else { double }
+
+fn viaAdder(n: Int) -> Int {
+    let f = adder(3)
+    twice(f, n)
+}
+
+fn sumWith(xs: [Int], f: (Int) -> Int) -> Int {
+    var total = 0
+    for x in xs {
+        total += f(x)
+    }
+    total
+}
+
+fn keepIf<T>(xs: [T], test: (T) -> Bool) -> [T] = xs.filter(test).toArray()
+
+fn chorus(all: [Speaker]) -> Text = all.map(s => s.speak()).join(" / ")
+
+fn area(s: Shape) -> Float = match s {
+    Circle(r) => 3.0 * r * r
+    Square(side) => side * side
+    Dot => 0.0
+}
+
+fn primes(n: Int) -> [Int] = (2..n).filter(k => (2..k).all(d => k % d != 0)).toArray()
+
+fn histogram(fruits: [Text]) -> Text = fruits
+    .countBy(w => len(w))
+    .map(e => "{e.key}:{e.value}")
+    .join(",")
+
+const nums = [5, 3, 8, 1, 9, 2]
+const fruits = ["pear", "fig", "apple", "kiwi", "plum", "fig"]
+const mapped = nums.map(x => x * 10).toArray()
+const filtered = nums.filter(x => x % 2 == 1).toArray()
+const folded = nums.fold(0, (acc, x) => acc * 2 + x)
+const foldedFloat = nums.fold(0.5, (acc, x) => acc + toFloat(x) / 2.0)
+const flags = [nums.any(x => x > 8), nums.any(x => x > 9), nums.all(x => x > 0), nums.all(x => x > 1)]
+const found = [nums.first(x => x > 5), nums.first(x => x > 50), nums.last(x => x < 5), nums.first(), nums.last()]
+const counts = [nums.count(x => x > 2), len(nums), nums.sum(), nums.min(), nums.max(), len(nums.filter(x => x > 4))]
+const means = [nums.mean(), [1.5, 2.5].sum(), [2.5, -1.0, 7.25].min(), [2.5, -1.0, 7.25].max()]
+const byLength = fruits.countBy(w => len(w))
+const extremes = [fruits.minBy(w => len(w)), fruits.maxBy(w => len(w)), fruits.minBy(w => w), fruits.maxBy(w => w)]
+
+const ordered = [
+    nums.sorted(),
+    nums.sorted(descending: true),
+    nums.reversed(),
+    nums.sortedBy(x => x % 3),
+    nums.sortedBy(x => -x, descending: true),
+]
+
+const wordsSorted = [fruits.sorted(), fruits.sortedBy(w => len(w)), fruits.reversed()]
+const searched = [nums.contains(8), nums.contains(7), fruits.contains("kiwi")]
+const indexes = [nums.indexOf(8), nums.indexOf(7), fruits.indexOf("fig")]
+
+const taken = [
+    (0..100).take(3).toArray(),
+    nums.skip(4).toArray(),
+    (0..10).skip(2).take(3).map(x => x * x).toArray(),
+    nums.take(-1).toArray(),
+]
+
+const lazy = (1..1000000000)
+    .map(x => x * 3)
+    .filter(x => x % 7 == 0)
+    .take(4)
+    .toArray()
+
+const indexed = fruits.enumerate().map((i, w) => "{i}{w}").toArray()
+
+const pairsOut = nums
+    .enumerate()
+    .filter((i, x) => i % 2 == 0)
+    .map(p => p.0 * 100 + p.1)
+    .toArray()
+
+const joined = [fruits.join("-"), fruits.map(w => w.upper()).join(""), (1..4).map(i => "{i}").join("+")]
+const unique = fruits.toSet()
+const ranged = [(1..5).sum(), (1..5).fold(1, (a, b) => a * b), len(0..7), (0..20).count(x => x % 3 == 0)]
+const parallel = nums.parallelMap(x => x + 1)
+const sizes = [len("añ€x".codePoints()), "añ€".codePoints().sum(), "añb".bytes().map(b => b % 16).sum()]
+const firstPrimes = primes(40)
+const hist = histogram(fruits)
+const seen: Set<Int> = [3, 1, 3, 2]
+const evens = (0..10).filter(x => x % 2 == 0).toSet()
+const setOps = [seen | evens, seen & evens, seen - evens, evens - seen]
+const setFacts = [len(seen), len(evens | seen)]
+const setHas = [seen.contains(2), seen.contains(5), evens.contains(4)]
+const setLoop = seen.map(x => x * 7).toArray()
+
+fn grownSet() -> Set<Text> {
+    var s: Set<Text> = []
+    for w in ["b", "a", "b", "c"] {
+        s.add(w)
+    }
+    s.remove("a")
+    s.remove("z")
+    s
+}
+
+const grown = grownSet()
+const sameSets = [seen == [1, 2, 3].toSet(), seen == [1, 2].toSet()]
+const adders = [adder(5)(10), viaAdder(1), twice(double, 5), twice(x => x - 1, 0), pick(true)(6), pick(false)(6)]
+const kept = [sumWith(nums, square), sumWith(nums, x => x % 4), sumWith([1, 2, 3], x => adder(100)(x))]
+const generic = [keepIf(nums, x => x < 5), keepIf(nums, x => x > 100)]
+const genericTexts = keepIf(fruits, w => w.startsWith("p"))
+
+fn viaValues() -> [Int] {
+    let f = double
+    let base = 7
+    let g: (Int) -> Int = x => x + base
+    let ops = [double, square, x => x - base]
+    let b = Button("ok", square)
+    [f(4), g(1), b.onPress(9)] + ops.map(op => op(6)).toArray() + [1, 2].map(g).toArray()
+}
+
+const viaFns = viaValues()
+
+fn mapOfFns() -> [Int] {
+    var named: [Text: (Int) -> Int] = [:]
+    named["d"] = double
+    named["s"] = square
+    var out: [Int] = []
+    for (key, op) in named {
+        out.push(op(len(key) + 2))
+    }
+    out
+}
+
+const fnMap = mapOfFns()
+const crew: [Speaker] = [Dog("rex"), Cat(9), Dog("fido")]
+const chorusText = chorus(crew)
+const pets: [Speaker] = [Cat(1), Dog("a")]
+const petCount = len(pets)
+const p = Point(1, 2)
+const moved = p with { y: 20 }
+const tuple = (1, "one", 2.5)
+const tupleParts = "{tuple.0} {tuple.1} {tuple.2}"
+const nested = ((1, 2), (3, 4))
+const deep = nested.1.0 + nested.0.1
+const entries = ["a": 1, "b": 2, "c": 3].map(e => e.key + "{e.value}").toArray()
+
+const entryValue = ["x": 5]
+    .filter(e => e.value > 1)
+    .map(e => (e.key, e.value * 2))
+    .toArray()
+
+const mapStuff = [["k": 1, "j": 2].keys(), ["x"]]
+const mapValues = ["k": 1, "j": 2].values()
+const mapHas = [["k": 1].contains("k"), ["k": 1].contains("q"), len(["k": 1, "j": 2]) == 2]
+const vecs = [Vec(1.0, 2.0) + Vec(0.5, 0.5), -Vec(1.0, -1.0)]
+const vecSorted = [Vec(3.0, 0.0), Vec(1.0, 1.0), Vec(0.0, 2.0)].sorted()
+const vecLess = [Vec(1.0, 0.0) < Vec(0.0, 2.0), Vec(3.0, 0.0) <= Vec(0.0, 2.0)]
+const shapes = [Shape.Circle(1.0), .Square(2.0), .Dot].map(s => area(s)).toArray()
+
+const shapeText = [
+    Shape.Circle(1.5).toText(),
+    "{Shape.Dot}",
+    "{[Shape.Square(2.0)]}",
+    "{Color.Green}",
+    "{[Color.Blue]}",
+]
+
+const colorIndex = [Color.Red.index(), Color.Blue.index()]
+
+const shown = [
+    "{nums}",
+    "{p}",
+    "{tuple}",
+    "{[Some(1), None]}",
+    "{["a": [1]]}",
+    "{seen}",
+    "{Ok(2)}",
+    [1.5, 2.0].toText(),
+]
+
+const formatted = ["{3.14159:.2}", "{7:5}|", "{2.5:8.3}|", "{"añ":4}|", "{-1:.1}"]
+
+const math = [
+    sqrt(16.0),
+    toFloat(7) / 2.0,
+    abs(-3.5),
+    lerp(0.0, 10.0, 0.25),
+    clamp(1.5, 0.0, 1.0),
+    max(2.5, 1.0),
+    min(-1.0, 3.0),
+]
+
+const ints = [
+    floor(2.7),
+    ceil(2.1),
+    round(2.5),
+    round(-2.5),
+    toInt(-3.9),
+    abs(-4),
+    clamp(15, 0, 10),
+    clamp(-5, 0, 10),
+    floor(3),
+]
+
+const texts = ["ab" * 3, "x" * 0, " a  b c ".words().join("|"), "one\r\ntwo\n\nthree\n".lines().join("|")]
+const bytesOut = [Text("hé".bytes()), Text([0xff, 0x41]), Text([104, 105])]
+const lists = [[7] * 3, [[1, 2, 3].get(1) ?? -1, [1, 2, 3].get(5) ?? -1]]
+const errs = ["x".parseInt().mapErr(e => "bad: " + e), "12".parseInt().mapErr(e => "bad")]
+
+fn popped() -> [Int] {
+    var xs = [1, 2, 3]
+    let last = xs.pop() ?? 0
+    xs.push(last * 10)
+    let gone = xs.pop() ?? 0
+    var ys: [Int] = []
+    let none = ys.pop() ?? -1
+    xs + [gone, none]
+}
+
+const pops = popped()
+
+fn removed() -> [Text: Int] {
+    var m = ["a": 1, "b": 2, "c": 3]
+    m.remove("b")
+    m["d"] = 4
+    m
+}
+
+const rem = removed()
+
+fn main() {
+    print(mapped, filtered, folded, foldedFloat, flags, found, counts, means)
+    print(byLength, extremes, ordered, wordsSorted, searched, indexes, taken, lazy)
+    print(indexed, pairsOut, joined, unique, ranged, parallel, sizes, firstPrimes, hist)
+    print(seen, evens, setOps, setFacts, setHas, setLoop, grown, sameSets)
+    print(adders, kept, generic, genericTexts, viaFns, fnMap, chorusText, petCount)
+    print(moved, tuple, tupleParts, deep, entries, entryValue, mapStuff, mapValues, mapHas)
+    print(vecs, vecSorted, vecLess, shapes, shapeText, colorIndex, shown, formatted)
+    print(math, ints, texts, bytesOut, lists, errs, pops, rem)
+    print(
+        mapped == nums.map(x => x * 10).toArray(),
+        filtered == nums.filter(x => x % 2 == 1).toArray(),
+        folded == nums.fold(0, (acc, x) => acc * 2 + x),
+    )
+    print(
+        foldedFloat == nums.fold(0.5, (acc, x) => acc + toFloat(x) / 2.0),
+        flags == [nums.any(x => x > 8), nums.any(x => x > 9), nums.all(x => x > 0), nums.all(x => x > 1)],
+    )
+    print(found == [nums.first(x => x > 5), nums.first(x => x > 50), nums.last(x => x < 5), nums.first(), nums.last()])
+    print(
+        counts == [nums.count(x => x > 2), len(nums), nums.sum(), nums.min(), nums.max(), len(nums.filter(x => x > 4))],
+    )
+    print(
+        means == [nums.mean(), [1.5, 2.5].sum(), [2.5, -1.0, 7.25].min(), [2.5, -1.0, 7.25].max()],
+        byLength == fruits.countBy(w => len(w)),
+    )
+    print(
+        extremes == [fruits.minBy(w => len(w)), fruits.maxBy(w => len(w)), fruits.minBy(w => w), fruits.maxBy(w => w)],
+    )
+    print(
+        ordered == [
+            nums.sorted(),
+            nums.sorted(descending: true),
+            nums.reversed(),
+            nums.sortedBy(x => x % 3),
+            nums.sortedBy(x => -x, descending: true),
+        ],
+    )
+    print(
+        wordsSorted == [fruits.sorted(), fruits.sortedBy(w => len(w)), fruits.reversed()],
+        searched == [nums.contains(8), nums.contains(7), fruits.contains("kiwi")],
+    )
+    print(indexes == [nums.indexOf(8), nums.indexOf(7), fruits.indexOf("fig")], lazy == (1..1000000000)
+        .map(x => x * 3)
+        .filter(x => x % 7 == 0)
+        .take(4)
+        .toArray())
+    print(
+        taken == [
+            (0..100).take(3).toArray(),
+            nums.skip(4).toArray(),
+            (0..10).skip(2).take(3).map(x => x * x).toArray(),
+            nums.take(-1).toArray(),
+        ],
+    )
+    print(indexed == fruits.enumerate().map((i, w) => "{i}{w}").toArray(), pairsOut == nums
+        .enumerate()
+        .filter((i, x) => i % 2 == 0)
+        .map(p => p.0 * 100 + p.1)
+        .toArray())
+    print(
+        joined == [fruits.join("-"), fruits.map(w => w.upper()).join(""), (1..4).map(i => "{i}").join("+")],
+        unique == fruits.toSet(),
+    )
+    print(
+        ranged == [(1..5).sum(), (1..5).fold(1, (a, b) => a * b), len(0..7), (0..20).count(x => x % 3 == 0)],
+        parallel == nums.parallelMap(x => x + 1),
+    )
+    print(
+        sizes == [len("añ€x".codePoints()), "añ€".codePoints().sum(), "añb".bytes().map(b => b % 16).sum()],
+        firstPrimes == primes(40),
+        hist == histogram(fruits),
+    )
+    let seenNow: Set<Int> = [3, 1, 3, 2]
+    let evensNow = (0..10).filter(x => x % 2 == 0).toSet()
+    print(
+        seen == seenNow,
+        evens == evensNow,
+        setOps == [seenNow | evensNow, seenNow & evensNow, seenNow - evensNow, evensNow - seenNow],
+    )
+    print(
+        setFacts == [len(seenNow), len(evensNow | seenNow)],
+        setHas == [seenNow.contains(2), seenNow.contains(5), evensNow.contains(4)],
+    )
+    print(
+        setLoop == seenNow.map(x => x * 7).toArray(),
+        grown == grownSet(),
+        sameSets == [seenNow == [1, 2, 3].toSet(), seenNow == [1, 2].toSet()],
+    )
+    print(adders == [adder(5)(10), viaAdder(1), twice(double, 5), twice(x => x - 1, 0), pick(true)(6), pick(false)(6)])
+    print(
+        kept == [sumWith(nums, square), sumWith(nums, x => x % 4), sumWith([1, 2, 3], x => adder(100)(x))],
+        generic == [keepIf(nums, x => x < 5), keepIf(nums, x => x > 100)],
+        genericTexts == keepIf(fruits, w => w.startsWith("p")),
+    )
+    print(viaFns == viaValues(), fnMap == mapOfFns(), chorusText == chorus(crew))
+    print(moved == p with { y: 20 }, tupleParts == "{tuple.0} {tuple.1} {tuple.2}", deep == nested.1.0 + nested.0.1)
+    print(entries == ["a": 1, "b": 2, "c": 3].map(e => e.key + "{e.value}").toArray(), entryValue == ["x": 5]
+        .filter(e => e.value > 1)
+        .map(e => (e.key, e.value * 2))
+        .toArray())
+    print(
+        mapStuff == [["k": 1, "j": 2].keys(), ["x"]],
+        mapValues == ["k": 1, "j": 2].values(),
+        mapHas == [["k": 1].contains("k"), ["k": 1].contains("q"), len(["k": 1, "j": 2]) == 2],
+    )
+    print(
+        vecs == [Vec(1.0, 2.0) + Vec(0.5, 0.5), -Vec(1.0, -1.0)],
+        vecSorted == [Vec(3.0, 0.0), Vec(1.0, 1.0), Vec(0.0, 2.0)].sorted(),
+    )
+    print(
+        vecLess == [Vec(1.0, 0.0) < Vec(0.0, 2.0), Vec(3.0, 0.0) <= Vec(0.0, 2.0)],
+        shapes == [Shape.Circle(1.0), .Square(2.0), .Dot].map(s => area(s)).toArray(),
+    )
+    print(
+        shapeText == [
+            Shape.Circle(1.5).toText(),
+            "{Shape.Dot}",
+            "{[Shape.Square(2.0)]}",
+            "{Color.Green}",
+            "{[Color.Blue]}",
+        ],
+        colorIndex == [Color.Red.index(), Color.Blue.index()],
+    )
+    print(
+        shown == [
+            "{nums}",
+            "{p}",
+            "{tuple}",
+            "{[Some(1), None]}",
+            "{["a": [1]]}",
+            "{seen}",
+            "{Ok(2)}",
+            [1.5, 2.0].toText(),
+        ],
+    )
+    print(formatted == ["{3.14159:.2}", "{7:5}|", "{2.5:8.3}|", "{"añ":4}|", "{-1:.1}"])
+    print(
+        math == [
+            sqrt(16.0),
+            toFloat(7) / 2.0,
+            abs(-3.5),
+            lerp(0.0, 10.0, 0.25),
+            clamp(1.5, 0.0, 1.0),
+            max(2.5, 1.0),
+            min(-1.0, 3.0),
+        ],
+    )
+    print(
+        ints == [
+            floor(2.7),
+            ceil(2.1),
+            round(2.5),
+            round(-2.5),
+            toInt(-3.9),
+            abs(-4),
+            clamp(15, 0, 10),
+            clamp(-5, 0, 10),
+            floor(3),
+        ],
+    )
+    print(texts == ["ab" * 3, "x" * 0, " a  b c ".words().join("|"), "one\r\ntwo\n\nthree\n".lines().join("|")])
+    print(
+        bytesOut == [Text("hé".bytes()), Text([0xff, 0x41]), Text([104, 105])],
+        lists == [[7] * 3, [[1, 2, 3].get(1) ?? -1, [1, 2, 3].get(5) ?? -1]],
+    )
+    print(
+        errs == ["x".parseInt().mapErr(e => "bad: " + e), "12".parseInt().mapErr(e => "bad")],
+        pops == popped(),
+        rem == removed(),
+    )
+}

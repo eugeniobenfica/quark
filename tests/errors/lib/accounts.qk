@@ -1,0 +1,3 @@
+pub opaque type Account { balance: Int }
+
+pub fn open() -> Account = Account(0)

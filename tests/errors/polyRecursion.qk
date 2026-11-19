@@ -1,0 +1,11 @@
+// error: deep calls itself with new types: each call would need a new instance (deep<Int>, deep<(Int, Int)>
+fn deep<T>(x: T, n: Int) -> Int {
+    if n == 0 {
+        return 0
+    }
+    deep((x, x), n - 1)
+}
+
+fn main() {
+    print(deep(1, 3))
+}

@@ -1,4 +1,4 @@
-// error: a lambda cannot have any
+// error: this lambda must be pure
 fn shout(x: Int) -> Int {
     print(x)
     x

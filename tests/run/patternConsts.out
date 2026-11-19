@@ -1,0 +1,8 @@
+none the limit past it: 12 some: 3
+a greeting else: bye true false
+Ok(Some(4)) Ok(None) Err(negative: -2)
+Ok(Some(12)) Ok(None) Err(negative: -1)
+found 8
+none
+error: negative: -7
+Ok(None) y

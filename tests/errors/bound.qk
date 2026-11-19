@@ -1,5 +1,5 @@
 // error: twice needs its T to fit Speaker: Rock has no fn speak() -> Text
-type Speaker { fn speak() -> Text }
+interface Speaker { fn speak() -> Text }
 type Dog { name: Text }
 type Rock { weight: Int }
 

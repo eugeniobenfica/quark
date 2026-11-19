@@ -1,0 +1,34 @@
+// == looks inside: records, cases and tuples holding arrays, maps, sets, texts or boxed (recursive) fields compare
+// field by field, element by element (maps and sets whatever their order), on every tier.
+type Doc { title: Text, lines: [Text], meta: [Text: Int] }
+enum Tree { Leaf(value: Int), Node(left: Tree, right: Tree) }
+enum Value { List(items: [Value]), Number(n: Float), Empty }
+
+fn main() {
+    let a = Doc("t", ["x", "y"], ["a": 1, "b": 2])
+    let b = Doc("t", ["x", "y"], ["b": 2, "a": 1])
+    let c = Doc("t", ["x", "z"], ["a": 1, "b": 2])
+    print(a == b, a != b, a == c, a != c)
+    print([1, 2, 3] == [1, 2, 3], [1, 2] == [1, 2, 3], ["a"] != ["b"])
+    let t1: Tree = .Node(.Leaf(1), .Node(.Leaf(2), .Leaf(3)))
+    let t2: Tree = .Node(.Leaf(1), .Node(.Leaf(2), .Leaf(3)))
+    let t3: Tree = .Node(.Leaf(1), .Leaf(2))
+    print(t1 == t2, t1 == t3)
+    let v1 = Value.List([Value.Number(1.0), Value.List([Value.Empty])])
+    let v2 = Value.List([Value.Number(1.0), Value.List([Value.Empty])])
+    print(v1 == v2, v1 == Value.List([]), (1, [2.0]) == (1, [2.0]))
+    print([1, 2].toSet() == [2, 1].toSet(), [-0.0] == [0.0])
+    let nan = 0.0 / 0.0
+    print([nan] == [nan])
+    var docs = [a, c]
+    print(docs.contains(b), docs.indexOf(c) ?? -1)
+    var deep: Tree = .Leaf(0)
+    for i in 0..20000 {
+        deep = .Node(.Leaf(i), deep)
+    }
+    var deep2: Tree = .Leaf(0)
+    for i in 0..20000 {
+        deep2 = .Node(.Leaf(i), deep2)
+    }
+    print(deep == deep2)
+}

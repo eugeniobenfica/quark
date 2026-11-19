@@ -1,4 +1,6 @@
 5.0 6.708203932499369 Vec2(x: 0.6, y: 0.8) Vec3(x: 0.0, y: 0.0, z: 1.0)
 {"name":"Ana","age":31,"tags":["a","b\n"],"ok":true,"none":null,"pi":3.5}
 Ana 31.0
-Err(JSON: the text ends where a value should be) Err(JSON: a : after "a", at character 5) [1,"x\"y"]
+Err(JSON: the text ends where a value should be) Err(JSON: a : after "a", at byte 5) [1,"x\"y"]
+é 😀 / 	 "é 😀 \b\f/ \t\u0001"
+Err(JSON: half of a surrogate pair (\ud83d), at byte 1) Err(JSON: "q" after a backslash is not an escape, at byte 1)

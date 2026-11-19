@@ -1,0 +1,10 @@
+// Repetition: * repeats a text or an array, as + joins them; in constants too.
+const line = "=" * 10
+const zeros = [0] * 4
+
+fn main() {
+    var counts = [0] * 5
+    counts[2] += 7
+    let pair = [1, 2] * 3
+    print(line, zeros, counts, pair, "ab" * 3, "x" * -1, [true] * 0, [1, 2] * -2)
+}

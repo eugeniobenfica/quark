@@ -1,0 +1,19 @@
+// The C library through declarations quark bind made from tests/bind/libc.h (libc.qk, beside this file).
+use libc
+
+fn descending(a: Pointer<UInt8>, b: Pointer<UInt8>) -> Int = Pointer<Int32>(b)[0] - Pointer<Int32>(a)[0]
+
+fn main() {
+    let d = div(17, 5)
+    print(strlen("quark"), cAbs(-7), d.quot, d.rem, atoi("42"), cSqrt(81.0))
+    let room = malloc(64) ?? panic("no memory")
+    let numbers = Pointer<Int32>(room)
+    for (i, n) in [3, 9, 1, 7].enumerate() {
+        numbers[i] = n
+    }
+    qsort(room, 4, 4, descending)
+    print(numbers[0], numbers[1], numbers[2], numbers[3])
+    print(strtol("ff", None, 16), getenv("QUARK_NO_SUCH_VARIABLE") == None)
+    free(room)
+    free(None)
+}

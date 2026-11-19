@@ -1,0 +1,44 @@
+// A function's written result reaches the ifs and matches at its end: Err takes its error type, and a branch
+// that returns gives nothing (the other branch's value is the if's).
+enum Fault { Bad(why: Text), Zero }
+
+fn half(x: Int) -> Int ! Fault = if x % 2 == 0 { Ok(x / 2) } else { Err(Fault.Bad("odd")) }
+
+fn check(x: Int) -> Int ! Fault {
+    if x == 0 { 1 } else { Err(Fault.Bad("not zero")) }
+}
+
+fn classify(x: Int) -> Int ! Fault {
+    let y = x * 2
+    if y == 0 {
+        Err(Fault.Zero)
+    } else if y > 10 {
+        Ok(y)
+    } else {
+        match y {
+            2 => Err(Fault.Bad("two"))
+            _ => Ok(y + 1)
+        }
+    }
+}
+
+fn pick(c: Bool) -> Int {
+    if c { return 1 } else { return 2 }
+}
+
+fn firstPositive(xs: [Int]) -> Int {
+    for x in xs {
+        if x > 0 {
+            return x
+        }
+    }
+    if len(xs) > 0 { return 0 } else { return -1 }
+}
+
+fn main() {
+    print(half(4), half(3), check(0), check(5))
+    print(classify(0), classify(1), classify(3), classify(6))
+    print(pick(true), pick(false), firstPositive([-1, 3]), firstPositive([-1]), firstPositive([]))
+    let done: Unit ! Fault = Ok(())
+    print(done)
+}

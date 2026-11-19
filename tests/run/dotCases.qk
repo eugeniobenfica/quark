@@ -1,0 +1,81 @@
+// .Case where the enum is known from where the value goes; Self inside a type's functions
+enum Grade { A, B, C }
+enum Shape { Circle(radius: Float), Square(side: Float), Empty }
+enum Tree<T> { Leaf, Node(left: Tree<T>, value: T, right: Tree<T>) }
+enum Problem { Missing, Bad(line: Int) }
+type Vec2 { x: Float, y: Float }
+
+fn grade(n: Int) -> Grade = match n {
+    90.. => .A
+    70.. => .B
+    _ => .C
+}
+
+fn area(s: Shape) -> Float = match s {
+    Circle(r) => 3.0 * r * r
+    Square(a) => a * a
+    Empty => 0.0
+}
+
+fn find(xs: [Int], x: Int) -> Int ! Problem {
+    for (i, y) in xs.enumerate() {
+        if y == x {
+            return i
+        }
+    }
+    if x < 0 {
+        return Err(.Bad(x))
+    }
+    Err(.Missing)
+}
+
+fn Vec2.plus(self, b: Self) -> Self = Self(self.x + b.x, self.y + b.y)
+
+fn Vec2.scaled(self, k: Float) -> Self {
+    let v: Self = Self(x: self.x * k, y: self.y * k)
+    v
+}
+
+fn Tree.insert(self, v: Int) -> Tree<Int> = match self {
+    Leaf => Self.Node(.Leaf, v, .Leaf)
+    Node(l, x, r) => if v < x {
+        .Node(l.insert(v), x, r)
+    } else {
+        .Node(l, x, r.insert(v))
+    }
+}
+
+fn Tree.count(self) -> Int = match self {
+    Leaf => 0
+    Node(l, _, r) => l.count() + 1 + r.count()
+}
+
+fn main() {
+    print(grade(95), grade(75), grade(10))
+    let shapes: [Shape] = [.Circle(radius: 1.0), .Square(2.0), .Empty]
+    print(shapes.map(area))
+    print(area(.Square(side: 3.0)))
+    var t: Tree<Int> = .Leaf
+    for x in [5, 3, 8, 1] {
+        t = t.insert(x)
+    }
+    print(t.count())
+    let s: Shape = .Empty
+    print(s == .Empty, shapes[0] != .Empty)
+    let maybe: Grade? = .B
+    print(maybe)
+    let g: Grade = if len(shapes) > 2 { .A } else { .C }
+    print(g)
+    print(find([4, 5], 5), find([4, 5], 6), find([], -2))
+    let v = Vec2(1.0, 2.0).plus(Vec2(3.0, 4.0)).scaled(2.0)
+    print(v.x, v.y)
+    let found: [Shape?] = [Some(.Circle(radius: 2.0)), None]
+    let held: Int ! Problem = Err(.Bad(7))
+    print(found, held, found[0] is Some(Circle(_)))
+    let counts: [Grade: Int] = [.A: 2, .C: 1]
+    let nested: [[Shape]] = [[.Empty], [.Square(side: 1.0)]]
+    let byName: [Text: Shape] = ["dot": .Circle(radius: 0.5)]
+    var trees: Set<Tree<Int>> = [.Leaf]
+    trees.add(.Node(.Leaf, 1, .Leaf))
+    print(counts, nested, byName, len(trees))
+}

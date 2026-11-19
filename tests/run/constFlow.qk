@@ -1,0 +1,288 @@
+// Constants worked out when compiling follow the control flow of the code they call: return (a statement or an
+// expression, from any depth), break and continue (also after ??), defer, ? and loops over every kind of source;
+// each gives what the same call gives when it runs.
+type Counter { n: Int, seen: [Int] }
+
+fn Counter.add(var self, x: Int) {
+    self.n += x
+    self.seen.push(x)
+}
+
+fn nested(n: Int) -> Int {
+    let k = {
+        if n > 5 {
+            return 100
+        }
+        n * 2
+    }
+    k + 1
+}
+
+fn firstBig(xs: [Int]) -> Int {
+    for x in xs {
+        if x > 4 {
+            return x * 10
+        }
+    }
+    -1
+}
+
+fn orFive(x: Int?) -> Int {
+    let v = x ?? return 5
+    v + 1
+}
+
+fn byMatch(n: Int) -> Int {
+    let m = match n {
+        0 => 10
+        1 => 20
+        _ => return -n
+    }
+    m * 2
+}
+
+fn eitherWay(c: Bool) -> Text {
+    if c { return "yes" } else { return "no" }
+}
+
+fn sumUntilNone(xs: [Int?]) -> Int {
+    var total = 0
+    var i = 0
+    while i < len(xs) {
+        let x = xs[i] ?? break
+        total += x
+        i += 1
+    }
+    total
+}
+
+fn sumSkipNone(xs: [Int?]) -> Int {
+    var total = 0
+    for x in xs {
+        let v = x ?? continue
+        total += v
+    }
+    total
+}
+
+fn pairs(n: Int) -> [Int] {
+    var out: [Int] = []
+    for i in 0..n {
+        for j in 0..n {
+            if j == i {
+                continue
+            }
+            if j > i + 1 {
+                break
+            }
+            out.push(i * 10 + j)
+        }
+        if i == 3 {
+            break
+        }
+    }
+    out
+}
+
+fn deferred(n: Int) -> [Int] {
+    var log: [Int] = []
+    for i in 0..n {
+        defer {
+            log.push(-i)
+        }
+        if i == 1 {
+            continue
+        }
+        log.push(i)
+        if i == 2 {
+            break
+        }
+    }
+    {
+        defer {
+            log.push(99)
+        }
+        log.push(50)
+    }
+    log
+}
+
+fn earlyDefer(n: Int) -> [Int] {
+    var log = [n]
+    defer {
+        log.push(7)
+    }
+    if n > 0 {
+        return log
+    }
+    log.push(0)
+    log
+}
+
+fn doubled(t: Text) -> Int! {
+    let n = t.parseInt()?
+    Ok(n * 2)
+}
+
+fn firstPlusOne(xs: [Int]) -> Int? {
+    let x = xs.first()?
+    Some(x + 1)
+}
+
+fn collatz(n: Int) -> Int {
+    var steps = 0
+    var k = n
+    while k != 1 {
+        k = if k % 2 == 0 { k / 2 } else { 3 * k + 1 }
+        steps += 1
+    }
+    steps
+}
+
+fn sumTo(n: Int) -> Int {
+    var total = 0
+    for i in 0..n {
+        total += i
+    }
+    total
+}
+
+fn indexed(xs: [Text]) -> Text {
+    var out = ""
+    for (i, x) in xs.enumerate() {
+        out += "{i}={x} "
+    }
+    out
+}
+
+fn tally(words: [Text]) -> [Text: Int] {
+    var m: [Text: Int] = [:]
+    for w in words {
+        m[w] = (m[w] ?? 0) + 1
+    }
+    m
+}
+
+fn mapWalk(m: [Text: Int]) -> Text {
+    var out = ""
+    for (k, v) in m {
+        out += "{k}{v}"
+    }
+    for e in m {
+        out += " {e.key}:{e.value}"
+    }
+    out
+}
+
+fn letters(t: Text) -> Int {
+    var n = 0
+    for c in t.codePoints() {
+        if c >= 'a' and c <= 'z' {
+            n += 1
+        }
+    }
+    n
+}
+
+fn byteSum(t: Text) -> Int {
+    var n = 0
+    for b in t.bytes() {
+        n += b
+    }
+    n
+}
+
+fn grid(n: Int) -> [[Int]] {
+    var g: [[Int]] = []
+    for i in 0..n {
+        g.push([])
+        for j in 0..n {
+            g[i].push(i * j)
+        }
+    }
+    g[1][1] = -1
+    g
+}
+
+fn counted(xs: [Int]) -> Counter {
+    var c = Counter(0, [])
+    for x in xs {
+        c.add(x)
+    }
+    c.n %= 7
+    c
+}
+
+fn firstWordOver(words: [Text], n: Int) -> Text {
+    for w in words {
+        let Some(at) = w.indexOf("-") else {
+            continue
+        }
+        if at > n {
+            return w
+        }
+    }
+    "none"
+}
+
+fn digits(t: Text) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < len(t) {
+        i += 1
+        if t[i - 1..i].parseInt() is Ok(d) { out.push(d) } else { continue }
+    }
+    out
+}
+
+const a = [nested(3), nested(9), firstBig([1, 5, 9, 2]), firstBig([1, 2])]
+const b = [orFive(None), orFive(Some(1)), byMatch(0), byMatch(1), byMatch(7)]
+const c = [eitherWay(true), eitherWay(false)]
+const d = [sumUntilNone([Some(1), Some(2), None, Some(4)]), sumSkipNone([Some(1), Some(2), None, Some(4)])]
+const e = pairs(5)
+const f = [deferred(5), earlyDefer(1), earlyDefer(0)]
+const g = [doubled("21"), doubled("x")]
+const h = [firstPlusOne([4, 5]), firstPlusOne([])]
+const k = [collatz(27), sumTo(100000)]
+const l = indexed(["a", "b", "c"])
+const m = tally(["x", "y", "x", "z", "x"])
+const n = mapWalk(tally(["p", "q", "p"]))
+const o = [letters("añb-c"), byteSum("añ")]
+const p = grid(3)
+const q = counted([3, 4, 5])
+const r = [firstWordOver(["a-b", "abc-d", "xyzw-q"], 2), firstWordOver(["a"], 0)]
+const s = digits("a1b23c")
+const t = ["12345678901234567890123456789012345678901234567890x".parseInt(), "short".parseInt()]
+
+fn main() {
+    print(a, b, c, d)
+    print(e, f, g, h, k)
+    print(l, m, n, o, p, q, r, s, t)
+    print(
+        a == [nested(3), nested(9), firstBig([1, 5, 9, 2]), firstBig([1, 2])],
+        b == [orFive(None), orFive(Some(1)), byMatch(0), byMatch(1), byMatch(7)],
+    )
+    print(
+        c == [eitherWay(true), eitherWay(false)],
+        d == [sumUntilNone([Some(1), Some(2), None, Some(4)]), sumSkipNone([Some(1), Some(2), None, Some(4)])],
+        e == pairs(5),
+    )
+    print(
+        f == [deferred(5), earlyDefer(1), earlyDefer(0)],
+        g == [doubled("21"), doubled("x")],
+        h == [firstPlusOne([4, 5]), firstPlusOne([])],
+    )
+    print(k == [collatz(27), sumTo(100000)], l == indexed(["a", "b", "c"]), m == tally(["x", "y", "x", "z", "x"]))
+    print(
+        n == mapWalk(tally(["p", "q", "p"])),
+        o == [letters("añb-c"), byteSum("añ")],
+        p == grid(3),
+        q == counted([3, 4, 5]),
+    )
+    print(r == [firstWordOver(["a-b", "abc-d", "xyzw-q"], 2), firstWordOver(["a"], 0)], s == digits("a1b23c"))
+    print(
+        t == ["12345678901234567890123456789012345678901234567890x".parseInt(), "short".parseInt()],
+        ("1.2.3" + "0123456789" + "0123456789" + "0123456789" + "0123456789").parseFloat(),
+    )
+    print(("ñ" + "0123456789" + "0123456789" + "0123456789" + "0123456789" + "x").parseInt())
+}

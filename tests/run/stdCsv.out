@@ -1,0 +1,11 @@
+4 [Ana, 31, likes "tea", and cake] two
+lines [Caio, 40, ]
+Ana 31 21
+Bia 27 9
+Caio 40 0
+a,"b,c"
+"say ""hi""","x
+y"
+
+Ok([[a, b], [1, 2]]) Err(line 1: a quoted field is not closed) Err(line 1: a quoted field goes on after its closing quote) Ok([])
+[/a.txt, /b/c/y.txt, /b/x.txt]

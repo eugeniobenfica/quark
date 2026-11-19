@@ -1,0 +1,8 @@
+// error: constant size is worked out when the program is compiled, and the host's function is not
+extern fn hostSize(t: Text) -> Int
+
+const size = hostSize("hey")
+
+fn main() {
+    print(size)
+}

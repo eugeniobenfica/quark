@@ -1,4 +1,4 @@
-// error: ? passes a None on, so the function must give an optional (T?), not Int
+// error: ? passes an Err on, so the function must give a result (T!), not Int
 fn half(t: Text) -> Int {
     let n = parseInt(t)?
     n / 2

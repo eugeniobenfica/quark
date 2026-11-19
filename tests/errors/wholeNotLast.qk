@@ -1,0 +1,9 @@
+// error: n catches everything: it goes last
+fn size(count: Int) -> Text = match count {
+    n => "any {n}"
+    0 => "none"
+}
+
+fn main() {
+    print(size(1))
+}

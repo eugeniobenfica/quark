@@ -1,0 +1,7 @@
+// error: unknown type "Account": it is in accounts.qk; add use accounts
+use lib.accounts
+use lib.teller
+
+fn main() {
+    print(balanceOf(open()))
+}

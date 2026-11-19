@@ -1,0 +1,35 @@
+// Files a part at a time: written in pieces, read back by parts and seeks, line by line (std.files), copied, sized;
+// the errors a path or a mode gives.
+use std.files
+
+fn main() {
+    let dir = env("TEMP") ?? env("TMPDIR") ?? "/tmp"
+    let path = "{dir}/quark-filesParts.txt"
+    let f = openFile(path, "w")?
+    for i in 0..5 {
+        writeChunk(f, "line {i}\r\n".bytes())?
+    }
+    writeChunk(f, "last, with no end".bytes())?
+    closeFile(f)
+    let g = openFile(path, "r")?
+    print(Text(readChunk(g, 6)?), seekFile(g, 8), Text(readChunk(g, 6)?), seekFile(g, -4, 2), Text(readChunk(g, 99)?))
+    print(len(readChunk(g, 10)?), seekFile(g, 0, 1))
+    closeFile(g)
+    var lines = lineReader(openFile(path, "r")?)
+    var got: [Text] = []
+    while lines.next() is Some(line) {
+        got.push(line)
+    }
+    lines.close()
+    print(got, lines.error == "")
+    let copy = "{dir}/quark-filesParts-copy.txt"
+    copyFile(path, copy)?
+    print(fileSize(path), fileSize(copy), readFile(copy)? == readFile(path)?)
+    let a = openFile(copy, "a")?
+    writeChunk(a, "!".bytes())?
+    closeFile(a)
+    print(fileSize(copy), fileSize("{dir}/quark-no-such-file.txt") is Err(_))
+    print(openFile(path, "rw"))
+    removePath(path)?
+    removePath(copy)?
+}

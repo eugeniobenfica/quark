@@ -1,0 +1,6 @@
+// error: expected a type, found ()
+fn nothing() -> () = ()
+
+fn main() {
+    nothing()
+}

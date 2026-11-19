@@ -1,0 +1,4 @@
+// error: this text has no closing "
+fn main() {
+    print(r"abc)
+}

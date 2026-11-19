@@ -1,0 +1,5 @@
+// error: +% -% *% wrap around on Ints, not Float and Float
+fn main() {
+    let x = 1.5 +% 2.0
+    print(x)
+}

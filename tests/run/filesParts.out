@@ -1,0 +1,6 @@
+Ok(line 0) Ok(8) Ok(line 1) Ok(53) Ok( end)
+0 Ok(57)
+[line 0, line 1, line 2, line 3, line 4, last, with no end] true
+Ok(57) Ok(57) true
+Ok(58) true
+Err(openFile: the mode is "r", "w", "a", "r+" or "w+", not "rw")

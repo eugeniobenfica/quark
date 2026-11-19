@@ -1,0 +1,18 @@
+// std.machine: the stack switch, the frame address and the processor's features, as the runtime written in Quark
+// uses them.
+use std.machine as machine
+
+extern effect fn malloc(size: UInt64) -> Pointer<Int64>?
+extern effect fn free(p: Pointer<Int64>)
+
+fn main() {
+    let cpu = machine.cpu()
+    print(cpu & 7 == cpu)
+    let words = malloc(8 * 64) ?? panic("out of memory")
+    let here = machine.frame()
+    let a = 1.5
+    let n = 41
+    machine.switchStack(words, words) // saved, then loaded at once: it goes on right here
+    print(n + 1, a * 2, words[0] != 0, words[0] < here.address, words[1] == here.address)
+    free(words)
+}

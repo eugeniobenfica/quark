@@ -1,0 +1,5 @@
+// error: mapErr changes a result's error (T ! E, or T!), not Int?
+fn main() {
+    let x: Int? = Some(1)
+    print(x.mapErr(e => e))
+}

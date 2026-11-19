@@ -9,7 +9,7 @@ fn main() {
     assertEqual("ab" + "c", "abc", what: "joined text")
     assertEqual(Point(1, 2), Point(1, 2))
     assertEqual(Shape.Circle(2), Shape.Circle(2.0))
-    assertEqual(parseInt("12"), Some(12))
+    assertEqual("12".parseInt(), Ok(12))
     assertNotEqual(Point(1, 2), Point(2, 1))
     assertNear(0.1 + 0.2, 0.3)
     assertNear(3.14159, 3.14, tolerance: 0.01)
@@ -18,9 +18,9 @@ fn main() {
 }
 
 fn parseVersion(t: Text) -> Int! {
-    let parts = split(t, ".")
+    let parts = t.split(".")
     if len(parts) != 2 {
         return Err("expected major.minor, found \"{t}\"")
     }
-    parseInt(parts[0]) ?? 0
+    parts[0].parseInt() ?? 0
 }

@@ -1,13 +1,16 @@
-// Fused loops: a let used once is folded into its use; used twice, it is kept as an array.
+// Replayable pipelines are evaluated by their consumers.
 fn main() {
     let squares = (1..6).map(x => x * x)
     print(squares.sum())
     let kept = (0..5).map(x => x * 2)
     print(kept, kept.sum(), len(kept))
-    let odd = (0..20).filter(x => x % 2 == 1).map((x, i) => x * 100 + i)
+    let odd = (0..20)
+        .filter(x => x % 2 == 1)
+        .enumerate()
+        .map((i, x) => x * 100 + i)
     print(odd)
     var found = -1
-    for x, i in (10..100).filter(x => x % 7 == 0) {
+    for (i, x) in (10..100).filter(x => x % 7 == 0).enumerate() {
         if x > 40 {
             found = i
             break
@@ -26,4 +29,18 @@ fn main() {
     }
     print(n)
     print((0..0).sum(), (5..2).map(x => x).len(), [1.5, 2.5].fold(0.0, (a, x) => a + x))
+    let ages = ["ana": 31, "caio": 28]
+    // a map's values in a loop are its entries, in the order the keys came
+    for e in ages {
+        print(e.key, e.value)
+    }
+    for (name, age) in ages {
+        print(name, age)
+    }
+    for Entry(name, age) in ages {
+        print(name, age + 1)
+    }
+    for (i, word) in ["x", "y"].enumerate() {
+        print(i, word)
+    }
 }

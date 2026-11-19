@@ -1,0 +1,9 @@
+// error: alternatives (|) cannot bind values or destructure fields
+enum Shape { Circle(radius: Float), Square(side: Float) }
+
+fn main() {
+    let s = Shape.Circle(1.0)
+    if s is Circle(r) | Square(r) {
+        print(r)
+    }
+}

@@ -34,11 +34,24 @@ fn main() {
         steps += 1
     }
     print("steps", steps)
-    let t0 = now()
-    let sleeper = spawn(() => wait(0.05))
+    let t0 = monotonicTime()
+    let sleeper = spawn(() => sleep(0.05))
     var turns = 0
     while step(sleeper) {
         turns += 1
     }
-    print(now() - t0 >= 0.05, turns > 0)
+    print(monotonicTime() - t0 >= 0.05, turns > 0)
+    let joined: Task = spawn(() => countdown("joined", 1))
+    joinTask(joined)
+    // joinTask waits only while the task sleeps: a task that only yields runs its turns back to back
+    let t1 = monotonicTime()
+    joinTask(spawn(() => {
+        for _ in 0..2000 {
+            yield()
+        }
+    }))
+    let napper = spawn(() => sleep(0.05))
+    joinTask(napper)
+    let took = monotonicTime() - t1
+    print(took >= 0.05, took < 1.0)
 }

@@ -1,0 +1,9 @@
+// panic: an Int went past its limits (overflow; +% -% *% wrap around)
+fn grow(n: Int) -> Int = n * 1_000_000
+
+fn main() {
+    var x = 3
+    while true {
+        x = grow(x)
+    }
+}

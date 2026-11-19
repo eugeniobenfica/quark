@@ -1,0 +1,8 @@
+// error: alternatives in a match arm cannot bind values or destructure fields
+fn size(count: Int) -> Text = match count {
+    0 | n => "{n}"
+}
+
+fn main() {
+    print(size(1))
+}

@@ -1,0 +1,37 @@
+// value is Pattern: a Bool; its names are in reach in the if's block, the while's body, and after and
+enum Token { Ident(name: Text), Number(value: Int), Space, End }
+enum Shape { Circle(radius: Float), Square(side: Float), Empty }
+
+fn describe(t: Token) -> Text {
+    if t is Ident(name) and name == "fn" {
+        return "keyword"
+    }
+    if t is Ident(name) {
+        return "name {name}"
+    }
+    if t is Number(n) and n > 9 {
+        return "big {n}"
+    }
+    if t is Space | End {
+        return "blank"
+    }
+    "small"
+}
+
+fn main() {
+    for t in [Token.Ident("fn"), Token.Ident("x"), Token.Number(42), Token.Number(1), Token.Space, Token.End] {
+        print(describe(t))
+    }
+    let s = Shape.Square(2.0)
+    let empty = s is Empty
+    print(empty, s is Square(_), 5 is 1..10, "a" is "b", (1, "x") is (1, _))
+    var stack = [1, 2, 3]
+    while stack.last() is Some(top) {
+        print("top", top)
+        stack = stack[0..len(stack) - 1]
+    }
+    let maybe: Int? = Some(7)
+    if maybe is Some(v) and v > 5 and v < 10 {
+        print("in range", v)
+    }
+}

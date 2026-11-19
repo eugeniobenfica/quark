@@ -1,0 +1,67 @@
+// A loop gives back only what its turns made: what was there before stays where it is, and containers from before
+// that the loop changes in place (an element set, a key added, a push into their room) keep what goes into them.
+type Item { name: Text, tags: [Text] }
+type Store { items: [Item], index: [Text: Int], log: Text }
+
+fn Store.add(var self, name: Text) {
+    self.index[name] = len(self.items)
+    self.items.push(Item(name, ["new"]))
+    self.log = self.log + name + ";"
+}
+
+fn Store.tag(var self, i: Int, t: Text) {
+    self.items[i].tags.push(t)
+    self.items[i].name = self.items[i].name + "+"
+}
+
+fn main() {
+    // made before the loops: old to all of them
+    var texts: [Text] = []
+    for i in 0..1000 {
+        texts.push("t{i}")
+    }
+    var m: [Int: Text] = [:]
+    var groups: [Text: [Text]] = [:]
+    for g in 0..50 {
+        groups["g{g}"] = []
+    }
+    var s = Store([], [:], "")
+    var seen = [0].toSet()
+    var words: Set<Text> = ["a"].toSet()
+    var grid: [[Text]] = [[""] * 20] * 20
+    for round in 0..300 {
+        for i in 0..1000 {
+            texts[i] = "r{round}-{i}"
+            m[i % 700] = "v{round}.{i}"
+            groups["g{i % 50}"].push("x{i}")
+            grid[i % 20][i / 20 % 20] = "c{round}{i}"
+            seen.add(i + round)
+            words.add("w{i % 300}")
+        }
+        s.add("item{round}")
+        s.tag(round / 2, "t{round}")
+        if len(groups["g0"] ?? []) > 200 {
+            for g in 0..50 {
+                groups["g{g}"] = []
+            }
+        }
+    }
+    var total = 0
+    for t in texts {
+        total += len(t)
+    }
+    var gl = 0
+    for (k, v) in groups {
+        for x in v {
+            gl += len(x)
+        }
+    }
+    var gridLen = 0
+    for row in grid {
+        for c in row {
+            gridLen += len(c)
+        }
+    }
+    print(total, len(m), m[5] ?? "-", gl, gridLen, len(seen), len(words))
+    print(len(s.items), s.items[10].name, s.items[10].tags, len(s.log), s.index["item299"] ?? -1)
+}

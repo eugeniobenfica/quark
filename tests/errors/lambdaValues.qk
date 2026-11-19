@@ -1,0 +1,4 @@
+// error: a lambda takes at most 16 values: give it a record instead
+fn main() {
+    let f = (a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Int, k: Int, l: Int, m: Int, n: Int, o: Int, p: Int, q: Int) => a + q
+}

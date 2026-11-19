@@ -1,0 +1,29 @@
+// Any value print shows goes into a text as print writes it (a case without its enum's name), and a lambda over
+// tuples or a map's entries takes one value for each field, as for (i, x) in does.
+enum Color { Red, Green }
+enum Shape { Circle(r: Float), Empty }
+enum Tree<T> { Leaf, Node(left: Tree<T>, value: T, right: Tree<T>) }
+type P { x: Int, name: Text }
+
+fn each<T>(xs: [T], f: effect (T) -> Unit) {
+    for x in xs {
+        f(x)
+    }
+}
+
+fn main() {
+    let c = Color.Green
+    let s = Shape.Circle(2)
+    let t: Tree<Int> = .Node(.Leaf, 3, .Leaf)
+    let o: Int? = 4
+    let r: Int! = Err("bad")
+    print("{c} {s} {Shape.Empty} {t} {o} {r}")
+    print("{[1, 2]} {(1, "a")} {P(1, "n")} {["k": [1]]} {"ab".bytes()} {(0..3).map(x => x * x)} {[1, 2]:10}|")
+    print(s.toText(), [P(2, "q")].toText(), len([1, 2, 3].toText()))
+    let xs = ["a", "b", "c"]
+    print(xs.enumerate().map((i, x) => "{i}:{x}"), xs.enumerate().filter((i, x) => i > 0).map((i, x) => x))
+    let m = ["k": 1, "j": 2]
+    print(m.map((k, v) => v * 10), m.filter((k, v) => v > 1).map(e => e.key), m.sortedBy((k, v) => -v).map((k, v) => k))
+    print([(1, 2), (3, 4)].map((a, b) => a + b).sum(), [[], [1]], [None, Some(2)])
+    each([(1, "one")], (n, w) => print(n, w))
+}

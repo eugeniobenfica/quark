@@ -1,0 +1,6 @@
+// error: n: expected Int, found Text
+type Counter { n: Int = "zero" }
+
+fn main() {
+    print(Counter())
+}

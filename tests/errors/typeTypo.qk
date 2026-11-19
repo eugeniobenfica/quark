@@ -1,0 +1,6 @@
+// error: unknown type "Pont": did you mean "Point"?
+type Point { x: Int, y: Int }
+
+fn main() {
+    let p: Pont = Point(1, 2)
+}

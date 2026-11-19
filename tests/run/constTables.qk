@@ -1,0 +1,13 @@
+// Constants are worked out when the program is compiled, calls and all: a table that takes millions of steps
+// (fib(30) makes 2.7 million calls) is still a literal in the program.
+fn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+
+fn sumTo(n: Int) -> Int = if n == 0 { 0 } else { n + sumTo(n - 1) }
+
+const f30 = fib(30)
+const deep = sumTo(5000)
+const firsts = [fib(10), fib(15), fib(20)]
+
+fn main() {
+    print(f30, deep, firsts)
+}

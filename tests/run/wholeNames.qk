@@ -1,0 +1,45 @@
+// A match arm (or an is) may name the whole value: n if n > 2 => ... A bare name always matches, as _ does.
+enum Shape { Circle(radius: Float), Square(side: Float) }
+type Pair { a: Int, b: Int }
+
+fn size(count: Int) -> Text = match count {
+    0 => "none"
+    n if n > 2 => "many: {n}"
+    n => "few: {n}"
+}
+
+fn describe(s: Shape) -> Text = match s {
+    Circle(r) if r > 10.0 => "a big circle"
+    shape => "{shape}"
+}
+
+fn order(p: Pair) -> Text = match p {
+    Pair(a, b) if a < b => "{a} < {b}"
+    same if same.a == same.b => "equal at {same.a}"
+    other => "{other.b} < {other.a}"
+}
+
+fn word(t: Text) -> Text = match t {
+    "" => "(empty)"
+    w if len(w) > 3 => "long {w}"
+    w => w
+}
+
+fn main() {
+    print(size(0), size(1), size(5))
+    print(describe(.Circle(20.0)), describe(.Square(2.0)))
+    print(order(Pair(1, 2)), order(Pair(3, 3)), order(Pair(5, 4)))
+    print(word(""), word("quark"), word("qk"))
+    let found: Int? = Some(4)
+    if found is v and v != None {
+        print("found", v)
+    }
+    let label = match found {
+        Some(n) if n > 10 => "big"
+        whole => "{whole}"
+    }
+    print(label, match 2.5 {
+        x if x > 2 => "above 2: {x}"
+        _ => "not above"
+    })
+}

@@ -1,0 +1,19 @@
+// A map that keys go into and out of, a million times: its removed entries are compacted as it goes, so the
+// memory it holds stays bounded by the keys it has (quark run --memory 16 too).
+fn main() {
+    var live: [Int: Text] = [:]
+    var total = 0
+    for i in 0..1000000 {
+        live[i] = "k{i % 10}"
+        if i >= 8 {
+            live.remove(i - 8)
+        }
+        total += len(live)
+    }
+    print(len(live), total, live[999999] ?? "-", live[5] ?? "gone")
+    var keys: [Int] = []
+    for (k, _) in live {
+        keys.push(k)
+    }
+    print(keys)
+}

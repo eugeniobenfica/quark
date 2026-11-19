@@ -1,0 +1,4 @@
+tests/recover/errors.qk:5:5: expected a value, found "let"
+tests/recover/errors.qk:6:5: expected ")" to close the parenthesis, found "a"
+tests/recover/errors.qk:11:18: expected ")" after the parameters, found "->"
+tests/recover/errors.qk:18:5: expected "]" to close the array, found "print"

@@ -1,6 +1,6 @@
 9.75 19.50 9.75 -975 0.05
 true true true red
 true Money(cents: 975)
-17 [many, words, here] Some(1000.0) None Some(-12)
+17 [many, words, here] Ok(1000.0) Err(not a number: "1.5.2") Ok(-12)
 true true none
 0

@@ -6,7 +6,9 @@ fn main() {
     let a = Vec2(3, 4)
     let b = Vec2(1, 0).rotated(pi / 2)
     print(a.length(), (a + b * 2).length(), a.normalized(), Vec3(1, 0, 0).cross(Vec3(0, 1, 0)))
-    let text = "\{\"name\": \"Ana\", \"age\": 31, \"tags\": [\"a\", \"b\n\"], \"ok\": true, \"none\": null, \"pi\": 3.5\}"
+    let text = r"""
+        {"name": "Ana", "age": 31, "tags": ["a", "b\n"], "ok": true, "none": null, "pi": 3.5}
+        """
     match parseJson(text) {
         Ok(j) => {
             print(toJson(j))
@@ -15,4 +17,14 @@ fn main() {
         Err(why) => print(why)
     }
     print(parseJson("[1, 2,"), parseJson("\{\"a\" 1\}"), toJson(Json.List([Json.Num(1), Json.Str("x\"y")])))
+    // escapes: \u with surrogate pairs, \b \f \/, and control characters written back escaped
+    let escaped = parseJson(r"""
+        "\u00e9 \ud83d\ude00 \b\f\/ \t\u0001"
+        """)?
+    print(escaped.text() ?? "?", toJson(escaped))
+    print(parseJson(r"""
+        "\ud83d alone"
+        """), parseJson(r"""
+        "\q"
+        """))
 }

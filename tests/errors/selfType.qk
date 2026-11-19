@@ -1,4 +1,4 @@
-// error: Point.scale's self is the Point it works on
+// error: self takes no type: it is the Point the function works on
 type Point { x: Float, y: Float }
 
 fn Point.scale(self: Float, p: Point) -> Point = Point(p.x * self, p.y * self)

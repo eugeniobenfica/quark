@@ -1,0 +1,4 @@
+Lisboa ?
+Some(1000) None Some(3)
+Ok(41.0) Err(not a number: "x") Ok(7.0) Err(Fault.Missing(what: y))
+5 3.5 -5 [1, 2, 3] [3, 2, 1] [2, 1]

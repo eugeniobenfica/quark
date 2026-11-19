@@ -1,0 +1,12 @@
+// error: next changes its value: p must be a var
+type Parser { at: Int }
+
+fn Parser.next(var self) -> Int {
+    self.at += 1
+    self.at
+}
+
+fn main() {
+    let p = Parser(0)
+    print(p.next())
+}

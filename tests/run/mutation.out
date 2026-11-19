@@ -1,0 +1,14 @@
+[Item(name: plate, shape: Shape.Circle(radius: 1.0), count: 4), Item(name: tray, shape: Shape.Rect(width: 2.0, height: 3.0), count: 2), Item(name: void, shape: Shape.Empty, count: 0)]
+fn ( 2
+4 None
+10
+Some(b) Some(a) None Stack(items: [])
+Light.Off
+500
+[Sym(name: x, uses: 3), Sym(name: y, uses: 3), Sym(name: z, uses: 20)] 3
+[[0, 1, 2, 3], [10, 11, 12, 13], [20, 21, 22, 123]]
+[odd: [-1, 3, 5], even: [0, 2, 4, 6]]
+[Sym(name: q, uses: 1)] Counter(n: 3) [Box(items: [1, 2, 3, 4], tag: a), Box(items: [], tag: c)]
+[1, 2, 3] [100, 2, 3] [100, 2, 3, 4, 100, 2, 3, 4]
+[[1, 2], [3, 4]] [[1, 2], [3, 4]] [[1, 2], [3, 4]] [1, 2] [[9, 2], [3, 4, 5]]
+500 Sym(name: w499, uses: 400) 200000

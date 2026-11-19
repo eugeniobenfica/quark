@@ -1,0 +1,4 @@
+// error: unknown escape in text
+fn main() {
+    print("a\qb")
+}

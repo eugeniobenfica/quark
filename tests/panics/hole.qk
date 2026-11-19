@@ -1,0 +1,6 @@
+// panic: a hole (_) was reached: this value is not written yet
+fn area(w: Float, h: Float) -> Float = _
+
+fn main() {
+    print(area(2, 3))
+}

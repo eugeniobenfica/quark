@@ -1,0 +1,17 @@
+// Holes: _ where a value goes is a value not written yet. It takes the type it goes into (it is Never, as panic is),
+// so a program with holes is checked and runs; only reaching one stops it.
+type Shape { name: Text, sides: Int }
+
+fn describe(s: Shape) -> Text = match s.sides {
+    3 => "a triangle"
+    4 => "a square"
+    // the rest is not written yet
+    _ => _
+}
+
+fn main() {
+    print(describe(Shape("t", 3)), describe(Shape("q", 4)))
+    let fast = true
+    let speed: Float = if fast { 9.5 } else { _ }
+    print(speed)
+}

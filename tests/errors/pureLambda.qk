@@ -1,0 +1,9 @@
+// error: a lambda given to map is pure: it cannot change total; use fold, or a for loop
+fn main() {
+    var total = 0
+    let doubled = [1, 2, 3].map(x => {
+        total += x
+        x * 2
+    })
+    print(doubled, total)
+}

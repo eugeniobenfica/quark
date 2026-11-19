@@ -1,0 +1,8 @@
+// error: v is named by an is pattern: it is in reach only where the pattern held
+fn main() {
+    let x: Int? = Some(3)
+    if x is Some(v) {
+        print(v)
+    }
+    print(v)
+}

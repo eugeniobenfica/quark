@@ -1,0 +1,308 @@
+// Files, folders, the input, the environment, the arguments, and other programs. The bytes come and go through C's
+// streams (fread, fwrite) opened by the system's layer (UTF-8 names on every system); messages say why with C's
+// strerror.
+use base
+use arena
+use text
+use print
+
+extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fclose(f: Int64) -> Int32
+extern effect fn ferror(f: Int64) -> Int32
+extern effect fn osOpen(path: Int64, mode: Int64) -> Int64 as "qkosOpen" // a FILE*, or 0 (errno set)
+extern effect fn osEnv(name: Int64) -> Int64 as "qkosEnv" // malloc'd UTF-8, or 0
+extern effect fn osPathKind(path: Int64) -> Int64 as "qkosPathKind" // -1 nothing, 0 a file, 1 a folder
+extern effect fn osMakeDir(path: Int64) -> Int64 as "qkosMakeDir" // 0, or -1 (errno set)
+extern effect fn osRemove(path: Int64, folder: Int64) -> Int64 as "qkosRemove" // 0, or -1 (errno set)
+extern effect fn osListDir(path: Int64) -> Int64 as "qkosListDir" // malloc'd names, each zero-ended, then a zero; or 0
+extern effect fn osReadIn(p: Int64, n: Int64) -> Int64 as "qkosReadIn" // the input's bytes: how many (0 at its end)
+extern effect fn osReadLine(out: Int64) -> Int64 as "qkosReadLine" // a typed line (a console): 1 and (malloc'd, length) in out, 0 at the end, -1 not a console
+extern effect fn osRunProcess(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosRunProcess"
+extern effect fn osSeparator(c: Int64) -> Int64 as "qkosSeparator"
+
+const errnoNoEnt = 2
+const errnoIo = 5
+const errnoExist = 17
+const errnoNotDir = 20
+
+fn cannot(what: Text, name: Int) -> Int =
+    errResult(message().text("cannot ").text(what).text(" ").zeroText(name).text(": ").zeroText(strerror(osErrno())))
+
+type Read { p: Int, n: Int, ok: Bool }
+
+// the whole file, in the arena
+fn readWhole(name: Int) -> Read {
+    let f = osOpen(name, textAt("rb\0"))
+    if f == 0 {
+        return Read(0, 0, false)
+    }
+    var cap = 65536
+    var p = malloc(cap)
+    var n = 0
+    while true {
+        if n == cap {
+            cap *= 2
+            p = realloc(p, cap)
+        }
+        let got = fread(p + n, 1, cap - n, f)
+        if got == 0 {
+            break
+        }
+        n += got
+    }
+    let failed = ferror(f) != 0
+    let _ = fclose(f)
+    if failed {
+        free(p)
+        return Read(0, 0, false)
+    }
+    let bytes = cString(p, n)
+    free(p)
+    Read(bytes, n, true)
+}
+
+pub extern effect fn rtReadFile(path: Int64, pathLen: Int64) -> Int64 as "qk_readFile" {
+    let name = cString(path, pathLen)
+    let r = readWhole(name)
+    if not r.ok {
+        return cannot("read", name)
+    }
+    let bad = utf8Invalid(r.p, r.n)
+    if bad >= 0 {
+        return errResult(
+            message().text("cannot read ").zeroText(name).text(": it is not UTF-8 text (byte ").int(bad).text(
+                "): readBytes reads any file",
+            ),
+        )
+    }
+    okResult(r.p, r.n)
+}
+
+pub extern effect fn rtReadBytes(path: Int64, pathLen: Int64) -> Int64 as "qk_readBytes" {
+    let name = cString(path, pathLen)
+    let r = readWhole(name)
+    if not r.ok {
+        return cannot("read", name)
+    }
+    okResult(r.p, r.n)
+}
+
+fn writeWhole(path: Int, pathLen: Int, text: Int, n: Int, mode: Text, what: Text) -> Int {
+    let name = cString(path, pathLen)
+    let f = osOpen(name, textAt(mode))
+    if f == 0 {
+        return cannot(what, name)
+    }
+    let written = if n > 0 { fwrite(text, 1, n, f) } else { 0 }
+    let writeError = if written == n { 0 } else { osErrno() }
+    let closed = fclose(f)
+    if written != n {
+        osSetErrno(if writeError != 0 { writeError } else { errnoIo })
+        return cannot(what, name)
+    }
+    if closed != 0 {
+        return cannot("close", name)
+    }
+    okResult(0, 0)
+}
+
+pub extern effect fn rtWriteFile(path: Int64, pathLen: Int64, text: Int64, n: Int64) -> Int64 as "qk_writeFile" =
+    writeWhole(path, pathLen, text, n, "wb\0", "write")
+
+pub extern effect fn rtAppendFile(path: Int64, pathLen: Int64, text: Int64, n: Int64) -> Int64 as "qk_appendFile" =
+    writeWhole(path, pathLen, text, n, "ab\0", "append to")
+
+// the input, a byte at a time from a buffer of the program's own
+fn nextByte() -> Int {
+    let g = globals()
+    if word(g, gInAt) >= word(g, gInLen) {
+        if word(g, gInBuf) == 0 {
+            setWord(g, gInBuf, malloc(65536))
+        }
+        let got = osReadIn(word(g, gInBuf), 65536)
+        setWord(g, gInAt, 0)
+        setWord(g, gInLen, if got > 0 { got } else { 0 })
+        if got <= 0 {
+            return -1
+        }
+    }
+    let c = byte(word(g, gInBuf), word(g, gInAt))
+    setWord(g, gInAt, word(g, gInAt) + 1)
+    c
+}
+
+// readLine() -> Text?: the next line, without its line break; None at the end
+pub extern effect fn rtReadLine() -> Int64 as "qk_readLine" {
+    flush() // what was printed before the question shows first
+    let typed = alloc(2, 8)
+    let console = osReadLine(typed)
+    if console >= 0 {
+        if console == 0 {
+            return optional(false, 0, 0)
+        }
+        let line = cString(word(typed, 0), word(typed, 1))
+        free(word(typed, 0))
+        return optional(true, line, word(typed, 1))
+    }
+    var cap = 256
+    var p = malloc(cap)
+    var n = 0
+    var any = false
+    while true {
+        let c = nextByte()
+        if c < 0 {
+            break
+        }
+        any = true
+        if c == '\n' {
+            break
+        }
+        if n == cap {
+            cap *= 2
+            p = realloc(p, cap)
+        }
+        setByte(p, n, c)
+        n += 1
+    }
+    if not any {
+        free(p)
+        return optional(false, 0, 0)
+    }
+    if n > 0 and byte(p, n - 1) == '\r' {
+        n -= 1
+    }
+    let bytes = cString(p, n)
+    free(p)
+    optional(true, bytes, n)
+}
+
+// args() -> [Text]: the command line after the program
+pub extern effect fn rtArgs() -> Int64 as "qk_args" {
+    let count = gGet(gArgCount)
+    let p = textArray(count)
+    copyBytes(p + 8, gGet(gArgs), 16 * count)
+    p
+}
+
+pub extern effect fn rtEnv(name: Int64, n: Int64) -> Int64 as "qk_env" {
+    let v = osEnv(cString(name, n))
+    if v == 0 {
+        return optional(false, 0, 0)
+    }
+    let k = strlen(v)
+    let t = cString(v, k)
+    free(v)
+    optional(true, t, k)
+}
+
+pub extern effect fn rtPathExists(path: Int64, n: Int64) -> Int64 as "qk_pathExists" =
+    if osPathKind(cString(path, n)) >= 0 { 1 } else { 0 }
+
+// listDir(path) -> [Text]!: the names in a folder, sorted
+pub extern effect fn rtListDir(path: Int64, n: Int64) -> Int64 as "qk_listDir" {
+    let dir = cString(path, n)
+    let names = osListDir(dir)
+    if names == 0 {
+        return cannot("list", dir)
+    }
+    var count = 0
+    var at = names
+    while byte(at, 0) != 0 {
+        at += strlen(at) + 1
+        count += 1
+    }
+    let arr = textArray(count)
+    at = names
+    for i in 0..count {
+        let k = strlen(at)
+        setWord(arr, 1 + 2 * i, cString(at, k))
+        setWord(arr, 2 + 2 * i, k)
+        at += k + 1
+    }
+    free(names)
+    for i in 1..count {
+        // sorted as strcmp sorts: by bytes
+        var j = i
+        while j > 0
+            and textCompare(word(arr, 2 * j + 1), word(arr, 2 * j + 2), word(arr, 2 * j - 1), word(arr, 2 * j)) < 0 {
+            let p = word(arr, 2 * j + 1)
+            let k = word(arr, 2 * j + 2)
+            setWord(arr, 2 * j + 1, word(arr, 2 * j - 1))
+            setWord(arr, 2 * j + 2, word(arr, 2 * j))
+            setWord(arr, 2 * j - 1, p)
+            setWord(arr, 2 * j, k)
+            j -= 1
+        }
+    }
+    okResult(arr + 8, count)
+}
+
+// makeDir(path) -> Unit!: the folder, and the folders above it that are missing
+pub extern effect fn rtMakeDir(path: Int64, n: Int64) -> Int64 as "qk_makeDir" {
+    let name = cString(path, n)
+    for i in 1..n + 1 {
+        if i < n and osSeparator(byte(name, i)) == 0 {
+            continue
+        }
+        if osSeparator(byte(name, i - 1)) != 0 {
+            // a//b, the root, or a separator at the end
+            continue
+        }
+        if i < n and byte(name, i - 1) == ':' {
+            // C:\
+            continue
+        }
+        let kept = byte(name, i)
+        setByte(name, i, 0)
+        if osPathKind(name) != 1 and osMakeDir(name) != 0 and not (osErrno() == errnoExist and osPathKind(name) == 1) {
+            if osErrno() == errnoExist {
+                osSetErrno(errnoNotDir)
+            }
+            let r = cannot("make the folder", name)
+            setByte(name, i, kept)
+            return r
+        }
+        setByte(name, i, kept)
+    }
+    okResult(0, 0)
+}
+
+// removePath(path) -> Unit!: a file, or a folder with nothing in it
+pub extern effect fn rtRemovePath(path: Int64, n: Int64) -> Int64 as "qk_removePath" {
+    let name = cString(path, n)
+    let kind = osPathKind(name)
+    if kind < 0 {
+        osSetErrno(errnoNoEnt)
+        return cannot("remove", name)
+    }
+    if osRemove(name, kind) != 0 {
+        return cannot("remove", name)
+    }
+    okResult(0, 0)
+}
+
+// runProcess(program, args) -> Process!: [ok], then the message or the Process (status, out, err), from slot 1
+pub extern effect fn rtRunProcess(prog: Int64, progLen: Int64, args: Int64, count: Int64) -> Int64 as "qk_runProcess" {
+    let name = cString(prog, progLen)
+    flush() // what was printed before comes first
+    let out = alloc(5, 8) // status, out (malloc'd), its length, err, its length; or the message (malloc'd)
+    let p = alloc(6, 8)
+    if osRunProcess(name, args, count, out) != 0 {
+        let m = word(out, 1)
+        let k = strlen(m)
+        setWord(p, 1, cString(m, k))
+        setWord(p, 2, k)
+        free(m)
+        return p
+    }
+    setWord(p, 0, 1)
+    setWord(p, 1, word(out, 0))
+    setWord(p, 2, cString(word(out, 1), word(out, 2)))
+    setWord(p, 3, word(out, 2))
+    setWord(p, 4, cString(word(out, 3), word(out, 4)))
+    setWord(p, 5, word(out, 4))
+    free(word(out, 1))
+    free(word(out, 3))
+    p
+}

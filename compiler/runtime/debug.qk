@@ -1,0 +1,404 @@
+// The debugger's hooks: code compiled for debugging (quark debug, quark run --trace, quark dap) says where each
+// function starts and ends, each statement's line and each name's value as print writes it. A built executable has
+// no debugger (gDebug is 0: the hooks do nothing); the command line (compiler/memory.qk) makes one for its runs:
+// - quark debug: stops at its breakpoints (or every line while stepping) and reads commands from the input, as
+//   the debugger's;
+// - --trace: every name's last value, by its graph key, written as JSON when the program ends;
+// - quark dap: stops by giving the turn back (the program runs as a task of the debugger's, host.qk), and the
+//   adapter reads the calls and their names from the state below.
+use base
+use print
+
+extern effect fn osReadIn(p: Int64, n: Int64) -> Int64 as "qkosReadIn"
+extern effect fn osOpen(path: Int64, mode: Int64) -> Int64 as "qkosOpen"
+extern effect fn fwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fclose(f: Int64) -> Int32
+extern effect fn yieldNow() as "qk_yield"
+
+// the debugger's words (gDebug)
+pub const dInteractive = 0 // quark debug: commands from the input
+pub const dStepping = 1 // stop at the next line
+pub const dBreaks = 2 // lines (any file's), dBreakCount of them
+pub const dBreakCount = 3
+pub const dBreakCap = 4
+pub const dFrames = 5 // the calls the program is in, main first: fWords each
+pub const dFrameCount = 6
+pub const dFrameCap = 7
+pub const dTraced = 8 // --trace: every name's last value, by key (vWords each)
+pub const dTracedCount = 9
+pub const dTracedCap = 10
+pub const dTracePath = 11 // zero-ended, or 0
+pub const dRemote = 12 // quark dap: stops give the turn back to the task's stepper
+pub const dStopLine = 13 // the line it stopped at
+pub const dTask = 14 // the task the program runs as (quark dap)
+pub const dWords = 16
+
+// a call's words: its function's name (zero-ended), the line it is at, its names (vWords each)
+pub const fFn = 0
+pub const fLine = 1
+pub const fVars = 2
+pub const fVarCount = 3
+pub const fVarCap = 4
+pub const fWords = 5
+
+// a name's words: the name, its graph key, its last value as print writes it (each zero-ended), how often it was set
+pub const vName = 0
+pub const vKey = 1
+pub const vText = 2
+pub const vHits = 3
+pub const vWords = 4
+
+fn state() -> Int = gGet(gDebug)
+
+fn dup(p: Int, n: Int) -> Int {
+    let s = malloc(n + 1)
+    copyBytes(s, p, n)
+    setByte(s, n, 0)
+    s
+}
+
+// one more of size words at list (count and capacity in d's words at countAt, countAt + 1): its address
+fn grow(d: Int, listAt: Int, countAt: Int, size: Int) -> Int {
+    let n = word(d, countAt)
+    if n == word(d, countAt + 1) {
+        let cap = if n != 0 { n * 2 } else { 16 }
+        setWord(d, listAt, realloc(word(d, listAt), 8 * size * cap))
+        setWord(d, countAt + 1, cap)
+    }
+    setWord(d, countAt, n + 1)
+    word(d, listAt) + 8 * size * n
+}
+
+fn setVar(owner: Int, listAt: Int, countAt: Int, name: Int, nn: Int, key: Int, kn: Int, text: Int, tn: Int) {
+    let list = word(owner, listAt)
+    for i in 0..word(owner, countAt) {
+        let v = list + 8 * vWords * i
+        let k = word(v, vKey)
+        if strlen(k) == kn and sameBytes(k, key, kn) {
+            free(word(v, vText))
+            setWord(v, vText, dup(text, tn))
+            setWord(v, vHits, word(v, vHits) + 1)
+            return
+        }
+    }
+    let v = grow(owner, listAt, countAt, vWords)
+    setWord(v, vName, dup(name, nn))
+    setWord(v, vKey, dup(key, kn))
+    setWord(v, vText, dup(text, tn))
+    setWord(v, vHits, 1)
+}
+
+fn top(d: Int) -> Int = if word(d, dFrameCount) > 0 {
+    word(d, dFrames) + 8 * fWords * (word(d, dFrameCount) - 1)
+} else {
+    0
+}
+
+pub extern effect fn rtDebugEnter(name: Int64, n: Int64) as "qk_debugEnter" {
+    let d = state()
+    if d == 0 {
+        return
+    }
+    let f = grow(d, dFrames, dFrameCount, fWords)
+    setWord(f, fFn, dup(name, n))
+    setWord(f, fLine, 0)
+    setWord(f, fVars, 0)
+    setWord(f, fVarCount, 0)
+    setWord(f, fVarCap, 0)
+}
+
+pub extern effect fn rtDebugLeave() as "qk_debugLeave" {
+    let d = state()
+    let f = if d != 0 { top(d) } else { 0 }
+    if f == 0 {
+        return
+    }
+    for i in 0..word(f, fVarCount) {
+        let v = word(f, fVars) + 8 * vWords * i
+        free(word(v, vName))
+        free(word(v, vKey))
+        free(word(v, vText))
+    }
+    free(word(f, fVars))
+    free(word(f, fFn))
+    setWord(d, dFrameCount, word(d, dFrameCount) - 1)
+}
+
+// a stop: the calls are gone
+pub extern effect fn debugUnwind() as "qkDebugUnwind" {
+    let d = state()
+    while d != 0 and word(d, dFrameCount) > 0 {
+        rtDebugLeave()
+    }
+}
+
+pub extern effect fn rtDebugValue(name: Int64, nn: Int64, key: Int64, kn: Int64, text: Int64, tn: Int64) as "qk_debugValue" {
+    let d = state()
+    if d == 0 {
+        return
+    }
+    let shown = if tn > 300 {
+        300 // a long array: its start
+    } else {
+        tn
+    }
+    let f = top(d)
+    if f != 0 {
+        setVar(f, fVars, fVarCount, name, nn, key, kn, text, shown)
+    }
+    if word(d, dTracePath) != 0 {
+        setVar(d, dTraced, dTracedCount, name, nn, key, kn, text, shown)
+    }
+}
+
+fn isBreak(d: Int, line: Int) -> Bool {
+    for i in 0..word(d, dBreakCount) {
+        if word(word(d, dBreaks), i) == line {
+            return true
+        }
+    }
+    false
+}
+
+pub fn addBreak(d: Int, line: Int) {
+    let n = word(d, dBreakCount)
+    if n == word(d, dBreakCap) {
+        let cap = if n != 0 { n * 2 } else { 8 }
+        setWord(d, dBreaks, realloc(word(d, dBreaks), 8 * cap))
+        setWord(d, dBreakCap, cap)
+    }
+    setWord(word(d, dBreaks), n, line)
+    setWord(d, dBreakCount, n + 1)
+}
+
+fn removeBreak(d: Int, line: Int) {
+    var i = 0
+    while i < word(d, dBreakCount) {
+        if word(word(d, dBreaks), i) == line {
+            let last = word(d, dBreakCount) - 1
+            setWord(word(d, dBreaks), i, word(word(d, dBreaks), last))
+            setWord(d, dBreakCount, last)
+        } else {
+            i += 1
+        }
+    }
+}
+
+// ---- quark debug: the commands ----
+fn scratch() -> Buf = bufAt(word(state(), dWords - 1), 2048)
+
+fn say(b: Buf) = osWrite(2, b.p, b.n)
+
+fn showLocals(d: Int) {
+    let f = top(d)
+    if f == 0 {
+        return
+    }
+    for i in 0..word(f, fVarCount) {
+        let v = word(f, fVars) + 8 * vWords * i
+        say(scratch().text("  ").zeroText(word(v, vName)).text(" = ").zeroText(word(v, vText)).text("\n"))
+    }
+    if word(f, fVarCount) == 0 {
+        say(scratch().text("  (no names yet)\n"))
+    }
+}
+
+// a line of the input (zero-ended, without its line break) into p (cap bytes); false at the input's end
+fn readCommand(p: Int, cap: Int) -> Bool {
+    var n = 0
+    var any = false
+    let c = calloc(1, 8)
+    while osReadIn(c, 1) == 1 {
+        any = true
+        let ch = byte(c, 0)
+        if ch == '\n' {
+            break
+        }
+        if n < cap - 1 {
+            setByte(p, n, ch)
+            n += 1
+        }
+    }
+    free(c)
+    setByte(p, n, 0)
+    any
+}
+
+fn isWord(p: Int, n: Int, w: Text) -> Bool = n == len(w) and sameBytes(p, textAt(w), n)
+
+// a statement starts: stop when it is a breakpoint, or the debugger is stepping; then read commands
+pub extern effect fn rtDebugLine(line: Int64) as "qk_debugLine" {
+    let d = state()
+    if d == 0 {
+        return
+    }
+    let f = top(d)
+    if f != 0 {
+        setWord(f, fLine, line)
+    }
+    let stops = word(d, dStepping) != 0 or isBreak(d, line)
+    if word(d, dRemote) != 0 {
+        if stops and ctxGet(ctxTask) == word(d, dTask) {
+            setWord(d, dStopLine, line)
+            yieldNow() // back to the adapter, until it resumes
+        }
+        return
+    }
+    if word(d, dInteractive) == 0 or not stops {
+        return
+    }
+    flush()
+    let path = gGet(gRunPath)
+    let head = scratch().text("stopped at ")
+    let named = if path != 0 { head.zeroText(path) } else { head.text("program") }
+    say(named.text(":").int(line).text(" in ").zeroText(if f != 0 { word(f, fFn) } else { textAt("?\0") }).text("\n"))
+    showLocals(d)
+    let cmd = calloc(1, 256)
+    while true {
+        say(scratch().text("(quark) "))
+        if not readCommand(cmd, 256) {
+            setWord(d, dInteractive, 0)
+            free(cmd)
+            return
+        }
+        var c = cmd
+        while byte(c, 0) == ' ' {
+            c += 1
+        }
+        var n = strlen(c)
+        while n > 0 and byte(c, n - 1) is '\n' | '\r' | ' ' {
+            n -= 1
+            setByte(c, n, 0)
+        }
+        if isWord(c, n, "c") or isWord(c, n, "continue") {
+            setWord(d, dStepping, 0)
+            free(cmd)
+            return
+        }
+        if isWord(c, n, "s") or isWord(c, n, "step") or isWord(c, n, "n") or n == 0 {
+            setWord(d, dStepping, 1)
+            free(cmd)
+            return
+        }
+        let arg = n > 2 and byte(c, 1) == ' '
+        if isWord(c, n, "l") or isWord(c, n, "locals") {
+            showLocals(d)
+        } else if isWord(c, n, "bt") or isWord(c, n, "where") {
+            var i = word(d, dFrameCount) - 1
+            while i >= 0 {
+                let fr = word(d, dFrames) + 8 * fWords * i
+                say(scratch().text("  ").zeroText(word(fr, fFn)).text(" at line ").int(word(fr, fLine)).text("\n"))
+                i -= 1
+            }
+        } else if arg and byte(c, 0) == 'p' {
+            let want = c + 2
+            var found = false
+            let fr = top(d)
+            if fr != 0 {
+                for i in 0..word(fr, fVarCount) {
+                    let v = word(fr, fVars) + 8 * vWords * i
+                    let name = word(v, vName)
+                    if strlen(name) == strlen(want) and sameBytes(name, want, strlen(want)) {
+                        say(scratch().text("  ").zeroText(want).text(" = ").zeroText(word(v, vText)).text("\n"))
+                        found = true
+                    }
+                }
+            }
+            if not found {
+                say(scratch().text("  ").zeroText(want).text(" has no value here yet\n"))
+            }
+        } else if arg and byte(c, 0) == 'b' {
+            let at = strtoll(c + 2, 0, 10)
+            addBreak(d, at)
+            say(scratch().text("  a breakpoint at line ").int(at).text("\n"))
+        } else if arg and byte(c, 0) == 'd' {
+            removeBreak(d, strtoll(c + 2, 0, 10))
+        } else if isWord(c, n, "q") or isWord(c, n, "quit") {
+            flush()
+            cExit(0)
+        } else {
+            say(scratch().text("  c continue, s step (or Enter), p name, l locals, bt calls, b LINE, d LINE, q quit\n"))
+        }
+    }
+}
+
+// ---- --trace: {"key": {"value": "...", "hits": n}}: what an editor shows on each node's wire ----
+type Out { p: Int, n: Int, cap: Int }
+
+fn Out.add(var self, p: Int, n: Int) {
+    if self.n + n > self.cap {
+        while self.n + n > self.cap {
+            self.cap *= 2
+        }
+        self.p = realloc(self.p, self.cap)
+    }
+    copyBytes(self.p + self.n, p, n)
+    self.n += n
+}
+
+fn Out.text(var self, t: Text) = self.add(textAt(t), len(t))
+
+fn Out.json(var self, s: Int) {
+    self.text("\"")
+    let hex = textAt("0123456789abcdef")
+    let one = calloc(1, 8)
+    for i in 0..strlen(s) {
+        let ch = byte(s, i)
+        if ch == '"' or ch == '\\' {
+            setByte(one, 0, '\\')
+            setByte(one, 1, ch)
+            self.add(one, 2)
+        } else if ch == '\n' {
+            self.text("\\n")
+        } else if ch < 32 {
+            self.text("\\u00")
+            setByte(one, 0, byte(hex, ch >> 4))
+            setByte(one, 1, byte(hex, ch & 15))
+            self.add(one, 2)
+        } else {
+            self.add(s + i, 1)
+        }
+    }
+    free(one)
+    self.text("\"")
+}
+
+pub extern effect fn debugFinish() as "qkDebugFinish" {
+    let d = state()
+    if d == 0 or word(d, dTracePath) == 0 {
+        return
+    }
+    let path = word(d, dTracePath)
+    setWord(d, dTracePath, 0)
+    let f = osOpen(path, textAt("wb\0"))
+    if f == 0 {
+        return
+    }
+    var out = Out(malloc(4096), 0, 4096)
+    out.text("\{")
+    for i in 0..word(d, dTracedCount) {
+        let v = word(d, dTraced) + 8 * vWords * i
+        out.text(if i != 0 { ",\n " } else { "\n " })
+        out.json(word(v, vKey))
+        out.text(": \{\"value\": ")
+        out.json(word(v, vText))
+        let b = scratch().text(", \"hits\": ").int(word(v, vHits)).text("\}")
+        out.add(b.p, b.n)
+    }
+    out.text("\n\}\n")
+    let _ = fwrite(out.p, 1, out.n, f)
+    let _ = fclose(f)
+    free(out.p)
+}
+
+// the debugger made (host.qk): its state, which the hooks find through gDebug
+pub fn debugNew(interactive: Bool, tracePath: Int, remote: Bool) -> Int {
+    let d = calloc(dWords, 8)
+    setWord(d, dInteractive, if interactive { 1 } else { 0 })
+    setWord(d, dStepping, if interactive { 1 } else { 0 })
+    setWord(d, dTracePath, tracePath)
+    setWord(d, dRemote, if remote { 1 } else { 0 })
+    setWord(d, dWords - 1, malloc(2048)) // the messages' room
+    gSet(gDebug, d)
+    d
+}

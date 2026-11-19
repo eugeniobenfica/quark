@@ -1,0 +1,153 @@
+// The command line's hold on a program it runs in memory (compiler/memory.qk: quark run, test, debug, dap, repl).
+// The command line maps this runtime into its own process, then calls these by their symbols (machine.call: at
+// most four integers each): the program loaded once, then called (main, or each test, with its own memory), its
+// panic's text read, its output flushed, a debugger made for it, its time sampled (--profile).
+use base
+use arena
+use print
+use loader
+use start
+use tasks
+use trace
+use debug
+
+extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction"
+extern effect fn osProfileStart(p: Int64) as "qkosProfileStart" // every millisecond, where this thread is
+extern effect fn osProfileStop(p: Int64) as "qkosProfileStop"
+
+// this thread's context and the process's state, the arguments args() gives (argv: argc zero-ended texts, the first
+// the program's name), the path its panics say (zero-ended)
+pub extern effect fn hostBegin(argc: Int64, argv: Int64, runPath: Int64) as "qkHostBegin" {
+    begin(argc, argv)
+    gSet(gRunPath, runPath)
+}
+
+// The program a trailer describes (quark build's), from its payload (payloadSize + 1 bytes of
+// the caller's): its budget and memory limit kept, its C functions found, loaded. The Loaded, or 0 with why (512
+// bytes) said.
+pub extern effect fn hostLoad(payload: Int64, t: Int64, why: Int64) -> Int64 as "qkHostLoad" {
+    let codeLen = word(t, 1)
+    let dataLen = word(t, 2)
+    let relocCount = word(t, 3)
+    let fuel = word(t, 7)
+    let memory = word(t, 8)
+    let externCount = word(t, 10)
+    if fuel > 0 {
+        ctxSet(ctxFuel, fuel)
+    }
+    if memory > 0 {
+        setLimit(arena(), memory)
+    }
+    setByte(payload, word(t, 12), 0)
+    let data = payload + codeLen
+    let relocs = data + dataLen
+    var names = relocs + 16 * relocCount
+    let hosts = calloc(if externCount != 0 { externCount } else { 1 }, 8)
+    for i in 0..externCount {
+        let name = names
+        names += strlen(names) + 1
+        let lib = if byte(names, 0) != 0 { names } else { 0 }
+        names += strlen(names) + 1
+        let address = osCFunction(name, lib, why)
+        if address == 0 {
+            return 0
+        }
+        setWord(hosts, i, address)
+    }
+    let l = load(payload, codeLen, data, dataLen, relocs, relocCount, word(t, 5), word(t, 6), hosts)
+    if l == 0 {
+        let _ = bufAt(why, 512).text("cannot load the machine code")
+    }
+    l
+}
+
+// what a panic says, with the calls it went through: the loaded program's trace (trace.qk's words)
+pub extern effect fn hostTrace(l: Int64, t: Int64) as "qkHostTrace" = setWord(l, lTrace, t)
+
+// calls the function at offset entry of l's code (its budget fuel first, when not 0): 1, or 0 when it panicked
+pub extern effect fn hostCall(l: Int64, entry: Int64, fuel: Int64) -> Int64 as "qkHostCall" {
+    if fuel != 0 {
+        ctxSet(ctxFuel, fuel)
+    }
+    if runEntry(l, word(l, lCode) + entry, 0, 0, 0, 0) { 1 } else { 0 }
+}
+
+// the panic's text, zero-ended
+pub extern effect fn hostPanicText() -> Int64 as "qkHostPanicText" = panicText()
+
+// what print buffered, written (or kept, when the output is kept)
+pub extern effect fn hostFlush() as "qkHostFlush" = flush()
+
+// n bytes at p to the output (1: buffered as print's) or the errors (2: print's written first)
+pub extern effect fn hostWrite(fd: Int64, p: Int64, n: Int64) as "qkHostWrite" {
+    if fd == 1 {
+        outWrite(p, n)
+    } else {
+        flush()
+        osWrite(2, p, n)
+    }
+}
+
+// the output kept rather than written (quark dap): its buffer's words (bytes, length, capacity)
+pub extern effect fn hostKeepOutput() -> Int64 as "qkHostKeepOutput" {
+    let sink = calloc(3, 8)
+    gSet(gOutSink, sink)
+    sink
+}
+
+// ---- the debugger ----
+// made: quark debug (interactive: stops at the breaks, or the first line when there are none), --trace (the values
+// written to tracePath when the program ends), quark dap (remote: the program runs as a task, hostDebugStep)
+pub extern effect fn hostDebug(interactive: Int64, tracePath: Int64, remote: Int64) -> Int64 as "qkHostDebug" =
+    debugNew(interactive != 0, tracePath, remote != 0)
+
+pub extern effect fn hostDebugBreak(line: Int64) as "qkHostDebugBreak" =
+    addBreak(gGet(gDebug), line)
+
+pub extern effect fn hostDebugClear() as "qkHostDebugClear" = setWord(gGet(gDebug), dBreakCount, 0)
+
+// --trace: the values, written
+pub extern effect fn hostDebugFinish() as "qkHostDebugFinish" = debugFinish()
+
+// the program's function at offset entry, as a task the adapter steps
+pub extern effect fn hostDebugTask(l: Int64, entry: Int64) -> Int64 as "qkHostDebugTask" {
+    let t = taskNew(l, word(l, lCode) + entry, 0, 0)
+    setWord(gGet(gDebug), dTask, t)
+    t
+}
+
+// runs it on until it stops (1: at dStopLine), ends (0) or panics (-1: the panic text says why)
+pub extern effect fn hostDebugStep(t: Int64, stepping: Int64) -> Int64 as "qkHostDebugStep" {
+    let d = gGet(gDebug)
+    setWord(d, dStepping, stepping)
+    let r = taskStep(t)
+    if r < 0 {
+        copyBytes(panicText(), taskError(t), panicTextSize)
+        debugUnwind()
+    }
+    if r == 0 {
+        debugUnwind()
+    }
+    r
+}
+
+// ---- --profile: where this thread is, every millisecond (windows.qk, linux.qk sample it) ----
+// the sampler's words: on, the sampled thread, the sampling thread, the samples, their count, room, the sampled
+// thread's stack (low, high). A sample is sampleWords words: where the thread was, then the return addresses of the
+// frames above it (0 past the last one found): the time of each function with what it calls, and the runtime's by
+// the program's function that called it.
+pub const sampleWords = 32
+
+pub extern effect fn hostProfileStart(room: Int64) -> Int64 as "qkHostProfileStart" {
+    let p = calloc(8, 8)
+    setWord(p, 3, calloc(room, 8 * sampleWords))
+    setWord(p, 5, room)
+    setWord(p, 0, 1)
+    osProfileStart(p)
+    p
+}
+
+pub extern effect fn hostProfileStop(p: Int64) as "qkHostProfileStop" {
+    setWord(p, 0, 0)
+    osProfileStop(p)
+}

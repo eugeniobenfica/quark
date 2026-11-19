@@ -1,0 +1,319 @@
+// The syntax tree. One Ast value holds a whole program: every node of a kind sits in that kind's array (exprs,
+// stmts, blocks, arms, params, types, decls), and nodes link to each other by their index there, never by a
+// copy: a node's index is its identity ("the same node" is a == b), and -1 is "none". The parser builds the tree
+// through Ast's var self functions; the checker and lowering change it in place the same way
+// (`ast.exprs[e].ty = t`, `ast.exprs[e].node = .Case(...)`) and add nodes. A node's index never changes, so a node
+// wrapped in another (an implicit conversion) is copied to a new index and the wrapper takes its old one.
+//
+// A node is a record: where it was written (line, col), what it is (node: an enum whose cases carry what each kind
+// holds), and what checking works out (the fields after those, -1, false or empty until then). A text that may be
+// missing is "" when it is (a name, a qualifier, a comment), except a trailing comment, which may be empty itself
+// (Text?).
+//
+// Ast: the arrays of nodes; decls are the program's declarations in order (a used file's come after, module > 0);
+// closingComment the comments after the last one; holes how many a?.rest names were made ("#c1", "#c2"...).
+use token
+
+pub type Ast {
+    exprs: [Expr] = []
+    stmts: [Stmt] = []
+    blocks: [Block] = []
+    arms: [Arm] = []
+    params: [Param] = []
+    types: [TypeExpr] = []
+    decls: [Decl] = []
+    closingComment: Text = ""
+    holes: Int = 0
+}
+
+// ---- expressions ------------------------------------------------------------------------------------------------
+// What an expression is:
+// - IntLit 42, 1_000, 0xff, 'a'; FloatLit 1.5, 1e-6: the value, and raw as written (-5 too; "": made, not written)
+// - TextLit "a\n": text decoded, raw as written ("""...""" and r"""...""": its lines between the quotes)
+// - Name x, Vec2, g.area (a used module's, by its alias), "#c1" (a?.rest's hole)
+// - Call f(a, b); a.f(b) (method: args[0] is a); Shape.Circle(2) (qualifier "Shape"); .Circle(2) (dotted); (a, b)
+//   (name "(,)": a tuple, and () the unit); pick(true)(5) (name "()": args[0] the function called). names: each
+//   argument's name, "" when it is given by position
+// - Field a.name, t.0; Index a[i], a[i..j]; Unary -x, ~x, not x; Binary a + b ... a ?? b, a and b
+// - Range a..b, a.., ..b (an end left out: -1)
+// - If: then a block; otherwise an If or a BlockExpr, or -1
+// - Match: its arms; chain: a?.rest, its first arm's body read from the hole
+// - BlockExpr { ... }; jump: return, break or continue where a value goes (x ?? return 0), its one statement
+// - Case Color.Red (resolved from a Field, target its Name), .Red (dotted)
+// - With a with { field: value, ... }
+// - Interp "text {x} text {y:.2}": the pieces around the values (one more than the values), decoded and as
+//   written, and each value's format ("" none; formats empty when none has one)
+// - Try a?; MapLit [k: v, ...] (keys and values in turn; [:] is empty); Is a is Pattern (pattern: an arm)
+pub enum ExprNode {
+    IntLit(value: Int, raw: Text)
+    FloatLit(value: Float, raw: Text)
+    TextLit(text: Text, raw: Text, multiline: Bool)
+    BoolLit(value: Bool)
+    Name(name: Text)
+    Call(name: Text, qualifier: Text, args: [Int], names: [Text], method: Bool, dotted: Bool)
+    Field(target: Int, name: Text)
+    Index(target: Int, index: Int)
+    Unary(op: Op, operand: Int)
+    Binary(op: Op, left: Int, right: Int)
+    Range(low: Int, high: Int)
+    If(cond: Int, then: Int, otherwise: Int)
+    Match(subject: Int, arms: [Int], chain: Bool)
+    Lambda(params: [Int], body: Int)
+    ArrayLit(items: [Int])
+    BlockExpr(block: Int, jump: Bool)
+    Case(name: Text, target: Int, dotted: Bool)
+    With(target: Int, values: [Int], fields: [Text])
+    Interp(values: [Int], parts: [Text], raws: [Text], formats: [Text], multiline: Bool)
+    Try(value: Int)
+    MapLit(items: [Int])
+    Is(value: Int, pattern: Int)
+    Hole // _ where a value goes: not written yet (it takes the type it goes into; reached, it stops the program)
+}
+
+// An expression, and what checking works out: ty its type; binding a name's; decl a called function, a built
+// record, an enum or a constant; builtin the built-in called (0: none); caseIndex a case built or matched; callee
+// the field holding a function called (button.onPress(3)); ordered a call's values, one per parameter, defaults
+// filled in; implicit added by the checker (a conversion: not printed, not a node); place m[k] in a place (the
+// value itself: a missing key is a panic); typed checked already (a method call's receiver); sugar a lambda made of
+// a function's name: the name as written; spread a lambda of n values given a tuple of n: the tuple's type.
+pub type Expr {
+    node: ExprNode
+    line: Int
+    col: Int
+    ty: Int = -1
+    binding: Int = -1
+    decl: Int = -1
+    builtin: Int = 0
+    caseIndex: Int = -1
+    callee: Int = -1
+    ordered: [Int] = []
+    implicit: Bool = false
+    place: Bool = false
+    typed: Bool = false
+    sugar: Int = -1
+    spread: Int = -1
+}
+
+// ---- statements and blocks --------------------------------------------------------------------------------------
+// What a statement is:
+// - Let: let x: T = v, var x = v (mutable), and with a pattern (an arm): let Some(x) = v else { ... } (otherwise:
+//   the else block, or -1), var (a, b) = v; ty -1 when not written
+// - Assign x = v, x += v...; ExprStmt a call, an if, a match... whose value is not kept
+// - For for x in xs { }, for (i, x) in ... (pattern: an arm, name ""); While; Defer
+// - Return (value -1: none); Break; Continue
+pub enum StmtNode {
+    Let(mutable: Bool, name: Text, ty: Int, value: Int, pattern: Int, otherwise: Int)
+    Assign(target: Int, op: Op, value: Int)
+    ExprStmt(value: Int)
+    For(name: Text, pattern: Int, iter: Int, body: Int)
+    While(cond: Int, body: Int)
+    Return(value: Int)
+    Break
+    Continue
+    Defer(body: Int)
+}
+
+// A statement: leading the comment lines above it, trailing the comment after it on its line, blankBefore an empty
+// line above it; worked out by checking: binding a let's or a for's, opValue x += v on a record (the new value,
+// through its type's plus).
+pub type Stmt {
+    node: StmtNode
+    line: Int
+    col: Int
+    leading: Text = ""
+    trailing: Text? = None
+    blankBefore: Bool = false
+    binding: Int = -1
+    opValue: Int = -1
+}
+
+// statements, and the comments before the closing brace
+pub type Block { stmts: [Int] = [], closingComment: Text = "" }
+
+// ---- patterns: a match's arms, an is's, a let's or a for's --------------------------------------------------------
+// A pattern, and an arm when it has a body. pattern: a case's or a record's name ("(,)" a tuple, "" none), with
+// binds: the names for its fields in order ("_" skipped), and subs: a pattern inside a field (Some(Circle(r)),
+// Point(x, 0)), -1 where a name is (subs empty when no field has one). Or intPattern: an Int (or Bool) literal, a
+// range's start (isRange; -1 for ..b) to intHigh (-1 for a..; inclusive: a..=b, its value one past what is
+// written); or textPattern: a text literal; or whole: a name for the whole value (n if n > 2 => ...); or none of
+// those: _. alternatives: Red | Green, the patterns after the first. guard: if condition; body: what it gives;
+// comment: the comment lines above it; hidden: added by the checker (not printed). Worked out by checking:
+// caseIndex, bindings (one per bind), wholeBinding; expanded: an alternative made an arm of its own (Red | Green:
+// Green, with the arm's guard and body), checked with the others, never printed.
+pub type Arm {
+    pattern: Text = ""
+    binds: [Text] = []
+    subs: [Int] = []
+    intPattern: Int = -1
+    intHigh: Int = -1
+    isRange: Bool = false
+    inclusive: Bool = false
+    textPattern: Int = -1
+    valuePattern: Int = -1 // worked out by checking: the constant a name pattern names (compared with ==), -1 none
+    whole: Text = ""
+    alternatives: [Int] = []
+    guard: Int = -1
+    body: Int = -1
+    comment: Text = ""
+    hidden: Bool = false
+    caseIndex: Int = 0
+    bindings: [Int] = []
+    wholeBinding: Int = -1
+    expanded: Bool = false
+}
+
+// ---- types as written -------------------------------------------------------------------------------------------
+// What a type is: Named Int, Vec2, g.Vec2, Pair<Int, Text>, Pointer<UInt8>; Array [T]; Map [K: V]; Fn (A, B) -> R,
+// effect (A) -> R, extern (A) -> R (a C function), result -1 for nothing (an interface's fn without ->), names the
+// values' names (written in an interface's fn, else empty); Tuple (Int, Text); Optional T?; Result T!, T ! E (error
+// -1: a Text).
+pub enum TypeNode {
+    Named(name: Text, args: [Int])
+    Array(elem: Int)
+    Map(key: Int, value: Int)
+    Fn(params: [Int], names: [Text], result: Int, isEffect: Bool, external: Bool)
+    Tuple(items: [Int])
+    Optional(inner: Int)
+    Result(inner: Int, error: Int)
+}
+
+pub type TypeExpr { node: TypeNode, line: Int, col: Int }
+
+// A function's parameter, a record's field, an enum case's data, a lambda's value, or an interface's function (ty a
+// Fn, with its values' names). ty -1: not written (a lambda's, fn T.f(self)); fallback a default value; isVar fn
+// Parser.next(var self). Worked out by checking: binding; boxed a field whose type holds its own type (one slot, the
+// address of its value).
+pub type Param {
+    name: Text
+    ty: Int
+    line: Int
+    col: Int
+    fallback: Int = -1
+    isVar: Bool = false
+    binding: Int = -1
+    boxed: Bool = false
+}
+
+// ---- declarations -----------------------------------------------------------------------------------------------
+pub enum DeclKind { Fn, Type, Enum, Const, Use }
+
+// A declaration. name: fn Vec2.plus "Vec2.plus", test "it adds" "test \"it adds\"", use a.b "a.b". params a
+// function's parameters, a record's (or a C struct's) fields, an interface's functions; ret a function's result
+// type, a constant's type (-1 none); body a BlockExpr, or the expression after = (-1: none, C's function); cases an
+// enum's, and caseFields each one's data ([] none); typeParams fn first<T>, type Pair<A, B>; typeBounds fn talk<T:
+// Speaker> each one's interface ("" none; empty when none has one); leading the comment lines above it, trailing the
+// one after it; opaque pub opaque type; isExtern extern fn (C's, or with a body, Quark's that C calls), extern type
+// (C's handle, or with cStruct a C struct: its fields in C's layout); isEffect written effect (or inferred);
+// effectDeclared pub effect fn (or an extern effect fn with a body); externSymbol extern fn ... as "symbol"; externLib
+// extern fn ... in "m"; alias use geometry as g; module the file it
+// comes from (0 the program's own).
+//
+// Worked out by checking: owner fn Vec2.plus "Vec2"; ty the record or enum type; retType; state 0 unchecked, 1
+// checking, 2 done; index its place in decls; fromPrelude the host's; isTemplate generic or takes a function,
+// templateOf an instance's template, typeArgs its types, inlineOnly holds a caller's lambdas, instances a
+// template's, pristine a template as parsed; returnsEarly, callsItself: its result made nothing; lifted a lambda
+// kept as a value, made a function; inferEffect its effects are its body's; folded a constant's value, foldedAgain,
+// dataAt where an array constant is in the data; impliedSelf, impliedTypes fn Pair.swap(self) not written; isTuple,
+// isEntry records of their own; optionOf, resultOf, errorOf the built-in T?, T!; env a lambda's captured values;
+// valueParams a template's parameters given a function value; captureOuter and captureInner a lifted lambda's
+// captured names (the binding around it, and its own copy, pair by pair); cTypes an extern fn's parameters' and
+// result's types as written (C's: Int32, CText...), or an extern type's fields'.
+pub type Decl {
+    kind: DeclKind
+    name: Text
+    line: Int
+    col: Int
+    params: [Int] = []
+    ret: Int = -1
+    body: Int = -1
+    cases: [Text] = []
+    caseFields: [[Int]] = []
+    typeParams: [Text] = []
+    typeBounds: [Text] = []
+    leading: Text = ""
+    trailing: Text? = None
+    memberLeading: [Text] = [] // each field's (an enum's: case's) comment lines above it, and the one after it
+    memberTrailing: [Text?] = []
+    isPub: Bool = false
+    opaque: Bool = false
+    isExtern: Bool = false
+    isEffect: Bool = false
+    effectDeclared: Bool = false
+    isInterface: Bool = false
+    isTest: Bool = false
+    testName: Text = ""
+    externSymbol: Text = ""
+    externLib: Text = ""
+    variadic: Bool = false // extern fn printf(format: CText, ...): C's variadic arguments after the parameters
+    cStruct: Bool = false
+    alias: Text = ""
+    module: Int = 0
+    owner: Text = ""
+    ty: Int = -1
+    retType: Int = -1
+    state: Int = 0
+    index: Int = -1
+    fromPrelude: Bool = false
+    builtin: Bool = false // the language's own (compiler/prelude.qk): seen everywhere, hidden by a program's own
+    isTemplate: Bool = false
+    templateOf: Int = -1
+    typeArgs: [Int] = []
+    inlineOnly: Bool = false
+    instances: [Int] = []
+    pristine: Int = -1
+    returnsEarly: Bool = false
+    callsItself: Bool = false
+    lifted: Bool = false
+    inferEffect: Bool = false
+    folded: Int = -1
+    foldedAgain: Bool = false
+    dataAt: Int = -1
+    impliedSelf: Bool = false
+    impliedTypes: Bool = false
+    isTuple: Bool = false
+    isEntry: Bool = false
+    optionOf: Int = -1
+    resultOf: Int = -1
+    errorOf: Int = -1
+    env: Int = -1
+    valueParams: [Bool] = []
+    captureOuter: [Int] = []
+    captureInner: [Int] = []
+    cTypes: [Int] = []
+}
+
+// ---- building ---------------------------------------------------------------------------------------------------
+pub fn Ast.expr(var self, node: ExprNode, line: Int, col: Int) -> Int {
+    self.exprs.push(Expr(node, line, col))
+    len(self.exprs) - 1
+}
+
+pub fn Ast.stmt(var self, s: Stmt) -> Int {
+    self.stmts.push(s)
+    len(self.stmts) - 1
+}
+
+pub fn Ast.block(var self, b: Block) -> Int {
+    self.blocks.push(b)
+    len(self.blocks) - 1
+}
+
+pub fn Ast.arm(var self, a: Arm) -> Int {
+    self.arms.push(a)
+    len(self.arms) - 1
+}
+
+pub fn Ast.param(var self, p: Param) -> Int {
+    self.params.push(p)
+    len(self.params) - 1
+}
+
+pub fn Ast.typeExpr(var self, node: TypeNode, line: Int, col: Int) -> Int {
+    self.types.push(TypeExpr(node, line, col))
+    len(self.types) - 1
+}
+
+pub fn Ast.decl(var self, d: Decl) -> Int {
+    self.decls.push(d)
+    len(self.decls) - 1
+}

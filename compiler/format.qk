@@ -1,0 +1,1346 @@
+// The formatter: one canonical text for every program. Four spaces, parentheses only where precedence needs
+// them, comments where they were, a method chain with several lambdas one call per line. Node graphs print
+// through it too, so text -> graph -> text gives the same text.
+use token
+use ast
+
+// how tightly an expression binds, loosest first
+const lowest = 0
+const coalesce = 1
+const orLevel = 2
+const andLevel = 3
+const notLevel = 4
+const compare = 5
+const rangeLevel = 6
+const add = 7
+const mul = 8
+const unary = 9
+const postfix = 10
+const primary = 11
+
+// the canonical text of a program
+pub fn format(a: Ast) -> Text {
+    var w = Writer()
+    var before = -1
+    for (i, d) in a.decls.enumerate() {
+        // a blank line between declarations, except between one-line ones (types, enums, externs)
+        if d.fromPrelude or d.templateOf >= 0 or d.module != 0 or d.lifted {
+            continue // the host's; a template's instance; another file's
+        }
+        let together = before >= 0
+            and d.leading == ""
+            and listLike(a, before)
+            and listLike(a, i)
+            and family(a.decls[before]) == family(d)
+        if before >= 0 and not together {
+            w.put("\n")
+        }
+        w.decl(a, i, true)
+        before = i
+    }
+    if a.closingComment != "" {
+        if len(a.decls) > 0 {
+            w.put("\n")
+        }
+        w.comments(a.closingComment, 0)
+    }
+    w.out
+}
+
+// the text of a type as written
+pub fn typeText(a: Ast, t: Int) -> Text {
+    var w = Writer()
+    w.typeExpr(a, t)
+    w.out
+}
+
+// the text of an expression, at an indentation
+pub fn exprText(a: Ast, e: Int, indent: Int) -> Text {
+    var w = Writer()
+    w.expr(a, e, indent, lowest)
+    w.out
+}
+
+// the text of a statement (its comments too), at no indentation
+pub fn stmtText(a: Ast, s: Int) -> Text {
+    var w = Writer()
+    w.stmt(a, s, 0)
+    w.out
+}
+
+// the text of an interface's function: fn speak(loud: Bool) -> Text
+pub fn memberText(a: Ast, f: Param) -> Text {
+    var w = Writer()
+    w.interfaceFn(a, f)
+    w.out
+}
+
+// inText: in a one-line text's {...}, where nothing breaks the line; noWrap: measuring, so nothing is broken for
+// the width (the rest is laid out as always); col: the column the next byte goes at
+type Writer { out: Text = "", inText: Bool = false, noWrap: Bool = false, col: Int = 0 }
+
+// a line's most columns: a call, a list, a chain of and / or / + that would go past them takes lines of its own
+const width = 120
+
+fn Writer.put(var self, t: Text) {
+    self.out += t
+    let b = t.bytes()
+    var i = len(b) - 1
+    while i >= 0 and b[i] != '\n' {
+        i -= 1
+    }
+    self.col = if i >= 0 { len(b) - 1 - i } else { self.col + len(b) }
+}
+
+fn Writer.indentTo(var self, indent: Int) {
+    self.put("    " * indent)
+}
+
+// what e is on one line from here (no line of its own), or None when it would pass the width or takes lines anyway
+fn Writer.fits(self, a: Ast, e: Int, indent: Int, minPrec: Int) -> Bool {
+    if self.inText or self.noWrap {
+        return true
+    }
+    var flat = Writer(noWrap: true, col: self.col)
+    flat.expr(a, e, indent, minPrec)
+    flat.out.contains("\n") or flat.col <= width
+}
+
+fn Writer.comments(var self, text: Text, indent: Int) {
+    if text == "" {
+        return
+    }
+    for line in text.split("\n") {
+        self.indentTo(indent)
+        self.put(if line == "" { "//\n" } else { "// " + line + "\n" })
+    }
+}
+
+fn Writer.trailing(var self, comment: Text?) {
+    if comment is Some(c) {
+        self.put(" // " + c)
+    }
+}
+
+fn precedence(a: Ast, e: Int) -> Int = match a.exprs[e].node {
+    Binary(op, _, _) => match op {
+        Coalesce => coalesce
+        Or => orLevel
+        And => andLevel
+        Plus | Minus | Pipe | Caret | PlusWrap | MinusWrap => add
+        Star | Slash | Percent | Amp | Shl | Shr | StarWrap => mul
+        _ => compare
+    }
+    Range(_, _) => rangeLevel
+    Try(_) => postfix
+    Unary(op, _) => if op == Op.Not { notLevel } else { unary }
+    Match(_, _, chain) => if chain { postfix } else { lowest }
+    Lambda(_, _) | If(_, _, _) => lowest
+    BlockExpr(_, jump) => if jump { lowest } else { primary }
+    Is(_, _) => compare
+    _ => primary
+}
+
+// what is written for an expression: a conversion the checker added is not, a lambda made of a name is the name
+fn visible(a: Ast, e: Int) -> Int {
+    var v = e
+    while a.exprs[v].implicit and a.exprs[v].node is Call(_, _, args, _, _, _) {
+        v = args[0]
+    }
+    if a.exprs[v].node is Lambda(_, _) and a.exprs[v].sugar >= 0 {
+        return a.exprs[v].sugar
+    }
+    v
+}
+
+fn typedError(a: Ast, t: Int) -> Bool {
+    let Result(_, error) = a.types[t].node else {
+        return false
+    }
+    error >= 0 and not (a.types[error].node is Named(name, args) and name == "Text" and len(args) == 0)
+}
+
+fn Writer.typeExpr(var self, a: Ast, t: Int) {
+    match a.types[t].node {
+        Optional(inner) => self.wrapped(a, inner, "?", -1)
+        Result(inner, error) => self.wrapped(a, inner, "!", if typedError(a, t) { error } else { -1 })
+        Tuple(items) => {
+            for (i, item) in items.enumerate() {
+                self.put(if i > 0 { ", " } else { "(" })
+                self.typeExpr(a, item)
+            }
+            self.put(")")
+        }
+        Fn(params, _, result, isEffect, external) => {
+            self.put(if external {
+                "extern ("
+            } else if isEffect {
+                "effect ("
+            } else {
+                "("
+            })
+            for (i, p) in params.enumerate() {
+                if i > 0 {
+                    self.put(", ")
+                }
+                self.typeExpr(a, p)
+            }
+            self.put(") -> ")
+            if result >= 0 {
+                self.typeExpr(a, result)
+            } else {
+                self.put("nothing")
+            }
+        }
+        Array(elem) => {
+            self.put("[")
+            self.typeExpr(a, elem)
+            self.put("]")
+        }
+        Map(key, value) => {
+            self.put("[")
+            self.typeExpr(a, key)
+            self.put(": ")
+            self.typeExpr(a, value)
+            self.put("]")
+        }
+        Named(name, args) => {
+            self.put(name)
+            for (i, arg) in args.enumerate() {
+                self.put(if i > 0 { ", " } else { "<" })
+                self.typeExpr(a, arg)
+            }
+            if len(args) > 0 {
+                self.put(">")
+            }
+        }
+    }
+}
+
+// T?, T!, T ! E: ((Int) -> Int)?, (Int ! E)? group what they wrap
+fn Writer.wrapped(var self, a: Ast, inner: Int, mark: Text, error: Int) {
+    let group = a.types[inner].node is Fn(_, _, _, _, _) or typedError(a, inner)
+    if group {
+        self.put("(")
+    }
+    self.typeExpr(a, inner)
+    if group {
+        self.put(")")
+    }
+    if error >= 0 {
+        self.put(" ! ")
+        self.typeExpr(a, error)
+    } else {
+        self.put(mark)
+    }
+}
+
+// an interface's function: fn speak(loud: Bool) -> Text
+fn Writer.interfaceFn(var self, a: Ast, f: Param) {
+    let Fn(params, names, result, isEffect, _) = a.types[f.ty].node else {
+        return
+    }
+    self.put(if isEffect { "effect fn " } else { "fn " })
+    self.put(f.name + "(")
+    for (i, p) in params.enumerate() {
+        if i > 0 {
+            self.put(", ")
+        }
+        self.put((names.get(i) ?? "x") + ": ")
+        self.typeExpr(a, p)
+    }
+    self.put(")")
+    if result >= 0 {
+        self.put(" -> ")
+        self.typeExpr(a, result)
+    }
+}
+
+// a record's field (name: Type), or an interface's function (fn name(...) -> Type)
+fn Writer.field(var self, a: Ast, d: Decl, i: Int) {
+    let f = a.params[d.params[i]]
+    if d.isInterface {
+        self.interfaceFn(a, f)
+        return
+    }
+    self.put(f.name + ": ")
+    self.typeExpr(a, f.ty)
+    if f.fallback >= 0 {
+        self.put(" = ")
+        self.expr(a, f.fallback, 0, lowest)
+    }
+}
+
+// type Pair<A, B>
+fn Writer.typeHead(var self, d: Decl) {
+    if d.opaque {
+        self.put("opaque ")
+    }
+    if d.cStruct {
+        self.put("extern ")
+    }
+    self.put(if d.isInterface {
+        "interface "
+    } else if d.kind == DeclKind.Type {
+        "type "
+    } else {
+        "enum "
+    })
+    self.put(d.name)
+    for (i, p) in d.typeParams.enumerate() {
+        self.put(if i > 0 { ", " } else { "<" })
+        self.put(p)
+    }
+    if len(d.typeParams) > 0 {
+        self.put(">")
+    }
+}
+
+// return x, break, continue: a statement, or a value that never comes (x ?? return 0)
+fn Writer.leave(var self, a: Ast, s: Stmt, indent: Int) {
+    match s.node {
+        Return(value) => {
+            self.put("return")
+            if value >= 0 {
+                self.put(" ")
+                self.expr(a, value, indent, lowest)
+            }
+        }
+        Break => self.put("break")
+        _ => self.put("continue")
+    }
+}
+
+// a literal in a pattern, as written
+fn literal(a: Ast, e: Int) -> Text = match a.exprs[e].node {
+    IntLit(_, raw) => raw
+    FloatLit(_, raw) => raw
+    BoolLit(value) => if value { "true" } else { "false" }
+    _ => ""
+}
+
+// A match arm's pattern (or let's): Circle(r, _), 3, 80..90, "quit", _
+fn Writer.pattern(var self, a: Ast, arm: Arm) {
+    if arm.pattern != "" {
+        let tuple = arm.pattern == "(,)"
+        if not tuple {
+            self.put(arm.pattern)
+        }
+        for (k, bind) in arm.binds.enumerate() {
+            self.put(if k > 0 { ", " } else { "(" })
+            let sub = arm.subs.get(k) ?? -1
+            if sub >= 0 { self.pattern(a, a.arms[sub]) } else { self.put(bind) }
+        }
+        if len(arm.binds) > 0 or tuple {
+            self.put(")")
+        }
+    } else if arm.isRange {
+        if arm.intPattern >= 0 {
+            self.put(literal(a, arm.intPattern))
+        }
+        self.put(if arm.inclusive { "..=" } else { ".." })
+        if arm.intHigh >= 0 {
+            self.put(literal(a, arm.intHigh))
+        }
+    } else if arm.intPattern >= 0 {
+        self.put(literal(a, arm.intPattern))
+    } else if arm.textPattern >= 0 {
+        self.textLiteral(a, arm.textPattern)
+    } else if arm.whole != "" {
+        self.put(arm.whole)
+    } else {
+        self.put("_")
+    }
+    for alternative in arm.alternatives {
+        self.put(" | ")
+        self.pattern(a, a.arms[alternative])
+    }
+}
+
+// What a text holds that cannot be seen, written as an escape: a control character (\r, \0, \x1b), or a code point
+// that shows nothing (C1 controls, soft hyphen, zero widths, direction marks, line separators, BOM: \u{200B}). The
+// escape and the bytes it takes at b[i], or None for a character written as itself.
+fn unseen(b: Bytes, i: Int) -> (Text, Int)? {
+    let c = b[i]
+    if c < 0x20 or c == 0x7f {
+        let escape = match c {
+            '\r' => "\\r"
+            0 => "\\0"
+            _ => "\\x" + hexByte(c)
+        }
+        return (escape, 1)
+    }
+    let n = len(b)
+    if c < 0xc2 or c >= 0xf0 or i + (if c >= 0xe0 { 2 } else { 1 }) >= n {
+        return None
+    }
+    let size = if c >= 0xe0 { 3 } else { 2 }
+    let cp = if size == 2 {
+        c & 31 << 6 | b[i + 1] & 63
+    } else {
+        c & 15 << 12 | b[i + 1] & 63 << 6 | b[i + 2] & 63
+    }
+    let hidden = cp < 0xa0 or cp == 0xad or cp is 0x200b..=0x200f | 0x2028..=0x202e | 0x2060..=0x2064 | 0xfeff
+    if not hidden {
+        return None
+    }
+    ("\\u\{" + hexUpper(cp) + "\}", size)
+}
+
+fn hexByte(c: Int) -> Text =
+    "0123456789abcdef"[c >> 4..c >> 4 + 1] + "0123456789abcdef"[c & 15..c & 15 + 1]
+
+fn hexUpper(n: Int) -> Text {
+    var out = ""
+    var v = n
+    while true {
+        out = "0123456789ABCDEF"[v & 15..v & 15 + 1] + out
+        v = v >> 4
+        if v == 0 {
+            break
+        }
+    }
+    out
+}
+
+// """ text """: each line one level in from where the text is, the closing quotes too; decoded: a value's text,
+// its braces, backslashes, tabs and unseen characters escaped (else the pieces as written)
+fn Writer.linesPiece(var self, s: Text, indent: Int, decoded: Bool) {
+    let b = s.bytes()
+    let n = len(b)
+    var from = 0
+    var i = 0
+    while i < n {
+        let c = b[i]
+        var escape = ""
+        var size = 1
+        if c == '\n' {
+            escape = if i + 1 >= n or b[i + 1] != '\n' {
+                "\n" + "    " * (indent + 1) // an empty line stays empty
+            } else {
+                "\n"
+            }
+        } else if decoded {
+            escape = match c {
+                '\\' => "\\\\"
+                '{' => "\\\{"
+                '}' => "\\\}"
+                '\t' => "\\t"
+                _ => ""
+            }
+            if escape == "" and unseen(b, i) is Some((text, k)) {
+                escape = text
+                size = k
+            }
+        }
+        if escape == "" {
+            i += 1
+            continue
+        }
+        self.put(s[from..i] + escape)
+        i += size
+        from = i
+    }
+    self.put(s[from..])
+}
+
+fn Writer.linesOpen(var self, indent: Int) {
+    self.put("\"\"\"\n")
+    self.indentTo(indent + 1)
+}
+
+fn Writer.linesClose(var self, indent: Int) {
+    self.put("\n")
+    self.indentTo(indent + 1)
+    self.put("\"\"\"")
+}
+
+fn Writer.textLiteral(var self, a: Ast, e: Int) {
+    let TextLit(text, raw, _) = a.exprs[e].node else {
+        return
+    }
+    if raw.startsWith("r") {
+        self.put(raw) // r"...": as written
+        return
+    }
+    self.put(quoteText(text))
+}
+
+// a text as a Quark literal writes it: in quotes, \n \t \" \ escaped, a brace (it would start a value) too, and what
+// cannot be seen as \u{...}
+pub fn quoteText(text: Text) -> Text {
+    let b = text.bytes()
+    var out = "\""
+    var from = 0
+    var i = 0
+    while i < len(b) {
+        let c = b[i]
+        var escape = match c {
+            '\n' => "\\n"
+            '\t' => "\\t"
+            '"' => "\\\""
+            '\\' => "\\\\"
+            '{' => "\\\{"
+            '}' => "\\\}"
+            _ => ""
+        }
+        var size = 1
+        if escape == "" and unseen(b, i) is Some((t, k)) {
+            escape = t
+            size = k
+        }
+        if escape == "" {
+            i += 1
+            continue
+        }
+        out += text[from..i] + escape
+        i += size
+        from = i
+    }
+    out + text[from..] + "\""
+}
+
+fn lambdaArgs(a: Ast, args: [Int]) -> Int =
+    args.count(arg => a.exprs[visible(a, arg)].node is Lambda(_, _))
+
+// a.f(x).g(y): how many calls in the chain carry a lambda
+fn chainLambdas(a: Ast, e: Int) -> Int {
+    var n = 0
+    var at = e
+    while not a.exprs[at].implicit and a.exprs[at].node is Call(_, _, args, _, method, _) and method {
+        if lambdaArgs(a, args) > 0 {
+            n += 1
+        }
+        at = visible(a, args[0])
+    }
+    n
+}
+
+fn Writer.args(var self, a: Ast, args: [Int], names: [Text], from: Int, indent: Int) {
+    if not self.inText and not self.noWrap and len(args) > from {
+        var flat = Writer(noWrap: true, col: self.col)
+        flat.argsFlat(a, args, names, from, indent)
+        if not flat.out.contains("\n") and flat.col > width {
+            self.put("(\n")
+            for i in from..len(args) {
+                self.indentTo(indent + 1)
+                let name = names.get(i) ?? ""
+                if name != "" {
+                    self.put(name + ": ")
+                }
+                self.expr(a, args[i], indent + 1, lowest)
+                self.put(",\n")
+            }
+            self.indentTo(indent)
+            self.put(")")
+            return
+        }
+    }
+    self.argsFlat(a, args, names, from, indent)
+}
+
+fn Writer.argsFlat(var self, a: Ast, args: [Int], names: [Text], from: Int, indent: Int) {
+    self.put("(")
+    for i in from..len(args) {
+        if i > from {
+            self.put(", ")
+        }
+        let name = names.get(i) ?? ""
+        if name != "" {
+            self.put(name + ": ")
+        }
+        self.expr(a, args[i], indent, lowest)
+    }
+    self.put(")")
+}
+
+// a op b op c (op left-associative) as [a, b, c]
+fn chainOf(a: Ast, e: Int, op: Op) -> [Int] {
+    var rights: [Int] = []
+    var at = visible(a, e)
+    while a.exprs[at].node is Binary(o, l, r) and o == op and precedence(a, at) == precedence(a, e) {
+        rights.push(r)
+        at = visible(a, l)
+    }
+    [at] + rights.reversed()
+}
+
+// a plain value: a number, a text without values in it, a name, true, false, a case without data
+fn plainItem(a: Ast, e: Int) -> Bool =
+    a.exprs[visible(a, e)].node is IntLit(_, _) | FloatLit(_, _) | TextLit(_, _, _) | BoolLit(_) | Name(_)
+        or a.exprs[visible(a, e)].node is Call(_, _, args, _, _, dotted) and dotted and len(args) == 0
+        or a.exprs[visible(a, e)].node is Field(t, _) and a.exprs[visible(a, t)].node is Name(_)
+        or a.exprs[visible(a, e)].node is Case(_, _, _)
+
+// Op.Const
+// Op.Const, .Mov
+// a list's (each: 1) or a map's (each: 2, key: value) items, past the width: plain values packed into lines, any
+// other one a line; a comma after each, the bracket on a line of its own
+fn Writer.items(var self, a: Ast, items: [Int], each: Int, indent: Int) {
+    let packed = items.all(i => plainItem(a, i))
+    self.put("[\n")
+    self.indentTo(indent + 1)
+    var first = true
+    var i = 0
+    while i + each - 1 < len(items) {
+        var one = Writer(noWrap: true, col: 0)
+        one.expr(a, items[i], indent + 1, lowest)
+        if each == 2 {
+            one.put(": ")
+            one.expr(a, items[i + 1], indent + 1, lowest)
+        }
+        if not first {
+            if packed and self.col + 1 + len(one.out) + 1 <= width {
+                self.put(" ")
+            } else {
+                self.put("\n")
+                self.indentTo(indent + 1)
+            }
+        }
+        if packed {
+            self.put(one.out + ",")
+        } else {
+            self.expr(a, items[i], indent + 1, lowest)
+            if each == 2 {
+                self.put(": ")
+                self.expr(a, items[i + 1], indent + 1, lowest)
+            }
+            self.put(",")
+        }
+        first = false
+        i += each
+    }
+    self.put("\n")
+    self.indentTo(indent)
+    self.put("]")
+}
+
+fn Writer.call(var self, a: Ast, e: Int, indent: Int, broken: Bool) {
+    let Call(name, qualifier, args, names, method, dotted) = a.exprs[e].node else {
+        return
+    }
+    if method and len(args) > 0 {
+        let recv = visible(a, args[0])
+        if a.exprs[recv].node is Call(_, _, _, _, m, _) and m {
+            self.call(a, recv, indent, broken)
+        } else if a.exprs[recv].node is Try(_) {
+            // (f()?).g(): f()?.g() would be the optional's chain
+            self.put("(")
+            self.expr(a, args[0], indent, lowest)
+            self.put(")")
+        } else {
+            self.expr(a, args[0], indent, postfix)
+        }
+        if broken {
+            self.put("\n")
+            self.indentTo(indent + 1)
+        }
+        self.put("." + name)
+        self.args(a, args, names, 1, if broken { indent + 1 } else { indent })
+        return
+    }
+    if name == "(,)" {
+        self.args(a, args, names, 0, indent) // (a, b): a tuple
+        return
+    }
+    if name == "()" and len(args) > 0 {
+        self.expr(a, args[0], indent, postfix) // pick(true)(5)
+        self.args(a, args, names, 1, indent)
+        return
+    }
+    if qualifier != "" {
+        self.put(qualifier + ".")
+    } else if dotted {
+        self.put(".")
+    }
+    self.put(name)
+    self.args(a, args, names, 0, indent)
+}
+
+// if c { a } else { b } on one line, when both sides are one short value or one jump (return x, break,
+// continue: values too, of type Never) and it fits; an if without else, or a chain with else if, never is
+fn shortValue(a: Ast, e: Int) -> Bool =
+    e < 0 or not a.exprs[e].node is If(_, _, _) | Match(_, _, _) | BlockExpr(_, _)
+
+fn shortBranch(a: Ast, block: Int) -> Bool {
+    let b = a.blocks[block]
+    if len(b.stmts) != 1 or b.closingComment != "" {
+        return false
+    }
+    let s = a.stmts[b.stmts[0]]
+    if s.leading != "" or s.trailing != None {
+        return false
+    }
+    match s.node {
+        ExprStmt(value) => shortValue(a, value)
+        Return(value) => shortValue(a, value)
+        Break | Continue => true
+        _ => false
+    }
+}
+
+fn Writer.shortItem(var self, a: Ast, block: Int, indent: Int) {
+    let s = a.stmts[a.blocks[block].stmts[0]]
+    if s.node is ExprStmt(value) {
+        self.expr(a, value, indent, lowest)
+    } else {
+        self.leave(a, s, indent)
+    }
+}
+
+fn Writer.ifExpr(var self, a: Ast, e: Int, indent: Int, chained: Bool) {
+    let If(cond, then, otherwise) = a.exprs[e].node else {
+        return
+    }
+    if not chained
+        and shortBranch(a, then)
+        and otherwise >= 0
+        and a.exprs[otherwise].node is BlockExpr(other, _)
+        and shortBranch(a, other) {
+        var line = Writer("if ", inText: self.inText, noWrap: true)
+        line.expr(a, cond, indent, lowest)
+        line.put(" \{ ")
+        line.shortItem(a, then, indent)
+        line.put(" \} else \{ ")
+        line.shortItem(a, other, indent)
+        line.put(" \}")
+        if (len(line.out) <= 70 or self.inText) and not line.out.contains("\n") {
+            self.put(line.out)
+            return
+        }
+    }
+    self.put("if ")
+    self.expr(a, cond, indent, lowest)
+    self.put(" ")
+    self.block(a, then, indent)
+    if otherwise >= 0 {
+        self.put(" else ")
+        match a.exprs[otherwise].node {
+            If(_, _, _) => self.ifExpr(a, otherwise, indent, true)
+            BlockExpr(b, _) => self.block(a, b, indent)
+            _ => {}
+        }
+    }
+}
+
+fn Writer.expr(var self, a: Ast, at: Int, indent: Int, minPrec: Int) {
+    let e = visible(a, at)
+    let parens = precedence(a, e) < minPrec
+    if parens {
+        self.put("(")
+    }
+    let x = a.exprs[e]
+    match x.node {
+        Hole => self.put("_")
+        IntLit(value, raw) => self.put(if raw != "" { raw } else { "{value}" })
+        FloatLit(value, raw) => self.put(if raw != "" { raw } else { "{value}" })
+        TextLit(text, raw, multiline) => {
+            if multiline {
+                let isRaw = raw.startsWith("r") // r""": its lines as written
+                if isRaw {
+                    self.put("r")
+                }
+                self.linesOpen(indent)
+                self.linesPiece(text, indent, not isRaw)
+                self.linesClose(indent)
+            } else {
+                self.textLiteral(a, e)
+            }
+        }
+        BoolLit(value) => self.put(if value { "true" } else { "false" })
+        Name(name) => {
+            if not name.startsWith("#c") {
+                self.put(name) // #cN: a?.rest's hole
+            }
+        }
+        Case(name, target, dotted) => {
+            // as written: .Leaf, Tree.Leaf, Self.Leaf
+            if dotted {
+                self.put("." + name)
+            } else if target >= 0 and a.exprs[target].node is Name(n) {
+                self.put(n + "." + name)
+            } else if x.decl >= 0 {
+                let d = a.decls[x.decl]
+                self.put((if d.templateOf >= 0 { a.decls[d.templateOf].name } else { d.name }) + "." + name)
+            }
+        }
+        Is(value, pattern) => {
+            self.expr(a, value, indent, compare + 1)
+            self.put(" is ")
+            self.pattern(a, a.arms[pattern])
+        }
+        Field(target, name) => {
+            self.expr(a, target, indent, postfix)
+            self.put("." + name)
+        }
+        Index(target, index) => {
+            self.expr(a, target, indent, postfix)
+            self.put("[")
+            self.expr(a, index, indent, lowest)
+            self.put("]")
+        }
+        Unary(op, operand) => {
+            self.put(match op {
+                Not => "not "
+                Tilde => "~"
+                _ => "-"
+            })
+            // -(5.abs()): a number right after - would be the literal -5
+            let inner = visible(a, operand)
+            var first = inner
+            while true {
+                match a.exprs[first].node {
+                    Call(_, _, args, _, method, _) if method and len(args) > 0 => {
+                        first = visible(a, args[0])
+                    }
+                    Field(target, _) => {
+                        first = visible(a, target)
+                    }
+                    Index(target, _) => {
+                        first = visible(a, target)
+                    }
+                    Try(value) => {
+                        first = visible(a, value)
+                    }
+                    _ => break
+                }
+            }
+            // -(-x), -(-5): two minus signs side by side would read as one -- operator
+            let leadsMinus = match a.exprs[first].node {
+                Unary(o, _) => o == Op.Minus
+                IntLit(_, raw) => raw.startsWith("-")
+                FloatLit(_, raw) => raw.startsWith("-")
+                _ => false
+            }
+            let number = op == Op.Minus
+                and (a.exprs[first].node is IntLit(_, _) | FloatLit(_, _) and first != inner or leadsMinus)
+            self.expr(a, operand, indent, if number {
+                primary + 1
+            } else if op == Op.Not {
+                notLevel
+            } else {
+                unary
+            })
+        }
+        Binary(op, left, right) if op is And | Or | Plus and not self.fits(a, e, indent, precedence(a, e)) => {
+            // a long chain of one operator: a line for each operand after the first, the operator first (a line that
+            // starts with one goes on the one before)
+            let prec = precedence(a, e)
+            let parts = chainOf(a, e, op)
+            self.expr(a, parts[0], indent, prec)
+            for p in parts[1..] {
+                self.put("\n")
+                self.indentTo(indent + 1)
+                self.put(op.name() + " ")
+                self.expr(a, p, indent + 1, prec + 1)
+            }
+        }
+        Binary(op, left, right) => {
+            // left-associative: the right side binds one level tighter
+            let prec = precedence(a, e)
+            self.expr(a, left, indent, if prec == compare { prec + 1 } else { prec })
+            self.put(" " + op.name() + " ")
+            let r = visible(a, right)
+            self.expr(a, right, indent, if a.exprs[r].node is BlockExpr(_, jump) and jump {
+                lowest // a ?? return 0
+            } else {
+                prec + 1
+            })
+        }
+        Range(low, high) => {
+            // a range may leave out either end
+            if low >= 0 {
+                self.expr(a, low, indent, rangeLevel + 1)
+            }
+            self.put("..")
+            if high >= 0 {
+                let r = visible(a, high)
+                self.expr(a, high, indent, if a.exprs[r].node is BlockExpr(_, jump) and jump {
+                    lowest
+                } else {
+                    rangeLevel + 1
+                })
+            }
+        }
+        Try(value) => {
+            self.expr(a, value, indent, postfix)
+            self.put("?")
+        }
+        MapLit(items) => {
+            if len(items) == 0 {
+                self.put("[:]")
+            } else if not self.fits(a, e, indent, lowest) {
+                self.items(a, items, 2, indent)
+            } else {
+                self.put("[")
+                var i = 0
+                while i + 1 < len(items) {
+                    if i > 0 {
+                        self.put(", ")
+                    }
+                    self.expr(a, items[i], indent, lowest)
+                    self.put(": ")
+                    self.expr(a, items[i + 1], indent, lowest)
+                    i += 2
+                }
+                self.put("]")
+            }
+        }
+        If(_, _, _) => self.ifExpr(a, e, indent, false)
+        Match(subject, arms, chain) => {
+            if chain {
+                // a?.rest: the first arm's body, its hole written as nothing
+                self.expr(a, subject, indent, postfix)
+                self.put("?")
+                self.expr(a, a.arms[arms[0]].body, indent, postfix)
+            } else {
+                self.put("match ")
+                self.expr(a, subject, indent, lowest)
+                self.put(" \{\n")
+                for k in arms {
+                    let arm = a.arms[k]
+                    if arm.hidden {
+                        continue
+                    }
+                    self.comments(arm.comment, indent + 1)
+                    self.indentTo(indent + 1)
+                    self.pattern(a, arm)
+                    if arm.guard >= 0 {
+                        self.put(" if ")
+                        self.expr(a, arm.guard, indent + 1, lowest)
+                    }
+                    self.put(" => ")
+                    if a.exprs[arm.body].node is BlockExpr(b, jump) and not jump {
+                        self.block(a, b, indent + 1)
+                    } else {
+                        self.expr(a, arm.body, indent + 1, lowest)
+                    }
+                    self.put("\n")
+                }
+                self.indentTo(indent)
+                self.put("\}")
+            }
+        }
+        Lambda(params, body) => {
+            let typed = params.any(p => a.params[p].ty >= 0)
+            if len(params) == 1 and not typed {
+                self.put(a.params[params[0]].name)
+            } else {
+                self.put("(")
+                for (i, k) in params.enumerate() {
+                    let p = a.params[k]
+                    self.put(if i > 0 { ", " + p.name } else { p.name })
+                    if p.ty >= 0 {
+                        self.put(": ")
+                        self.typeExpr(a, p.ty)
+                    }
+                }
+                self.put(")")
+            }
+            self.put(" => ")
+            self.expr(a, body, indent, lowest)
+        }
+        ArrayLit(items) => {
+            if not self.fits(a, e, indent, lowest) {
+                self.items(a, items, 1, indent)
+            } else {
+                self.put("[")
+                for (i, item) in items.enumerate() {
+                    if i > 0 {
+                        self.put(", ")
+                    }
+                    self.expr(a, item, indent, lowest)
+                }
+                self.put("]")
+            }
+        }
+        BlockExpr(b, jump) => {
+            if jump {
+                self.leave(a, a.stmts[a.blocks[b].stmts[0]], indent)
+            } else {
+                self.block(a, b, indent)
+            }
+        }
+        With(target, values, fields) => {
+            self.expr(a, target, indent, postfix)
+            self.put(" with \{ ")
+            for (i, value) in values.enumerate() {
+                self.put(if i > 0 { ", " + fields[i] + ": " } else { fields[i] + ": " })
+                self.expr(a, value, indent, lowest)
+            }
+            self.put(" \}")
+        }
+        Interp(values, _, raws, formats, multiline) => {
+            // the pieces as written, the values between braces
+            if multiline { self.linesOpen(indent) } else { self.put("\"") }
+            for (i, raw) in raws.enumerate() {
+                if multiline {
+                    self.linesPiece(raw, indent, false)
+                } else {
+                    self.put(raw)
+                }
+                if i == len(values) {
+                    break
+                }
+                self.put("\{")
+                let was = self.inText
+                self.inText = not multiline
+                self.expr(a, values[i], indent, lowest)
+                self.inText = was
+                let format = formats.get(i) ?? ""
+                if format != "" {
+                    self.put(":" + format)
+                }
+                self.put("\}")
+            }
+            if multiline { self.linesClose(indent) } else { self.put("\"") }
+        }
+        Call(_, _, _, _, method, _) => {
+            // a chain of calls with lambdas goes one call per line when it is long
+            let lambdas = if method { chainLambdas(a, e) } else { 0 }
+            var broken = lambdas >= 3 and not self.inText
+            if lambdas == 2 and not self.inText {
+                var line = Writer(noWrap: true)
+                line.call(a, e, indent, false)
+                broken = len(line.out) > 60 or line.out.contains("\n")
+            }
+            self.call(a, e, indent, broken)
+        }
+    }
+    if parens {
+        self.put(")")
+    }
+}
+
+fn Writer.stmt(var self, a: Ast, at: Int, indent: Int) {
+    let s = a.stmts[at]
+    self.comments(s.leading, indent)
+    self.indentTo(indent)
+    match s.node {
+        Let(mutable, name, ty, value, pattern, otherwise) => {
+            self.put(if mutable { "var " } else { "let " })
+            if pattern >= 0 {
+                // let Some(x) = value else { ... }, var (a, b) = ...
+                self.pattern(a, a.arms[pattern])
+                self.put(" = ")
+                self.expr(a, value, indent, lowest)
+                if otherwise >= 0 {
+                    self.put(" else ")
+                    self.block(a, otherwise, indent)
+                }
+            } else {
+                self.put(name)
+                if ty >= 0 {
+                    self.put(": ")
+                    self.typeExpr(a, ty)
+                }
+                self.put(" = ")
+                self.expr(a, value, indent, lowest)
+            }
+        }
+        Assign(target, op, value) => {
+            self.expr(a, target, indent, lowest)
+            self.put(" " + op.name() + " ")
+            self.expr(a, value, indent, lowest)
+        }
+        ExprStmt(value) => self.expr(a, value, indent, lowest)
+        For(name, pattern, iter, body) => {
+            self.put("for ")
+            if pattern >= 0 {
+                self.pattern(a, a.arms[pattern])
+            } else {
+                self.put(name)
+            }
+            self.put(" in ")
+            self.expr(a, iter, indent, lowest)
+            self.put(" ")
+            self.block(a, body, indent)
+        }
+        Defer(body) => {
+            self.put("defer ")
+            self.block(a, body, indent)
+        }
+        While(cond, body) => {
+            self.put("while ")
+            self.expr(a, cond, indent, lowest)
+            self.put(" ")
+            self.block(a, body, indent)
+        }
+        _ => self.leave(a, s, indent)
+    }
+    self.trailing(s.trailing)
+    self.put("\n")
+}
+
+fn Writer.block(var self, a: Ast, at: Int, indent: Int) {
+    let b = a.blocks[at]
+    if len(b.stmts) == 0 and b.closingComment == "" {
+        self.put("\{\}")
+        return
+    }
+    self.put("\{\n")
+    for (i, s) in b.stmts.enumerate() {
+        if i > 0 and a.stmts[s].blankBefore {
+            self.put("\n")
+        }
+        self.stmt(a, s, indent + 1)
+    }
+    self.comments(b.closingComment, indent + 1)
+    self.indentTo(indent)
+    self.put("\}")
+}
+
+// Circle(radius: Float), or a plain case's name
+fn Writer.case(var self, a: Ast, d: Decl, k: Int) {
+    self.put(d.cases[k])
+    let fields = d.caseFields.get(k) ?? []
+    for (i, f) in fields.enumerate() {
+        let p = a.params[f]
+        self.put(if i > 0 { ", " + p.name + ": " } else { "(" + p.name + ": " })
+        self.typeExpr(a, p.ty)
+    }
+    if len(fields) > 0 {
+        self.put(")")
+    }
+}
+
+// the record's, interface's or enum's members, on its line when it fits in 100 columns, else one a line
+fn Writer.members(var self, a: Ast, d: Decl) {
+    let n = if d.kind == DeclKind.Type { len(d.params) } else { len(d.cases) }
+    var line = Writer(noWrap: true)
+    line.typeHead(d)
+    line.put(if n > 0 { " \{ " } else { " \{" })
+    for i in 0..n {
+        if i > 0 {
+            line.put(", ")
+        }
+        line.member(a, d, i)
+    }
+    line.put(if n > 0 {
+        " \}" // interface Marker {}
+    } else {
+        "\}"
+    })
+    // a member with a comment: one a line, the comments where they were
+    let commented = len(d.memberLeading) > 0 or len(d.memberTrailing) > 0
+    if len(line.out) <= 100 and not commented {
+        self.put(line.out)
+        return
+    }
+    self.typeHead(d)
+    self.put(" \{\n")
+    for i in 0..n {
+        self.comments(d.memberLeading.get(i) ?? "", 1)
+        self.indentTo(1)
+        self.member(a, d, i)
+        self.trailing(if i < len(d.memberTrailing) { d.memberTrailing[i] } else { None })
+        self.put("\n")
+    }
+    self.put("\}")
+}
+
+fn Writer.member(var self, a: Ast, d: Decl, i: Int) {
+    if d.kind == DeclKind.Type {
+        self.field(a, d, i)
+    } else {
+        self.case(a, d, i)
+    }
+}
+
+fn Writer.decl(var self, a: Ast, at: Int, leading: Bool) {
+    let d = a.decls[at]
+    if leading {
+        self.comments(d.leading, 0)
+    }
+    if d.kind == DeclKind.Use {
+        self.put("use " + d.name)
+        if d.alias != "" {
+            self.put(" as " + d.alias)
+        }
+        self.trailing(d.trailing)
+        self.put("\n")
+        return
+    }
+    if d.isPub {
+        self.put("pub ")
+    }
+    if d.kind == DeclKind.Type and d.isExtern and not d.cStruct {
+        self.put("extern type " + d.name) // a C handle
+        self.trailing(d.trailing)
+        self.put("\n")
+        return
+    }
+    if d.kind == DeclKind.Const {
+        self.put("const " + d.name)
+        if d.ret >= 0 {
+            self.put(": ")
+            self.typeExpr(a, d.ret)
+        }
+        self.put(" = ")
+        self.expr(a, d.body, 0, lowest)
+        self.trailing(d.trailing)
+        self.put("\n")
+        return
+    }
+    if d.kind == DeclKind.Fn and d.isTest {
+        self.put(d.name + " ") // test "name"
+        if a.exprs[d.body].node is BlockExpr(b, _) {
+            self.block(a, b, 0)
+        }
+    } else if d.kind == DeclKind.Fn {
+        self.signature(a, d)
+        if d.isExtern {
+            if d.externLib != "" {
+                self.put(" in " + jsonString(d.externLib))
+            }
+            if d.externSymbol != "" {
+                self.put(" as " + jsonString(d.externSymbol))
+            }
+        }
+        if d.body >= 0 {
+            self.fnBody(a, d.body)
+        }
+    } else {
+        self.members(a, d)
+    }
+    self.trailing(d.trailing)
+    self.put("\n")
+}
+
+// [pub] [extern] [effect] fn name<T: Bound>(params) -> R
+fn Writer.signature(var self, a: Ast, d: Decl) {
+    if d.isExtern {
+        self.put("extern ")
+    }
+    if isCFunction(d) and d.isEffect or d.effectDeclared {
+        self.put("effect ")
+    }
+    self.put("fn " + d.name)
+    let typeParams = if d.impliedTypes { 0 } else { len(d.typeParams) }
+    for i in 0..typeParams {
+        self.put(if i > 0 { ", " } else { "<" })
+        self.put(d.typeParams[i])
+        let bound = d.typeBounds.get(i) ?? ""
+        if bound != "" {
+            self.put(": " + bound) // T: Speaker
+        }
+    }
+    self.put(if typeParams > 0 { ">" } else { "" })
+    // the parameters, each as written alone; one a line when the signature would pass the width
+    var params: [Text] = []
+    for (i, k) in d.params.enumerate() {
+        let p = a.params[k]
+        if i == 0 and (p.ty < 0 or d.impliedSelf) {
+            // fn Vec2.length(self), fn Parser.next(var self)
+            params.push(if p.isVar { "var " + p.name } else { p.name })
+            continue
+        }
+        var w = Writer(p.name + ": ", noWrap: true)
+        w.typeExpr(a, p.ty)
+        if p.fallback >= 0 {
+            w.put(" = ")
+            w.expr(a, p.fallback, 0, lowest)
+        }
+        params.push(w.out)
+    }
+    if d.variadic {
+        params.push("...")
+    }
+    var ret = Writer(noWrap: true)
+    if d.ret >= 0 {
+        ret.put(" -> ")
+        ret.typeExpr(a, d.ret)
+    }
+    let flat = "(" + params.join(", ") + ")" + ret.out
+    if not self.noWrap and not self.inText and len(params) > 0 and self.col + len(flat) + 2 > width {
+        self.put("(\n")
+        for p in params {
+            self.put("    " + p + (if p == "..." { "" } else { "," }) + "\n")
+        }
+        self.put(")" + ret.out)
+        return
+    }
+    self.put(flat)
+}
+
+// a function's block, or = expr on the same line, or indented on the next when the line would pass 100 columns
+fn Writer.fnBody(var self, a: Ast, body: Int) {
+    if a.exprs[body].node is BlockExpr(b, _) {
+        self.put(" ")
+        self.block(a, b, 0)
+        return
+    }
+    var line = Writer(noWrap: true, col: self.col + 3)
+    line.expr(a, body, 0, lowest)
+    if not line.out.contains("\n") and self.col + 3 + len(line.out) > 100 {
+        self.put(" =\n    ")
+        self.expr(a, body, 1, lowest)
+    } else {
+        self.put(" = ")
+        self.expr(a, body, 0, lowest)
+    }
+}
+
+// extern fn ... without a body: C's
+fn isCFunction(d: Decl) -> Bool = d.kind == DeclKind.Fn and d.isExtern and d.body < 0
+
+// one line, its comments aside
+fn oneLine(a: Ast, d: Int) -> Bool {
+    var w = Writer()
+    w.decl(a, d, false)
+    let b = w.out.bytes()
+    len(b) > 0 and not b[..len(b) - 1].contains('\n')
+}
+
+// (a C function with a body is a function as any other)
+fn listLike(a: Ast, d: Int) -> Bool {
+    let decl = a.decls[d]
+    (decl.kind != DeclKind.Fn or isCFunction(decl)) and oneLine(a, d)
+}
+
+// one-liners of one family stay together: uses, the host's (extern), constants, types and enums
+fn family(d: Decl) -> Int = if d.kind == DeclKind.Use {
+    0
+} else if d.isExtern and d.body < 0 {
+    1
+} else if d.kind == DeclKind.Const {
+    2
+} else {
+    3
+}
+
+// a text in quotes, as JSON writes it
+pub fn jsonString(s: Text) -> Text {
+    var out = "\""
+    var from = 0
+    let b = s.bytes()
+    for (i, c) in b.enumerate() {
+        let escaped = match c {
+            '"' => "\\\""
+            '\\' => "\\\\"
+            '\n' => "\\n"
+            '\t' => "\\t"
+            0..=0x1f => "\\u00" + hexByte(c)
+            _ => ""
+        }
+        if escaped != "" {
+            out += s[from..i] + escaped
+            from = i + 1
+        }
+    }
+    out + s[from..] + "\""
+}
+
+// the text of a pattern as written (its alternatives too): for node graphs
+pub fn patternText(a: Ast, arm: Arm) -> Text {
+    var w = Writer()
+    w.pattern(a, arm)
+    w.out
+}
+
+// one declaration as the formatter writes it, without the comments above it: for quark doc
+pub fn declText(a: Ast, at: Int) -> Text {
+    var w = Writer()
+    w.decl(a, at, false)
+    w.out
+}

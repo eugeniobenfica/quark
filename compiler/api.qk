@@ -1,0 +1,1114 @@
+// libquark: the embedding API (include/quark.h) written in Quark, every function a `pub extern fn` C calls by its
+// name. It wraps the compiler written in Quark (module, check, lower, the optimizers, x64 and arm64), the runtime
+// written in Quark (its loader, trampoline and tasks run what qkCompile makes), the formatter, node graphs,
+// catalog, diffs and merges; it collects errors instead of printing them. tools/libquark.sh compiles it, with the
+// runtime's system calls (compiler/apiwindows.qk, apilinux.qk), into one object: libquark.a.
+//
+// What C keeps (machines, modules, tasks, diagnostics, texts given back) lives in C's memory: the compiler's own
+// values live in the library's arena, emptied when the next call of the API starts. A program's calls allocate in
+// their machine's arena.
+use std.machine as machine
+use runtime.base
+use runtime.arena
+use runtime.print
+use runtime.loader
+use runtime.tasks
+use runtime.start
+use source
+use parser
+use format
+use types
+use ast
+use module
+use check
+use ir
+use lower
+use release
+use x64
+use arm64
+use graph
+use qgn
+use collab
+use catalog
+
+extern effect fn fflush(f: Int64) -> Int32
+extern effect fn osLibraryStart() -> Int64 as "qkosLibraryStart" // the thread's context made findable; the system (0 Windows, 1 Linux)
+extern fn fnAddress(f: extern () -> Int64) -> Int64 as "qkTextAddress"
+extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" // a C function, or 0 and why
+
+// ---- C's variables: their places in the library's data (tools/libquark.sh exports each by its name) ----
+// int qkAbi: 1 makes System V code (the Windows test of Linux's calls); char* (*qkModuleReader)(const char*, size_t*)
+// (each through a symbol of its own, as the runtime's cell: one place, however the code that asks is made)
+pub extern fn abiCellOf() -> Int64 as "qkLibraryAbiCell" =
+    textAt("qkAbi=library-variable-cell-0001")
+
+extern fn abiCellAddress() -> Int64 as "qkLibraryAbiCell"
+
+fn abiCell() -> Int = abiCellAddress()
+
+pub extern fn readerCellOf() -> Int64 as "qkLibraryReaderCell" =
+    textAt("qkModuleReader=library-variable-cell-0002")
+
+extern fn readerCellAddress() -> Int64 as "qkLibraryReaderCell"
+
+fn readerCell() -> Int = readerCellAddress()
+
+// ---- the machine's words, in C's memory ----
+const vPrelude = 0 // its text (malloc'd, zero-ended), or 0
+const vCapabilities = 1
+const vHosts = 2 // (name, function) pairs
+const vHostCount = 3
+const vHostCap = 4
+const vFuel = 5
+const vNoAvx = 6
+const vRelease = 8
+const vDiags = 9 // QkDiagnostic each (diagBytes)
+const vDiagCount = 10
+const vDiagCap = 11
+const vLastError = 12 // errorBytes
+const vArena = 13
+const vmWords = 16
+const diagBytes = 424 // int line, col; char key[96], message[320]
+const diagKey = 8
+const diagMessage = 104
+const errorBytes = 512
+
+// a module's words; each function's (name, signature, slot kinds, parameter slots, result slots, offset)
+const mVm = 0
+const mName = 1
+const mLoaded = 2
+const mFns = 3
+const mCount = 4
+const mStatic = 5 // linked into the host (qkModuleStatic): its code is not the module's to free
+const moduleWords = 6
+const fName = 0
+const fSignature = 1
+const fKinds = 2
+const fParams = 3
+const fResults = 4
+const fAt = 5
+const fnWords = 6
+
+// ---- the library's start: the runtime's state, once ----
+// the library's own words: started (when it holds the mark), the system
+pub extern fn stateCellOf() -> Int64 as "qkLibraryStateCell" =
+    textAt("qkLibrary=library-state-cell-0003:started,system,context,nested,adapters")
+
+extern fn stateCellAddress() -> Int64 as "qkLibraryStateCell"
+
+fn stateCell() -> Int = stateCellAddress()
+
+const started = 0x7472617473717571 // "quqstart"
+
+fn library() {
+    let s = stateCell()
+    if word(s, 0) == started {
+        if osCtx() == 0 {
+            setCtx(word(s, 2)) // another thread of the host: the same state (one call at a time)
+        }
+        return
+    }
+    setWord(s, 1, osLibraryStart())
+    begin(0, 0)
+    gSet(gExitEnds, 0) // exit() in a program ends its call, not the host
+    setWord(s, 2, ctx())
+    setWord(s, 3, 0) // not on the compiler's thread
+    setWord(s, 0, started)
+}
+
+fn system() -> Int = word(stateCell(), 1)
+
+fn libraryArm() -> Bool = byte(fnAddress(() => 0), 0) != 0x55 // x86-64 code starts push rbp
+
+// a call of the API begins: its errors so far forgotten
+// (the compiler's memory is given back by job, before the compiler's code runs: code may allocate as it starts)
+fn enter(vm: Int) {
+    library()
+    if vm != 0 {
+        setWord(vm, vDiagCount, 0)
+    }
+}
+
+// ---- C's memory both ways ----
+fn textOf(p: Int) -> Text = if p == 0 { "" } else { Text(Pointer<UInt8>(p), strlen(p)) }
+
+fn textOfLen(p: Int, n: Int) -> Text =
+    if p == 0 or n <= 0 { "" } else { Text(Pointer<UInt8>(p), n) }
+
+// a text in C's memory, zero-ended (the host frees it: qkFree)
+fn cText(t: Text) -> Int {
+    let n = len(t)
+    let p = malloc(n + 1)
+    copyBytes(p, textAt(t), n)
+    setByte(p, n, 0)
+    p
+}
+
+fn cBytes(b: Bytes) -> Int {
+    let p = malloc(len(b) + 16)
+    let at = Pointer<UInt8>(p)
+    for (i, x) in b.enumerate() {
+        at[i] = x
+    }
+    p
+}
+
+// at most size - 1 bytes of t at p, zero-ended (C's snprintf)
+fn putText(p: Int, size: Int, t: Text) {
+    let n = if len(t) < size { len(t) } else { size - 1 }
+    copyBytes(p, textAt(t), n)
+    setByte(p, n, 0)
+}
+
+fn setLastError(vm: Int, t: Text) = putText(word(vm, vLastError), errorBytes, t)
+
+// ---- diagnostics ----
+fn digitsAt(b: Bytes, at: Int) -> Int {
+    var i = at
+    while i < len(b) and b[i] >= '0' and b[i] <= '9' {
+        i += 1
+    }
+    i - at
+}
+
+// an error as the compiler says it ("path:line:col: message", then its line and a caret): one diagnostic
+fn collect(vm: Int, said: Text) {
+    var head = said
+    if said.indexOf("\n") is Some(nl) {
+        head = said[..nl]
+    }
+    let b = head.bytes()
+    var line = 0
+    var col = 0
+    var i = 0
+    while i < len(b) {
+        // the first ":line:col: " (a path may hold colons of its own)
+        if b[i] == ':' {
+            let n = digitsAt(b, i + 1)
+            if n > 0 and i + 1 + n < len(b) and b[i + 1 + n] == ':' {
+                let m = digitsAt(b, i + 2 + n)
+                if m > 0 and i + 2 + n + m < len(b) and b[i + 2 + n + m] == ':' {
+                    line = head[i + 1..i + 1 + n].parseInt() ?? 0
+                    col = head[i + 2 + n..i + 2 + n + m].parseInt() ?? 0
+                    break
+                }
+            }
+        }
+        i += 1
+    }
+    collectAt(vm, line, col, head)
+}
+
+fn collectAt(vm: Int, line: Int, col: Int, message: Text) {
+    let count = word(vm, vDiagCount)
+    if count == word(vm, vDiagCap) {
+        let cap = if count > 0 { count * 2 } else { 8 }
+        setWord(vm, vDiags, realloc(word(vm, vDiags), cap * diagBytes))
+        setWord(vm, vDiagCap, cap)
+    }
+    let d = word(vm, vDiags) + count * diagBytes
+    zeroBytes(d, diagBytes)
+    setInt32(d, 0, line)
+    setInt32(d, 1, col)
+    putText(d + diagMessage, 320, message)
+    setWord(vm, vDiagCount, count + 1)
+}
+
+fn collectAll(vm: Int, errors: [Text]) {
+    for e in errors {
+        collect(vm, e)
+    }
+}
+
+// ---- the machine ----
+pub extern effect fn qkVmNew() -> Int64 as "qkVmNew" {
+    library()
+    let vm = calloc(vmWords, 8)
+    setWord(vm, vLastError, calloc(1, errorBytes))
+    setWord(vm, vArena, arenaNew())
+    vm
+}
+
+pub extern effect fn qkVmFree(vm: Int64) as "qkVmFree" {
+    if vm == 0 {
+        return
+    }
+    library()
+    for i in 0..word(vm, vHostCount) {
+        free(word(word(vm, vHosts), 2 * i))
+    }
+    free(word(vm, vHosts))
+    free(word(vm, vDiags))
+    free(word(vm, vPrelude))
+    free(word(vm, vCapabilities))
+    free(word(vm, vLastError))
+    arenaFree(word(vm, vArena))
+    free(vm)
+}
+
+fn preludeOf(vm: Int) -> Source? = if word(vm, vPrelude) == 0 {
+    None
+} else {
+    Source("prelude", textOf(word(vm, vPrelude)))
+}
+
+fn vmPreludeNow(vm: Int, text: Int) -> Bool {
+    enter(vm)
+    let t = textOf(text)
+    let loaded = loadProgram(Source("prelude", t), None)
+    collectAll(vm, loaded.errors.shown)
+    if not loaded.ok {
+        return false
+    }
+    let checked = checkProgram(loaded.program, Errors(), false, None)
+    collectAll(vm, checked.errors.shown)
+    if not checked.ok {
+        return false
+    }
+    free(word(vm, vPrelude))
+    setWord(vm, vPrelude, cText(t))
+    true
+}
+
+pub extern effect fn qkVmCapabilities(vm: Int64, list: Int64) as "qkVmCapabilities" {
+    library()
+    free(word(vm, vCapabilities))
+    setWord(vm, vCapabilities, if list == 0 { 0 } else { cText(textOf(list)) })
+}
+
+pub extern effect fn qkVmHost(vm: Int64, name: Int64, function: Int64) as "qkVmHost" {
+    library()
+    let n = textOf(name)
+    for i in 0..word(vm, vHostCount) {
+        if textOf(word(word(vm, vHosts), 2 * i)) == n {
+            setWord(word(vm, vHosts), 2 * i + 1, function)
+            return
+        }
+    }
+    let count = word(vm, vHostCount)
+    if count == word(vm, vHostCap) {
+        let cap = if count > 0 { count * 2 } else { 16 }
+        setWord(vm, vHosts, realloc(word(vm, vHosts), 16 * cap))
+        setWord(vm, vHostCap, cap)
+    }
+    setWord(word(vm, vHosts), 2 * count, cText(n))
+    setWord(word(vm, vHosts), 2 * count + 1, function)
+    setWord(vm, vHostCount, count + 1)
+}
+
+pub extern effect fn qkVmFuel(vm: Int64, steps: Int64) as "qkVmFuel" =
+    setWord(vm, vFuel, if steps > 0 { steps } else { 0 })
+
+pub extern effect fn qkVmMemoryLimit(vm: Int64, bytes: Int64) as "qkVmMemoryLimit" =
+    qkArenaLimit(word(vm, vArena), bytes)
+
+pub extern effect fn qkVmNoAvx(vm: Int64, on: Bool) as "qkVmNoAvx" =
+    setWord(vm, vNoAvx, if on { 1 } else { 0 })
+
+pub extern effect fn qkVmRelease(vm: Int64, on: Bool) as "qkVmRelease" =
+    setWord(vm, vRelease, if on { 1 } else { 0 })
+
+pub extern effect fn qkDiagnosticCount(vm: Int64) -> Int32 as "qkDiagnosticCount" =
+    word(vm, vDiagCount)
+
+pub extern effect fn qkDiagnosticAt(vm: Int64, i: Int32) -> Int64 as "qkDiagnosticAt" = if i >= 0
+    and i < word(vm, vDiagCount) {
+    word(vm, vDiags) + i * diagBytes
+} else {
+    0
+}
+
+pub extern effect fn qkLastError(vm: Int64) -> Int64 as "qkLastError" = word(vm, vLastError)
+
+// ---- compiling ----
+fn hostFor(vm: Int, name: Text) -> Int {
+    for i in 0..word(vm, vHostCount) {
+        if textOf(word(word(vm, vHosts), 2 * i)) == name {
+            return word(word(vm, vHosts), 2 * i + 1)
+        }
+    }
+    0
+}
+
+// The program and the files it uses: from the host's reader when it gives one (qkModuleReader: each file asked for
+// as the program names it, malloc'd text and its length, or NULL), else from the disk.
+fn loadUsing(src: Source, prelude: Source?) -> Loaded {
+    let reader = word(readerCell(), 0)
+    if reader == 0 {
+        return loadProgram(src, prelude)
+    }
+    var files: [Text: Text] = [:]
+    var asked: Set<Text> = []
+    while true {
+        let loaded = loadProgram(src, prelude, hostFiles: Some(files))
+        var more = false
+        for e in loaded.errors.shown {
+            let head = if e.indexOf("\n") is Some(nl) { e[..nl] } else { e }
+            if head.indexOf(": cannot read ") is Some(at) and not asked.contains(head[at + 14..]) {
+                let file = head[at + 14..]
+                asked.add(file)
+                more = true
+                let path = cText(file)
+                let size = calloc(1, 8)
+                let p = machine.call(Pointer<UInt8>(reader), path, size, 0, 0)
+                if p != 0 {
+                    files[file] = textOfLen(p, word(size, 0))
+                    free(p)
+                }
+                free(size)
+                free(path)
+            }
+        }
+        if not more {
+            return loaded
+        }
+    }
+    loadProgram(src, prelude)
+}
+
+// The program in name's text, after the machine's prelude, checked; None when it has errors (collected).
+fn checkedText(vm: Int, name: Text, text: Text, allowed: Text?) -> Checked? {
+    let loaded = loadUsing(Source(name, text), preludeOf(vm))
+    collectAll(vm, loaded.errors.shown)
+    if not loaded.ok {
+        return None
+    }
+    let checked = checkProgram(loaded.program, Errors(), false, allowed)
+    collectAll(vm, checked.errors.shown)
+    if not checked.ok {
+        return None
+    }
+    checked
+}
+
+// fn update(self: Object, dt: Float) -> Float
+fn signatureOf(p: Program, d: Decl) -> Text {
+    var s = "fn {d.name}("
+    for (i, prm) in d.params.enumerate() {
+        let param = p.ast.params[prm]
+        s += (if i > 0 { ", " } else { "" }) + (if param.isVar { "var " } else { "" }) + param.name
+        if i == 0 and (param.ty < 0 or d.impliedSelf) {
+            continue // fn Vec2.length(self), fn Parser.next(var self)
+        }
+        s += ": " + p.typeName(p.paramType(prm))
+    }
+    s += ")"
+    if d.retType >= 0 and p.types[d.retType].kind != Kind.Void {
+        s += " -> " + p.typeName(d.retType)
+    }
+    s
+}
+
+// the address of each extern's function: the host's (it wins), else C's; 0 for one that has none (collected)
+fn hostsFor(vm: Int, name: Text, p: Program, ir: IrProgram) -> Int {
+    let hosts = calloc(if len(ir.externs) > 0 { len(ir.externs) } else { 1 }, 8)
+    let why = calloc(1, 512)
+    for (i, x) in ir.externs.enumerate() {
+        var f = if x.lib == None { hostFor(vm, x.name) } else { 0 }
+        if f == 0 {
+            f = osCFunction(cText(x.name), if x.lib is Some(lib) { cText(lib) } else { 0 }, why)
+        }
+        if f == 0 {
+            var line = 0
+            var col = 0
+            for at in p.decls {
+                let d = p.ast.decls[at]
+                if line == 0 and d.kind == DeclKind.Fn and d.name == x.name and not d.fromPrelude {
+                    line = d.line
+                    col = d.col
+                }
+            }
+            let message = if x.lib != None {
+                "extern fn {x.name}: {textOf(why)}"
+            } else {
+                "extern fn {x.name} has no function in this host (qkVmHost), nor in the C library"
+            }
+            collectAt(vm, line, col, "{name}:{line}:{col}: {message}")
+        }
+        setWord(hosts, i, f)
+    }
+    free(why)
+    hosts
+}
+
+fn relocBytes(mc: MachineCode) -> Int {
+    let r = calloc(len(mc.relocs) + 1, 16)
+    for (i, x) in mc.relocs.enumerate() {
+        setInt32(r + 16 * i, 0, x.at)
+        setInt32(r + 16 * i, 1, x.kind)
+        setWord(r + 16 * i, 1, x.target)
+    }
+    r
+}
+
+fn compileNow(vm: Int, name: Int, text: Int, n: Int) -> Int {
+    enter(vm)
+    let path = if name == 0 { "program" } else { textOf(name) }
+    let caps = if word(vm, vCapabilities) == 0 {
+        None
+    } else {
+        Some(textOf(word(vm, vCapabilities)))
+    }
+    let Some(checked) = checkedText(vm, path, textOfLen(text, n), caps) else {
+        return 0
+    }
+    let p = checked.program
+    let arm = libraryArm()
+    let sysv = system() == 1 or Pointer<Int32>(abiCell())[0] == 1
+    let arch = if arm { Arch.Arm64 } else { Arch.X64 }
+    let low = lowerProgram(p, LowerOptions(fuel: word(vm, vFuel) > 0, arch: arch, sysv: sysv))
+    var ir = low.program
+    let cpu = machine.cpu()
+    let avx = not arm and word(vm, vNoAvx) == 0 and cpu & 1 != 0
+    let lanes = if not arm and avx and cpu & 2 != 0 { 4 } else { 2 }
+    ir.target = Target(arch: arch, sysv: sysv, avx: avx, lanes: lanes, sse42: not arm and cpu & 4 != 0)
+    ir.optimize(word(vm, vRelease) != 0)
+    let mc = if arm { genArm64(ir) } else { genX64(ir) }
+    let hosts = hostsFor(vm, path, p, ir)
+    if word(vm, vDiagCount) > 0 {
+        free(hosts)
+        return 0
+    }
+    let code = cBytes(mc.code)
+    let data = cBytes(low.data)
+    let relocs = relocBytes(mc)
+    let windowsSysv = sysv and system() == 0 // the runtime is called the Quark way, the same in both: only the way in changes
+    let l = load(code, len(mc.code), data, len(low.data), relocs, len(mc.relocs), mc.enter, mc.escape, hosts)
+    if windowsSysv and l != 0 {
+        setWord(l, lSysvEnter, sysvEnter(word(l, lEnter)))
+        setWord(l, lEnter, word(l, lSysvEnter))
+    }
+    free(code)
+    free(data)
+    free(relocs)
+    free(hosts)
+    if l == 0 {
+        collectAt(vm, 0, 0, "quark:0:0: {path}: cannot get executable memory")
+        return 0
+    }
+    // the module's functions: the IR's own, in the order lowering made them
+    var count = 0
+    for at in p.decls {
+        let d = p.ast.decls[at]
+        if d.kind == DeclKind.Fn and not (d.isExtern and d.body < 0) and not d.isTemplate and not d.inlineOnly {
+            count += 1
+        }
+    }
+    let m = calloc(moduleWords, 8)
+    setWord(m, mVm, vm)
+    setWord(m, mName, cText(path))
+    setWord(m, mLoaded, l)
+    let fns = calloc(fnWords * (count + 1), 8)
+    setWord(m, mFns, fns)
+    var k = 0
+    for at in p.decls {
+        let d = p.ast.decls[at]
+        if d.kind != DeclKind.Fn or d.isExtern and d.body < 0 or d.isTemplate or d.inlineOnly {
+            continue
+        }
+        let f = ir.fns[k]
+        var kinds: Bytes = []
+        for v in f.params {
+            kinds.push(f.kinds[v])
+        }
+        let resultKinds = if f.resultCount > 0 { p.slotKinds(d.retType) } else { "" }
+        let e = fns + 8 * fnWords * k
+        setWord(e, fName, cText(d.name))
+        setWord(e, fSignature, cText(signatureOf(p, d)))
+        setWord(e, fKinds, cText((Text(kinds) ?? "") + resultKinds))
+        setWord(e, fParams, len(f.params))
+        setWord(e, fResults, f.resultCount)
+        setWord(e, fAt, mc.fnAt[k])
+        k += 1
+    }
+    setWord(m, mCount, k)
+    m
+}
+
+// The canonical text of a graph, compiled; its errors pointed at the graph's nodes.
+fn compileGraphNow(vm: Int, name: Int, json: Int, n: Int) -> Int {
+    let text = graphToTextNow(vm, json, n)
+    if text == 0 {
+        return 0
+    }
+    let m = compileNow(vm, name, text, strlen(text))
+    if m == 0 and word(vm, vDiagCount) > 0 {
+        let parsed = parse(Source(if name == 0 { "program" } else { textOf(name) }, textOf(text)))
+        if parsed.ok {
+            let p = newProgram(parsed.ast, [])
+            for i in 0..word(vm, vDiagCount) {
+                let d = word(vm, vDiags) + i * diagBytes
+                if keyAtLine(p, int32At(d, 0)) is Some(key) {
+                    putText(d + diagKey, 96, key)
+                }
+            }
+        }
+    }
+    free(text)
+    m
+}
+
+pub extern effect fn qkModuleFree(m: Int64) as "qkModuleFree" {
+    if m == 0 {
+        return
+    }
+    library()
+    if word(m, mStatic) == 0 {
+        if word(word(m, mLoaded), lSysvEnter) != 0 {
+            osUnmapCode(word(word(m, mLoaded), lSysvEnter), enterBytes)
+        }
+        unload(word(m, mLoaded))
+    } else {
+        free(word(m, mLoaded))
+    }
+    let fns = word(m, mFns)
+    for i in 0..word(m, mCount) {
+        let e = fns + 8 * fnWords * i
+        free(word(e, fName))
+        free(word(e, fSignature))
+        free(word(e, fKinds))
+    }
+    free(fns)
+    free(word(m, mName))
+    free(m)
+}
+
+fn fnAt(m: Int, f: Int) -> Int = if f >= 0 and f < word(m, mCount) {
+    word(m, mFns) + 8 * fnWords * f
+} else {
+    0
+}
+
+fn fnWord(m: Int, f: Int, w: Int, none: Int) -> Int {
+    let e = fnAt(m, f)
+    if e == 0 { none } else { word(e, w) }
+}
+
+pub extern effect fn qkFunctionCount(m: Int64) -> Int32 as "qkFunctionCount" = word(m, mCount)
+
+pub extern effect fn qkFind(m: Int64, name: Int64) -> Int32 as "qkFind" {
+    let n = strlen(name)
+    for i in 0..word(m, mCount) {
+        let s = word(fnAt(m, i), fName)
+        if strlen(s) == n and sameBytes(s, name, n) {
+            return i
+        }
+    }
+    -1
+}
+
+pub extern effect fn qkFunctionName(m: Int64, f: Int32) -> Int64 as "qkFunctionName" =
+    fnWord(m, f, fName, 0)
+
+pub extern effect fn qkFunctionSignature(m: Int64, f: Int32) -> Int64 as "qkFunctionSignature" =
+    fnWord(m, f, fSignature, 0)
+
+pub extern effect fn qkParamSlots(m: Int64, f: Int32) -> Int32 as "qkParamSlots" =
+    fnWord(m, f, fParams, -1)
+
+pub extern effect fn qkResultSlots(m: Int64, f: Int32) -> Int32 as "qkResultSlots" =
+    fnWord(m, f, fResults, -1)
+
+pub extern effect fn qkSlotKinds(m: Int64, f: Int32) -> Int64 as "qkSlotKinds" =
+    fnWord(m, f, fKinds, 0)
+
+// ---- running ----
+// why a call stopped: the panic's text, its "program:" the module's name
+fn stopped(vm: Int, m: Int, text: Int) {
+    let t = textOf(text)
+    if t.startsWith("program:") {
+        setLastError(vm, textOf(word(m, mName)) + t[7..])
+    } else {
+        setLastError(vm, t)
+    }
+}
+
+// The machine's settings around a call: its budget, its arena; what the host printed shows first, and what the
+// program printed before the host goes on.
+type Around { fuel: Int, arena: Int }
+
+fn around(vm: Int) -> Around {
+    let _ = fflush(0)
+    let was = Around(ctxGet(ctxFuel), ctxGet(ctxArena))
+    if word(vm, vFuel) > 0 {
+        ctxSet(ctxFuel, word(vm, vFuel))
+    }
+    ctxSet(ctxArena, word(vm, vArena))
+    was
+}
+
+fn back(was: Around) {
+    ctxSet(ctxFuel, was.fuel)
+    ctxSet(ctxArena, was.arena)
+    flush()
+}
+
+pub extern effect fn qkCall(
+    m: Int64,
+    f: Int32,
+    args: Int64,
+    argSlots: Int32,
+    results: Int64,
+    resultSlots: Int32,
+) -> Bool as "qkCall" {
+    library()
+    let vm = word(m, mVm)
+    setByte(word(vm, vLastError), 0, 0) // (nothing allocated unless it stops: a host calls every frame)
+    let e = fnAt(m, f)
+    if e == 0 {
+        setLastError(vm, "{textOf(word(m, mName))}: no function {f}")
+        return false
+    }
+    let params = word(e, fParams)
+    let count = word(e, fResults)
+    if argSlots != params or results != 0 and resultSlots != count {
+        setLastError(
+            vm,
+            "{textOf(word(m, mName))}: {textOf(word(e, fSignature))} takes {params} slots and gives {count} (called with {argSlots} and {resultSlots})",
+        )
+        return false
+    }
+    var out = results
+    if results == 0 and count > 0 {
+        if count > 64 {
+            setLastError(vm, "{textOf(word(m, mName))}: pass room for the {count} result slots")
+            return false
+        }
+        out = malloc(8 * 64)
+    }
+    let l = word(m, mLoaded)
+    let was = around(vm)
+    let ok = runEntry(l, word(l, lCode) + word(e, fAt), args, argSlots, out, count)
+    back(was)
+    if out != results {
+        free(out)
+    }
+    if not ok {
+        stopped(vm, m, panicText())
+    }
+    ok
+}
+
+// A function as a task: (task, module) words.
+pub extern effect fn qkTaskStart(m: Int64, f: Int32, args: Int64, argSlots: Int32) -> Int64 as "qkTaskStart" {
+    library()
+    let vm = word(m, mVm)
+    setByte(word(vm, vLastError), 0, 0)
+    let e = fnAt(m, f)
+    if e == 0 or argSlots != word(e, fParams) or word(e, fResults) != 0 {
+        setLastError(
+            vm,
+            "{textOf(word(m, mName))}: a task runs a function that gives nothing, with its {if e == 0 { 0 } else { word(e, fParams) }} slots",
+        )
+        return 0
+    }
+    let saved = ctxGet(ctxArena)
+    ctxSet(ctxArena, word(vm, vArena))
+    let l = word(m, mLoaded)
+    let t = taskNew(l, word(l, lCode) + word(e, fAt), args, argSlots)
+    ctxSet(ctxArena, saved)
+    if t == 0 {
+        return 0
+    }
+    let h = calloc(2, 8)
+    setWord(h, 0, t)
+    setWord(h, 1, m)
+    h
+}
+
+pub extern effect fn qkTaskResume(h: Int64) -> Int32 as "qkTaskResume" {
+    if h == 0 {
+        return -1
+    }
+    library()
+    let m = word(h, 1)
+    let vm = word(m, mVm)
+    let was = around(vm)
+    let r = taskStep(word(h, 0))
+    back(was)
+    if r < 0 {
+        stopped(vm, m, taskError(word(h, 0)))
+    }
+    r
+}
+
+pub extern effect fn qkTaskEnd(h: Int64) as "qkTaskEnd" {
+    if h == 0 {
+        return
+    }
+    library()
+    taskFree(word(h, 0))
+    free(h)
+}
+
+// A program quark object compiled, linked into the host: its table filled (data, not code), its module.
+pub extern effect fn qkModuleStatic(vm: Int64, p: Int64) -> Int64 as "qkModuleStatic" {
+    library()
+    setByte(word(vm, vLastError), 0, 0)
+    if p == 0 or word(p, 0) != 0x316B72617551 {
+        setLastError(vm, "not a program made by quark object")
+        return 0
+    }
+    let externCount = word(p, 12)
+    let hosts = calloc(if externCount > 0 { externCount } else { 1 }, 8)
+    let why = calloc(1, 512)
+    for i in 0..externCount {
+        let name = word(word(p, 13), i)
+        let libs = word(p, 14)
+        let lib = if libs != 0 and word(libs, i) != 0 and byte(word(libs, i), 0) != 0 {
+            word(libs, i)
+        } else {
+            0
+        }
+        var f = if lib == 0 { hostFor(vm, textOf(name)) } else { 0 }
+        if f == 0 {
+            f = osCFunction(name, lib, why)
+        }
+        if f == 0 {
+            if lib != 0 {
+                setLastError(vm, "extern fn {textOf(name)}: {textOf(why)}")
+            } else {
+                setLastError(
+                    vm,
+                    "extern fn {textOf(name)} has no function in this host (qkVmHost), nor in the C library",
+                )
+            }
+            free(hosts)
+            free(why)
+            return 0
+        }
+        setWord(hosts, i, f)
+    }
+    free(why)
+    let table = word(p, 5)
+    let relocs = word(p, 7)
+    for i in 0..word(p, 6) {
+        setWord(table, i, relocTarget(word(relocs, 2 * i), word(relocs, 2 * i + 1), word(p, 8), hosts))
+    }
+    free(hosts)
+    let code = word(p, 1)
+    let l = calloc(loadedWords, 8)
+    setWord(l, lCode, code)
+    setWord(l, lCodeLen, word(p, 2))
+    setWord(l, lEnter, code + word(p, 3))
+    setWord(l, lEscape, code + word(p, 4))
+    let m = calloc(moduleWords, 8)
+    setWord(m, mVm, vm)
+    setWord(m, mName, cText("program"))
+    setWord(m, mLoaded, l)
+    setWord(m, mStatic, 1)
+    let count = word(p, 10)
+    let fns = calloc(fnWords * (count + 1), 8)
+    for i in 0..count {
+        let s = word(p, 11) + 40 * i
+        let e = fns + 8 * fnWords * i
+        setWord(e, fName, cText(textOf(word(s, 0))))
+        setWord(e, fSignature, cText(textOf(word(s, 0))))
+        setWord(e, fKinds, cText(textOf(word(s, 4))))
+        setWord(e, fParams, word(s, 2))
+        setWord(e, fResults, word(s, 3))
+        setWord(e, fAt, word(s, 1))
+    }
+    setWord(m, mFns, fns)
+    setWord(m, mCount, count)
+    m
+}
+
+// ---- text and graphs ----
+pub extern effect fn qkFree(p: Int64) as "qkFree" = free(p)
+
+fn formatTextNow(vm: Int, text: Int, n: Int) -> Int {
+    enter(vm)
+    let parsed = parse(Source("program", textOfLen(text, n)))
+    collectAll(vm, parsed.errors)
+    if not parsed.ok {
+        return 0
+    }
+    cText(format(parsed.ast))
+}
+
+fn graphOfText(vm: Int, text: Text, layout: Text) -> Text? {
+    let Some(checked) = checkedText(vm, "program", text, None) else {
+        return None
+    }
+    graphOf(checked.program, layout)
+}
+
+fn textToGraphNow(vm: Int, text: Int, n: Int, layout: Int) -> Int {
+    enter(vm)
+    let Some(g) = graphOfText(vm, textOfLen(text, n), textOf(layout)) else {
+        return 0
+    }
+    cText(g)
+}
+
+// a graph's text: the graph in either notation (Quark's, QGN, or JSON)
+fn textOfGraph(vm: Int, given: Text) -> Text? {
+    let read = graphJson(given, "graph")
+    if read is Err(why) {
+        collectAll(vm, [why])
+        return None
+    }
+    let imported = graphToAst(read ?? "", "graph")
+    collectAll(vm, imported.errors)
+    if not imported.ok {
+        return None
+    }
+    format(imported.ast)
+}
+
+fn graphToTextNow(vm: Int, json: Int, n: Int) -> Int {
+    enter(vm)
+    let Some(t) = textOfGraph(vm, textOfLen(json, n)) else {
+        return 0
+    }
+    cText(t)
+}
+
+fn catalogNow(vm: Int, text: Int, n: Int) -> Int {
+    enter(vm)
+    let loaded = loadUsing(Source("program", textOfLen(text, n)), preludeOf(vm))
+    collectAll(vm, loaded.errors.shown)
+    if not loaded.ok {
+        return cText(catalogOf(loaded.program, false, false))
+    }
+    let checked = checkProgram(loaded.program, Errors(), false, None)
+    collectAll(vm, checked.errors.shown)
+    cText(catalogOf(checked.program, true, checked.ok and checked.errors.count == 0))
+}
+
+// ---- versions side by side ----
+// a program's graph: given as its graph (JSON, '{' first) or as its text
+fn graphFrom(vm: Int, s: Text) -> Text? {
+    if s.trim().startsWith("\{") {
+        return s
+    }
+    setWord(vm, vDiagCount, 0)
+    graphOfText(vm, s, "")
+}
+
+fn diffNow(vm: Int, a: Int, aLen: Int, b: Int, bLen: Int, json: Bool) -> Int {
+    enter(vm)
+    let Some(ga) = graphFrom(vm, textOfLen(a, aLen)) else {
+        return 0
+    }
+    let Some(gb) = graphFrom(vm, textOfLen(b, bLen)) else {
+        return 0
+    }
+    setWord(vm, vDiagCount, 0)
+    let d = diffGraphs(ga, gb, json)
+    collectAll(vm, d.errors)
+    if d.changes < 0 {
+        return 0
+    }
+    cText(d.out)
+}
+
+fn mergeNow(
+    vm: Int,
+    base: Int,
+    baseLen: Int,
+    ours: Int,
+    oursLen: Int,
+    theirs: Int,
+    theirsLen: Int,
+    graph: Bool,
+    conflicts: Int,
+) -> Int {
+    enter(vm)
+    if conflicts != 0 {
+        setWord(conflicts, 0, 0)
+    }
+    var gs: [Text] = []
+    for (p, n) in [(base, baseLen), (ours, oursLen), (theirs, theirsLen)] {
+        let Some(g) = graphFrom(vm, textOfLen(p, n)) else {
+            return 0
+        }
+        gs.push(g)
+    }
+    setWord(vm, vDiagCount, 0)
+    let merged = mergeGraphs(gs[0], gs[1], gs[2], true)
+    collectAll(vm, merged.errors)
+    var text: Text? = None
+    if merged.count >= 0 {
+        let imported = graphToAst(merged.merged, "merge")
+        collectAll(vm, imported.errors)
+        if imported.ok {
+            text = format(imported.ast)
+        }
+    }
+    if conflicts != 0 {
+        setWord(conflicts, 0, cText(merged.said))
+    }
+    let Some(t) = text else {
+        return 0
+    }
+    if not graph {
+        return cText(t)
+    }
+    let keepIds = graphHasUids(merged.merged)
+    setWord(vm, vDiagCount, 0)
+    let Some(g) = graphOfText(vm, t, "") else {
+        return 0 // the merged program checked: none when it has errors
+    }
+    cText(if keepIds { merged.merged } else { g })
+}
+
+// ---- the compiler's calls: on a thread whose stack is 256 MB (the compiler's frames are large, as the command line's
+// are), the host's thread waiting; one inside another runs where it is
+extern effect fn osLibraryRun(f: Int64, arg: Int64, ctx: Int64) as "qkosLibraryRun"
+extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+const jobWhat = 0 // then 9 arguments
+const jobResult = 10
+const jobWords = 11
+
+fn job(what: Int, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int) -> Int {
+    library()
+    if word(stateCell(), 3) == 0 and ctxGet(ctxEscapeRsp) == 0 {
+        arenaReset() // the compiler's memory of the last call given back (not inside a program's call: a host function may compile)
+    }
+    let j = calloc(jobWords, 8)
+    setWord(j, jobWhat, what)
+    setWord(j, 1, a)
+    setWord(j, 2, b)
+    setWord(j, 3, c)
+    setWord(j, 4, d)
+    setWord(j, 5, e)
+    setWord(j, 6, f)
+    setWord(j, 7, g)
+    setWord(j, 8, h)
+    setWord(j, 9, i)
+    if word(stateCell(), 3) != 0 {
+        let _ = runJob(j)
+    } else {
+        osLibraryRun(jobAddress(x => runJob(x)), j, ctx())
+    }
+    let r = word(j, jobResult)
+    free(j)
+    r
+}
+
+fn bit(b: Bool) -> Int = if b { 1 } else { 0 }
+
+fn runJob(j: Int) -> Int {
+    let s = stateCell()
+    let nested = word(s, 3) != 0
+    setWord(s, 3, 1)
+    let a = word(j, 1)
+    let b = word(j, 2)
+    let c = word(j, 3)
+    let d = word(j, 4)
+    let e = word(j, 5)
+    let f = word(j, 6)
+    let g = word(j, 7)
+    let h = word(j, 8)
+    let r = match word(j, jobWhat) {
+        0 => bit(vmPreludeNow(a, b))
+        1 => compileNow(a, b, c, d)
+        2 => compileGraphNow(a, b, c, d)
+        3 => formatTextNow(a, b, c)
+        4 => textToGraphNow(a, b, c, d)
+        5 => graphToTextNow(a, b, c)
+        6 => catalogNow(a, b, c)
+        7 => diffNow(a, b, c, d, e, f != 0)
+        _ => mergeNow(a, b, c, d, e, f, g, h != 0, word(j, 9))
+    }
+    setWord(j, jobResult, r)
+    if not nested {
+        setWord(s, 3, 0)
+    }
+    0
+}
+
+pub extern effect fn qkVmPrelude(vm: Int64, text: Int64) -> Bool as "qkVmPrelude" =
+    job(0, vm, text, 0, 0, 0, 0, 0, 0, 0) != 0
+
+pub extern effect fn qkCompile(vm: Int64, name: Int64, text: Int64, n: UInt64) -> Int64 as "qkCompile" =
+    job(1, vm, name, text, n, 0, 0, 0, 0, 0)
+
+pub extern effect fn qkCompileGraph(vm: Int64, name: Int64, json: Int64, n: UInt64) -> Int64 as "qkCompileGraph" =
+    job(2, vm, name, json, n, 0, 0, 0, 0, 0)
+
+pub extern effect fn qkFormatText(vm: Int64, text: Int64, n: UInt64) -> Int64 as "qkFormatText" =
+    job(3, vm, text, n, 0, 0, 0, 0, 0, 0)
+
+pub extern effect fn qkTextToGraph(vm: Int64, text: Int64, n: UInt64, layout: Int64) -> Int64 as "qkTextToGraph" =
+    job(4, vm, text, n, layout, 0, 0, 0, 0, 0)
+
+pub extern effect fn qkGraphToText(vm: Int64, json: Int64, n: UInt64) -> Int64 as "qkGraphToText" =
+    job(5, vm, json, n, 0, 0, 0, 0, 0, 0)
+
+pub extern effect fn qkCatalog(vm: Int64, text: Int64, n: UInt64) -> Int64 as "qkCatalog" =
+    job(6, vm, text, n, 0, 0, 0, 0, 0, 0)
+
+pub extern effect fn qkDiff(vm: Int64, a: Int64, aLen: UInt64, b: Int64, bLen: UInt64, json: Bool) -> Int64 as "qkDiff" =
+    job(7, vm, a, aLen, b, bLen, bit(json), 0, 0, 0)
+
+pub extern effect fn qkMerge(
+    vm: Int64,
+    base: Int64,
+    baseLen: UInt64,
+    ours: Int64,
+    oursLen: UInt64,
+    theirs: Int64,
+    theirsLen: UInt64,
+    graph: Bool,
+    conflicts: Int64,
+) -> Int64 as "qkMerge" =
+    job(8, vm, base, baseLen, ours, oursLen, theirs, theirsLen, bit(graph), conflicts)
+
+// ---- System V code on Windows (qkAbi = 1, the test of Linux's calls): its way in ----
+extern effect fn osMapCode(n: Int64) -> Int64 as "qkosMapCode"
+extern effect fn osProtectCode(p: Int64, n: Int64) as "qkosProtectCode"
+extern effect fn osUnmapCode(p: Int64, n: Int64) as "qkosUnmapCode"
+
+const lSysvEnter = 14 // a Loaded's spare word: the trampoline's way in from Windows' calls
+const enterBytes = 4096
+const rsp = 4
+const rbp = 5
+
+// x86-64's few forms the way in needs: [rsp + at] with 32-bit places
+fn word32(v: Int) -> Bytes = [v & 255, v >> 8 & 255, v >> 16 & 255, v >> 24 & 255]
+
+fn word64(v: Int) -> Bytes = word32(v) + word32(v >> 32)
+
+fn sse(op: Int, prefix: Int, x: Int, base: Int, at: Int) -> Bytes {
+    var b = [prefix]
+    if x >= 8 {
+        b.push(0x44)
+    }
+    b += [0x0F, op, 0x80 | x & 7 << 3 | (if base == rsp { 4 } else { rbp })]
+    if base == rsp {
+        b.push(0x24)
+    }
+    b + word32(at)
+}
+
+fn callAbsolute(f: Int) -> Bytes = [0x48, 0xB8] + word64(f) + [0xFF, 0xD0] // mov rax, f; call rax
+
+fn executable(code: Bytes, size: Int) -> Int {
+    let mem = osMapCode(size)
+    let p = Pointer<UInt8>(mem)
+    for (i, x) in code.enumerate() {
+        p[i] = x
+    }
+    osProtectCode(mem, size)
+    mem
+}
+
+// The trampoline (System V's: its argument in rdi) entered from Windows' calls: rsi, rdi and xmm6-15 kept, as
+// Windows' callers expect and System V's code does not.
+fn sysvEnter(enter: Int) -> Int {
+    var code = [0x55, 0x48, 0x89, 0xE5, 0x56, 0x57, 0x48, 0x81, 0xEC] + word32(160) // push rbp, rsi, rdi; sub rsp, 160
+    for k in 0..10 {
+        code += sse(0x7F, 0xF3, 6 + k, rsp, 16 * k) // movdqu [rsp + 16k], xmm 6 + k
+    }
+    code += [0x48, 0x89, 0xCF, 0x48, 0x89, 0xD6] // mov rdi, rcx; mov rsi, rdx
+    code += callAbsolute(enter)
+    for k in 0..10 {
+        code += sse(0x6F, 0xF3, 6 + k, rsp, 16 * k)
+    }
+    code += [0x48, 0x81, 0xC4] + word32(160) + [0x5F, 0x5E, 0x5D, 0xC3] // add rsp, 160; pop rdi, rsi, rbp; ret
+    executable(code, enterBytes)
+}

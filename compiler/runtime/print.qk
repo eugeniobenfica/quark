@@ -1,0 +1,151 @@
+// Printing: print's bytes go to a buffer (written when it fills, before printErr and at the end), printErr's
+// straight to the errors, and a value made text ("{p}") into the thread's capture.
+use base
+use arena
+use text
+
+const outCap = 65536
+
+// where print writes: the capture, or the output
+pub fn outWrite(p: Int, n: Int) {
+    if n <= 0 {
+        return
+    }
+    let c = ctx()
+    if word(c, ctxCapture) != 0 {
+        var cap = word(c, ctxCaptureCap)
+        let had = word(c, ctxCaptureLen)
+        if had + n > cap {
+            while had + n > cap {
+                cap = if cap != 0 { cap * 2 } else { 256 }
+            }
+            setWord(c, ctxCaptureBuf, realloc(word(c, ctxCaptureBuf), cap))
+            setWord(c, ctxCaptureCap, cap)
+        }
+        copyBytes(word(c, ctxCaptureBuf) + had, p, n)
+        setWord(c, ctxCaptureLen, had + n)
+        return
+    }
+    let g = word(c, ctxGlobals)
+    if word(g, gOutFd) == 2 {
+        osWrite(2, p, n)
+        return
+    }
+    if word(g, gOutLen) + n > outCap {
+        flush()
+        if n > outCap {
+            outPut(p, n)
+            return
+        }
+    }
+    copyBytes(word(g, gOutBuf) + word(g, gOutLen), p, n)
+    setWord(g, gOutLen, word(g, gOutLen) + n)
+}
+
+pub fn flush() {
+    let g = globals()
+    let n = word(g, gOutLen)
+    if n > 0 {
+        setWord(g, gOutLen, 0)
+        outPut(word(g, gOutBuf), n)
+    }
+}
+
+// the output's bytes: written, or kept when the command line keeps them (its debug adapter: gOutSink)
+fn outPut(p: Int, n: Int) {
+    let sink = gGet(gOutSink)
+    if sink == 0 {
+        osWrite(1, p, n)
+        return
+    }
+    var cap = word(sink, 2)
+    let had = word(sink, 1)
+    if had + n > cap {
+        while had + n > cap {
+            cap = if cap != 0 { cap * 2 } else { 4096 }
+        }
+        setWord(sink, 0, realloc(word(sink, 0), cap))
+        setWord(sink, 2, cap)
+    }
+    copyBytes(word(sink, 0) + had, p, n)
+    setWord(sink, 1, had + n)
+}
+
+pub extern effect fn rtFlush() as "qkrtFlush" = flush()
+
+pub fn outText(t: Text) = outWrite(textAt(t), len(t))
+
+pub fn outBuf(b: Buf) = outWrite(b.p, b.n)
+
+pub extern effect fn rtPrintInt(v: Int64) as "qk_printInt" {
+    let b = Buf(ctx() + 8 * ctxScratch + 96, 32, 0).int(v) // the scratch's last 32 bytes
+    outWrite(b.p, b.n)
+}
+
+pub extern effect fn rtPrintFloat(v: Float64) as "qk_printFloat" {
+    let s = ctx() + 8 * ctxScratch + 48
+    outWrite(s, floatText(s, v))
+}
+
+pub extern effect fn rtPrintBool(v: Int64) as "qk_printBool" {
+    if v != 0 { outText("true") } else { outText("false") }
+}
+
+pub extern effect fn rtPrintText(p: Int64, n: Int64) as "qk_printText" = outWrite(p, n)
+
+pub extern effect fn rtPrintSep() as "qk_printSep" = outText(" ")
+
+pub extern effect fn rtPrintEnd() as "qk_printEnd" = outText("\n")
+
+// 2: the errors (printErr), 1: the output
+pub extern effect fn rtPrintTo(stream: Int64) as "qk_printTo" {
+    flush()
+    gSet(gOutFd, if stream == 2 { 2 } else { 1 })
+}
+
+pub extern effect fn rtPrintHandle(name: Int64, n: Int64, v: Int64) as "qk_printHandle" {
+    outWrite(name, n)
+    outText("#")
+    rtPrintInt(v)
+}
+
+pub extern effect fn rtPrintPointer(v: Int64) as "qk_printPointer" {
+    outText("Pointer(0x")
+    let b = Buf(ctx() + 8 * ctxScratch + 96, 32, 0).hex(v)
+    outWrite(b.p, b.n)
+    outText(")")
+}
+
+// print of a Bytes: Bytes[0x01, 0xff]
+pub extern effect fn rtPrintBytes(p: Int64, n: Int64) as "qk_printBytes" {
+    outText("Bytes[")
+    let s = ctx() + 8 * ctxScratch + 96
+    let digits = textAt("0123456789abcdef")
+    for i in 0..n {
+        let c = byte(p, i)
+        setByte(s, 0, ',')
+        setByte(s, 1, ' ')
+        setByte(s, 2, '0')
+        setByte(s, 3, 'x')
+        setByte(s, 4, byte(digits, c >> 4))
+        setByte(s, 5, byte(digits, c & 15))
+        if i != 0 { outWrite(s, 6) } else { outWrite(s + 2, 4) }
+    }
+    outText("]")
+}
+
+// a value made text: what print writes until captureEnd, as a text
+pub extern effect fn rtCaptureBegin() as "qk_captureBegin" {
+    ctxSet(ctxCaptureLen, 0)
+    ctxSet(ctxCapture, 1)
+}
+
+pub extern effect fn rtCaptureEnd() -> Int64 as "qk_captureEnd" {
+    let c = ctx()
+    setWord(c, ctxCapture, 0)
+    let n = word(c, ctxCaptureLen)
+    let p = alloc(n + 8, 1)
+    setWord(p, 0, n)
+    copyBytes(p + 8, word(c, ctxCaptureBuf), n)
+    p
+}

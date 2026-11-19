@@ -1,0 +1,1779 @@
+// A language server: an editor talks to it over the standard input and output (the Language Server Protocol), as
+// `quark lsp [--prelude P]`. It checks every open file as it changes and reports the errors where they are; formats
+// a file into its one canonical text; tells the type of the name under the cursor; goes to where a name was made;
+// lists a file's declarations; finds a name's uses and renames it; shows the types Quark worked out; helps with a
+// call's values; offers names to complete (after a dot: fields, cases, a type's functions; in a call: the names of
+// its values); offers the fixes the errors' messages ask for. Each request checks the text afresh, so nothing is
+// kept between requests but the files' texts.
+use source
+use ast
+use types
+use parser
+use format
+use canon
+use module
+use check
+use json
+use dap
+use package
+
+type Doc { uri: Text, text: Text }
+
+// an error: where (Quark's line and byte column, from 1), what, and whether it is in the file (not the prelude or
+// a file it uses: those are said at 1:1, "in path:line: message")
+type Problem { line: Int, col: Int, message: Text, here: Bool }
+
+// a file analyzed: the program (checked or not), the errors, whether it parsed
+type Analysis { p: Program, problems: [Problem], ok: Bool }
+type Server { docs: [Doc] = [], prelude: Source? = None, down: Bool = false }
+
+pub fn serveLsp(preludePath: Text) -> Int {
+    var s = Server()
+    if preludePath != "" {
+        if readFile(preludePath) is Ok(text) {
+            s.prelude = Source(preludePath, text)
+        }
+    }
+    var wire = Wire()
+    while true {
+        let Some(body) = wire.read(false) else {
+            break
+        }
+        let Some(m) = parseJson(body) else {
+            continue
+        }
+        if not s.handle(m) {
+            break
+        }
+    }
+    if s.down { 0 } else { 1 }
+}
+
+fn respond(id: Text, result: Text) {
+    send("\{\"jsonrpc\": \"2.0\", \"id\": {id}, \"result\": {result}}")
+}
+
+// an id as it came: a number, or a text
+fn idText(m: Json, id: Int) -> Text = match m.kind(id) {
+    Num => "{toInt(m.nodes[id].num)}"
+    Str => jsonString(m.nodes[id].text)
+    _ => "null"
+}
+
+fn Server.findDoc(self, uri: Text) -> Int {
+    for (i, d) in self.docs.enumerate() {
+        if d.uri == uri {
+            return i
+        }
+    }
+    -1
+}
+
+// one message handled; false at exit
+fn Server.handle(var self, m: Json) -> Bool {
+    let name = m.text(m.get(0, "method")) ?? ""
+    let idAt = m.get(0, "id")
+    let id = idText(m, idAt)
+    let params = m.get(0, "params")
+    let textDoc = m.get(params, "textDocument")
+    let uri = m.text(m.get(textDoc, "uri"))
+    let at = if uri is Some(u) { self.findDoc(u) } else { -1 }
+    if name == "initialize" {
+        respond(
+            id,
+            "\{\"capabilities\": \{\"textDocumentSync\": 1, \"hoverProvider\": true, \"definitionProvider\": true, "
+                + "\"documentSymbolProvider\": true, \"documentFormattingProvider\": true, \"completionProvider\": \{\"triggerCharacters\": [\".\"]\}, "
+                + "\"codeActionProvider\": \{\"codeActionKinds\": [\"quickfix\"]\}, "
+                + "\"referencesProvider\": true, \"renameProvider\": true, \"inlayHintProvider\": true, "
+                + "\"signatureHelpProvider\": \{\"triggerCharacters\": [\"(\", \",\"]\}\}, "
+                + "\"serverInfo\": \{\"name\": \"quark\"\}\}",
+        )
+        return true
+    }
+    if name == "shutdown" {
+        self.down = true
+        respond(id, "null")
+        return true
+    }
+    if name == "exit" {
+        return false
+    }
+    if name == "textDocument/didOpen" or name == "textDocument/didChange" {
+        var text = m.text(m.get(textDoc, "text"))
+        let changes = m.items(m.get(params, "contentChanges"))
+        if text == None and len(changes) > 0 {
+            text = m.text(m.get(changes[len(changes) - 1], "text"))
+        }
+        if uri is Some(u) and text is Some(t) {
+            let i = self.findDoc(u)
+            if i < 0 {
+                self.docs.push(Doc(u, t))
+            } else {
+                self.docs[i] = Doc(u, t)
+            }
+            self.publish(Doc(u, t))
+        }
+        return true
+    }
+    if name == "textDocument/didClose" {
+        if at >= 0 {
+            var kept: [Doc] = []
+            for (i, x) in self.docs.enumerate() {
+                if i != at {
+                    kept.push(x)
+                }
+            }
+            self.docs = kept
+        }
+        return true
+    }
+    let known = name is "textDocument/hover" | "textDocument/definition" | "textDocument/documentSymbol" | "textDocument/formatting" | "textDocument/references" | "textDocument/rename" | "textDocument/signatureHelp" | "textDocument/inlayHint" | "textDocument/completion" | "textDocument/codeAction"
+    if not known {
+        if idAt >= 0 and name != "" {
+            send("\{\"jsonrpc\": \"2.0\", \"id\": {id}, \"error\": \{\"code\": -32601, \"message\": \"not handled\"}}")
+        }
+        return true
+    }
+    if at < 0 {
+        let none = if name is "textDocument/documentSymbol" | "textDocument/inlayHint" | "textDocument/completion" | "textDocument/codeAction" {
+            "[]"
+        } else {
+            "null"
+        }
+        respond(id, none)
+        return true
+    }
+    let d = self.docs[at]
+    let pos = m.get(params, "position")
+    let line = m.int(m.get(pos, "line"), 0) + 1
+    let col = byteColumn(d.text, line, m.int(m.get(pos, "character"), 0))
+    let result = match name {
+        "textDocument/hover" => self.hover(d, line, col)
+        "textDocument/definition" => self.definition(d, line, col)
+        "textDocument/documentSymbol" => self.symbols(d)
+        "textDocument/formatting" => formatting(d)
+        "textDocument/references" => self.references(d, line, col)
+        "textDocument/rename" => self.rename(d, line, col, m.text(m.get(params, "newName")) ?? "")
+        "textDocument/signatureHelp" => self.signatureHelp(d, line, col)
+        "textDocument/inlayHint" => self.inlayHints(d)
+        "textDocument/completion" => self.completion(d, line, col)
+        _ => {
+            let range = m.get(params, "range")
+            let from = m.int(m.get(m.get(range, "start"), "line"), 0) + 1
+            let to = m.int(m.get(m.get(range, "end"), "line"), 1 << 30) + 1
+            self.codeActions(d, from, to)
+        }
+    }
+    respond(id, result)
+    true
+}
+
+// ---- positions: Quark's (line and byte column, from 1) and the editor's (from 0, in UTF-16 units) --------------
+fn isNameChar(c: Int) -> Bool = c is 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'
+
+fn byteAt(b: Bytes, i: Int) -> Int = if i >= 0 and i < len(b) { b[i] } else { 0 }
+
+// where a line (from 1) starts, as a byte of the text
+fn lineStart(text: Text, line: Int) -> Int {
+    let b = text.bytes()
+    var p = 0
+    var l = 1
+    while l < line and p < len(b) {
+        if b[p] == '\n' {
+            l += 1
+        }
+        p += 1
+    }
+    p
+}
+
+fn utf16Column(text: Text, line: Int, byteCol: Int) -> Int {
+    let b = text.bytes()
+    let p = lineStart(text, line)
+    var units = 0
+    var i = 0
+    while i < byteCol - 1 and p + i < len(b) and b[p + i] != '\n' {
+        let c = b[p + i]
+        if c & 0xC0 != 0x80 {
+            units += if c >= 0xF0 { 2 } else { 1 }
+        }
+        i += 1
+    }
+    units
+}
+
+fn byteColumn(text: Text, line: Int, units: Int) -> Int {
+    let b = text.bytes()
+    let p = lineStart(text, line)
+    var i = 0
+    var seen = 0
+    while p + i < len(b) and b[p + i] != '\n' and seen < units {
+        seen += if b[p + i] >= 0xF0 { 2 } else { 1 }
+        i += 1
+        while p + i < len(b) and b[p + i] & 0xC0 == 0x80 {
+            i += 1
+        }
+    }
+    i + 1
+}
+
+fn position(line: Int, character: Int) -> Text = "\{\"line\": {line}, \"character\": {character}}"
+
+// the word at Quark's (line, col), at least one character
+fn rangeAt(text: Text, line: Int, col: Int) -> Text {
+    let b = text.bytes()
+    let p = lineStart(text, line)
+    var end = col
+    while isNameChar(byteAt(b, p + end - 1)) {
+        end += 1
+    }
+    if end == col {
+        end += 1
+    }
+    let l = if line > 0 { line - 1 } else { 0 }
+    "\{\"start\": {position(l, utf16Column(text, line, col))}, \"end\": {position(l, utf16Column(text, line, end))}}"
+}
+
+fn location(d: Doc, line: Int, col: Int) -> Text =
+    "\{\"uri\": {jsonString(d.uri)}, \"range\": {rangeAt(d.text, line, col)}}"
+
+// ---- checking a file -------------------------------------------------------------------------------------------
+// file:///C:/x/a.qk (or file:///home/x/a.qk) as a path, for the files its uses name
+fn uriPath(uri: Text) -> Text {
+    if not uri.startsWith("file://") {
+        return uri
+    }
+    var s = uri[7..]
+    let b = s.bytes()
+    if len(b) > 2 and b[0] == '/' and b[2] == ':' {
+        s = s[1..]
+    }
+    let sb = s.bytes()
+    var out = ""
+    var from = 0
+    var i = 0
+    while i < len(sb) {
+        if sb[i] == '%' and i + 2 < len(sb) {
+            out += s[from..i] + char(hexDigit(sb[i + 1]) * 16 + hexDigit(sb[i + 2]))
+            i += 3
+            from = i
+        } else {
+            i += 1
+        }
+    }
+    out + s[from..]
+}
+
+fn hexDigit(c: Int) -> Int = match c {
+    '0'..='9' => c - '0'
+    'a'..='f' => c - 'a' + 10
+    'A'..='F' => c - 'A' + 10
+    _ => 0
+}
+
+// An error as said ("path:line:col: message", then the line and a caret when line > 0) taken apart.
+fn problemOf(shown: Text, uri: Text) -> Problem {
+    let b = shown.bytes()
+    var i = 0
+    while i < len(b) {
+        if b[i] == ':' {
+            var j = i + 1
+            while j < len(b) and b[j] is '0'..='9' {
+                j += 1
+            }
+            if j > i + 1 and j < len(b) and b[j] == ':' {
+                var k = j + 1
+                while k < len(b) and b[k] is '0'..='9' {
+                    k += 1
+                }
+                if k > j + 1 and k + 1 < len(b) and b[k] == ':' and b[k + 1] == ' ' {
+                    let path = shown[..i]
+                    let line = shown[i + 1..j].parseInt() ?? 0
+                    let col = shown[j + 1..k].parseInt() ?? 0
+                    var end = len(b)
+                    if line > 0 {
+                        // the line and the caret after the message: its last two lines
+                        var cuts = 0
+                        while end > k and cuts < 2 {
+                            end -= 1
+                            if b[end] == '\n' {
+                                cuts += 1
+                            }
+                        }
+                        if cuts < 2 {
+                            end = len(b)
+                        }
+                    }
+                    let message = shown[k + 2..end]
+                    if path == uri {
+                        return Problem(line, col, message, true)
+                    }
+                    return Problem(1, 1, "in {path}:{line}: {message}", false)
+                }
+            }
+        }
+        i += 1
+    }
+    Problem(1, 1, shown, false)
+}
+
+// The file parsed (and checked, when it parses and check): its problems. ok: it parsed.
+fn Server.analyze(self, d: Doc, check: Bool) -> Analysis {
+    let src = Source(d.uri, d.text)
+    let first = parse(src)
+    if not first.ok {
+        return Analysis(newProgram(first.ast, []), first.errors.map(e => problemOf(e, d.uri)).toArray(), false)
+    }
+    let loaded = loadProgram(src, self.prelude, at: uriPath(d.uri))
+    var p = loaded.program
+    var errors = loaded.errors
+    if check and len(p.modules) > 0 {
+        let checked = checkProgram(p, errors, false, None)
+        p = checked.program
+        errors = checked.errors
+    }
+    Analysis(p, errors.shown.map(e => problemOf(e, d.uri)).toArray(), true)
+}
+
+fn diagnostic(d: Doc, p: Problem) -> Text {
+    let line = if p.line > 0 { p.line } else { 1 }
+    let col = if p.col > 0 { p.col } else { 1 }
+    "\{\"range\": {rangeAt(d.text, line, col)}, \"severity\": 1, \"source\": \"quark\", \"message\": {jsonString(p.message)}}"
+}
+
+fn Server.publish(self, d: Doc) {
+    let a = self.analyze(d, true)
+    var out = "\{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/publishDiagnostics\", \"params\": \{\"uri\": {jsonString(d.uri)}, \"diagnostics\": ["
+    for (i, pr) in a.problems.enumerate() {
+        if i > 0 {
+            out += ", "
+        }
+        out += diagnostic(d, pr)
+    }
+    send(out + "]\}\}")
+}
+
+// ---- the tree, walked as the C server walks it ------------------------------------------------------------------
+// An expression's parts in the C tree's order: its expressions (a, b, body, else, args), its arms, its blocks (then,
+// block).
+type Parts { exprs: [Int] = [], arms: [Int] = [], blocks: [Int] = [] }
+
+fn parts(a: Ast, e: Int) -> Parts = match a.exprs[e].node {
+    Call(_, _, args, _, _, _) => Parts(exprs: args)
+    Field(target, _) => Parts(exprs: [target])
+    Index(target, index) => Parts(exprs: [target, index])
+    Unary(_, operand) => Parts(exprs: [operand])
+    Binary(_, left, right) => Parts(exprs: [left, right])
+    Range(low, high) => Parts(exprs: [low, high])
+    If(cond, then, otherwise) => Parts(exprs: [cond, otherwise], blocks: [then])
+    Match(subject, arms, _) => Parts(exprs: [subject], arms: arms)
+    Lambda(_, body) => Parts(exprs: [body])
+    ArrayLit(items) => Parts(exprs: items)
+    BlockExpr(block, _) => Parts(blocks: [block])
+    Case(_, target, _) => Parts(exprs: [target])
+    With(target, values, _) => Parts(exprs: [target] + values)
+    Interp(values, _, _, _, _) => Parts(exprs: values)
+    Try(value) => Parts(exprs: [value])
+    MapLit(items) => Parts(exprs: items)
+    Is(value, pattern) => Parts(exprs: [value], arms: [pattern])
+    _ => Parts()
+}
+
+// A statement's parts in the C tree's order: value, target, iter, then its blocks (body, else).
+fn stmtParts(a: Ast, s: Int) -> Parts = match a.stmts[s].node {
+    Let(_, _, _, value, _, otherwise) => Parts(exprs: [value], blocks: [-1, otherwise])
+    Assign(target, _, value) => Parts(exprs: [value, target])
+    ExprStmt(value) => Parts(exprs: [value])
+    For(_, _, iter, body) => Parts(exprs: [-1, -1, iter], blocks: [body])
+    While(cond, body) => Parts(exprs: [cond], blocks: [body])
+    Return(value) => Parts(exprs: [value])
+    Defer(body) => Parts(blocks: [body])
+    _ => Parts()
+}
+
+// the name a let, a var or a for makes ("" none)
+fn stmtName(a: Ast, s: Int) -> Text = match a.stmts[s].node {
+    Let(_, name, _, _, _, _) => name
+    For(name, _, _, _) => name
+    _ => ""
+}
+
+// the name an expression writes: a name's, a call's, a field's ("" none)
+fn exprName(a: Ast, e: Int) -> Text = match a.exprs[e].node {
+    Name(name) => name
+    Call(name, _, _, _, _, _) => name
+    Field(_, name) => name
+    _ => ""
+}
+
+fn isName(a: Ast, e: Int) -> Bool = a.exprs[e].node is Name(_)
+
+fn isCall(a: Ast, e: Int) -> Bool = a.exprs[e].node is Call(_, _, _, _, _, _)
+
+fn isLambda(a: Ast, e: Int) -> Bool = a.exprs[e].node is Lambda(_, _)
+
+fn covers(line: Int, col: Int, name: Text, atLine: Int, atCol: Int) -> Bool =
+    name != "" and line == atLine and col >= atCol and col < atCol + len(name)
+
+// ---- what is at a place ----------------------------------------------------------------------------------------
+type Found { line: Int, col: Int, expr: Int = -1, stmt: Int = -1, decl: Int = -1, param: Int = -1 }
+
+fn Found.inExpr(var self, a: Ast, e: Int) {
+    if e < 0 {
+        return
+    }
+    let x = a.exprs[e]
+    if (isName(a, e) or x.node is Field(_, _) or isCall(a, e) and not x.implicit)
+        and covers(self.line, self.col, exprName(a, e), x.line, x.col) {
+        self.expr = e
+    }
+    if isLambda(a, e) and x.sugar >= 0 {
+        return // a function's name, made into a lambda: its name is the sugar
+    }
+    let ps = parts(a, e)
+    for c in ps.exprs {
+        self.inExpr(a, c)
+    }
+    for arm in ps.arms {
+        self.inExpr(a, a.arms[arm].guard)
+        self.inExpr(a, a.arms[arm].body)
+    }
+    for b in ps.blocks {
+        self.inBlock(a, b)
+    }
+}
+
+fn Found.inBlock(var self, a: Ast, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in a.blocks[b].stmts {
+        let st = a.stmts[s]
+        if covers(self.line, self.col, stmtName(a, s), st.line, st.col + 4) {
+            self.stmt = s
+        }
+        let ps = stmtParts(a, s)
+        for c in ps.exprs {
+            self.inExpr(a, c)
+        }
+        for k in ps.blocks {
+            self.inBlock(a, k)
+        }
+    }
+}
+
+fn isCFunction(x: Decl) -> Bool = x.kind == DeclKind.Fn and x.isExtern and x.body < 0
+
+// where a declaration's name is: after fn, let, type, enum, extern (effect) fn ...
+fn nameColumn(x: Decl) -> Int {
+    if x.isTest {
+        return x.col + 5
+    }
+    let at = x.col + (if x.isExtern { 7 } else { 0 })
+    if x.kind == DeclKind.Fn {
+        return at + (if isCFunction(x) and x.isEffect or x.effectDeclared { 10 } else { 3 })
+    }
+    if x.isInterface {
+        return at + 10
+    }
+    if x.kind == DeclKind.Const {
+        return at + 6
+    }
+    at + 5
+}
+
+fn find(p: Program, line: Int, col: Int) -> Found {
+    var f = Found(line, col)
+    for d in p.decls {
+        let x = p.ast.decls[d]
+        if x.fromPrelude or x.templateOf >= 0 or x.lifted {
+            continue
+        }
+        if covers(line, col, x.name, x.line, nameColumn(x)) {
+            f.decl = d
+        }
+        for k in x.params {
+            let prm = p.ast.params[k]
+            if covers(line, col, prm.name, prm.line, prm.col) {
+                f.param = k
+            }
+        }
+        if x.kind == DeclKind.Fn or x.kind == DeclKind.Const {
+            f.inExpr(p.ast, x.body)
+        }
+    }
+    f
+}
+
+fn typeOf(p: Program, t: Int) -> Text = if t < 0 { "?" } else { p.typeName(t) }
+
+fn typeWritten(p: Program, t: Int) -> Text = if t < 0 { "" } else { typeText(p.ast, t) }
+
+fn signature(p: Program, d: Int) -> Text {
+    let x = p.ast.decls[d]
+    if x.kind != DeclKind.Fn {
+        let what = if x.kind == DeclKind.Enum {
+            "enum"
+        } else if x.kind == DeclKind.Const {
+            "const"
+        } else if x.isExtern {
+            "extern type"
+        } else if x.isInterface {
+            "interface"
+        } else if x.opaque {
+            "opaque type"
+        } else {
+            "type"
+        }
+        var s = "{what} {x.name}"
+        if x.kind == DeclKind.Const and x.retType >= 0 {
+            s += ": " + typeOf(p, x.retType)
+        }
+        return s
+    }
+    var s = if x.isExtern { "extern " } else { "" }
+    s += if isCFunction(x) and x.isEffect or x.effectDeclared {
+        "effect "
+    } else {
+        ""
+    }
+    s += "fn " + x.name
+    for (i, t) in x.typeParams.enumerate() {
+        s += (if i > 0 { ", " } else { "<" }) + t
+    }
+    s += if len(x.typeParams) > 0 { ">(" } else { "(" }
+    for (i, k) in x.params.enumerate() {
+        let prm = p.ast.params[k]
+        s += (if i > 0 { ", " } else { "" }) + (if prm.isVar { "var " } else { "" }) + prm.name
+        if i == 0 and (prm.ty < 0 or x.impliedSelf) {
+            continue // fn Point.scaled(self, k: Int), fn Parser.next(var self)
+        }
+        s += ": " + typeWritten(p, prm.ty)
+    }
+    if x.variadic {
+        s += if len(x.params) > 0 { ", ..." } else { "..." }
+    }
+    s += ")"
+    if x.isExtern and x.ret >= 0 {
+        s += " -> " + typeText(p.ast, x.ret) // C's types, as written
+    } else if x.retType >= 0 and p.types[x.retType].kind != Kind.Void {
+        s += " -> " + typeOf(p, x.retType)
+    } else if x.ret >= 0 {
+        s += " -> " + typeText(p.ast, x.ret)
+    }
+    if x.externLib != "" {
+        s += " in " + jsonString(x.externLib)
+    }
+    s
+}
+
+// ---- hover, definition -----------------------------------------------------------------------------------------
+fn Server.hover(self, d: Doc, line: Int, col: Int) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok {
+        return "null"
+    }
+    let p = a.p
+    let f = find(p, line, col)
+    var text = ""
+    if f.expr >= 0 {
+        let e = p.ast.exprs[f.expr]
+        let call = isCall(p.ast, f.expr)
+        if call and e.decl >= 0 and p.ast.decls[e.decl].kind == DeclKind.Fn {
+            let of = p.ast.decls[e.decl].templateOf
+            text = signature(p, if of >= 0 { of } else { e.decl })
+            if of >= 0 {
+                text += "\n// here: " + typeOf(p, e.ty) // an instance: what its types are here
+            }
+        } else if call and e.builtin != 0 {
+            text = "{exprName(p.ast, f.expr)}(...) -> {typeOf(p, e.ty)}  // built in"
+        } else if call and e.decl >= 0 {
+            text = signature(p, e.decl)
+        } else if isName(p.ast, f.expr) or e.node is Field(_, _) {
+            if isName(p.ast, f.expr) and e.decl >= 0 and p.ast.decls[e.decl].kind == DeclKind.Fn {
+                text = signature(p, e.decl)
+            } else {
+                let how = if e.binding < 0 {
+                    ""
+                } else if p.bindings[e.binding].mutable {
+                    "var "
+                } else {
+                    "let "
+                }
+                text = "{how}{exprName(p.ast, f.expr)}: {typeOf(p, e.ty)}"
+            }
+        }
+    }
+    if text == "" and f.expr < 0 {
+        if f.stmt >= 0 and p.ast.stmts[f.stmt].binding >= 0 {
+            let s = p.ast.stmts[f.stmt]
+            let how = match s.node {
+                Let(mutable, _, _, _, _, _) => if mutable { "var" } else { "let" }
+                _ => "for"
+            }
+            text = "{how} {stmtName(p.ast, f.stmt)}: {typeOf(p, p.bindings[s.binding].ty)}"
+        } else if f.param >= 0 and p.ast.params[f.param].binding >= 0 {
+            let prm = p.ast.params[f.param]
+            text = "{prm.name}: {typeOf(p, p.bindings[prm.binding].ty)}"
+        } else if f.decl >= 0 {
+            text = signature(p, f.decl)
+        }
+    }
+    if text == "" {
+        return "null"
+    }
+    "\{\"contents\": \{\"kind\": \"markdown\", \"value\": {jsonString("```quark\n" + text + "\n```")}}}"
+}
+
+fn Server.definition(self, d: Doc, line: Int, col: Int) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok {
+        return "null"
+    }
+    let p = a.p
+    let f = find(p, line, col)
+    if f.expr < 0 {
+        return "null"
+    }
+    let e = p.ast.exprs[f.expr]
+    if e.binding >= 0 and p.bindings[e.binding].line != 0 {
+        let b = p.bindings[e.binding]
+        return location(d, b.line, b.col)
+    }
+    if e.decl >= 0 and not p.ast.decls[e.decl].fromPrelude {
+        let to = declOf(p, e.decl)
+        return location(d, p.ast.decls[to].line, nameColumn(p.ast.decls[to]))
+    }
+    "null"
+}
+
+// ---- references, rename, inlay hints, signature help -------------------------------------------------------------
+// what a name is: a binding (a let, a var, a parameter, a loop's or a pattern's name), or a declaration
+type Target { binding: Int = -1, decl: Int = -1 }
+
+fn rootOf(p: Program, b: Int) -> Int {
+    var at = b
+    while at >= 0 and p.bindings[at].capturedFrom >= 0 {
+        at = p.bindings[at].capturedFrom
+    }
+    at
+}
+
+fn declOf(p: Program, d: Int) -> Int = if d >= 0 and p.ast.decls[d].templateOf >= 0 {
+    p.ast.decls[d].templateOf
+} else {
+    d
+}
+
+fn targetAt(p: Program, line: Int, col: Int) -> Target {
+    let f = find(p, line, col)
+    if f.expr >= 0 {
+        let e = p.ast.exprs[f.expr]
+        if e.binding >= 0 {
+            return Target(binding: rootOf(p, e.binding))
+        }
+        if e.decl >= 0 and not p.ast.decls[e.decl].fromPrelude {
+            return Target(decl: declOf(p, e.decl))
+        }
+    }
+    if f.stmt >= 0 {
+        return Target(binding: p.ast.stmts[f.stmt].binding)
+    }
+    if f.param >= 0 and p.ast.params[f.param].binding >= 0 {
+        return Target(binding: p.ast.params[f.param].binding)
+    }
+    Target(decl: f.decl)
+}
+
+type Refs { t: Target, at: [(Int, Int)] = [] }
+
+fn Refs.add(var self, line: Int, col: Int) {
+    if not self.at.contains((line, col)) {
+        self.at.push((line, col))
+    }
+}
+
+fn Refs.inExpr(var self, p: Program, e: Int) {
+    if e < 0 {
+        return
+    }
+    let x = p.ast.exprs[e]
+    let name = exprName(p.ast, e)
+    if (isName(p.ast, e) or isCall(p.ast, e) and not x.implicit) and name != "" {
+        if self.t.binding >= 0 and x.binding >= 0 and rootOf(p, x.binding) == self.t.binding {
+            self.add(x.line, x.col)
+        }
+        if self.t.decl >= 0 and x.decl >= 0 and declOf(p, x.decl) == self.t.decl and not name.bytes().contains('.') {
+            self.add(x.line, x.col)
+        }
+    }
+    if isLambda(p.ast, e) and x.sugar >= 0 {
+        self.inExpr(p, x.sugar)
+        return
+    }
+    let ps = parts(p.ast, e)
+    for c in ps.exprs {
+        self.inExpr(p, c)
+    }
+    for arm in ps.arms {
+        self.inExpr(p, p.ast.arms[arm].guard)
+        self.inExpr(p, p.ast.arms[arm].body)
+    }
+    for b in ps.blocks {
+        self.inBlock(p, b)
+    }
+}
+
+fn Refs.inBlock(var self, p: Program, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in p.ast.blocks[b].stmts {
+        let st = p.ast.stmts[s]
+        if self.t.binding >= 0 and st.binding == self.t.binding {
+            self.add(st.line, st.col + 4)
+        }
+        let ps = stmtParts(p.ast, s)
+        for c in ps.exprs {
+            self.inExpr(p, c)
+        }
+        for k in ps.blocks {
+            self.inBlock(p, k)
+        }
+    }
+}
+
+// every place the target's name is written in the file: its declaration first
+fn references(p: Program, t: Target) -> [(Int, Int)] {
+    var r = Refs(t)
+    if t.decl >= 0 {
+        let x = p.ast.decls[t.decl]
+        if not x.fromPrelude and x.module == 0 {
+            r.add(x.line, nameColumn(x))
+        }
+    }
+    if t.binding >= 0 and p.bindings[t.binding].line != 0 {
+        r.add(p.bindings[t.binding].line, p.bindings[t.binding].col)
+    }
+    for d in p.decls {
+        let x = p.ast.decls[d]
+        if x.fromPrelude or x.templateOf >= 0 or x.lifted or x.module != 0 {
+            continue
+        }
+        for k in x.params {
+            r.inExpr(p, p.ast.params[k].fallback)
+        }
+        if x.kind == DeclKind.Fn or x.kind == DeclKind.Const {
+            r.inExpr(p, x.body)
+        }
+    }
+    r.at
+}
+
+fn Server.references(self, d: Doc, line: Int, col: Int) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok {
+        return "[]"
+    }
+    var out = "["
+    for (i, (l, c)) in references(a.p, targetAt(a.p, line, col)).enumerate() {
+        out += (if i > 0 { ", " } else { "" }) + location(d, l, c)
+    }
+    out + "]"
+}
+
+fn startsWithUpper(t: Text) -> Bool = len(t) > 0 and t.bytes()[0] is 'A'..='Z'
+
+fn startsWithLower(t: Text) -> Bool = len(t) > 0 and t.bytes()[0] is 'a'..='z'
+
+fn Server.rename(self, d: Doc, line: Int, col: Int, to: Text) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok or to == "" {
+        return "null"
+    }
+    let p = a.p
+    let t = targetAt(p, line, col)
+    let typeName = t.decl >= 0 and p.ast.decls[t.decl].kind is Type | Enum
+    let fine = (t.binding >= 0 or t.decl >= 0)
+        and not to.bytes().contains('_')
+        and (if typeName { startsWithUpper(to) } else { startsWithLower(to) })
+    if not fine or t.decl >= 0 and p.ast.decls[t.decl].owner != "" {
+        return "null" // a name of the wrong case, or a type's own function (its type's part stays)
+    }
+    var out = "\{\"changes\": \{{jsonString(d.uri)}: ["
+    for (i, (l, c)) in references(p, t).enumerate() {
+        out += (if i > 0 { ", " } else { "" }) + "\{\"range\": {rangeAt(d.text, l, c)}, \"newText\": {jsonString(to)}}"
+    }
+    out + "]\}\}"
+}
+
+// the types Quark worked out, shown after the names that do not write them: let total: Int = ...
+type Hints { out: Text = "", n: Int = 0 }
+
+fn Hints.inExpr(var self, p: Program, d: Doc, e: Int) {
+    if e < 0 {
+        return
+    }
+    let ps = parts(p.ast, e)
+    for c in ps.exprs {
+        self.inExpr(p, d, c)
+    }
+    for arm in ps.arms {
+        self.inExpr(p, d, p.ast.arms[arm].body)
+    }
+    for b in ps.blocks {
+        self.inBlock(p, d, b)
+    }
+}
+
+fn Hints.inBlock(var self, p: Program, d: Doc, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in p.ast.blocks[b].stmts {
+        let st = p.ast.stmts[s]
+        if st.node is Let(_, name, ty, _, _, _) and name != "" and ty < 0 and st.binding >= 0 {
+            let t = p.bindings[st.binding].ty
+            if t >= 0 and p.types[t].kind != Kind.Error {
+                let col = st.col + 4 + len(name)
+                let pos = position(st.line - 1, utf16Column(d.text, st.line, col))
+                self.out += (if self.n > 0 { ", " } else { "" })
+                    + "\{\"position\": {pos}, \"label\": {jsonString(": " + p.typeName(t))}, \"kind\": 1}"
+                self.n += 1
+            }
+        }
+        let ps = stmtParts(p.ast, s)
+        if len(ps.exprs) > 0 {
+            self.inExpr(p, d, ps.exprs[0]) // the value
+        }
+        if len(ps.exprs) > 2 {
+            self.inExpr(p, d, ps.exprs[2]) // the iter
+        }
+        for k in ps.blocks {
+            self.inBlock(p, d, k)
+        }
+    }
+}
+
+fn Server.inlayHints(self, d: Doc) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok {
+        return "[]"
+    }
+    let p = a.p
+    var h = Hints()
+    for x in p.decls {
+        let decl = p.ast.decls[x]
+        if decl.fromPrelude
+            or decl.templateOf >= 0
+            or decl.lifted
+            or decl.module != 0
+            or decl.isTemplate
+            or decl.kind != DeclKind.Fn
+            or decl.body < 0 {
+            continue
+        }
+        if p.ast.exprs[decl.body].node is BlockExpr(block, _) {
+            h.inBlock(p, d, block)
+        } else {
+            h.inExpr(p, d, decl.body)
+        }
+    }
+    "[" + h.out + "]"
+}
+
+// the call the cursor is in: the latest one on the line to start before it
+type Calls { line: Int, col: Int, best: Int = -1 }
+
+fn Calls.inExpr(var self, p: Program, e: Int) {
+    if e < 0 {
+        return
+    }
+    let x = p.ast.exprs[e]
+    if isCall(p.ast, e)
+        and not x.implicit
+        and x.decl >= 0
+        and p.ast.decls[x.decl].kind == DeclKind.Fn
+        and x.line == self.line
+        and x.col < self.col
+        and (self.best < 0 or p.ast.exprs[self.best].col < x.col) {
+        self.best = e
+    }
+    let ps = parts(p.ast, e)
+    for c in ps.exprs {
+        self.inExpr(p, c)
+    }
+    for arm in ps.arms {
+        self.inExpr(p, p.ast.arms[arm].body)
+    }
+    for b in ps.blocks {
+        self.inBlock(p, b)
+    }
+}
+
+fn Calls.inBlock(var self, p: Program, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in p.ast.blocks[b].stmts {
+        let ps = stmtParts(p.ast, s)
+        for c in ps.exprs {
+            self.inExpr(p, c)
+        }
+        for k in ps.blocks {
+            self.inBlock(p, k)
+        }
+    }
+}
+
+fn Server.signatureHelp(self, d: Doc, line: Int, col: Int) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok {
+        return "null"
+    }
+    let p = a.p
+    var calls = Calls(line, col)
+    for x in p.decls {
+        let decl = p.ast.decls[x]
+        if decl.fromPrelude
+            or decl.templateOf >= 0
+            or decl.lifted
+            or decl.module != 0
+            or decl.kind != DeclKind.Fn
+            or decl.body < 0 {
+            continue
+        }
+        calls.inExpr(p, decl.body)
+    }
+    let best = calls.best
+    if best < 0 {
+        return "null"
+    }
+    let b = d.text.bytes()
+    let start = lineStart(d.text, line)
+    var open = -1
+    var depth = 0
+    var commas = 0
+    var k = p.ast.exprs[best].col - 1
+    while k < col - 1 and start + k < len(b) and b[start + k] != '\n' {
+        let c = b[start + k]
+        if c == '(' {
+            if depth == 0 {
+                open = k
+            }
+            depth += 1
+        } else if c == ')' {
+            depth -= 1
+        } else if c == ',' and depth == 1 {
+            commas += 1
+        }
+        k += 1
+    }
+    if open < 0 or depth <= 0 {
+        return "null"
+    }
+    let f = declOf(p, p.ast.exprs[best].decl)
+    var out = "\{\"signatures\": [\{\"label\": {jsonString(signature(p, f))}, \"parameters\": ["
+    for (i, prm) in p.ast.decls[f].params.enumerate() {
+        let label = "{p.ast.params[prm].name}: {typeWritten(p, p.ast.params[prm].ty)}"
+        out += (if i > 0 { ", " } else { "" }) + "\{\"label\": {jsonString(label)}}"
+    }
+    let method = p.ast.exprs[best].node is Call(_, _, _, _, true, _)
+    let active = commas + (if method { 1 } else { 0 })
+    out + "]}], \"activeSignature\": 0, \"activeParameter\": {active}}"
+}
+
+fn Server.symbols(self, d: Doc) -> Text {
+    let a = self.analyze(d, false)
+    if not a.ok {
+        return "[]"
+    }
+    let p = a.p
+    var out = "["
+    var n = 0
+    for x in p.decls {
+        let decl = p.ast.decls[x]
+        if decl.fromPrelude or decl.lifted or decl.module != 0 or decl.templateOf >= 0 or decl.kind == DeclKind.Use {
+            continue
+        }
+        let kind = match decl.kind {
+            Fn => if decl.owner != "" or decl.name.bytes().contains('.') {
+                6
+            } else {
+                12
+            }
+            Enum => 10
+            Const => 14
+            _ => 23
+        }
+        let name = if decl.isTest { decl.testName } else { decl.name }
+        out += (if n > 0 { ", " } else { "" })
+            + "\{\"name\": {jsonString(name)}, \"kind\": {kind}, \"location\": {location(d, decl.line, nameColumn(decl))}}"
+        n += 1
+    }
+    out + "]"
+}
+
+fn formatting(d: Doc) -> Text {
+    let parsed = parse(Source(d.uri, d.text))
+    if not parsed.ok {
+        return "null" // it does not parse: nothing to format
+    }
+    let lines = d.text.bytes().count(c => c == '\n')
+    "[\{\"range\": \{\"start\": {position(0, 0)}, \"end\": {position(lines + 1, 0)}}, \"newText\": {jsonString(format(canonical(parsed.ast, Source(uriPath(d.uri), d.text))))}}]"
+}
+
+// ---- completion: names; after a dot, a record's fields, an enum's cases, a type's or a module's functions; inside
+// a call, the names of the values it takes -----------------------------------------------------------------------------
+type Items { out: Text = "", n: Int = 0 }
+
+fn Items.add(var self, label: Text, kind: Int, detail: Text?, insert: Text?, sort: Text?) {
+    self.out += (if self.n > 0 { ", " } else { "" }) + "\{\"label\": {jsonString(label)}, \"kind\": {kind}"
+    self.n += 1
+    if detail is Some(t) {
+        self.out += ", \"detail\": " + jsonString(t)
+    }
+    if insert is Some(t) {
+        self.out += ", \"insertText\": " + jsonString(t)
+    }
+    if sort is Some(t) {
+        self.out += ", \"sortText\": " + jsonString(t)
+    }
+    self.out += "\}"
+}
+
+fn writtenOrNone(p: Program, t: Int) -> Text? = if t < 0 { None } else { typeText(p.ast, t) }
+
+const keywordList: [Text] = [
+    "fn", "let", "var", "type", "enum", "if", "else", "match", "for", "in", "while", "return", "break", "continue",
+    "and", "or", "not", "true", "false", "extern", "with", "effect", "use", "pub", "const", "defer", "interface", "is",
+]
+
+// a type's own functions (fn Vec2.length), named without the type: a value's (they take self), or the type's
+fn Items.ownFunctions(var self, p: Program, owner: Text, values: Bool) {
+    for d in p.decls {
+        let x = p.ast.decls[d]
+        if x.kind != DeclKind.Fn or x.owner == "" or x.templateOf >= 0 or x.lifted or x.owner != owner {
+            continue
+        }
+        let takesSelf = len(x.params) > 0 and p.ast.params[x.params[0]].name == "self"
+        if values != takesSelf {
+            continue
+        }
+        self.add(x.name[len(owner) + 1..], 2, signature(p, d), None, "1")
+    }
+}
+
+fn Items.membersOf(var self, p: Program, t: Int) {
+    if t < 0 {
+        return
+    }
+    let ty = p.types[t]
+    let d = if ty.decl >= 0 { declOf(p, ty.decl) } else { -1 }
+    if ty.kind == Kind.Record and d >= 0 and not p.ast.decls[d].isTuple {
+        let x = p.ast.decls[d]
+        for k in x.params {
+            self.add(
+                p.ast.params[k].name,
+                if x.isInterface { 2 } else { 5 },
+                writtenOrNone(p, p.ast.params[k].ty),
+                None,
+                "0",
+            )
+        }
+    }
+    if (ty.kind == Kind.Record or ty.kind == Kind.Enum) and d >= 0 {
+        self.ownFunctions(p, p.ast.decls[d].name, true)
+        return
+    }
+    if ty.kind == Kind.Error or ty.kind == Kind.Void {
+        return
+    }
+    for (i, name) in builtinNames.enumerate() {
+        if i > 0 and not name.startsWith("#") {
+            self.add(name, 3, None, None, "2") // xs.map(f): a function after its first value
+        }
+    }
+}
+
+// the latest let, var, for, parameter or lambda's parameter named name at or before line
+type Latest { name: Text, line: Int, found: Int = -1, foundLine: Int = 0 }
+
+fn Latest.inExpr(var self, a: Ast, e: Int) {
+    if e < 0 {
+        return
+    }
+    let ps = parts(a, e)
+    for c in ps.exprs {
+        self.inExpr(a, c)
+    }
+    for arm in ps.arms {
+        self.inExpr(a, a.arms[arm].body)
+    }
+    let x = a.exprs[e]
+    if x.node is Lambda(params, _) {
+        for k in params {
+            let prm = a.params[k]
+            if prm.binding >= 0 and prm.name == self.name and x.line <= self.line and x.line >= self.foundLine {
+                self.found = prm.binding
+                self.foundLine = x.line
+            }
+        }
+    }
+    for b in ps.blocks {
+        self.inBlock(a, b)
+    }
+}
+
+fn Latest.inBlock(var self, a: Ast, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in a.blocks[b].stmts {
+        let st = a.stmts[s]
+        if st.line > self.line {
+            return
+        }
+        let name = stmtName(a, s)
+        if st.binding >= 0 and name != "" and name == self.name and st.line >= self.foundLine {
+            self.found = st.binding
+            self.foundLine = st.line
+        }
+        let ps = stmtParts(a, s)
+        if len(ps.exprs) > 0 {
+            self.inExpr(a, ps.exprs[0])
+        }
+        if len(ps.exprs) > 2 {
+            self.inExpr(a, ps.exprs[2])
+        }
+        for k in ps.blocks {
+            self.inBlock(a, k)
+        }
+    }
+}
+
+fn typeOfName(p: Program, name: Text, line: Int) -> Int {
+    var within = -1 // the function the line is in: the last one to start before it
+    for d in p.decls {
+        let x = p.ast.decls[d]
+        if x.kind == DeclKind.Fn
+            and x.body >= 0
+            and x.module == 0
+            and not x.fromPrelude
+            and x.templateOf < 0
+            and not x.lifted
+            and x.line <= line
+            and (within < 0 or x.line > p.ast.decls[within].line) {
+            within = d
+        }
+    }
+    if within < 0 {
+        return -1
+    }
+    var l = Latest(name, line)
+    for k in p.ast.decls[within].params {
+        if p.ast.params[k].name == name {
+            l.found = p.ast.params[k].binding
+        }
+    }
+    l.inExpr(p.ast, p.ast.decls[within].body)
+    if l.found >= 0 { p.bindings[l.found].ty } else { -1 }
+}
+
+// The text with [from, to) of its bytes made spaces: what is being typed there taken out, so the rest parses.
+fn blanked(d: Doc, from: Int, to: Int) -> Doc {
+    let b = d.text.bytes()
+    let end = min(to, len(b))
+    if from >= end {
+        return d
+    }
+    var mid = ""
+    for i in from..end {
+        mid += if b[i] == '\n' { "\n" } else { " " }
+    }
+    Doc(d.uri, d.text[..from] + mid + d.text[end..])
+}
+
+// the text analyzed, else the text without the cursor's line
+fn Server.analyzeSome(self, t: Doc, line: Int) -> Analysis {
+    let first = self.analyze(t, true)
+    if first.ok {
+        return first
+    }
+    let start = lineStart(t.text, line)
+    var end = start
+    let b = t.text.bytes()
+    while end < len(b) and b[end] != '\n' {
+        end += 1
+    }
+    self.analyze(blanked(t, start, end), true)
+}
+
+// After a dot: what is before it, and what it offers.
+fn Server.memberCompletion(self, given: Items, d: Doc, line: Int, dot: Int) -> Items {
+    var it = given
+    let b = d.text.bytes()
+    var start = dot
+    while start > 0 and isNameChar(b[start - 1]) {
+        start -= 1
+    }
+    let receiver = d.text[start..dot]
+    let recvCol = start - lineStart(d.text, line) + 1
+    var to = dot + 1
+    while to < len(b) and isNameChar(b[to]) {
+        to += 1
+    }
+    let a = self.analyzeSome(blanked(d, dot, to), line)
+    if not a.ok {
+        return it
+    }
+    let p = a.p
+    if startsWithUpper(receiver) {
+        // a type: an enum's cases, the type's own functions
+        for x in p.decls {
+            let decl = p.ast.decls[x]
+            if decl.kind != DeclKind.Enum or decl.name != receiver {
+                continue
+            }
+            for (k, c) in decl.cases.enumerate() {
+                var detail: Text? = None
+                if k < len(decl.caseFields) and len(decl.caseFields[k]) > 0 {
+                    var t = ""
+                    for (f, prm) in decl.caseFields[k].enumerate() {
+                        t += (if f > 0 { ", " } else { "(" })
+                            + p.ast.params[prm].name
+                            + ": "
+                            + typeWritten(p, p.ast.params[prm].ty)
+                    }
+                    detail = t + ")"
+                }
+                it.add(c, 20, detail, None, "0")
+            }
+        }
+        it.ownFunctions(p, receiver, false)
+    } else if receiver != "" {
+        var module = -1 // use geometry as g: g. offers geometry's pub declarations
+        if len(p.modules) > 0 {
+            for (i, alias) in p.modules[0].aliases.enumerate() {
+                if alias != "" and alias == receiver {
+                    module = p.modules[0].uses[i]
+                }
+            }
+        }
+        if module > 0 {
+            for x in p.decls {
+                let decl = p.ast.decls[x]
+                if decl.module != module
+                    or not decl.isPub
+                    or decl.owner != ""
+                    or decl.templateOf >= 0
+                    or decl.lifted
+                    or decl.kind == DeclKind.Use {
+                    continue
+                }
+                let kind = match decl.kind {
+                    Fn => 3
+                    Enum => 13
+                    Const => 21
+                    _ => 22
+                }
+                it.add(decl.name, kind, if decl.kind == DeclKind.Fn { signature(p, x) } else { None }, None, "0")
+            }
+        } else {
+            let f = find(p, line, recvCol)
+            var ty = -1
+            if f.expr >= 0 {
+                ty = p.ast.exprs[f.expr].ty
+            } else if f.stmt >= 0 and p.ast.stmts[f.stmt].binding >= 0 {
+                ty = p.bindings[p.ast.stmts[f.stmt].binding].ty
+            } else if f.param >= 0 and p.ast.params[f.param].binding >= 0 {
+                ty = p.bindings[p.ast.params[f.param].binding].ty
+            }
+            if ty < 0 or p.types[ty].kind == Kind.Error {
+                ty = typeOfName(p, receiver, line)
+            }
+            it.membersOf(p, ty)
+        }
+    }
+    it
+}
+
+fn isSpace(c: Int) -> Bool = c is ' ' | '\n' | '\r'
+
+// Inside a call's parentheses, where a value starts: the names of the values it takes, not written yet.
+fn Server.argumentCompletion(self, given: Items, d: Doc, at: Int) -> Items {
+    var it = given
+    let b = d.text.bytes()
+    var i = at
+    while i > 0 and isNameChar(b[i - 1]) {
+        i -= 1
+    }
+    let word = i
+    while i > 0 and isSpace(b[i - 1]) {
+        i -= 1
+    }
+    if i == 0 or not b[i - 1] is '(' | ',' {
+        return it
+    }
+    var depth = 0 // the call's (
+    var open = i
+    var found = false
+    while open > 0 {
+        open -= 1
+        let c = b[open]
+        if c is ')' | ']' | '}' {
+            depth += 1
+        } else if c is '(' | '[' | '{' {
+            if depth == 0 {
+                found = c == '('
+                break
+            }
+            depth -= 1
+        }
+    }
+    var nameStart = open
+    while found and nameStart > 0 and isNameChar(b[nameStart - 1]) {
+        nameStart -= 1
+    }
+    if not found or nameStart == open {
+        return it
+    }
+    let callee = d.text[nameStart..open]
+    var qualifier = "" // Shape.Circle( or p.scale(
+    if nameStart > 0 and b[nameStart - 1] == '.' {
+        var q = nameStart - 1
+        while q > 0 and isNameChar(b[q - 1]) {
+            q -= 1
+        }
+        qualifier = d.text[q..nameStart - 1]
+    }
+    let written = d.text[open..at] // the call so far: the names already given
+    var line = 1
+    for k in 0..at {
+        if b[k] == '\n' {
+            line += 1
+        }
+    }
+    let a = self.analyzeSome(blanked(d, word, at), line)
+    let p = a.p
+    var params: [Int] = []
+    var skip = 0
+    if a.ok {
+        for x in p.decls {
+            if len(params) > 0 {
+                break
+            }
+            let decl = p.ast.decls[x]
+            if decl.templateOf >= 0 or decl.lifted or decl.isTest {
+                continue
+            }
+            if decl.kind == DeclKind.Type
+                and not decl.isInterface
+                and not decl.isExtern
+                and qualifier == ""
+                and decl.name == callee {
+                params = decl.params
+            } else if decl.kind == DeclKind.Fn and decl.owner == "" and qualifier == "" and decl.name == callee {
+                params = decl.params
+            } else if decl.kind == DeclKind.Fn
+                and decl.owner != ""
+                and qualifier != ""
+                and decl.name[len(decl.owner) + 1..] == callee {
+                params = decl.params
+                skip = if len(decl.params) > 0 and p.ast.params[decl.params[0]].name == "self" {
+                    1 // p.scale(k: ...): self is p
+                } else {
+                    0
+                }
+            } else if decl.kind == DeclKind.Enum and qualifier != "" and decl.name == qualifier {
+                for (c, name) in decl.cases.enumerate() {
+                    if name == callee and c < len(decl.caseFields) {
+                        params = decl.caseFields[c]
+                    }
+                }
+            }
+        }
+    }
+    // the values given before, in order (not by name): they take the first parameters
+    let w = written.bytes()
+    var level = 0
+    var named = false
+    var started = false
+    var k = 1
+    while k < len(w) {
+        let c = w[k]
+        if c is '(' | '[' | '{' {
+            level += 1
+        } else if c is ')' | ']' | '}' {
+            level -= 1
+        } else if level == 0 and c == ',' {
+            if started and not named {
+                skip += 1
+            }
+            named = false
+            started = false
+        } else if level == 0 and not started and not isSpace(c) {
+            started = true
+            var e = k
+            while e < len(w) and isNameChar(w[e]) {
+                e += 1
+            }
+            let nameEnd = e
+            while e < len(w) and w[e] == ' ' {
+                e += 1
+            }
+            named = nameEnd > k and e < len(w) and w[e] == ':'
+        }
+        k += 1
+    }
+    var n = skip
+    while n < len(params) {
+        let prm = p.ast.params[params[n]]
+        n += 1
+        if givenIn(w, prm.name) {
+            continue
+        }
+        it.add(prm.name + ":", 5, writtenOrNone(p, prm.ty), prm.name + ": ", "0")
+    }
+    it
+}
+
+// whether written names the parameter: name, then spaces and a colon, not inside a longer name
+fn givenIn(w: Bytes, name: Text) -> Bool {
+    let nb = name.bytes()
+    let n = len(nb)
+    if n == 0 {
+        return false
+    }
+    var i = 0
+    while i + n <= len(w) {
+        if w[i..i + n] == nb {
+            var after = i + n
+            while after < len(w) and w[after] == ' ' {
+                after += 1
+            }
+            if after < len(w) and w[after] == ':' and (i == 0 or not isNameChar(w[i - 1])) {
+                return true
+            }
+            i += n
+        } else {
+            i += 1
+        }
+    }
+    false
+}
+
+fn Server.completion(self, d: Doc, line: Int, col: Int) -> Text {
+    var it = Items()
+    let b = d.text.bytes()
+    let at = min(lineStart(d.text, line) + col - 1, len(b)) // the cursor, as a byte of the text
+    var word = at
+    while word > 0 and isNameChar(b[word - 1]) {
+        word -= 1
+    }
+    if word > 0 and b[word - 1] == '.' and (word < 2 or b[word - 2] != '.') {
+        // not a range's ..
+        it = self.memberCompletion(it, d, line, word - 1)
+    } else {
+        it = self.argumentCompletion(it, d, at)
+        let a = self.analyze(d, false)
+        for k in keywordList {
+            it.add(k, 14, None, None, None)
+        }
+        for (i, name) in builtinNames.enumerate() {
+            if i > 0 and not name.startsWith("#") {
+                it.add(name, 3, None, None, None)
+            }
+        }
+        if a.ok {
+            let p = a.p
+            for x in p.decls {
+                let decl = p.ast.decls[x]
+                if decl.isTest
+                    or decl.owner != ""
+                    or decl.name.bytes().contains('.')
+                    or decl.kind == DeclKind.Use
+                    or decl.templateOf >= 0
+                    or decl.lifted
+                    or decl.fromPrelude {
+                    continue
+                }
+                let kind = match decl.kind {
+                    Fn => 3
+                    Enum => 13
+                    Const => 21
+                    _ => 22
+                }
+                it.add(decl.name, kind, None, None, None)
+            }
+        }
+    }
+    "[" + it.out + "]"
+}
+
+// ---- quick fixes: the edits the errors' own messages ask for --------------------------------------------------------
+// one edit: [from, to) of the text made text
+type Edit { from: Int, to: Int, text: Text }
+type Fix { title: Text, edits: [Edit] }
+
+fn editRange(d: Doc, from: Int, to: Int) -> Text {
+    let b = d.text.bytes()
+    var l0 = 1
+    var c0 = 1
+    for i in 0..from {
+        if b[i] == '\n' {
+            l0 += 1
+            c0 = 1
+        } else {
+            c0 += 1
+        }
+    }
+    var l1 = l0
+    var c1 = c0
+    for i in from..to {
+        if b[i] == '\n' {
+            l1 += 1
+            c1 = 1
+        } else {
+            c1 += 1
+        }
+    }
+    "\{\"start\": {position(l0 - 1, utf16Column(d.text, l0, c0))}, \"end\": {position(l1 - 1, utf16Column(d.text, l1, c1))}}"
+}
+
+fn wordAt(b: Bytes, at: Int, word: Text) -> Bool {
+    let wb = word.bytes()
+    let n = len(wb)
+    at + n <= len(b)
+        and b[at..at + n] == wb
+        and (at == 0 or not isNameChar(b[at - 1]))
+        and not isNameChar(byteAt(b, at + n))
+}
+
+// where sub starts in s (-1: nowhere)
+fn indexIn(s: Text, sub: Text) -> Int {
+    let b = s.bytes()
+    let sb = sub.bytes()
+    var i = 0
+    while i + len(sb) <= len(b) {
+        if b[i..i + len(sb)] == sb {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// the name after `after` in the message, without its quotes ("unknown name \"x\": did you mean \"y\"?")
+fn quoted(message: Text, after: Text) -> Text? {
+    let at = indexIn(message, after)
+    if at < 0 {
+        return None
+    }
+    let b = message.bytes()
+    var p = at + len(after)
+    if p < len(b) and b[p] == '"' {
+        p += 1
+    }
+    var end = p
+    while end < len(b) and isNameChar(b[end]) {
+        end += 1
+    }
+    if end > p { message[p..end] } else { None }
+}
+
+// where word is written nearest the place on its line (at it, then before, then after); -1 if nowhere
+fn nearest(d: Doc, line: Int, col: Int, word: Text) -> Int {
+    let b = d.text.bytes()
+    let start = lineStart(d.text, line)
+    let at = start + col - 1
+    var end = at
+    while end < len(b) and b[end] != '\n' {
+        end += 1
+    }
+    if wordAt(b, at, word) {
+        return at
+    }
+    var i = at
+    while i > start {
+        i -= 1
+        if wordAt(b, i, word) {
+            return i
+        }
+    }
+    for k in at..end {
+        if wordAt(b, k, word) {
+            return k
+        }
+    }
+    -1
+}
+
+// inside a "text" on its line, or a comment: not code
+fn inText(b: Bytes, at: Int) -> Bool {
+    var i = at
+    while i > 0 and b[i - 1] != '\n' {
+        i -= 1
+    }
+    var quote = false
+    while i < at {
+        if b[i] == '\\' {
+            i += 1
+        } else if b[i] == '"' {
+            quote = not quote
+        } else if not quote and b[i] == '/' and byteAt(b, i + 1) == '/' {
+            return true
+        }
+        i += 1
+    }
+    quote
+}
+
+// The fix a problem's message asks for: a title and its edits (None: none).
+fn quickFix(d: Doc, pr: Problem) -> Fix? {
+    let m = pr.message
+    let b = d.text.bytes()
+    let at = lineStart(d.text, pr.line) + pr.col - 1
+    if quoted(m, "without underscores: write ") is Some(fixed) {
+        // every snake_case spelling of the name, in camelCase
+        var s = at
+        var e = at
+        while s > 0 and isNameChar(b[s - 1]) {
+            s -= 1
+        }
+        while e < len(b) and isNameChar(b[e]) {
+            e += 1
+        }
+        let old = d.text[s..e]
+        var edits: [Edit] = []
+        for i in 0..len(b) {
+            if len(edits) < 64 and wordAt(b, i, old) and not inText(b, i) {
+                edits.push(Edit(i, i + len(old), fixed))
+            }
+        }
+        return if len(edits) > 0 {
+            Fix("Rename {old} to {fixed}", edits)
+        } else {
+            None
+        }
+    }
+    if indexIn(m, "did you mean") >= 0 {
+        // the name written, made the one meant
+        let meant = quoted(m, "did you mean ")
+        let wrong = quoted(m, "unknown name ") ?? quoted(m, "has no field ") ?? quoted(m, "has no parameter ") ?? quoted(
+            m,
+            "has no case ",
+        )
+        if meant is Some(to) and wrong is Some(from) {
+            let w = nearest(d, pr.line, pr.col, from)
+            if w >= 0 {
+                return Fix("Change {from} to {to}", [Edit(w, w + len(from), to)])
+            }
+        }
+        return None
+    }
+    let write = indexIn(m, ": write ")
+    if m.startsWith("there is no ") and write >= 0 {
+        // length(xs) -> len(xs): the name Quark has
+        let to = m[write + 8..]
+        let paren = indexIn(to, "(")
+        let n = if paren >= 0 { paren } else { len(to) }
+        var e = at
+        while e < len(b) and isNameChar(b[e]) {
+            e += 1
+        }
+        if e > at and n > 0 {
+            return Fix("Write {to[..n]}", [Edit(at, e, to[..n])])
+        }
+        return None
+    }
+    if indexIn(m, "write not x") >= 0 and at < len(b) and b[at] == '!' {
+        // !x -> not x
+        var e = at + 1
+        while e < len(b) and b[e] == ' ' {
+            e += 1
+        }
+        return Fix("Write not", [Edit(at, e, "not ")])
+    }
+    if indexIn(m, "a constant is written const") >= 0 and (wordAt(b, at, "let") or wordAt(b, at, "var")) {
+        return Fix("Make it a const", [Edit(at, at + 3, "const")])
+    }
+    if indexIn(m, "effects are inferred") >= 0 and wordAt(b, at, "effect") {
+        // effect fn -> fn
+        var e = at + 6
+        while e < len(b) and b[e] == ' ' {
+            e += 1
+        }
+        return Fix("Remove effect (effects are inferred)", [Edit(at, e, "")])
+    }
+    if indexIn(m, "declare it with var") >= 0 {
+        // "x" is a let: the let that makes it, a var
+        let name = quoted(m, "") ?? return None
+        var best = -1
+        for i in 0..min(at, len(b)) {
+            if wordAt(b, i, "let") and not inText(b, i) {
+                var n = i + 3
+                while n < len(b) and b[n] == ' ' {
+                    n += 1
+                }
+                if wordAt(b, n, name) {
+                    best = i
+                }
+            }
+        }
+        if best >= 0 {
+            return Fix("Make {name} a var", [Edit(best, best + 3, "var")])
+        }
+        return None
+    }
+    None
+}
+
+// the quick fixes for the problems on lines [fromLine, toLine]
+fn Server.codeActions(self, d: Doc, fromLine: Int, toLine: Int) -> Text {
+    let a = self.analyze(d, true)
+    var out = "["
+    var n = 0
+    for pr in a.problems {
+        if not pr.here or pr.line < fromLine or pr.line > toLine {
+            continue
+        }
+        let Some(fix) = quickFix(d, pr) else {
+            continue
+        }
+        out += (if n > 0 { ", " } else { "" })
+            + "\{\"title\": {jsonString(fix.title)}, \"kind\": \"quickfix\", \"isPreferred\": true, \"diagnostics\": ["
+        n += 1
+        out += diagnostic(d, pr) + "], \"edit\": \{\"changes\": \{{jsonString(d.uri)}: ["
+        for (k, e) in fix.edits.enumerate() {
+            out += (if k > 0 { ", " } else { "" })
+                + "\{\"range\": {editRange(d, e.from, e.to)}, \"newText\": {jsonString(e.text)}}"
+        }
+        out += "]\}\}\}"
+    }
+    out + "]"
+}
+
+// ---- the command line's tools --------------------------------------------------------------------------------------
+//   quark lsp [--prelude P]   the language server (this file)
+//   quark dap [--prelude P]   the debug adapter (dap.qk)
+//   quark get [dir]           the packages quark.toml names, into .quark/pkg (package.qk)
+pub fn toolCommand(given: [Text]) -> Int {
+    let command = given[0]
+    if command == "get" {
+        if len(given) > 2 {
+            printErr("usage: quark get [dir]")
+            return 2
+        }
+        return getPackages(if len(given) == 2 { given[1] } else { "." })
+    }
+    let prelude = if len(given) >= 3 and given[1] == "--prelude" {
+        given[2]
+    } else {
+        ""
+    }
+    if command == "dap" {
+        return serveDap(prelude)
+    }
+    serveLsp(prelude)
+}

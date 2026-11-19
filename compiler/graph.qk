@@ -1,0 +1,2346 @@
+// Programs as node graphs, and back. A graph is written in Quark's own notation (QGN, compiler/qgn.qk: a value of
+// std.graph's types) or JSON (--json); both say the data below, which is read and written here as JSON.
+//
+// Every expression that is not a plain value is a node; its inputs are wires from other nodes or values typed into
+// the pin. Every let, var, parameter and loop variable is a named node, and a use of the name is a wire from it.
+// Statements run in the order of their block's list: that order is the execution wire. Literals, enum cases and
+// function names are pin values, never nodes. Comments and blank lines ride on the nodes, so text -> graph -> text
+// gives back the formatter's text exactly.
+//
+// {"quark": 1, "decls": [
+//   {"kind": "fn", "name": "square", "params": [{"id": 1, "name": "x", "type": "Int"}], "returns": "Int",
+//    "form": "expr", "result": {"node": 4}, "nodes": [{"id": 4, "kind": "op", "op": "+", "inputs": [...]}, ...]},
+//   {"kind": "type", "name": "Point", "fields": [{"name": "x", "type": "Float"}]},
+//   {"kind": "enum", "name": "Color", "cases": ["Red", "Green"]}]}
+//
+// Inputs: {"node": id} | {"value": "12", "of": "Int"} | {"case": "Color.Red"} | {"fn": "square"}. Blocks:
+// {"stmts": [ids], "closing": "comment"}. A node's "key" (fn/name, for named nodes) is stable while the name is: an
+// editor keeps positions in a side file under it (--layout), with a "uid" that survives a move.
+//
+// JSON is read into one Json value: its values in an array, each naming its items by their index there (the same
+// arena holds several documents: quark merge reads three graphs into one and copies values between them).
+use token
+use ast
+use source
+use types
+use format
+use parser
+use module
+use check
+use qgn
+
+// ---- JSON --------------------------------------------------------------------------------------------------------
+pub enum JKind { Null, Bool, Num, Str, Arr, Obj }
+
+// a value: a number, a text, or an array's or an object's items (and an object's keys, one per item)
+pub type JNode {
+    kind: JKind
+    num: Float = 0.0
+    b: Bool = false
+    str: Text = ""
+    keys: [Text] = []
+    items: [Int] = []
+}
+
+pub type Json { nodes: [JNode] = [] }
+
+pub fn Json.add(var self, n: JNode) -> Int {
+    self.nodes.push(n)
+    len(self.nodes) - 1
+}
+
+pub fn Json.text(var self, s: Text) -> Int = self.add(JNode(.Str, str: s))
+
+pub fn Json.kind(self, v: Int) -> JKind = if v < 0 { JKind.Null } else { self.nodes[v].kind }
+
+pub fn Json.count(self, v: Int) -> Int = if v < 0 { 0 } else { len(self.nodes[v].items) }
+
+pub fn Json.item(self, v: Int, i: Int) -> Int = self.nodes[v].items[i]
+
+// an object's value for a key (the first), or -1
+pub fn Json.get(self, o: Int, key: Text) -> Int {
+    if o < 0 or self.nodes[o].kind != JKind.Obj {
+        return -1
+    }
+    let n = self.nodes[o]
+    for (i, k) in n.keys.enumerate() {
+        if k == key {
+            return n.items[i]
+        }
+    }
+    -1
+}
+
+pub fn Json.str(self, o: Int, key: Text) -> Text? {
+    let v = self.get(o, key)
+    if v >= 0 and self.nodes[v].kind == JKind.Str {
+        Some(self.nodes[v].str)
+    } else {
+        None
+    }
+}
+
+pub fn Json.isTrue(self, o: Int, key: Text) -> Bool {
+    let v = self.get(o, key)
+    v >= 0 and self.nodes[v].kind == JKind.Bool and self.nodes[v].b
+}
+
+pub fn Json.int(self, o: Int, key: Text, fallback: Int) -> Int {
+    let v = self.get(o, key)
+    if v >= 0 and self.nodes[v].kind == JKind.Num {
+        truncate(self.nodes[v].num)
+    } else {
+        fallback
+    }
+}
+
+pub fn Json.has(self, o: Int, key: Text) -> Bool = self.get(o, key) >= 0
+
+// a Float as C's (int) makes it
+pub fn truncate(x: Float) -> Int = if x != x or x > 9.0e18 or x < -9.0e18 { 0 } else { toInt(x) }
+
+// C's %g, at a precision (6 for %g, 15 for %.15g)
+pub fn floatG(x: Float, precision: Int) -> Text {
+    if x == toFloat(truncate(x)) and abs(x) < 1.0e15 {
+        let n = truncate(x)
+        if precision >= 15 or abs(n) < 1000000 {
+            return "{n}"
+        }
+    }
+    "{x}"
+}
+
+type JParser { b: Bytes, text: Text, p: Int = 0, failed: Bool = false, doc: Json }
+
+fn JParser.at(self) -> Int = if self.p < len(self.b) { self.b[self.p] } else { -1 }
+
+fn JParser.ws(var self) {
+    while self.p < len(self.b) and self.b[self.p] is ' ' | '\n' | '\r' | '\t' {
+        self.p += 1
+    }
+}
+
+fn hexValue(t: Text) -> Int {
+    var v = 0
+    for c in t.bytes() {
+        let d = match c {
+            '0'..='9' => c - '0'
+            'a'..='f' => c - 'a' + 10
+            'A'..='F' => c - 'A' + 10
+            _ => -1
+        }
+        if d < 0 {
+            return v
+        }
+        v = v *% 16 +% d // 64 bits: a hash
+    }
+    v
+}
+
+fn JParser.string(var self) -> Text {
+    self.p += 1 // the opening quote
+    var out = ""
+    var from = self.p
+    let n = len(self.b)
+    while self.p < n and self.b[self.p] != '"' {
+        if self.b[self.p] != '\\' or self.p + 1 >= n {
+            self.p += 1
+            continue
+        }
+        out += self.text[from..self.p]
+        let k = self.b[self.p + 1]
+        self.p += 2
+        if k == 'u' and self.p + 4 <= n {
+            var u = hexValue(self.text[self.p..self.p + 4])
+            self.p += 4
+            if u >= 0xd800 and u < 0xdc00 and self.p + 6 <= n and self.b[self.p] == '\\' and self.b[self.p + 1] == 'u' {
+                let low = hexValue(self.text[self.p + 2..self.p + 6])
+                if low >= 0xdc00 and low < 0xe000 {
+                    u = 0x10000 + (u - 0xd800) << 10 + (low - 0xdc00)
+                    self.p += 6
+                }
+            }
+            out += char(u)
+        } else {
+            out += match k {
+                'n' => "\n"
+                't' => "\t"
+                'r' => "\r"
+                'b' => char(8)
+                'f' => char(12)
+                _ => self.text[self.p - 1..self.p]
+            }
+        }
+        from = self.p
+    }
+    out += self.text[from..(if self.p < n { self.p } else { n })]
+    if self.p >= n {
+        self.failed = true
+    } else {
+        self.p += 1
+    }
+    out
+}
+
+fn JParser.word(self, w: Text) -> Bool {
+    let n = len(w)
+    self.p + n <= len(self.b) and self.text[self.p..self.p + n] == w
+}
+
+fn JParser.value(var self) -> Int {
+    self.ws()
+    let c = self.at()
+    if c < 0 {
+        self.failed = true
+        return self.doc.add(JNode(.Null))
+    }
+    if c == '{' or c == '[' {
+        let obj = c == '{'
+        let close = if obj { '}' } else { ']' }
+        self.p += 1
+        self.ws()
+        var keys: [Text] = []
+        var items: [Int] = []
+        if self.at() == close {
+            self.p += 1
+            return self.doc.add(JNode(if obj { JKind.Obj } else { JKind.Arr }))
+        }
+        while not self.failed {
+            var key = ""
+            if obj {
+                self.ws()
+                if self.at() != '"' {
+                    self.failed = true
+                    break
+                }
+                key = self.string()
+                self.ws()
+                if self.at() != ':' {
+                    self.failed = true
+                    break
+                }
+                self.p += 1
+            }
+            let item = self.value()
+            keys.push(key)
+            items.push(item)
+            self.ws()
+            if self.at() == ',' {
+                self.p += 1
+                continue
+            }
+            if self.at() == close {
+                self.p += 1
+                break
+            }
+            self.failed = true
+        }
+        return self.doc.add(
+            JNode(if obj { JKind.Obj } else { JKind.Arr }, keys: if obj { keys } else { [] }, items: items),
+        )
+    }
+    if c == '"' {
+        let s = self.string()
+        return self.doc.text(s)
+    }
+    if self.word("true") {
+        self.p += 4
+        return self.doc.add(JNode(.Bool, b: true))
+    }
+    if self.word("false") {
+        self.p += 5
+        return self.doc.add(JNode(.Bool))
+    }
+    if self.word("null") {
+        self.p += 4
+        return self.doc.add(JNode(.Null))
+    }
+    let start = self.p
+    var q = self.p
+    while q < len(self.b) and self.b[q] is '0'..='9' | '-' | '+' | '.' | 'e' | 'E' {
+        q += 1
+    }
+    let Ok(x) = self.text[start..q].parseFloat() else {
+        self.failed = true
+        return self.doc.add(JNode(.Num))
+    }
+    self.p = q
+    self.doc.add(JNode(.Num, num: x))
+}
+
+// JSON text read into the arena: its value, or -1 when it is not JSON
+pub fn Json.parse(var self, text: Text) -> Int {
+    var jp = JParser(text.bytes(), text, doc: self)
+    let v = jp.value()
+    self.nodes = jp.doc.nodes
+    if jp.failed { -1 } else { v }
+}
+
+// ---- writing a program's graph ----------------------------------------------------------------------------------
+// The writer: the program, each binding's node (wire), the layout; per declaration its nodes so far (written as they
+// are met), the next id, the function's name (keys start with it), how many lets, vars and fors name each name.
+type Out {
+    p: Program
+    wire: [Int]
+    layout: Json
+    layoutRoot: Int = -1
+    byHash: [Text: Int] = [:] // the layout's entries by the hash they say (an entry whose hash two say: none)
+    nodes: Text = ""
+    nextId: Int = 1
+    fnName: Text = ""
+    nodeCount: Int = 0
+    named: [Text: Int] = [:]
+}
+
+fn q(s: Text) -> Text = jsonString(s)
+
+// the node a name's uses wire to: a lambda's captured copy wires to the name it copies
+fn Out.wireOf(self, b: Int) -> Int {
+    var at = b
+    while self.p.bindings[at].capturedFrom >= 0 {
+        at = self.p.bindings[at].capturedFrom
+    }
+    self.wire[at]
+}
+
+fn Out.typeString(self, t: Int) -> Text = q(if t >= 0 { typeText(self.p.ast, t) } else { "" })
+
+fn Out.visible(self, e: Int) -> Int {
+    var v = e
+    while self.p.ast.exprs[v].implicit and self.p.ast.exprs[v].node is Call(_, _, args, _, _, _) {
+        v = args[0]
+    }
+    v
+}
+
+// A node's hash: its content's (its kind and canonical text, what it holds included), whatever its place: two
+// versions of a program agree on a node that did not change even where its key (its place) did (FNV-1a, 64 bits).
+fn contentHash(t: Text) -> Text {
+    var h = -3750763034362895579
+    for b in t.bytes() {
+        h = (h ^ b) *% 1099511628211
+    }
+    let digits = "0123456789abcdef".bytes()
+    var out = ""
+    for i in 0..16 {
+        out += char(digits[unsignedShift(h, 60 - 4 * i) & 15])
+    }
+    out
+}
+
+fn unsignedShift(x: Int, n: Int) -> Int = if n == 0 { x } else { x >> n & ~(-1 << (64 - n)) }
+
+fn Out.startNode(var self, id: Int, kind: Text, key: Text, line: Int, hash: Text) {
+    if self.nodeCount > 0 {
+        self.nodes += ",\n"
+    }
+    self.nodeCount += 1
+    var head = "    \{\"id\": {id}, \"kind\": {q(kind)}, \"key\": {q(key)}, \"hash\": {q(hash)}"
+    if line > 0 {
+        head += ", \"line\": {line}"
+    }
+    let l = self.layout
+    let entry = self.layoutEntry(key, hash)
+    if l.str(entry, "uid") is Some(uid) and uid != "" {
+        head += ", \"uid\": {q(uid)}"
+    }
+    let pos = if l.kind(entry) == JKind.Obj { l.get(entry, "pos") } else { entry }
+    if l.kind(pos) == JKind.Arr
+        and l.count(pos) == 2
+        and l.kind(l.item(pos, 0)) == JKind.Num
+        and l.kind(l.item(pos, 1)) == JKind.Num {
+        head += ", \"pos\": [{floatG(l.nodes[l.item(pos, 0)].num, 6)}, {floatG(l.nodes[l.item(pos, 1)].num, 6)}]"
+    }
+    self.nodes += head
+}
+
+// a node's entry in the layout: its key's while that one says the same hash (or none); else the one entry whose hash
+// is the node's (it moved: an inserted statement changed its key). An entry that says another hash is another node's
+// (one that moved away): a node changed where it is keeps its place by its uid (an editor's own id)
+fn Out.layoutEntry(self, key: Text, hash: Text) -> Int {
+    let l = self.layout
+    let byKey = l.get(self.layoutRoot, key)
+    let said = if l.kind(byKey) == JKind.Obj {
+        l.str(byKey, "hash") ?? ""
+    } else {
+        ""
+    }
+    if byKey >= 0 and (said == "" or said == hash) {
+        return byKey
+    }
+    self.byHash[hash] ?? -1
+}
+
+fn Out.typeField(self, t: Int) -> Text {
+    if t < 0 or self.p.types[t].kind is Error | Void {
+        return ""
+    }
+    ", \"type\": {q(self.p.typeName(t))}"
+}
+
+fn notes(leading: Text, trailing: Text?, blank: Bool) -> Text {
+    var out = ""
+    if leading != "" {
+        out += ", \"comment\": {q(leading)}"
+    }
+    if trailing is Some(t) {
+        out += ", \"trailing\": {q(t)}"
+    }
+    if blank {
+        out += ", \"blank\": true"
+    }
+    out
+}
+
+// inputs: the i-th one's key is key.i
+fn Out.inputs(var self, list: [Int], key: Text) -> Text {
+    var inp = ""
+    for (i, e) in list.enumerate() {
+        if i > 0 {
+            inp += ", "
+        }
+        let one = self.writeInput(e, "{key}.{i}")
+        inp += one
+    }
+    ", \"inputs\": [" + inp + "]"
+}
+
+// A pattern: "pattern" as text (Circle, 3, 80..90, "\"quit\"", _), and for a case its names, each a node the wires
+// from them come from.
+fn Out.writePattern(var self, arm: Arm) -> Text {
+    var out = "\"pattern\": "
+    if arm.pattern != "" {
+        out += q(arm.pattern)
+    } else {
+        out += q(patternText(self.p.ast, arm with { alternatives: [] }))
+    }
+    if arm.whole != "" {
+        let bid = self.nextId
+        self.nextId += 1
+        if arm.wholeBinding >= 0 {
+            self.wire[arm.wholeBinding] = bid
+        }
+        out += ", \"wholeId\": {bid}"
+    }
+    if len(arm.alternatives) > 0 {
+        out += ", \"alternatives\": ["
+        for (i, alt) in arm.alternatives.enumerate() {
+            out += if i > 0 { ", \{" } else { "\{" }
+            let inner = self.writePattern(self.p.ast.arms[alt])
+            out += inner + "\}"
+        }
+        out += "]"
+    }
+    if len(arm.binds) > 0 or arm.pattern == "(,)" {
+        out += ", \"binds\": ["
+        for (f, bind) in arm.binds.enumerate() {
+            let sub = arm.subs.get(f) ?? -1
+            if sub >= 0 {
+                out += if f > 0 { ", \{" } else { "\{" }
+                let inner = self.writePattern(self.p.ast.arms[sub])
+                out += inner + "\}"
+                continue
+            }
+            let bid = self.nextId
+            self.nextId += 1
+            let binding = arm.bindings.get(f) ?? -1
+            if binding >= 0 {
+                self.wire[binding] = bid
+            }
+            out += (if f > 0 { ", " } else { "" }) + "\{\"id\": {bid}, \"name\": {q(bind)}\}"
+        }
+        out += "]"
+    }
+    out
+}
+
+fn Out.isEffectCall(self, x: Expr) -> Bool {
+    if x.decl >= 0 and self.p.ast.decls[x.decl].kind == DeclKind.Fn and self.p.ast.decls[x.decl].isEffect {
+        return true
+    }
+    if effectGroup(x.builtin) {
+        return true
+    }
+    if x.callee >= 0 {
+        let t = self.p.ast.exprs[x.callee].ty
+        return t >= 0 and self.p.types[t].kind == Kind.Fn and self.p.types[t].isEffect
+    }
+    false
+}
+
+// the built-ins that reach the world (the checker's groups: print, files, process...)
+fn effectGroup(b: Int) -> Bool = b == bPrint or b == bPrintErr
+
+fn kindOfNode(node: ExprNode) -> Text = match node {
+    IntLit(_, _) | FloatLit(_, _) | TextLit(_, _, _) | BoolLit(_) => "value"
+    Hole => "hole"
+    Name(_) => "name"
+    Call(_, _, _, _, _, _) => "call"
+    Field(_, _) => "field"
+    Index(_, _) => "index"
+    Unary(_, _) | Binary(_, _, _) | Range(_, _) => "op"
+    If(_, _, _) => "if"
+    Match(_, _, _) => "match"
+    Lambda(_, _) => "lambda"
+    ArrayLit(_) => "array"
+    BlockExpr(_, _) => "block"
+    Case(_, _, _) => "case"
+    With(_, _, _) => "with"
+    Interp(_, _, _, _, _) => "text"
+    Try(_) => "try"
+    MapLit(_) => "map"
+    Is(_, _) => "is"
+}
+
+fn texts(list: [Text]) -> Text {
+    var out = ""
+    for (i, t) in list.enumerate() {
+        if i > 0 {
+            out += ", "
+        }
+        out += q(t)
+    }
+    out
+}
+
+// An expression as a node; its id. Its inputs are written (and numbered) first.
+fn Out.writeNode(var self, at: Int, key: Text) -> Int {
+    let e = self.visible(at)
+    let id = self.nextId
+    self.nextId += 1
+    let x = self.p.ast.exprs[e]
+    var node = ""
+    match x.node {
+        With(target, values, fields) => {
+            node += ", \"names\": [" + texts(fields) + "]"
+            let more = self.inputs([target] + values, key)
+            node += more
+        }
+        Interp(values, _, raws, formats, multiline) => {
+            if multiline {
+                node += ", \"multiline\": true"
+            }
+            node += ", \"parts\": [" + texts(raws) + "]"
+            if len(formats) > 0 {
+                var fs: [Text] = []
+                for i in 0..len(values) {
+                    fs.push(formats.get(i) ?? "")
+                }
+                node += ", \"formats\": [" + texts(fs) + "]"
+            }
+            let more = self.inputs(values, key)
+            node += more
+        }
+        Try(value) => {
+            let more = self.inputs([value], key)
+            node += more
+        }
+        MapLit(items) => {
+            let more = self.inputs(items, key)
+            node += more
+        }
+        Call(name, qualifier, args, names, method, dotted) => {
+            node += ", \"fn\": " + q(name)
+            if qualifier != "" {
+                node += ", \"qualifier\": " + q(qualifier)
+            }
+            if dotted {
+                node += ", \"dotted\": true"
+            }
+            if self.isEffectCall(x) {
+                node += ", \"effect\": true"
+            }
+            if method {
+                node += ", \"method\": true"
+            }
+            if names.any(n => n != "") {
+                var ns: [Text] = []
+                for i in 0..len(args) {
+                    ns.push(names.get(i) ?? "")
+                }
+                node += ", \"names\": [" + texts(ns) + "]"
+            }
+            let more = self.inputs(args, key)
+            node += more
+        }
+        Binary(op, left, right) => {
+            node += ", \"op\": " + q(op.name())
+            let more = self.inputs([left, right], key)
+            node += more
+        }
+        Unary(op, operand) => {
+            node += ", \"op\": " + q(if op == Op.Not {
+                "not"
+            } else if op == Op.Tilde {
+                "~"
+            } else {
+                "neg"
+            })
+            let more = self.inputs([operand], key)
+            node += more
+        }
+        Range(low, high) => {
+            node += ", \"op\": \"..\""
+            if low < 0 or high < 0 {
+                // xs[2..], xs[..3]: the end that is left out
+                node += if low >= 0 { ", \"open\": \"end\"" } else { ", \"open\": \"start\"" }
+                let one = if low >= 0 {
+                    [low]
+                } else if high >= 0 {
+                    [high]
+                } else {
+                    []
+                }
+                let more = self.inputs(one, key)
+                node += more
+            } else {
+                let more = self.inputs([low, high], key)
+                node += more
+            }
+        }
+        Field(target, name) => {
+            node += ", \"field\": " + q(name)
+            let more = self.inputs([target], key)
+            node += more
+        }
+        Index(target, index) => {
+            let more = self.inputs([target, index], key)
+            node += more
+        }
+        ArrayLit(items) => {
+            let more = self.inputs(items, key)
+            node += more
+        }
+        Lambda(params, body) => {
+            node += ", \"params\": ["
+            for (i, k) in params.enumerate() {
+                let prm = self.p.ast.params[k]
+                let pid = self.nextId
+                self.nextId += 1
+                if prm.binding >= 0 {
+                    self.wire[prm.binding] = pid
+                }
+                node += (if i > 0 { ", " } else { "" }) + "\{\"id\": {pid}, \"name\": {q(prm.name)}"
+                if prm.ty >= 0 {
+                    node += ", \"type\": " + self.typeString(prm.ty)
+                }
+                node += "\}"
+            }
+            node += "]"
+            let more = self.inputs([body], key)
+            node += more
+        }
+        If(cond, then, otherwise) => {
+            let more = self.inputs([cond], key)
+            node += more + ", \"then\": "
+            let thenText = self.writeBlock(then, key + "/then")
+            node += thenText
+            if otherwise >= 0 {
+                if self.p.ast.exprs[otherwise].node is If(_, _, _) {
+                    let elseId = self.writeNode(otherwise, key + "/else")
+                    node += ", \"elseIf\": {elseId}"
+                } else if self.p.ast.exprs[otherwise].node is BlockExpr(b, _) {
+                    let elseText = self.writeBlock(b, key + "/else")
+                    node += ", \"else\": " + elseText
+                }
+            }
+        }
+        Match(subject, arms, chain) => {
+            let more = self.inputs([subject], key)
+            node += more
+            if chain {
+                node += ", \"chain\": true" // a?.rest
+            }
+            node += ", \"arms\": ["
+            var ordinal = 0
+            for (i, k) in arms.enumerate() {
+                let arm = self.p.ast.arms[k]
+                if arm.expanded {
+                    continue
+                }
+                node += if i > 0 { ", \{" } else { "\{" }
+                let armKey = "{key}/arm{ordinal}"
+                ordinal += 1
+                let pat = self.writePattern(arm)
+                node += pat
+                if arm.guard >= 0 {
+                    let g = self.writeInput(arm.guard, armKey + "/if")
+                    node += ", \"guard\": " + g
+                }
+                if arm.comment != "" {
+                    node += ", \"comment\": " + q(arm.comment)
+                }
+                if self.p.ast.exprs[arm.body].node is BlockExpr(b, jump) and not jump {
+                    let bt = self.writeBlock(b, armKey)
+                    node += ", \"block\": " + bt
+                } else {
+                    let v = self.writeInput(arm.body, armKey)
+                    node += ", \"value\": " + v
+                }
+                node += "\}"
+            }
+            node += "]"
+        }
+        BlockExpr(b, jump) => {
+            if jump {
+                node += ", \"jump\": true" // x ?? return 0: its one statement, where a value goes
+            }
+            let bt = self.writeBlock(b, key + "/block")
+            node += ", \"block\": " + bt
+        }
+        Is(value, pattern) => {
+            let more = self.inputs([value], key)
+            node += more + ", "
+            let pat = self.writePattern(self.p.ast.arms[pattern])
+            node += pat
+        }
+        _ => {}
+    }
+    self.startNode(
+        id,
+        kindOfNode(x.node),
+        key,
+        x.line,
+        contentHash(kindOfNode(x.node) + ":" + exprText(self.p.ast, at, 0)),
+    )
+    self.nodes += self.typeField(x.ty) + node + "\}"
+    id
+}
+
+fn Out.writeInput(var self, at: Int, key: Text) -> Text {
+    var e = self.visible(at)
+    if self.p.ast.exprs[e].node is Lambda(_, _) and self.p.ast.exprs[e].sugar >= 0 {
+        e = self.p.ast.exprs[e].sugar
+    }
+    let x = self.p.ast.exprs[e]
+    match x.node {
+        IntLit(_, raw) => "\{\"value\": {q(raw)}, \"of\": \"Int\"\}"
+        FloatLit(_, raw) => "\{\"value\": {q(raw)}, \"of\": \"Float\"\}"
+        TextLit(_, raw, _) => "\{\"value\": {q(raw)}, \"of\": \"Text\"\}"
+        BoolLit(value) => "\{\"value\": {q(if value { "true" } else { "false" })}, \"of\": \"Bool\"\}"
+        Case(name, target, dotted) => "\{\"case\": {q(self.caseText(x, name, target, dotted))}\}"
+        Name(name) => if x.binding >= 0 {
+            "\{\"node\": {self.wireOf(x.binding)}\}"
+        } else if x.decl >= 0 and self.p.ast.decls[x.decl].kind == DeclKind.Fn {
+            "\{\"fn\": {q(name)}\}" // a function given where a lambda goes
+        } else {
+            "\{\"name\": {q(name)}\}" // a constant, None
+        }
+        _ => {
+            let id = self.writeNode(e, key)
+            "\{\"node\": {id}\}"
+        }
+    }
+}
+
+// a case as written: ".Leaf", "Tree.Leaf", "Self.Leaf"
+fn Out.caseText(self, x: Expr, name: Text, target: Int, dotted: Bool) -> Text {
+    if dotted {
+        return "." + name
+    }
+    if target >= 0 and self.p.ast.exprs[target].node is Name(n) {
+        return n + "." + name
+    }
+    if x.decl >= 0 {
+        let d = self.p.ast.decls[x.decl]
+        return (if d.templateOf >= 0 {
+            self.p.ast.decls[d.templateOf].name
+        } else {
+            d.name
+        }) + "." + name
+    }
+    ""
+}
+
+// how many lets, vars and fors of the function name each name (what keys a named statement by its place too)
+fn Out.countExpr(var self, e: Int) {
+    if e < 0 {
+        return
+    }
+    let x = self.p.ast.exprs[e]
+    match x.node {
+        Call(_, _, args, _, _, _) => {
+            for a in args {
+                self.countExpr(a)
+            }
+        }
+        Field(target, _) => self.countExpr(target)
+        Index(target, index) => {
+            self.countExpr(target)
+            self.countExpr(index)
+        }
+        Unary(_, operand) => self.countExpr(operand)
+        Binary(_, left, right) => {
+            self.countExpr(left)
+            self.countExpr(right)
+        }
+        Range(low, high) => {
+            self.countExpr(low)
+            self.countExpr(high)
+        }
+        If(cond, then, otherwise) => {
+            self.countExpr(cond)
+            self.countExpr(otherwise)
+            self.countBlock(then)
+        }
+        Match(subject, arms, _) => {
+            self.countExpr(subject)
+            for k in arms {
+                if not self.p.ast.arms[k].expanded {
+                    self.countExpr(self.p.ast.arms[k].body)
+                }
+            }
+        }
+        Lambda(_, body) => self.countExpr(body)
+        ArrayLit(items) => {
+            for a in items {
+                self.countExpr(a)
+            }
+        }
+        BlockExpr(b, _) => self.countBlock(b)
+        Case(_, target, _) => self.countExpr(target)
+        With(target, values, _) => {
+            self.countExpr(target)
+            for a in values {
+                self.countExpr(a)
+            }
+        }
+        Interp(values, _, _, _, _) => {
+            for a in values {
+                self.countExpr(a)
+            }
+        }
+        Try(value) => self.countExpr(value)
+        MapLit(items) => {
+            for a in items {
+                self.countExpr(a)
+            }
+        }
+        Is(value, pattern) => {
+            self.countExpr(value)
+            self.countExpr(self.p.ast.arms[pattern].body)
+        }
+        _ => {}
+    }
+}
+
+fn Out.countName(var self, name: Text) {
+    let n = self.named[name] ?? 0
+    self.named[name] = n + 1
+}
+
+fn Out.countBlock(var self, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in self.p.ast.blocks[b].stmts {
+        match self.p.ast.stmts[s].node {
+            Let(_, name, _, value, pattern, otherwise) => {
+                if pattern < 0 and name != "" {
+                    self.countName(name)
+                }
+                self.countExpr(value)
+                self.countBlock(otherwise)
+            }
+            Assign(target, _, value) => {
+                self.countExpr(value)
+                self.countExpr(target)
+            }
+            ExprStmt(value) => self.countExpr(value)
+            For(name, pattern, iter, body) => {
+                if pattern < 0 and name != "" {
+                    self.countName(name)
+                }
+                self.countExpr(iter)
+                self.countBlock(body)
+            }
+            While(cond, body) => {
+                self.countExpr(cond)
+                self.countBlock(body)
+            }
+            Return(value) => self.countExpr(value)
+            Defer(body) => self.countBlock(body)
+            _ => {}
+        }
+    }
+}
+
+// a declaration's writing starts: its nodes, ids and named statements of its own
+fn Out.begin(var self, d: Decl) {
+    self.nodes = ""
+    self.nextId = 1
+    self.fnName = d.name
+    self.nodeCount = 0
+    self.named = [:]
+    if d.body >= 0 and self.p.ast.exprs[d.body].node is BlockExpr(b, _) {
+        self.countBlock(b)
+    }
+}
+
+// the name a let, var or for gives (not a pattern's), or ""
+fn stmtName(s: Stmt) -> Text = match s.node {
+    Let(_, name, _, _, pattern, _) => if pattern < 0 { name } else { "" }
+    For(name, pattern, _, _) => if pattern < 0 { name } else { "" }
+    _ => ""
+}
+
+// A named statement is keyed fn/name; when the function names two (a for i in each of two loops), each is keyed by
+// its place too (main/@3/i). Other statements by their place.
+fn Out.stmtKey(self, s: Int, prefix: Text, i: Int) -> Text {
+    let name = stmtName(self.p.ast.stmts[s])
+    if name != "" {
+        if (self.named[name] ?? 0) <= 1 {
+            return self.fnName + "/" + name
+        }
+        return "{prefix}/@{i}/{name}"
+    }
+    "{prefix}/@{i}"
+}
+
+fn Out.writeBlock(var self, b: Int, prefix: Text) -> Text {
+    let bl = self.p.ast.blocks[b]
+    var ids = ""
+    for (i, s) in bl.stmts.enumerate() {
+        let key = self.stmtKey(s, prefix, i)
+        let id = self.writeStmt(s, key)
+        ids += (if i > 0 { ", " } else { "" }) + "{id}"
+    }
+    var out = "\{\"stmts\": [" + ids + "]"
+    if bl.closingComment != "" {
+        out += ", \"closing\": " + q(bl.closingComment)
+    }
+    out + "\}"
+}
+
+fn Out.writeStmt(var self, at: Int, key: Text) -> Int {
+    let s = self.p.ast.stmts[at]
+    let id = self.nextId
+    self.nextId += 1
+    var node = ""
+    var kind = ""
+    match s.node {
+        ExprStmt(value) => {
+            // a "do" node holds the statement's place in the order; the expression is its input
+            kind = "do"
+            let more = self.inputs([value], key)
+            node += more
+        }
+        Let(mutable, name, ty, value, pattern, otherwise) => {
+            kind = if mutable { "var" } else { "let" }
+            if pattern >= 0 {
+                // let Some(x) = value else { ... }, var (a, b) = ...
+                let pat = self.writePattern(self.p.ast.arms[pattern])
+                node += ", " + pat
+                let more = self.inputs([value], key)
+                node += more
+                if otherwise >= 0 {
+                    let bt = self.writeBlock(otherwise, key + "/else")
+                    node += ", \"else\": " + bt
+                }
+            } else {
+                if s.binding >= 0 {
+                    self.wire[s.binding] = id
+                }
+                node += ", \"name\": " + q(name)
+                if ty >= 0 {
+                    node += ", \"annotation\": " + self.typeString(ty)
+                }
+                let more = self.inputs([value], key)
+                node += more
+            }
+        }
+        Assign(target, op, value) => {
+            kind = "set"
+            node += ", \"op\": " + q(op.name())
+            let more = self.inputs([target, value], key)
+            node += more
+        }
+        For(name, pattern, iter, body) => {
+            kind = "for"
+            if pattern >= 0 {
+                let pat = self.writePattern(self.p.ast.arms[pattern])
+                node += ", " + pat
+            } else {
+                if s.binding >= 0 {
+                    self.wire[s.binding] = id
+                }
+                node += ", \"name\": " + q(name)
+            }
+            let more = self.inputs([iter], key)
+            node += more
+            let bt = self.writeBlock(body, key)
+            node += ", \"body\": " + bt
+        }
+        Defer(body) => {
+            kind = "defer"
+            let bt = self.writeBlock(body, key)
+            node += ", \"body\": " + bt
+        }
+        While(cond, body) => {
+            kind = "while"
+            let more = self.inputs([cond], key)
+            node += more
+            let bt = self.writeBlock(body, key)
+            node += ", \"body\": " + bt
+        }
+        Return(value) => {
+            kind = "return"
+            if value >= 0 {
+                let more = self.inputs([value], key)
+                node += more
+            }
+        }
+        Break => {
+            kind = "break"
+        }
+        Continue => {
+            kind = "continue"
+        }
+    }
+    node += notes(s.leading, s.trailing, s.blankBefore)
+    self.startNode(id, kind, key, s.line, contentHash(kind + ":" + stmtText(self.p.ast, at)))
+    self.nodes += node + "\}"
+    id
+}
+
+fn Out.writeParams(var self, d: Decl) -> Text {
+    var out = ", \"params\": ["
+    for (k, at) in d.params.enumerate() {
+        let prm = self.p.ast.params[at]
+        let pid = self.nextId
+        self.nextId += 1
+        if prm.binding >= 0 {
+            self.wire[prm.binding] = pid
+        }
+        out += (if k > 0 { ", " } else { "" }) + "\{\"id\": {pid}, \"name\": {q(prm.name)}"
+        if prm.isVar {
+            out += ", \"var\": true" // fn Parser.next(var self)
+        }
+        if k > 0 or not d.impliedSelf {
+            out += ", \"type\": " + self.typeString(prm.ty) // fn Vec2.length(self): its type is the type's
+        }
+        out += ", \"key\": " + q(d.name + "/" + prm.name)
+        if prm.fallback >= 0 {
+            // its default: a value, or nodes of its own
+            let v = self.writeInput(prm.fallback, d.name + "/" + prm.name + "=")
+            out += ", \"default\": " + v
+        }
+        out += "\}"
+    }
+    out += "]"
+    if d.ret >= 0 {
+        out += ", \"returns\": " + self.typeString(d.ret)
+    }
+    if d.isEffect and not d.isTest {
+        out += ", \"effect\": true"
+    }
+    if d.effectDeclared {
+        out += ", \"effectDeclared\": true"
+    }
+    if d.externSymbol != "" {
+        out += ", \"externSymbol\": " + q(d.externSymbol)
+    }
+    if d.externLib != "" {
+        out += ", \"library\": " + q(d.externLib)
+    }
+    if d.variadic {
+        out += ", \"variadic\": true"
+    }
+    if len(d.typeParams) > 0 and not d.impliedTypes {
+        out += ", \"typeParams\": ["
+        for (k, tp) in d.typeParams.enumerate() {
+            if k > 0 {
+                out += ", "
+            }
+            let bound = d.typeBounds.get(k) ?? ""
+            out += q(if bound != "" {
+                tp + ": " + bound // "T: Speaker"
+            } else {
+                tp
+            })
+        }
+        out += "]"
+    }
+    out
+}
+
+fn declKindText(d: Decl) -> Text = match d.kind {
+    Fn => if d.isExtern {
+        "extern fn"
+    } else if d.isTest {
+        "test"
+    } else {
+        "fn"
+    }
+    Type => if d.isExtern {
+        "extern type"
+    } else if d.isInterface {
+        "interface"
+    } else {
+        "type"
+    }
+    Const => "const"
+    Use => "use"
+    Enum => "enum"
+}
+
+fn Out.declJson(var self, d: Decl) -> Text {
+    var out = "\{\"kind\": " + q(declKindText(d)) + ", \"name\": " + q(d.name)
+    if d.isPub {
+        out += ", \"pub\": true"
+    }
+    if (d.kind == DeclKind.Type or d.kind == DeclKind.Enum) and len(d.typeParams) > 0 {
+        out += ", \"typeParams\": [" + texts(d.typeParams) + "]" // type Pair<A, B>
+    }
+    out += notes(d.leading, d.trailing, false)
+    if len(d.memberLeading) > 0 or len(d.memberTrailing) > 0 {
+        // each field's (case's) comments: [above it, after it or null]
+        var cs: [Text] = []
+        for i in 0..max(len(d.memberLeading), len(d.memberTrailing)) {
+            let after = if i < len(d.memberTrailing) { d.memberTrailing[i] } else { None }
+            cs.push("[" + q(d.memberLeading.get(i) ?? "") + ", " + (if after is Some(t) { q(t) } else { "null" }) + "]")
+        }
+        out += ", \"memberComments\": [" + cs.join(", ") + "]"
+    }
+    self.begin(d)
+    match d.kind {
+        Use => {
+            // another file: its declarations are its own graph's
+            if d.alias != "" {
+                out += ", \"alias\": " + q(d.alias)
+            }
+            return out + "\}"
+        }
+        Enum => {
+            out += ", \"cases\": ["
+            for (k, c) in d.cases.enumerate() {
+                if k > 0 {
+                    out += ", "
+                }
+                let fields = d.caseFields.get(k) ?? []
+                if len(fields) == 0 {
+                    out += q(c)
+                    continue
+                }
+                out += "\{\"name\": " + q(c) + ", \"fields\": [" // a case with data: its fields
+                for (f, prm) in fields.enumerate() {
+                    out += (if f > 0 { ", " } else { "" })
+                        + "\{\"name\": "
+                        + q(self.p.ast.params[prm].name)
+                        + ", \"type\": "
+                        + self.typeString(self.p.ast.params[prm].ty)
+                        + "\}"
+                }
+                out += "]\}"
+            }
+            return out + "]\}"
+        }
+        Const => {
+            // a constant: its value's nodes
+            if d.ret >= 0 {
+                out += ", \"annotation\": " + self.typeString(d.ret)
+            }
+            let v = self.writeInput(d.body, d.name + "/=")
+            return out + ", \"result\": " + v + ",\n   \"nodes\": [\n" + self.nodes + "]\}"
+        }
+        Type => {
+            if d.opaque {
+                out += ", \"opaque\": true"
+            }
+            if d.isInterface {
+                // its functions, as they are written
+                out += ", \"interface\": true, \"functions\": ["
+                for (k, prm) in d.params.enumerate() {
+                    if k > 0 {
+                        out += ", "
+                    }
+                    out += q(memberText(self.p.ast, self.p.ast.params[prm]))
+                }
+                out += "]"
+            } else if not d.isExtern or d.cStruct {
+                out += ", \"fields\": ["
+                for (k, at) in d.params.enumerate() {
+                    let prm = self.p.ast.params[at]
+                    out += (if k > 0 { ", " } else { "" })
+                        + "\{\"name\": "
+                        + q(prm.name)
+                        + ", \"type\": "
+                        + self.typeString(prm.ty)
+                    if prm.fallback >= 0 {
+                        let v = self.writeInput(prm.fallback, d.name + "/" + prm.name + "=")
+                        out += ", \"default\": " + v
+                    }
+                    out += "\}"
+                }
+                out += "]"
+                if self.nodes != "" {
+                    out += ",\n   \"nodes\": [\n" + self.nodes + "]"
+                }
+            }
+            return out + "\}"
+        }
+        Fn => {}
+    }
+    let params = self.writeParams(d)
+    out += params
+    if d.isExtern and d.body < 0 {
+        if self.nodeCount > 0 {
+            // defaults with nodes
+            out += ",\n   \"nodes\": [\n" + self.nodes + "]"
+        }
+        return out + "\}"
+    }
+    if self.p.ast.exprs[d.body].node is BlockExpr(b, _) {
+        let bt = self.writeBlock(b, d.name)
+        out += ", \"form\": \"block\", \"body\": " + bt
+    } else {
+        let v = self.writeInput(d.body, d.name + "/=")
+        out += ", \"form\": \"expr\", \"result\": " + v
+    }
+    out + ",\n   \"nodes\": [\n" + self.nodes + "]\}"
+}
+
+// A checked program's graph; layout: {"key": [x, y]} or {"key": {"pos": [x, y], "uid": "..."}} ("" none).
+pub fn graphOf(p: Program, layoutText: Text) -> Text {
+    var layout = Json()
+    var root = -1
+    if layoutText != "" {
+        root = layout.parse(layoutText)
+        if layout.kind(root) != JKind.Obj {
+            root = -1
+        }
+    }
+    var byHash: [Text: Int] = [:]
+    if root >= 0 {
+        for v in layout.nodes[root].items {
+            if layout.kind(v) == JKind.Obj and layout.str(v, "hash") is Some(h) and h != "" {
+                byHash[h] = if byHash.contains(h) { -1 } else { v }
+            }
+        }
+    }
+    var o = Out(p, [0] * len(p.bindings), layout, layoutRoot: root, byHash: byHash)
+    var out = "\{\"quark\": 1, \"decls\": [\n"
+    var written = 0
+    for at in p.decls {
+        let d = p.ast.decls[at]
+        if d.fromPrelude or d.templateOf >= 0 or d.module != 0 or d.lifted {
+            continue // the host's: in the catalog; another file's: in its own graph
+        }
+        out += if written > 0 { ",\n  " } else { "  " }
+        written += 1
+        let text = o.declJson(d)
+        out += text
+    }
+    out += "]"
+    if p.ast.closingComment != "" {
+        out += ",\n \"closing\": " + q(p.ast.closingComment)
+    }
+    out + "\}\n"
+}
+
+// ---- a graph back into a syntax tree -----------------------------------------------------------------------------
+// The reader: the graph's JSON, the tree being built, the errors; per declaration its nodes by id, the name a
+// binding node carries, the nodes being built (one met again is wired into itself).
+type In {
+    j: Json
+    ast: Ast = Ast()
+    src: Source
+    errors: Errors = Errors()
+    byId: [Int] = []
+    names: [Text?] = []
+    building: [Bool] = []
+    maxId: Int = 0
+    failed: Bool = false
+}
+
+fn In.fail(var self, what: Text, id: Int) {
+    if not self.failed {
+        self.errors.add(self.src, 0, 0, "the graph is not valid: {what} (node {id})")
+    }
+    self.failed = true
+}
+
+fn In.zero(var self) -> Int = self.ast.expr(.IntLit(0, ""), 0, 0)
+
+fn In.typeOf(var self, text: Text) -> Int = self.ast.parseTypeOnto(text)
+
+fn intValue(raw: Text) -> Int {
+    var digits = raw.replace("_", "")
+    let negative = digits.startsWith("-")
+    if negative {
+        digits = digits[1..]
+    }
+    var base = 10
+    if digits.startsWith("0x") {
+        base = 16
+    } else if digits.startsWith("0b") {
+        base = 2
+    } else if digits.startsWith("0o") {
+        base = 8
+    }
+    if base != 10 {
+        digits = digits[2..]
+    }
+    var v = 0
+    for c in digits.bytes() {
+        let d = match c {
+            '0'..='9' => c - '0'
+            'a'..='f' => c - 'a' + 10
+            'A'..='F' => c - 'A' + 10
+            _ => 99
+        }
+        if d >= base {
+            break
+        }
+        v = v *% base +% d
+    }
+    if negative { 0 -% v } else { v }
+}
+
+// a literal from its text as written ("12", "\"hi\"", "true") and its type's name
+fn In.literal(var self, raw: Text, of: Text) -> Int {
+    if of == "Bool" {
+        return self.ast.expr(.BoolLit(raw == "true"), 0, 0)
+    }
+    if of == "Text" {
+        let plain = raw.startsWith("r") // r"...": no escapes
+        let text = if plain { raw[1..] } else { raw }
+        let n = len(text)
+        var s = 1
+        var end = if n > 1 { n - 1 } else { n }
+        var multiline = false
+        if n >= 8 and text.startsWith("\"\"\"\n") and text.endsWith("\n\"\"\"") {
+            multiline = true // three quotes: lines
+            s = 4
+            end = n - 4
+        }
+        let decoded = if s > end {
+            ""
+        } else if plain {
+            text[s..end]
+        } else {
+            decodeEscapes(text, s, end) ?? "" // a bad escape: the checker of the text it becomes says so
+        }
+        return self.ast.expr(.TextLit(decoded, raw, multiline), 0, 0)
+    }
+    if of == "Float" {
+        return self.ast.expr(.FloatLit(raw.replace("_", "").parseFloat() ?? 0.0, raw), 0, 0)
+    }
+    if raw.startsWith("'") {
+        return self.ast.expr(.IntLit(charLiteral(raw) ?? 0, raw), 0, 0) // 'a': its code point
+    }
+    self.ast.expr(.IntLit(intValue(raw), raw), 0, 0)
+}
+
+fn In.name(var self, name: Text) -> Int = self.ast.expr(.Name(name), 0, 0)
+
+fn In.input(var self, input: Int) -> Int {
+    let j = self.j
+    if j.kind(input) != JKind.Obj {
+        self.fail("an input that is not an object", 0)
+        return self.zero()
+    }
+    if j.str(input, "value") is Some(raw) {
+        return self.literal(raw, j.str(input, "of") ?? "Int")
+    }
+    if j.str(input, "case") is Some(cs) {
+        if cs.startsWith(".") {
+            return self.ast.expr(.Case(cs[1..], -1, true), 0, 0) // .Leaf: the enum it goes into
+        }
+        let dot = lastDot(cs)
+        let typeName = if dot >= 0 { cs[..dot] } else { cs }
+        let target = self.name(typeName)
+        return self.ast.expr(.Field(target, if dot >= 0 { cs[dot + 1..] } else { "" }), 0, 0)
+    }
+    if j.str(input, "fn") is Some(f) {
+        return self.name(f)
+    }
+    if j.str(input, "name") is Some(f) {
+        return self.name(f) // a constant, None
+    }
+    let id = j.int(input, "node", -1)
+    if id < 0 or id > self.maxId {
+        self.fail("a wire from a node that does not exist", id)
+        return self.zero()
+    }
+    if self.names[id] is Some(n) {
+        return self.name(n) // a named node: the wire is its name
+    }
+    let target = self.byId[id]
+    let kind = j.str(target, "kind") ?? ""
+    if kind is "let" | "var" | "for" and j.str(target, "name") is Some(n) {
+        if self.building[id] {
+            self.fail("a node wired into itself (its value uses it)", id)
+            return self.zero()
+        }
+        // a wire from a let further on (a merge can make one): its name, which the checker finds is not known there yet
+        return self.name(n)
+    }
+    self.node(id)
+}
+
+fn lastDot(t: Text) -> Int {
+    let b = t.bytes()
+    var i = len(b) - 1
+    while i >= 0 and b[i] != '.' {
+        i -= 1
+    }
+    i
+}
+
+fn In.inputsOf(var self, node: Int) -> [Int] {
+    let list = self.j.get(node, "inputs")
+    var out: [Int] = []
+    if self.j.kind(list) == JKind.Arr {
+        for item in self.j.nodes[list].items {
+            let e = self.input(item)
+            out.push(e)
+        }
+    }
+    out
+}
+
+fn startsWithByte(t: Text, lo: Int, hi: Int) -> Bool {
+    let b = t.bytes()
+    len(b) > 0 and b[0] >= lo and b[0] <= hi
+}
+
+// "pattern" and "binds" (see writePattern) back into an arm
+fn In.pattern(var self, a: Int, given: Arm) -> Arm {
+    var arm = given
+    let j = self.j
+    let pat = j.str(a, "pattern")
+    if pat == Some("(,)") {
+        arm.pattern = "(,)"
+    } else if pat is Some(p) and p != "_" {
+        let dots = p.indexOf("..") ?? -1
+        if p.startsWith("\"") or p.startsWith("r\"") {
+            arm.textPattern = self.literal(p, "Text")
+        } else if dots >= 0 {
+            // 80..90, 90.., ..60, 'a'..='z'
+            arm.isRange = true
+            let inclusive = p[dots + 2..] != "" and p[dots + 2..].startsWith("=")
+            if dots > 0 {
+                arm.intPattern = self.literal(p[..dots], "Int")
+            }
+            let high = p[dots + 2 + (if inclusive { 1 } else { 0 })..]
+            if high != "" {
+                arm.intHigh = self.literal(high, "Int")
+            }
+            if inclusive and arm.intHigh >= 0 {
+                arm.inclusive = true
+                if self.ast.exprs[arm.intHigh].node is IntLit(v, raw) {
+                    self.ast.exprs[arm.intHigh].node = .IntLit(v + 1, raw)
+                }
+            }
+        } else if p == "true" or p == "false" {
+            arm.intPattern = self.literal(p, "Bool")
+        } else if p.startsWith("-") or p.startsWith("'") or startsWithByte(p, '0', '9') {
+            arm.intPattern = self.literal(p, "Int")
+        } else if startsWithByte(p, 'a', 'z') {
+            arm.whole = p // the whole value, named
+            let bid = j.int(a, "wholeId", -1)
+            if bid >= 0 and bid <= self.maxId {
+                self.names[bid] = p
+            }
+        } else {
+            arm.pattern = p
+        }
+    }
+    let binds = j.get(a, "binds")
+    if j.count(binds) > 0 {
+        // Circle(r): r names a node the arm's wires come from
+        var names: [Text] = []
+        var subs: [Int] = []
+        var anySub = false
+        for item in j.nodes[binds].items {
+            if j.has(item, "pattern") {
+                // a pattern inside
+                let inner = self.pattern(item, Arm())
+                let sub = self.ast.arm(inner)
+                subs.push(sub)
+                anySub = true
+                names.push("_")
+                continue
+            }
+            let name = j.str(item, "name") ?? "_"
+            names.push(name)
+            subs.push(-1)
+            let bid = j.int(item, "id", -1)
+            if bid >= 0 and bid <= self.maxId {
+                self.names[bid] = name
+            }
+        }
+        arm.binds = names
+        arm.subs = if anySub { subs } else { [] }
+    }
+    let alternatives = j.get(a, "alternatives")
+    if j.kind(alternatives) == JKind.Arr {
+        for item in j.nodes[alternatives].items {
+            let alt = self.pattern(item, Arm())
+            let at = self.ast.arm(alt)
+            arm.alternatives.push(at)
+        }
+    }
+    arm
+}
+
+fn In.node(var self, id: Int) -> Int {
+    if id >= 0 and id <= self.maxId {
+        if self.building[id] {
+            self.fail("a node wired into itself (its value uses it)", id)
+            return self.zero()
+        }
+        self.building[id] = true
+        let e = self.nodeInner(id)
+        self.building[id] = false
+        return e
+    }
+    self.nodeInner(id)
+}
+
+fn In.first(var self, args: [Int]) -> Int = if len(args) > 0 { args[0] } else { self.zero() }
+
+fn In.second(var self, args: [Int]) -> Int = if len(args) > 1 { args[1] } else { self.zero() }
+
+fn binaryOp(name: Text) -> Op? = match name {
+    "+" => Some(Op.Plus)
+    "-" => Some(Op.Minus)
+    "*" => Some(Op.Star)
+    "/" => Some(Op.Slash)
+    "%" => Some(Op.Percent)
+    "&" => Some(Op.Amp)
+    "|" => Some(Op.Pipe)
+    "^" => Some(Op.Caret)
+    "==" => Some(Op.Eq)
+    "!=" => Some(Op.Ne)
+    "<" => Some(Op.Lt)
+    "<=" => Some(Op.Le)
+    ">" => Some(Op.Gt)
+    ">=" => Some(Op.Ge)
+    "??" => Some(Op.Coalesce)
+    "<<" => Some(Op.Shl)
+    ">>" => Some(Op.Shr)
+    "and" => Some(Op.And)
+    "or" => Some(Op.Or)
+    "+%" => Some(Op.PlusWrap)
+    "-%" => Some(Op.MinusWrap)
+    "*%" => Some(Op.StarWrap)
+    _ => None
+}
+
+fn assignOp(name: Text) -> Op = match name {
+    "+=" => Op.PlusEq
+    "-=" => Op.MinusEq
+    "*=" => Op.StarEq
+    "/=" => Op.SlashEq
+    "%=" => Op.PercentEq
+    "&=" => Op.AmpEq
+    "|=" => Op.PipeEq
+    "^=" => Op.CaretEq
+    "<<=" => Op.ShlEq
+    ">>=" => Op.ShrEq
+    "+%=" => Op.PlusWrapEq
+    "-%=" => Op.MinusWrapEq
+    "*%=" => Op.StarWrapEq
+    _ => Op.Assign
+}
+
+fn In.textList(self, node: Int, key: Text) -> [Text]? {
+    let list = self.j.get(node, key)
+    if self.j.kind(list) != JKind.Arr {
+        return None
+    }
+    var out: [Text] = []
+    for item in self.j.nodes[list].items {
+        out.push(if self.j.kind(item) == JKind.Str {
+            self.j.nodes[item].str
+        } else {
+            ""
+        })
+    }
+    Some(out)
+}
+
+fn In.nodeInner(var self, id: Int) -> Int {
+    let node = if id >= 0 and id <= self.maxId { self.byId[id] } else { -1 }
+    if node < 0 {
+        self.fail("a missing node", id)
+        return self.zero()
+    }
+    let j = self.j
+    let kind = j.str(node, "kind") ?? ""
+    if kind == "lambda" {
+        // the parameters are named before the body is read
+        let ps = j.get(node, "params")
+        var params: [Int] = []
+        for k in 0..j.count(ps) {
+            let pj = j.item(ps, k)
+            let name = j.str(pj, "name") ?? ""
+            let ty = if j.str(pj, "type") is Some(t) { self.typeOf(t) } else { -1 }
+            let at = self.ast.param(Param(name, ty, 0, 0))
+            params.push(at)
+            let pid = j.int(pj, "id", -1)
+            if pid >= 0 and pid <= self.maxId {
+                self.names[pid] = name
+            }
+        }
+        let list = j.get(node, "inputs")
+        let body = self.input(if j.count(list) > 0 { j.item(list, 0) } else { -1 })
+        return self.ast.expr(.Lambda(params, body), 0, 0)
+    }
+    let args = self.inputsOf(node)
+    let n = len(args)
+    match kind {
+        "call" => {
+            let name = j.str(node, "fn")
+            var names = [""] * n
+            if self.textList(node, "names") is Some(given) {
+                for i in 0..min(n, len(given)) {
+                    names[i] = given[i]
+                }
+            }
+            if name == None {
+                self.fail("a call without a function", id)
+            }
+            return self.ast.expr(
+                .Call(
+                    name ?? "",
+                    j.str(node, "qualifier") ?? "",
+                    args,
+                    names,
+                    j.isTrue(node, "method"),
+                    j.isTrue(node, "dotted"),
+                ),
+                0,
+                0,
+            )
+        }
+        "with" => {
+            // inputs: the base, then the new values, named
+            let base = self.first(args)
+            let values = if n > 0 { args[1..] } else { [] }
+            var fields: [Text] = []
+            let list = j.get(node, "names")
+            for i in 0..len(values) {
+                let item = if i < j.count(list) { j.item(list, i) } else { -1 }
+                fields.push(if j.kind(item) == JKind.Str { j.nodes[item].str } else { "x" })
+            }
+            return self.ast.expr(.With(base, values, fields), 0, 0)
+        }
+        "text" => {
+            // "lap {n}": the pieces as written, a value between each two
+            let given = self.textList(node, "parts") ?? []
+            var raws: [Text] = []
+            var parts: [Text] = []
+            for i in 0..n + 1 {
+                let raw = given.get(i) ?? ""
+                raws.push(raw)
+                parts.push(decodeEscapes(raw, 0, len(raw)) ?? "")
+            }
+            var formats: [Text] = []
+            if self.textList(node, "formats") is Some(fs) {
+                for i in 0..n {
+                    formats.push(fs.get(i) ?? "")
+                }
+            }
+            return self.ast.expr(.Interp(args, parts, raws, formats, j.isTrue(node, "multiline")), 0, 0)
+        }
+        "try" => {
+            let v = self.first(args)
+            return self.ast.expr(.Try(v), 0, 0)
+        }
+        "map" => return self.ast.expr(.MapLit(args), 0, 0)
+        "op" => {
+            let op = j.str(node, "op") ?? "+"
+            if j.str(node, "open") is Some(open) and op == ".." {
+                // a range without its start or its end
+                let v = self.first(args)
+                return self.ast.expr(if open == "end" { .Range(v, -1) } else { .Range(-1, v) }, 0, 0)
+            }
+            if op is "neg" | "not" | "~" {
+                let v = self.first(args)
+                let u = if op == "neg" {
+                    Op.Minus
+                } else if op == "~" {
+                    Op.Tilde
+                } else {
+                    Op.Not
+                }
+                return self.ast.expr(.Unary(u, v), 0, 0)
+            }
+            let a = self.first(args)
+            let b = self.second(args)
+            if op == ".." {
+                return self.ast.expr(.Range(a, b), 0, 0)
+            }
+            let Some(o) = binaryOp(op) else {
+                self.fail("an unknown operator", id)
+                return self.ast.expr(.Binary(Op.Plus, a, b), 0, 0)
+            }
+            return self.ast.expr(.Binary(o, a, b), 0, 0)
+        }
+        "field" => {
+            let v = self.first(args)
+            return self.ast.expr(.Field(v, j.str(node, "field") ?? ""), 0, 0)
+        }
+        "index" => {
+            let a = self.first(args)
+            let b = self.second(args)
+            return self.ast.expr(.Index(a, b), 0, 0)
+        }
+        "array" => return self.ast.expr(.ArrayLit(args), 0, 0)
+        "if" => {
+            let cond = self.first(args)
+            let then = self.block(j.get(node, "then"))
+            let elseIf = j.int(node, "elseIf", -1)
+            var otherwise = -1
+            if elseIf >= 0 {
+                otherwise = self.node(elseIf)
+            } else if j.has(node, "else") {
+                let b = self.block(j.get(node, "else"))
+                otherwise = self.ast.expr(.BlockExpr(b, false), 0, 0)
+            }
+            return self.ast.expr(.If(cond, then, otherwise), 0, 0)
+        }
+        "match" => {
+            let subject = self.first(args)
+            let arms = j.get(node, "arms")
+            var list: [Int] = []
+            for k in 0..j.count(arms) {
+                let a = j.item(arms, k)
+                var arm = self.pattern(a, Arm())
+                arm.comment = j.str(a, "comment") ?? ""
+                if j.has(a, "guard") {
+                    let g = self.input(j.get(a, "guard"))
+                    arm.guard = g
+                }
+                if j.has(a, "block") {
+                    let b = self.block(j.get(a, "block"))
+                    arm.body = self.ast.expr(.BlockExpr(b, false), 0, 0)
+                } else {
+                    let v = self.input(j.get(a, "value"))
+                    arm.body = v
+                }
+                let at = self.ast.arm(arm)
+                list.push(at)
+            }
+            return self.ast.expr(.Match(subject, list, j.isTrue(node, "chain")), 0, 0)
+        }
+        "block" => {
+            let b = self.block(j.get(node, "block"))
+            var jump = j.isTrue(node, "jump")
+            if jump {
+                let stmts = self.ast.blocks[b].stmts
+                if len(stmts) != 1 or not self.ast.stmts[stmts[0]].node is Return(_) | Break | Continue {
+                    self.fail("a jump holds one return, break or continue", id)
+                    jump = false
+                }
+            }
+            return self.ast.expr(.BlockExpr(b, jump), 0, 0)
+        }
+        "hole" => return self.ast.expr(.Hole, 0, 0)
+        // _: a value not written yet (an empty pin)
+        "is" => {
+            // value is Pattern
+            let v = self.first(args)
+            let arm = self.pattern(node, Arm())
+            let at = self.ast.arm(arm)
+            return self.ast.expr(.Is(v, at), 0, 0)
+        }
+        _ => {}
+    }
+    self.fail("an unknown kind of node", id)
+    self.zero()
+}
+
+fn In.block(var self, b: Int) -> Int {
+    let j = self.j
+    let stmts = j.get(b, "stmts")
+    var list: [Int] = []
+    for k in 0..j.count(stmts) {
+        let item = j.item(stmts, k)
+        let s = self.stmt(if j.kind(item) == JKind.Num {
+            truncate(j.nodes[item].num)
+        } else {
+            0
+        })
+        list.push(s)
+    }
+    self.ast.block(Block(list, j.str(b, "closing") ?? ""))
+}
+
+fn In.stmt(var self, id: Int) -> Int {
+    let j = self.j
+    let node = if id >= 0 and id <= self.maxId { self.byId[id] } else { -1 }
+    if node < 0 {
+        self.fail("a missing statement", id)
+        return self.ast.stmt(Stmt(.Break, 0, 0))
+    }
+    let kind = j.str(node, "kind") ?? ""
+    let list = j.get(node, "inputs")
+    let first = if j.kind(list) == JKind.Arr and j.count(list) > 0 {
+        j.item(list, 0)
+    } else {
+        -1
+    }
+    var made: StmtNode = .Break
+    if kind is "let" | "var" and j.str(node, "pattern") != None {
+        // let Some(x) = value else { ... }
+        let arm = self.pattern(node, Arm())
+        let pattern = self.ast.arm(arm)
+        let value = self.input(first)
+        let otherwise = if j.has(node, "else") { self.block(j.get(node, "else")) } else { -1 }
+        made = .Let(kind == "var", "", -1, value, pattern, otherwise)
+    } else if kind is "let" | "var" {
+        let name = j.str(node, "name") ?? ""
+        let ty = if j.str(node, "annotation") is Some(t) { self.typeOf(t) } else { -1 }
+        self.building[id] = true
+        let value = self.input(first)
+        self.building[id] = false
+        self.names[id] = name // from here on, wires from it are its name
+        made = .Let(kind == "var", name, ty, value, -1, -1)
+    } else if kind == "set" {
+        let op = assignOp(j.str(node, "op") ?? "=")
+        let target = self.input(first)
+        let value = self.input(if j.count(list) > 1 { j.item(list, 1) } else { -1 })
+        made = .Assign(target, op, value)
+    } else if kind == "for" {
+        var name = ""
+        var pattern = -1
+        if j.str(node, "pattern") != None {
+            let arm = self.pattern(node, Arm())
+            pattern = self.ast.arm(arm)
+        } else {
+            name = j.str(node, "name") ?? ""
+            self.names[id] = name
+            if j.has(node, "index") {
+                self.fail("a for with an index: its names are a tuple pattern, (i, x) over xs.enumerate()", id)
+            }
+        }
+        let iter = self.input(first)
+        let body = self.block(j.get(node, "body"))
+        made = .For(name, pattern, iter, body)
+    } else if kind == "defer" {
+        let body = self.block(j.get(node, "body"))
+        made = .Defer(body)
+    } else if kind == "while" {
+        let cond = self.input(first)
+        let body = self.block(j.get(node, "body"))
+        made = .While(cond, body)
+    } else if kind == "return" {
+        let value = if first >= 0 { self.input(first) } else { -1 }
+        made = .Return(value)
+    } else if kind == "break" {
+        made = .Break
+    } else if kind == "continue" {
+        made = .Continue
+    } else if kind == "do" {
+        let value = self.input(first)
+        made = .ExprStmt(value)
+    } else {
+        self.fail("an unknown kind of statement", id)
+    }
+    self.ast.stmt(
+        Stmt(
+            made,
+            0,
+            0,
+            leading: j.str(node, "comment") ?? "",
+            trailing: j.str(node, "trailing"),
+            blankBefore: j.isTrue(node, "blank"),
+        ),
+    )
+}
+
+// the highest id among a pattern's binds, the patterns inside them too
+fn maxBindId(j: Json, binds: Int) -> Int {
+    var m = 0
+    for f in 0..j.count(binds) {
+        let item = j.item(binds, f)
+        m = max(m, j.int(item, "id", 0))
+        m = max(m, maxBindId(j, j.get(item, "binds")))
+    }
+    m
+}
+
+fn maxIdOf(j: Json, dj: Int) -> Int {
+    var m = 0
+    let params = j.get(dj, "params")
+    for k in 0..j.count(params) {
+        m = max(m, j.int(j.item(params, k), "id", 0))
+    }
+    let nodes = j.get(dj, "nodes")
+    for k in 0..j.count(nodes) {
+        let nd = j.item(nodes, k)
+        m = max(m, j.int(nd, "id", 0))
+        let ix = j.get(nd, "index")
+        if ix >= 0 {
+            m = max(m, j.int(ix, "id", 0))
+        }
+        let own = max(maxBindId(j, j.get(nd, "binds")), j.int(nd, "wholeId", 0)) // let Some(x) = ... else; v is n
+        m = max(m, own)
+        let ps = j.get(nd, "params")
+        for k2 in 0..j.count(ps) {
+            m = max(m, j.int(j.item(ps, k2), "id", 0))
+        }
+        let arms = j.get(nd, "arms")
+        for k2 in 0..j.count(arms) {
+            let arm = j.item(arms, k2)
+            m = max(m, max(maxBindId(j, j.get(arm, "binds")), j.int(arm, "wholeId", 0)))
+        }
+    }
+    m
+}
+
+// a declaration's nodes, by id
+fn In.startDecl(var self, dj: Int) {
+    let j = self.j
+    self.maxId = maxIdOf(j, dj)
+    self.byId = [-1] * (self.maxId + 1)
+    let none: Text? = None
+    self.names = [none] * (self.maxId + 1)
+    self.building = [false] * (self.maxId + 1)
+    self.failed = false
+    let nodes = j.get(dj, "nodes")
+    for k in 0..j.count(nodes) {
+        let nd = j.item(nodes, k)
+        let nid = j.int(nd, "id", -1)
+        if nid >= 0 and nid <= self.maxId {
+            self.byId[nid] = nd
+        }
+    }
+}
+
+// an interface's function from its text (fn speak(loud: Bool) -> Text)
+fn In.member(var self, text: Text) -> Param? {
+    let before = len(self.ast.decls)
+    let parsed = parseInto(self.ast, Source("type", "interface I \{\n    " + text + "\n\}\n"))
+    if not parsed.ok or len(parsed.ast.decls) <= before or len(parsed.ast.decls[before].params) == 0 {
+        return None
+    }
+    var tree = parsed.ast
+    let at = tree.decls[before].params[0]
+    tree.decls = tree.decls[..before]
+    self.ast = tree
+    Some(self.ast.params[at])
+}
+
+// A graph: its program's syntax tree, and the errors (said with path); ok when it is a whole one.
+pub type Imported { ast: Ast, errors: [Text], ok: Bool }
+
+pub fn graphToAst(json: Text, path: Text) -> Imported {
+    var j = Json()
+    let root = j.parse(json)
+    var r = In(j, src: Source(path, json))
+    let decls = j.get(root, "decls")
+    if root < 0 or j.kind(decls) != JKind.Arr {
+        r.errors.add(r.src, 0, 0, "this is not a Quark graph (JSON with \"decls\")")
+        return Imported(r.ast, r.errors.shown, false)
+    }
+    let version = j.get(root, "quark")
+    if version >= 0 and (j.kind(version) != JKind.Num or j.nodes[version].num != 1.0) {
+        r.errors.add(r.src, 0, 0, "unsupported Quark graph version (expected 1)")
+        return Imported(r.ast, r.errors.shown, false)
+    }
+    var ok = true
+    for i in 0..j.count(decls) {
+        let dj = j.item(decls, i)
+        let kind = j.str(dj, "kind")
+        let name = j.str(dj, "name")
+        if kind == None or name == None {
+            r.errors.add(r.src, 0, 0, "declaration {i + 1} has no kind or name")
+            return Imported(r.ast, r.errors.shown, false)
+        }
+        let k = kind ?? ""
+        var d = Decl(
+            kind: DeclKind.Fn,
+            name: name ?? "",
+            line: 0,
+            col: 0,
+            leading: j.str(dj, "comment") ?? "",
+            trailing: j.str(dj, "trailing"),
+            index: i,
+        )
+        d.isPub = j.isTrue(dj, "pub")
+        let tps = j.get(dj, "typeParams")
+        if j.kind(tps) == JKind.Arr and j.count(tps) > 0 {
+            var bounds: [Text] = []
+            var anyBound = false
+            for t in 0..j.count(tps) {
+                let item = j.item(tps, t)
+                let tp = if j.kind(item) == JKind.Str { j.nodes[item].str } else { "T" }
+                if tp.indexOf(": ") is Some(colon) {
+                    d.typeParams.push(tp[..colon]) // T: Speaker
+                    bounds.push(tp[colon + 2..])
+                    anyBound = true
+                } else {
+                    d.typeParams.push(tp)
+                    bounds.push("")
+                }
+            }
+            if anyBound {
+                d.typeBounds = bounds
+            }
+        }
+        let mc = j.get(dj, "memberComments")
+        for c in 0..j.count(mc) {
+            let pair = j.item(mc, c)
+            let above = if j.count(pair) > 0 { j.item(pair, 0) } else { -1 }
+            let after = if j.count(pair) > 1 { j.item(pair, 1) } else { -1 }
+            d.memberLeading.push(if j.kind(above) == JKind.Str { j.nodes[above].str } else { "" })
+            d.memberTrailing.push(if j.kind(after) == JKind.Str {
+                Some(j.nodes[after].str)
+            } else {
+                None
+            })
+        }
+        if k == "use" {
+            d.kind = DeclKind.Use
+            d.alias = j.str(dj, "alias") ?? ""
+        } else if k == "enum" {
+            d.kind = DeclKind.Enum
+            let cases = j.get(dj, "cases")
+            for c in 0..min(j.count(cases), 64) {
+                let cj = j.item(cases, c)
+                if j.kind(cj) == JKind.Str {
+                    d.cases.push(j.nodes[cj].str)
+                    d.caseFields.push([])
+                    continue
+                }
+                d.cases.push(j.str(cj, "name") ?? "Case") // a case with data
+                let fields = j.get(cj, "fields")
+                var ps: [Int] = []
+                for f in 0..j.count(fields) {
+                    let fj = j.item(fields, f)
+                    let ty = r.typeOf(j.str(fj, "type") ?? "Int")
+                    let at = r.ast.param(Param(j.str(fj, "name") ?? "", ty, 0, 0))
+                    ps.push(at)
+                }
+                d.caseFields.push(ps)
+            }
+        } else if k is "type" | "interface" | "extern type" {
+            d.kind = DeclKind.Type
+            d.isExtern = k == "extern type"
+            d.cStruct = d.isExtern and j.has(dj, "fields")
+            d.isInterface = k == "interface"
+            d.opaque = j.isTrue(dj, "opaque")
+            let functions = j.get(dj, "functions")
+            if j.count(functions) > 0 and not d.isInterface {
+                r.errors.add(r.src, 0, 0, "type {d.name} lists functions: an interface does (kind \"interface\")")
+                return Imported(r.ast, r.errors.shown, false)
+            }
+            for f in 0..j.count(functions) {
+                // an interface
+                let item = j.item(functions, f)
+                let text = if j.kind(item) == JKind.Str { j.nodes[item].str } else { "fn f()" }
+                if r.member(text) is Some(prm) {
+                    let at = r.ast.param(prm)
+                    d.params.push(at)
+                }
+            }
+            r.startDecl(dj)
+            let fields = j.get(dj, "fields")
+            for f in 0..j.count(fields) {
+                let fj = j.item(fields, f)
+                let ty = r.typeOf(j.str(fj, "type") ?? "Int")
+                var prm = Param(j.str(fj, "name") ?? "", ty, 0, 0)
+                if j.has(fj, "default") {
+                    let v = r.input(j.get(fj, "default"))
+                    prm.fallback = v
+                }
+                let at = r.ast.param(prm)
+                d.params.push(at)
+            }
+        } else {
+            // fn, extern fn, const, test: nodes of their own
+            let isConst = k == "const"
+            d.kind = if isConst { DeclKind.Const } else { DeclKind.Fn }
+            d.isExtern = k == "extern fn"
+            d.isEffect = j.isTrue(dj, "effect")
+            d.effectDeclared = j.isTrue(dj, "effectDeclared")
+            if d.isExtern {
+                d.externSymbol = j.str(dj, "externSymbol") ?? ""
+                d.externLib = j.str(dj, "library") ?? ""
+                d.variadic = j.isTrue(dj, "variadic")
+            }
+            if k == "test" {
+                // test "name": its name as text
+                d.isTest = true
+                d.isEffect = true
+                let title = if len(d.name) > 5 { d.name[5..] } else { "\"\"" }
+                let t = r.literal(title, "Text")
+                if r.ast.exprs[t].node is TextLit(text, _, _) {
+                    d.testName = text
+                }
+            }
+            r.startDecl(dj)
+            let params = j.get(dj, "params")
+            for p in 0..j.count(params) {
+                let pj = j.item(params, p)
+                let ty = if j.str(pj, "type") is Some(t) { r.typeOf(t) } else { -1 }
+                var prm = Param(j.str(pj, "name") ?? "", ty, 0, 0, isVar: j.isTrue(pj, "var"))
+                let pid = j.int(pj, "id", -1)
+                if pid >= 0 and pid <= r.maxId {
+                    r.names[pid] = prm.name
+                }
+                if j.has(pj, "default") {
+                    let v = r.input(j.get(pj, "default"))
+                    prm.fallback = v
+                }
+                let at = r.ast.param(prm)
+                d.params.push(at)
+            }
+            if j.str(dj, "returns") is Some(t) {
+                d.ret = r.typeOf(t)
+            }
+            if j.str(dj, "annotation") is Some(t) {
+                d.ret = r.typeOf(t)
+            }
+            let form = j.str(dj, "form")
+            if d.isExtern and form == None {
+                // C's, or the host's: no body
+            } else if isConst or form == Some("expr") {
+                let v = r.input(j.get(dj, "result"))
+                d.body = v
+            } else {
+                let b = r.block(j.get(dj, "body"))
+                d.body = r.ast.expr(.BlockExpr(b, false), 0, 0)
+            }
+            ok = ok and not r.failed
+        }
+        r.ast.decl(d)
+    }
+    r.ast.closingComment = j.str(root, "closing") ?? ""
+    Imported(r.ast, r.errors.shown, ok)
+}
+
+// whether a graph's nodes carry uids (a merge of such graphs keeps its own JSON)
+pub fn graphHasUids(json: Text) -> Bool {
+    var j = Json()
+    let root = j.parse(json)
+    let decls = j.get(root, "decls")
+    if j.kind(decls) != JKind.Arr {
+        return false
+    }
+    for i in 0..j.count(decls) {
+        let nodes = j.get(j.item(decls, i), "nodes")
+        if j.kind(nodes) != JKind.Arr {
+            continue
+        }
+        for k in 0..j.count(nodes) {
+            if (j.str(j.item(nodes, k), "uid") ?? "") != "" {
+                return true
+            }
+        }
+    }
+    false
+}
+
+// ---- the commands ------------------------------------------------------------------------------------------------
+// a command's output on standard output, as it is (print ends the line itself)
+pub fn emit(out: Text) {
+    if out == "" {
+        return
+    }
+    if out.endsWith("\n") {
+        print(out[..len(out) - 1])
+    } else {
+        print(out)
+    }
+}
+
+// the lines of a text on the error stream
+pub fn emitErr(out: Text) {
+    if out != "" {
+        printErr(if out.endsWith("\n") { out[..len(out) - 1] } else { out })
+    }
+}
+
+// A program read from its text (the files it uses, the host's declarations) and checked: the program, or None when
+// it has errors (said, unless silent: then it is checked for what it works out, its errors not said).
+pub type Read { program: Program, ok: Bool, parsed: Bool }
+
+pub fn readProgram(path: Text, text: Text, preludePath: Text, silent: Bool) -> Read {
+    var host: Source? = None
+    if preludePath != "" {
+        let Ok(t) = readFile(preludePath) else {
+            printErr("quark: cannot read {preludePath}")
+            return Read(newProgram(Ast(), []), false, false)
+        }
+        host = Source(preludePath, t)
+    }
+    let loaded = loadProgram(Source(path, text), host)
+    if not loaded.ok {
+        for e in loaded.errors.shown {
+            printErr(e)
+        }
+        return Read(loaded.program, false, false)
+    }
+    let checked = checkProgram(loaded.program, loaded.errors, false, None)
+    if not silent {
+        for e in checked.errors.shown {
+            printErr(e)
+        }
+    }
+    Read(checked.program, checked.ok, true)
+}
+
+// the command's options: its files, and each option's value (--layout L, -o out, --prelude P) or "" (--json)
+pub type Options {
+    files: [Text] = []
+    layout: Text = ""
+    out: Text = ""
+    prelude: Text = ""
+    json: Bool = false
+    bad: Text = ""
+}
+
+pub fn options(given: [Text], most: Int, takesOut: Bool) -> Options {
+    var o = Options()
+    var i = 1
+    while i < len(given) {
+        let a = given[i]
+        i += 1
+        if a == "--json" {
+            o.json = true
+        } else if a == "--layout" and i < len(given) {
+            o.layout = given[i]
+            i += 1
+        } else if a == "-o" and takesOut and i < len(given) {
+            o.out = given[i]
+            i += 1
+        } else if a == "--prelude" and i < len(given) {
+            o.prelude = given[i]
+            i += 1
+        } else if len(o.files) < most and (not a.startsWith("-") or a == "-") {
+            o.files.push(a)
+        } else {
+            o.bad = a
+            return o
+        }
+    }
+    o
+}
+
+// quark graph FILE [--layout L]: its node graph; quark text FILE.json: the program a graph is
+pub fn graphCommand(given: [Text]) -> Int {
+    let o = options(given, 1, true)
+    if o.bad != "" {
+        printErr("quark: unknown option {o.bad}")
+        return 2
+    }
+    if len(o.files) == 0 {
+        return 2
+    }
+    let path = o.files[0]
+    let Ok(text) = readFile(path) else {
+        printErr("quark: cannot read {path}")
+        return 1
+    }
+    if given[0] == "text" {
+        // a graph in either notation: Quark's (QGN) or JSON
+        let read = graphJson(text, path)
+        if read is Err(why) {
+            printErr(why)
+            return 1
+        }
+        let json = read ?? ""
+        let imported = graphToAst(json, path)
+        for e in imported.errors {
+            printErr(e)
+        }
+        if not imported.ok {
+            return 1
+        }
+        emit(format(imported.ast))
+        return 0
+    }
+    if path.endsWith(".qgn") or path.endsWith(".json") {
+        // a graph already: said again in the notation asked for (QGN, or JSON with --json)
+        let json = graphJson(text, path)
+        if json is Err(why) {
+            printErr(why)
+            return 1
+        }
+        let j = json ?? ""
+        emit(if o.json { j } else { qgnOf(j) ?? j })
+        return 0
+    }
+    let read = readProgram(path, text, o.prelude, false)
+    var layout = ""
+    if o.layout != "" {
+        let Ok(l) = readFile(o.layout) else {
+            printErr("quark: cannot read {o.layout}")
+            return 1
+        }
+        layout = l
+    }
+    // with errors (said already), the graph of what was read: what could not be read is a hole (an empty pin), so a
+    // program being written is a graph at every step; in Quark's notation (QGN), or JSON with --json
+    let out = graphOf(read.program, layout)
+    emit(if o.json { out } else { qgnOf(out) ?? out })
+    if read.ok { 0 } else { 1 }
+}
+
+// ---- a line of a graph's text, as its node ----------------------------------------------------------------------
+// The key of the statement a line belongs to (the last one starting at or before it, in the function that holds
+// it), else of the declaration: how an error in a graph's canonical text points at a node (qkCompileGraph).
+pub fn keyAtLine(p: Program, line: Int) -> Text? {
+    var o = Out(p, [], Json())
+    var best: Text? = None
+    var bestLine = 0
+    for at in p.decls {
+        let d = p.ast.decls[at]
+        if d.fromPrelude or d.line > line {
+            continue
+        }
+        if d.line >= bestLine {
+            best = d.name
+            bestLine = d.line
+        }
+        if d.kind == DeclKind.Fn and d.body >= 0 and p.ast.exprs[d.body].node is BlockExpr(b, _) {
+            o.begin(d)
+            let (key, keyLine) = o.keyInBlock(b, d.name, line, best, bestLine)
+            best = key
+            bestLine = keyLine
+        }
+    }
+    best
+}
+
+// each statement's line's graph key, as the debugger names the values of its statements (keyAtLine): LowerOptions.debugKeys
+pub fn lineKeys(p: Program) -> [Int: Text] {
+    var keys: [Int: Text] = [:]
+    for st in p.ast.stmts {
+        if st.line > 0 and not keys.contains(st.line) and keyAtLine(p, st.line) is Some(k) {
+            keys[st.line] = k
+        }
+    }
+    keys
+}
+
+fn Out.keyInBlock(self, b: Int, prefix: Text, line: Int, best: Text?, bestLine: Int) -> (Text?, Int) {
+    var key = best
+    var keyLine = bestLine
+    for (i, s) in self.p.ast.blocks[b].stmts.enumerate() {
+        let st = self.p.ast.stmts[s]
+        let here = self.stmtKey(s, prefix, i)
+        if st.line <= line and st.line >= keyLine {
+            key = here
+            keyLine = st.line
+        }
+        let body = match st.node {
+            For(_, _, _, body) => body
+            While(_, body) => body
+            Defer(body) => body
+            _ => -1
+        }
+        if body >= 0 {
+            let (k, l) = self.keyInBlock(body, here, line, key, keyLine)
+            key = k
+            keyLine = l
+        }
+    }
+    (key, keyLine)
+}

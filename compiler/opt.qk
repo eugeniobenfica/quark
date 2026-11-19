@@ -1,0 +1,549 @@
+// The quick tier: a few cheap optimizations on the IR, run before machine code, on every build:
+//  - x % d by a constant (not a power of two) is x - x / d * d, the division then shared with x / d nearby;
+//  - in a straight run of code, the same pure computation on the same values is done once, constants fold, and
+//    x * 2.0 is x + x;
+//  - a copy right after the instruction that computed its value is folded into that instruction;
+//  - code whose result nobody reads is dropped (a loop's index nobody asked for, say);
+//  - an Int register set once by a constant becomes an immediate (no register, no instruction);
+//  - a Float constant is computed once, at the start;
+//  - a path that sets r to a constant and goes on to `jz r` goes straight where that test sends it.
+use ir
+
+// the instruction gives its dst a value
+pub fn defines(ins: IrIns) -> Bool = match ins.op {
+    Store | Bounds | Label | Jmp | Jz | Jnz | Call | RtCall | HostCall | Ret | Fuel | Nop | Vstore | Vend => false
+    _ => ins.dst >= 0
+}
+
+// its value depends only on its operands (and memory), and nothing else happens
+fn pure(op: Op) -> Bool = match op {
+    Const | Mov | Add | Sub | Mul | Neg | Fadd | Fsub | Fmul | Fdiv | Fneg | Sqrt | Fmin | Fmax | Cmp | Fcmp | Not => true
+    IntToFloat | FloatToInt | Round | Load | And | Or | Xor | Shl | Sar | Vload | Vsplat | Vop | Vlane => true
+    _ => false
+}
+
+// a new virtual register of a kind (its weight is the caller's to set)
+pub fn IrFn.addReg(var self, kind: Int, weight: Float = 0.0) -> Int {
+    self.kinds.push(kind)
+    self.weight.push(weight)
+    len(self.kinds) - 1
+}
+
+// each register's definitions (parameters too)
+pub fn definitions(f: IrFn) -> [Int] {
+    var defs = [0] * max(len(f.kinds), 1)
+    for p in f.params {
+        defs[p] += 1
+    }
+    for ins in f.code {
+        if defines(ins) {
+            defs[ins.dst] += 1
+        }
+        for r in f.retsOf(ins) {
+            defs[r] += 1
+        }
+    }
+    defs
+}
+
+// ---- integer arithmetic as C's checked builtins see it ----
+pub fn addOverflows(x: Int, y: Int) -> Bool {
+    let r = x +% y
+    (x ^ r) & (y ^ r) < 0
+}
+
+pub fn subOverflows(x: Int, y: Int) -> Bool {
+    let r = x -% y
+    (x ^ y) & (x ^ r) < 0
+}
+
+pub fn mulOverflows(x: Int, y: Int) -> Bool {
+    if x == 0 or y == 0 {
+        return false
+    }
+    if y == -1 {
+        return x == minInt
+    }
+    if x == -1 {
+        return y == minInt
+    }
+    let r = x *% y
+    r % y != 0 or r / y != x
+}
+
+// the bits of the Float nearest x (C's (double)x: to nearest, ties to even)
+pub fn floatBitsOf(x: Int) -> Int {
+    if x == 0 {
+        return 0
+    }
+    let sign = if x < 0 { minInt } else { 0 }
+    let m = if x < 0 {
+        0 -% x // unsigned: minInt's is 2^63
+    } else {
+        x
+    }
+    var top = 63
+    while m >> top & 1 == 0 {
+        top -= 1
+    }
+    var exp = top
+    var mant = 0
+    if top <= 52 {
+        mant = m << (52 - top)
+    } else {
+        let drop = top - 52
+        var q = m >> drop & (1 << (64 - drop) -% 1)
+        let rest = m & (1 << drop - 1)
+        let half = 1 << (drop - 1)
+        if rest > half or rest == half and q & 1 == 1 {
+            q += 1
+        }
+        if q >> 53 != 0 {
+            q = q >> 1
+            exp += 1
+        }
+        mant = q
+    }
+    sign | (exp + 1023) << 52 | mant & 0xFFFFFFFFFFFFF
+}
+
+const twoBits = 0x4000000000000000 // 2.0
+
+// ---- x % d as x - x / d * d ----
+fn IrFn.remainderFromQuotient(var self) {
+    let n = max(len(self.kinds), 1)
+    let defs = definitions(self)
+    var kv = [0] * n
+    var found = 0
+    for k in 0..len(self.code) {
+        let op = self.code[k].op
+        let dst = self.code[k].dst
+        if op == .Const and self.code[k].c < 1 and self.kinds[dst] == 'I' and defs[dst] == 1 {
+            kv[dst] = self.code[k].imm
+        } else if op == .Mov and defs[dst] == 1 and self.kinds[dst] == 'I' {
+            kv[dst] = kv[self.code[k].a] // let d = 1000
+        } else if op == .Mod
+            and self.code[k].b >= 0
+            and kv[self.code[k].b] > 1
+            and kv[self.code[k].b] & (kv[self.code[k].b] - 1) != 0 {
+            found += 1
+        }
+    }
+    if found == 0 {
+        return
+    }
+    var code: [IrIns] = []
+    for k in 0..len(self.code) {
+        let ins = self.code[k]
+        if ins.op == .Mod and ins.b >= 0 and kv[ins.b] > 1 and kv[ins.b] & (kv[ins.b] - 1) != 0 {
+            let w = self.weight[ins.dst]
+            let q = self.addReg('I', w)
+            let p = self.addReg('I', w)
+            code.push(ins with { op: .Div, dst: q })
+            code.push(ins with { op: .Mul, cond: ins.cond & 1, dst: p, a: q }) // divNonNeg is the division's
+            code.push(ins with { op: .Sub, cond: ins.cond & 1, b: p })
+            continue
+        }
+        code.push(ins)
+    }
+    self.code = code
+}
+
+// ---- common subexpressions ----
+// a pure computation seen: an operand is a register's number and version, or a constant's value
+type Seen {
+    op: Int
+    cond: Int
+    kind: Int
+    a: Int
+    aK: Bool
+    va: Int
+    b: Int
+    bK: Bool
+    vb: Int
+    imm: Int
+    c: Int
+}
+
+fn commutative(op: Op) -> Bool = op is Add | Mul | Fadd | Fmul | Fmin | Fmax | And | Or | Xor
+
+fn resolve(rename: [Int], v: Int) -> Int {
+    var r = v
+    while r >= 0 and rename[r] >= 0 {
+        r = rename[r]
+    }
+    r
+}
+
+fn IrFn.renameOperands(var self, k: Int, rename: [Int]) {
+    if self.code[k].op is Store | Vstore {
+        self.code[k].dst = resolve(rename, self.code[k].dst)
+    }
+    if self.code[k].op != .Const {
+        self.code[k].a = resolve(rename, self.code[k].a)
+        self.code[k].b = resolve(rename, self.code[k].b)
+    }
+    let ins = self.code[k]
+    for j in ins.from..ins.from + ins.argCount {
+        self.operands[j] = resolve(rename, self.operands[j])
+    }
+}
+
+// In a straight run of code, the same pure computation on the same values is done once (i * 3 for the three
+// loads xs[i * 3], xs[i * 3 + 1] and xs[i * 3 + 2], say). Constants count by value, and a Float constant is one
+// register for the whole function. Only registers set once are merged.
+pub fn IrFn.commonSubexpressions(var self) {
+    let n = max(len(self.kinds), 1)
+    let defs = definitions(self)
+    var version = [0] * n
+    var rename = [-1] * n
+    var isK = [false] * n
+    var kv = [0] * n
+    for k in 0..len(self.code) {
+        if self.code[k].op == .Const and self.code[k].c < 1 and defs[self.code[k].dst] == 1 {
+            isK[self.code[k].dst] = true
+            kv[self.code[k].dst] = self.code[k].imm
+        }
+    }
+    // Float constants: one register per value (they are all hoisted to the start afterwards)
+    var firstFloat: [Int: Int] = [:]
+    for k in 0..len(self.code) {
+        let d = self.code[k].dst
+        if self.code[k].op != .Const or not isK[d] or self.kinds[d] != 'F' {
+            continue
+        }
+        match firstFloat[self.code[k].imm] {
+            Some(first) => {
+                rename[d] = first
+                self.code[k].op = .Nop
+            }
+            None => {
+                firstFloat[self.code[k].imm] = d
+            }
+        }
+    }
+    var table: [Seen: Int] = [:]
+    for k in 0..len(self.code) {
+        if self.code[k].op == .Nop {
+            continue
+        }
+        self.renameOperands(k, rename)
+        let op = self.code[k].op
+        let dst = self.code[k].dst
+        let a = self.code[k].a
+        let b = self.code[k].b
+        // constants fold: a copy of one, an Int made Float, arithmetic on two (registers set once only)
+        if defines(self.code[k]) and defs[dst] == 1 and op != .Const {
+            let aK = a >= 0 and isK[a]
+            let bK = b >= 0 and isK[b]
+            let x = if aK { kv[a] } else { 0 }
+            let y = if bK { kv[b] } else { 0 }
+            let checked = self.code[k].cond != 0
+            let (fold, r) = match op {
+                Mov => (aK, x)
+                IntToFloat => (aK, floatBitsOf(x))
+                Add => (aK and bK and not (checked and addOverflows(x, y)), x +% y)
+                Sub => (aK and bK and not (checked and subOverflows(x, y)), x -% y)
+                Mul => (aK and bK and not (checked and mulOverflows(x, y)), x *% y)
+                Neg => (aK, 0 -% x)
+                And => (aK and bK, x & y)
+                Or => (aK and bK, x | y)
+                Xor => (aK and bK, x ^ y)
+                Shl => (aK and bK, x << (y & 63))
+                Sar => (aK and bK, x >> (y & 63))
+                _ => (false, 0)
+            }
+            if fold {
+                self.code[k].op = .Const
+                self.code[k].a = -1
+                self.code[k].b = -1
+                self.code[k].c = 0
+                self.code[k].imm = r
+                isK[dst] = true
+                kv[dst] = r
+            }
+        }
+        // x * 2.0 is x + x: the same result, a cheaper instruction
+        if self.code[k].op == .Fmul {
+            let fa = self.code[k].a
+            let fb = self.code[k].b
+            if fb >= 0 and isK[fb] and kv[fb] == twoBits {
+                self.code[k].b = fa
+                self.code[k].op = .Fadd
+            } else if fa >= 0 and isK[fa] and kv[fa] == twoBits {
+                self.code[k].a = fb
+                self.code[k].op = .Fadd
+            }
+        }
+        let now = self.code[k].op
+        if now is Label | Jmp | Jz | Jnz | Call | RtCall | HostCall | Ret {
+            table = [:] // a new straight run
+        }
+        let ca = self.code[k].a
+        let cb = self.code[k].b
+        let safeDivide = now is Div | Mod and cb >= 0 and isK[cb] and kv[cb] != 0
+        let candidate = (pure(now) or safeDivide)
+            and not now is Load | Vload | Mov | Const
+            and defines(self.code[k])
+            and defs[dst] == 1
+        if candidate {
+            var s = Seen(
+                now.index(),
+                self.code[k].cond,
+                self.kinds[dst],
+                -1,
+                false,
+                0,
+                -1,
+                false,
+                0,
+                self.code[k].imm,
+                self.code[k].c,
+            )
+            if ca >= 0 {
+                s.aK = isK[ca]
+                s.a = if s.aK { kv[ca] } else { ca }
+                s.va = if s.aK { 0 } else { version[ca] }
+            }
+            if cb >= 0 {
+                s.bK = isK[cb]
+                s.b = if s.bK { kv[cb] } else { cb }
+                s.vb = if s.bK { 0 } else { version[cb] }
+            }
+            if commutative(now) and (s.aK and not s.bK or s.aK == s.bK and s.a > s.b) {
+                s = s with { a: s.b, aK: s.bK, va: s.vb, b: s.a, bK: s.aK, vb: s.va }
+            }
+            match table[s] {
+                Some(found) => {
+                    rename[dst] = found
+                    self.code[k].op = .Nop
+                    continue
+                }
+                None => {
+                    table[s] = dst
+                }
+            }
+        }
+        if defines(self.code[k]) {
+            version[dst] += 1
+        }
+        for r in self.retsOf(self.code[k]) {
+            version[r] += 1
+        }
+    }
+    for k in 0..len(self.code) {
+        if self.code[k].op != .Nop {
+            self.renameOperands(k, rename)
+        }
+    }
+}
+
+// ---- the quick tier ----
+// each register's definitions and uses (and uses by instructions other than the one defining it), kept as
+// instructions change
+type Counts { defs: [Int], uses: [Int], foreign: [Int] }
+
+fn Counts.addUse(var self, ins: IrIns, v: Int, k: Int) {
+    if v < 0 {
+        return
+    }
+    self.uses[v] += k
+    if not (defines(ins) and ins.dst == v) {
+        self.foreign[v] += k
+    }
+}
+
+fn Counts.count(var self, ops: [Int], ins: IrIns, k: Int) {
+    if ins.op is Nop | Label | Jmp {
+        return
+    }
+    if defines(ins) {
+        self.defs[ins.dst] += k
+    }
+    if ins.op is Store | Vstore {
+        self.addUse(ins, ins.dst, k)
+    }
+    if ins.op != .Const {
+        self.addUse(ins, ins.a, k)
+        self.addUse(ins, ins.b, k)
+    }
+    for j in ins.from..ins.from + ins.argCount {
+        self.addUse(ins, ops[j], k)
+    }
+    for j in ins.from + ins.argCount..ins.from + ins.argCount + ins.retCount {
+        self.defs[ops[j]] += k
+    }
+}
+
+pub fn IrFn.quickOptimize(var self) {
+    self.remainderFromQuotient() // adds registers: before the counts are sized
+    self.commonSubexpressions()
+    let n = max(len(self.kinds), 1)
+    var c = Counts([0] * n, [0] * n, [0] * n)
+    for p in self.params {
+        c.defs[p] += 1
+    }
+    for k in 0..len(self.code) {
+        c.count(self.operands, self.code[k], 1)
+    }
+    var changed = true
+    while changed {
+        changed = false
+        // copies
+        for k in 1..len(self.code) {
+            if self.code[k].op != .Mov {
+                continue
+            }
+            let t = self.code[k].a
+            let d = self.code[k].dst
+            if t == d or c.defs[t] != 1 or c.uses[t] != 1 or self.kinds[t] != self.kinds[d] {
+                continue
+            }
+            var p = k - 1
+            while p >= 0 and self.code[p].op == .Nop {
+                p -= 1
+            }
+            if p < 0 {
+                continue
+            }
+            var done = false
+            if defines(self.code[p]) and self.code[p].dst == t and self.code[p].op != .Const {
+                c.count(self.operands, self.code[p], -1)
+                self.code[p].dst = d
+                c.count(self.operands, self.code[p], 1)
+                done = true
+            } else if self.code[p].op is Call | RtCall and not self.retsOf(self.code[p]).contains(d) {
+                // not into a register the call gives another result in (p.c.hint = p.resolve(t) on a var self p:
+                // the hint's register is also one of p's slots coming back, and only one value can land there)
+                for i in 0..self.code[p].retCount {
+                    if self.ret(self.code[p], i) == t {
+                        c.count(self.operands, self.code[p], -1)
+                        self.setRet(p, i, d)
+                        c.count(self.operands, self.code[p], 1)
+                        done = true
+                    }
+                }
+            }
+            if done {
+                c.count(self.operands, self.code[k], -1)
+                self.code[k].op = .Nop
+                changed = true
+            }
+        }
+        // unused results
+        for k in 0..len(self.code) {
+            if not pure(self.code[k].op) or not defines(self.code[k]) or c.foreign[self.code[k].dst] != 0 {
+                continue
+            }
+            if self.code[k].op is Add | Sub | Mul | FloatToInt and self.code[k].cond != 0 {
+                continue // it may stop with a panic
+            }
+            c.count(self.operands, self.code[k], -1)
+            self.code[k].op = .Nop
+            changed = true
+        }
+    }
+    // constants
+    let count = len(self.kinds)
+    var isConst = [false] * count
+    var constValue = [0] * count
+    var defParam = [false] * n
+    for p in self.params {
+        defParam[p] = true
+    }
+    var code: [IrIns] = []
+    for k in 0..len(self.code) {
+        let d = self.code[k].dst
+        if self.code[k].op != .Const or self.code[k].c >= 1 or c.defs[d] != 1 or defParam[d] {
+            continue
+        }
+        if self.kinds[d] == 'I' {
+            isConst[d] = true
+            constValue[d] = self.code[k].imm
+            self.weight[d] = 0.0
+        } else {
+            code.push(self.code[k]) // hoisted
+        }
+        self.code[k].op = .Nop
+    }
+    // drop the Nops, the hoisted constants first
+    for k in 0..len(self.code) {
+        if self.code[k].op != .Nop {
+            code.push(self.code[k])
+        }
+    }
+    self.code = code
+    self.isConst = isConst
+    self.constValue = constValue
+    self.threadJumps()
+}
+
+// Jumps threaded: a path that sets r to a constant and goes on to `jz r` (or jnz) goes straight where that test
+// sends it. An inlined test that gives a Bool (inside(x, y) in a filter) then branches once, not three times.
+fn IrFn.threadJumps(var self) {
+    let count = len(self.code)
+    var at = [-1] * (self.labelCount + 1)
+    for k in 0..count {
+        if self.code[k].op == .Label {
+            at[self.code[k].imm] = k
+        }
+    }
+    var jumpTo = [0] * (count + 1) // after the mov at k: a jump there (+1), or 0
+    var fallLabel = [0] * (count + 1) // a label after the branch at k (+1), or 0
+    var any = false
+    for k in 0..count {
+        let a = self.code[k].a
+        let dst = self.code[k].dst
+        if self.code[k].op != .Mov or self.kinds[dst] != 'I' or a < 0 or not self.isConst[a] {
+            continue
+        }
+        var next = k + 1
+        if next < count and self.code[next].op == .Jmp {
+            next = at[self.code[next].imm]
+        }
+        if next < 0 {
+            continue
+        }
+        while next < count and self.code[next].op == .Label {
+            next += 1
+        }
+        if next >= count {
+            continue
+        }
+        let brOp = self.code[next].op
+        if not brOp is Jz | Jnz or self.code[next].a != dst {
+            continue
+        }
+        let v = self.constValue[a]
+        let taken = if brOp == .Jz { v == 0 } else { v != 0 }
+        if taken {
+            jumpTo[k] = self.code[next].imm + 1
+        } else {
+            if fallLabel[next] == 0 {
+                fallLabel[next] = self.labelCount + 1
+                self.labelCount += 1
+            }
+            jumpTo[k] = fallLabel[next]
+        }
+        any = true
+    }
+    if not any {
+        return
+    }
+    var code: [IrIns] = []
+    var k = 0
+    while k < count {
+        code.push(self.code[k])
+        if jumpTo[k] != 0 {
+            code.push(IrIns(.Jmp, dst: -1, a: -1, b: -1, c: -1, imm: jumpTo[k] - 1, line: self.code[k].line))
+            if k + 1 < count and self.code[k + 1].op == .Jmp {
+                k += 1 // the jump it replaces
+            }
+        }
+        if fallLabel[k] != 0 {
+            code.push(IrIns(.Label, dst: -1, a: -1, b: -1, c: -1, imm: fallLabel[k] - 1))
+        }
+        k += 1
+    }
+    self.code = code
+}

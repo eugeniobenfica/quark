@@ -1,0 +1,678 @@
+// Maps, and == of any value, by the description of its type the compiler wrote: I a plain slot, F a Float, T a
+// text, A<elem> an array, M<key><value> a map, (<fields>) a record, E<n><case's fields>.<...> an enum with data (n +
+// 32 its cases), B<type> a box, C a function's captured values, R<at> the type whose description starts `at` (three
+// base-64 digits) into the whole description, P<type> a var a loop keeps in memory (its address: looked into there).
+use base
+use arena
+
+// ---- descriptions (zero-ended bytes) ----
+pub type Desc {
+    n: Int // a type's slots, and where its description ends
+    d: Int
+}
+
+pub fn descBase() -> Int = ctxGet(ctxDescBase)
+
+pub fn setDescBase(b: Int) = ctxSet(ctxDescBase, b)
+
+pub fn descRef(d: Int) -> Int = descBase() + descNumber(d)
+
+// a number in three characters, six bits each from '0' (a reference, an enum's slots and where a case's data starts)
+pub fn descNumber(d: Int) -> Int {
+    var n = 0
+    for i in 0..3 {
+        n = n * 64 + byte(d, i) - '0'
+    }
+    n
+}
+
+// past one type, by its letters alone (a reference is never followed: it may be the type around it, and a type that
+// holds itself through a box would be followed for ever)
+pub fn skipDesc(d: Int) -> Int {
+    let k = byte(d, 0)
+    if k == 'R' {
+        return d + 4
+    }
+    if k == 'A' or k == 'B' or k == 'P' {
+        return skipDesc(d + 1)
+    }
+    if k == 'M' {
+        return skipDesc(skipDesc(d + 1))
+    }
+    if k == '(' {
+        var q = d + 1
+        while byte(q, 0) != ')' {
+            q = skipDesc(q)
+        }
+        return q + 1
+    }
+    if k == 'E' {
+        let cases = byte(d, 1) - 32
+        var q = d + 5 // E, the cases, the slots (three characters)
+        for _ in 0..cases {
+            q += 3 // where the case's data starts
+            while byte(q, 0) != '.' {
+                q = skipDesc(q)
+            }
+            q += 1
+        }
+        return q
+    }
+    d + 1 // I, F, T, C
+}
+
+pub fn descSlots(d0: Int) -> Desc {
+    let k = byte(d0, 0)
+    var d = d0 + 1
+    if k == 'I' or k == 'F' or k == 'C' {
+        return Desc(1, d)
+    }
+    if k == 'B' or k == 'P' {
+        return Desc(1, skipDesc(d))
+    }
+    if k == 'R' {
+        return Desc(descSlots(descRef(d)).n, d + 3)
+    }
+    if k == 'T' {
+        return Desc(2, d)
+    }
+    if k == 'A' {
+        return Desc(2, skipDesc(d))
+    }
+    if k == 'M' {
+        return Desc(1, skipDesc(skipDesc(d)))
+    }
+    if k == '(' {
+        var n = 0
+        while byte(d, 0) != ')' {
+            let f = descSlots(d)
+            n += f.n
+            d = f.d
+        }
+        return Desc(n, d + 1)
+    }
+    if k == 'E' {
+        // E, the cases' count, the slots, then each case: where its data starts, its fields, '.'
+        let cases = byte(d, 0) - 32
+        let n = descNumber(d + 1)
+        d += 4
+        for i in 0..cases {
+            d += 3
+            while byte(d, 0) != '.' {
+                d = descSlots(d).d
+            }
+            d += 1 // the case's end
+        }
+        return Desc(n, d)
+    }
+    Desc(0, d)
+}
+
+// ---- maps: entries in the order their keys came, and a table of where each key is ----
+// A map's words: an entry is [alive][key: at least 2 slots][value]. A table slot is a word: the entry's index + 1 in
+// its low 32 bits, the key's hash's high 32 bits above them (a probe that meets another key's slot goes on without
+// reading its entry), 0 empty.
+pub const mCount = 0
+pub const mUsed = 1
+pub const mCap = 2
+pub const mValueBytes = 3
+pub const mKeyKind = 4
+pub const mTableCap = 5
+pub const mEntries = 6
+pub const mTable = 7
+pub const mDesc = 8
+pub const mKeySlots = 9
+pub const mKeyBytes = 10
+pub const mapWords = 11
+const keyPlain = 0
+const keyText = 1
+const keyPair = 2
+const keyAny = 3
+
+pub fn entryBytes(m: Int) -> Int = 8 + word(m, mKeySlots) * 8 + word(m, mValueBytes)
+
+pub fn entryAt(m: Int, i: Int) -> Int = word(m, mEntries) + i * entryBytes(m)
+
+// eight bytes at a time, multiplied in, the last few as one word; mixed at the end
+fn textHash(p: Int, n: Int) -> Int {
+    var h = n *% -7046029254386353131 ^ 1469598103934665603
+    var i = 0
+    while i + 8 <= n {
+        h = (h ^ Pointer<Int64>(p + i)[0]) *% -7046029254386353131
+        h = h ^ shr(h, 29)
+        i += 8
+    }
+    var last = 0
+    var shift = 0
+    while i < n {
+        last = last | byte(p, i) << shift
+        shift += 8
+        i += 1
+    }
+    mix(h ^ last)
+}
+
+const tagBits = -4294967296 // a table slot's high 32 bits: the hash's
+const indexBits = 4294967295
+
+// the kind of key a description (of the key alone, n bytes) makes
+fn mapKeyKind(d: Int, n: Int) -> Int {
+    var plain = 0
+    var texts = 0
+    for i in 0..n {
+        let c = byte(d, i)
+        if c == 'I' {
+            plain += 1
+        } else if c == 'T' {
+            texts += 1
+        } else if c != '(' and c != ')' {
+            return keyAny
+        }
+    }
+    if texts == 1 and plain == 0 {
+        return keyText
+    }
+    if texts == 0 and plain == 1 {
+        return keyPlain
+    }
+    if texts == 0 and plain == 2 {
+        return keyPair
+    }
+    keyAny
+}
+
+// a map's value, after its key, in its description
+pub fn mapValueDesc(m: Int) -> Int {
+    let saved = descBase()
+    setDescBase(word(m, mDesc))
+    let d = skipDesc(word(m, mDesc) + 1)
+    setDescBase(saved)
+    d
+}
+
+// ---- == and hashing of any value: a list of what is left to do, not calls inside calls ----
+// Work: (a, b, description, base), four words each, in memory of its own.
+type Walk { items: Int, count: Int, cap: Int }
+
+fn walkNew() -> Walk = Walk(malloc(16 * 32), 0, 16)
+
+fn Walk.push(self, a: Int, b: Int, d: Int, base: Int) -> Walk {
+    var w = self
+    if w.count == w.cap {
+        w = Walk(realloc(w.items, w.cap * 2 * 32), w.count, w.cap * 2)
+    }
+    let at = w.items + 32 * w.count
+    setWord(at, 0, a)
+    setWord(at, 1, b)
+    setWord(at, 2, d)
+    setWord(at, 3, base)
+    Walk(w.items, w.count + 1, w.cap)
+}
+
+// the fields of a record, or of the case an enum's value is, each one a piece of work
+fn Walk.fields(self, a0: Int, b0: Int, d0: Int, base: Int) -> Walk {
+    var w = self
+    var a = a0
+    var b = b0
+    var d = d0
+    if byte(d, 0) == '(' {
+        d += 1
+        while byte(d, 0) != ')' {
+            let f = descSlots(d)
+            w = w.push(a, b, d, base)
+            a += 8 * f.n
+            if b != 0 {
+                b += 8 * f.n
+            }
+            d = f.d
+        }
+        return w
+    }
+    let cases = byte(d, 1) - 32 // E<n><slots>, then each case: <start> fields '.'
+    d += 5
+    let tag = word(a, 0)
+    for i in 0..cases {
+        let start = descNumber(d)
+        d += 3
+        if i != tag {
+            while byte(d, 0) != '.' {
+                d = descSlots(d).d
+            }
+            d += 1
+            continue
+        }
+        a += 8 * start
+        if b != 0 {
+            b += 8 * start
+        }
+        while byte(d, 0) != '.' {
+            let f = descSlots(d)
+            w = w.push(a, b, d, base)
+            a += 8 * f.n
+            if b != 0 {
+                b += 8 * f.n
+            }
+            d = f.d
+        }
+        return w
+    }
+    w
+}
+
+pub fn valuesEqual(a0: Int, b0: Int, d0: Int, base0: Int) -> Bool {
+    var w = walkNew().push(a0, b0, d0, base0)
+    let saved = descBase()
+    var same = true
+    while same and w.count > 0 {
+        w = Walk(w.items, w.count - 1, w.cap)
+        let it = w.items + 32 * w.count
+        let a = word(it, 0)
+        let b = word(it, 1)
+        let d = word(it, 2)
+        let base = word(it, 3)
+        setDescBase(base)
+        let k = byte(d, 0)
+        if k == 'F' {
+            same = floatAt(a, 0) == floatAt(b, 0) // -0.0 == 0.0; NaN is equal to nothing
+        } else if k == 'T' {
+            same = word(a, 1) == word(b, 1)
+                and (word(a, 0) == word(b, 0) or sameBytes(word(a, 0), word(b, 0), word(a, 1)))
+        } else if k == 'A' {
+            if word(a, 1) != word(b, 1) {
+                same = false
+            } else if word(a, 0) != word(b, 0) {
+                let elem = d + 1
+                let n = descSlots(elem).n
+                for i in 0..word(a, 1) {
+                    w = w.push(word(a, 0) + 8 * i * n, word(b, 0) + 8 * i * n, elem, base)
+                }
+            }
+        } else if k == 'M' {
+            let x = word(a, 0)
+            let y = word(b, 0)
+            if x != y {
+                if x == 0 or y == 0 {
+                    same = (if x != 0 { word(x, mCount) } else { 0 }) == (if y != 0 { word(y, mCount) } else { 0 })
+                } else if word(x, mCount) != word(y, mCount) {
+                    same = false
+                } else {
+                    let vd = mapValueDesc(x)
+                    var i = 0
+                    while same and i < word(x, mUsed) {
+                        // each key of one in the other, with an equal value
+                        let e = entryAt(x, i)
+                        if word(e, 0) != 0 {
+                            let at = if word(x, mKeyKind) == keyAny {
+                                mapFind(y, e + 8, 0)
+                            } else {
+                                mapFind(y, word(e, 1), word(e, 2))
+                            }
+                            if at < 0 {
+                                same = false
+                            } else {
+                                w = w.push(
+                                    e + 8 + 8 * word(x, mKeySlots),
+                                    entryAt(y, at) + 8 + 8 * word(y, mKeySlots),
+                                    vd,
+                                    word(x, mDesc),
+                                )
+                            }
+                        }
+                        i += 1
+                    }
+                }
+            }
+        } else if k == 'B' {
+            let pa = word(a, 0)
+            let pb = word(b, 0)
+            if pa != pb {
+                if pa == 0 or pb == 0 {
+                    same = false
+                } else {
+                    w = w.push(pa, pb, if byte(d, 1) == 'R' { descRef(d + 2) } else { d + 1 }, base)
+                }
+            }
+        } else if k == 'R' {
+            w = w.push(a, b, descRef(d + 1), base)
+        } else if k == '(' {
+            w = w.fields(a, b, d, base)
+        } else if k == 'E' {
+            if word(a, 0) != word(b, 0) {
+                same = false
+            } else {
+                w = w.fields(a, b, d, base)
+            }
+        } else {
+            same = word(a, 0) == word(b, 0) // I, and a function's address
+        }
+    }
+    free(w.items)
+    setDescBase(saved)
+    same
+}
+
+type Hashed { h: Int, nan: Bool }
+
+pub fn valueHash(a0: Int, d0: Int, base0: Int) -> Hashed {
+    var w = walkNew().push(a0, 0, d0, base0)
+    let saved = descBase()
+    var h = -8925532866252464924
+    var nan = false
+    while w.count > 0 {
+        w = Walk(w.items, w.count - 1, w.cap)
+        let it = w.items + 32 * w.count
+        let a = word(it, 0)
+        let d = word(it, 2)
+        let base = word(it, 3)
+        setDescBase(base)
+        let k = byte(d, 0)
+        if k == 'F' {
+            var x = floatAt(a, 0)
+            if x != x {
+                nan = true
+            }
+            if x == 0.0 {
+                x = 0.0 // -0.0 hashes as 0.0
+            }
+            h = mix(h ^ bitsOf(x))
+        } else if k == 'T' {
+            h = mix(h ^ textHash(word(a, 0), word(a, 1)))
+        } else if k == 'A' {
+            h = mix(h ^ word(a, 1))
+            let elem = d + 1
+            let n = descSlots(elem).n
+            for i in 0..word(a, 1) {
+                w = w.push(word(a, 0) + 8 * i * n, 0, elem, base)
+            }
+        } else if k == 'M' {
+            // the same keys in any order: the entries' hashes summed
+            let m = word(a, 0)
+            if m != 0 {
+                let kd = word(m, mDesc) + 1
+                let vd = mapValueDesc(m)
+                var sum = 0
+                for i in 0..word(m, mUsed) {
+                    let e = entryAt(m, i)
+                    if word(e, 0) != 0 {
+                        let hk = valueHash(e + 8, kd, word(m, mDesc))
+                        let hv = valueHash(e + 8 + 8 * word(m, mKeySlots), vd, word(m, mDesc))
+                        if hk.nan or hv.nan {
+                            nan = true
+                        }
+                        sum +%= mix(hk.h *% 31 +% hv.h)
+                    }
+                }
+                h = mix(h ^ sum ^ word(m, mCount))
+            }
+        } else if k == 'B' {
+            if word(a, 0) != 0 {
+                w = w.push(word(a, 0), 0, if byte(d, 1) == 'R' { descRef(d + 2) } else { d + 1 }, base)
+            }
+        } else if k == 'R' {
+            w = w.push(a, 0, descRef(d + 1), base)
+        } else if k == '(' {
+            w = w.fields(a, 0, d, base)
+        } else if k == 'E' {
+            h = mix(h ^ word(a, 0))
+            w = w.fields(a, 0, d, base)
+        } else {
+            h = mix(h ^ word(a, 0))
+        }
+    }
+    free(w.items)
+    setDescBase(saved)
+    Hashed(h, nan)
+}
+
+// a == b for values whose == looks inside arrays, maps and boxes
+pub extern effect fn rtValueEqual(a: Int64, b: Int64, desc: Int64) -> Int64 as "qk_valueEqual" =
+    if valuesEqual(a, b, desc, desc) { 1 } else { 0 }
+
+fn keyHash(m: Int, k0: Int, k1: Int) -> Hashed {
+    let kind = word(m, mKeyKind)
+    if kind == keyPair {
+        return Hashed(mix(k0 *% -7046029254386353131 ^ (k1 +% 7146057691288625177)), false)
+    }
+    if kind == keyText {
+        return Hashed(textHash(k0, k1), false)
+    }
+    if kind == keyAny {
+        return valueHash(k0, word(m, mDesc) + 1, word(m, mDesc))
+    }
+    Hashed(mix(k0 +% -7046029254386353131), false)
+}
+
+fn keyEqual(m: Int, e: Int, k0: Int, k1: Int) -> Bool {
+    let kind = word(m, mKeyKind)
+    if kind == keyPair {
+        return word(e, 1) == k0 and word(e, 2) == k1
+    }
+    if kind == keyText {
+        return word(e, 2) == k1 and sameBytes(word(e, 1), k0, k1)
+    }
+    if kind == keyAny {
+        return valuesEqual(e + 8, k0, word(m, mDesc) + 1, word(m, mDesc))
+    }
+    word(e, 1) == k0
+}
+
+fn mapFindHashed(m: Int, k0: Int, k1: Int, h: Int) -> Int {
+    if word(m, mTableCap) == 0 {
+        return -1
+    }
+    let mask = word(m, mTableCap) - 1
+    let table = word(m, mTable)
+    let tag = h & tagBits
+    var i = h & mask
+    while true {
+        let slot = word(table, i)
+        if slot == 0 {
+            return -1
+        }
+        if slot & tagBits == tag {
+            let at = slot & indexBits - 1
+            let e = entryAt(m, at)
+            if word(e, 0) != 0 and keyEqual(m, e, k0, k1) {
+                return at
+            }
+        }
+        i = (i + 1) & mask
+    }
+    -1
+}
+
+pub fn mapFind(m: Int, k0: Int, k1: Int) -> Int {
+    if m == 0 or word(m, mTableCap) == 0 {
+        return -1
+    }
+    let h = keyHash(m, k0, k1)
+    if h.nan {
+        -1 // NaN is no key's equal
+    } else {
+        mapFindHashed(m, k0, k1, h.h)
+    }
+}
+
+pub fn mapPlace(m: Int, index: Int) {
+    let e = entryAt(m, index)
+    let mask = word(m, mTableCap) - 1
+    let k0 = if word(m, mKeyKind) == keyAny { e + 8 } else { word(e, 1) }
+    let h = keyHash(m, k0, word(e, 2)).h
+    var i = h & mask
+    while word(word(m, mTable), i) != 0 {
+        i = (i + 1) & mask
+    }
+    setWord(word(m, mTable), i, h & tagBits | (index + 1))
+}
+
+fn mapRehash(m: Int, tableCap: Int) {
+    setWord(m, mTableCap, tableCap)
+    setWord(m, mTable, alloc(tableCap, 8))
+    for i in 0..word(m, mUsed) {
+        if word(entryAt(m, i), 0) != 0 {
+            mapPlace(m, i)
+        }
+    }
+}
+
+// a new map of the type desc describes (M<key><value>)
+pub extern effect fn rtMapNew(desc: Int64) -> Int64 as "qk_mapNew" {
+    let m = alloc(mapWords, 8)
+    let saved = descBase()
+    setDescBase(desc)
+    let key = descSlots(desc + 1)
+    setWord(m, mKeyKind, mapKeyKind(desc + 1, key.d - desc - 1))
+    setWord(m, mValueBytes, descSlots(key.d).n * 8)
+    setDescBase(saved)
+    setWord(m, mDesc, desc)
+    setWord(m, mKeyBytes, key.n * 8)
+    setWord(m, mKeySlots, if key.n < 2 { 2 } else { key.n })
+    m
+}
+
+const mapMost = 2147483646
+
+// removed entries go once they are half of those used: the others move down, and the table is made again
+fn mapCompact(m: Int) {
+    remember(m, 0, word(m, mDesc)) // its new table: kept by a loop that began before it
+    let size = entryBytes(m)
+    var to = 0
+    for i in 0..word(m, mUsed) {
+        let e = entryAt(m, i)
+        if word(e, 0) != 0 {
+            if to != i {
+                moveBytes(entryAt(m, to), e, size)
+            }
+            to += 1
+        }
+    }
+    setWord(m, mUsed, to)
+    var tableCap = 16
+    while tableCap < (to + 1) * 2 {
+        tableCap *= 2
+    }
+    mapRehash(m, tableCap)
+}
+
+// m[k] = ...: where the value goes (the key added when new); a NaN in the key stops the program
+pub extern effect fn rtMapSet(m: Int64, k0: Int64, k1: Int64, line: Int64) -> Int64 as "qk_mapSet" {
+    remember(m, 0, word(m, mDesc)) // a loop that began before the map was made keeps what goes in it
+    let h = keyHash(m, k0, k1)
+    if h.nan {
+        panicNow(panicNanKey, line, 0, 0)
+    }
+    let at = mapFindHashed(m, k0, k1, h.h)
+    if at >= 0 {
+        return entryAt(m, at) + 8 + 8 * word(m, mKeySlots)
+    }
+    if word(m, mUsed) >= mapMost {
+        if word(m, mUsed) > word(m, mCount) {
+            mapCompact(m)
+        }
+        if word(m, mUsed) >= mapMost {
+            panicNow(panicMapFull, line, mapMost, 0)
+        }
+    }
+    if word(m, mUsed) == word(m, mCap) {
+        let cap = if word(m, mCap) != 0 { word(m, mCap) * 2 } else { 8 }
+        let entries = alloc(cap, entryBytes(m))
+        copyBytes(entries, word(m, mEntries), word(m, mUsed) * entryBytes(m))
+        setWord(m, mEntries, entries)
+        setWord(m, mCap, cap)
+    }
+    if (word(m, mUsed) + 1) * 2 > word(m, mTableCap) {
+        mapRehash(m, if word(m, mTableCap) != 0 { word(m, mTableCap) * 2 } else { 16 })
+    }
+    let e = entryAt(m, word(m, mUsed))
+    zeroBytes(e, entryBytes(m))
+    setWord(e, 0, 1)
+    if word(m, mKeyKind) == keyAny {
+        copyBytes(e + 8, k0, word(m, mKeyBytes))
+    } else {
+        setWord(e, 1, k0)
+        setWord(e, 2, if word(m, mKeyKind) == keyPlain { 0 } else { k1 })
+    }
+    mapPlace(m, word(m, mUsed))
+    setWord(m, mUsed, word(m, mUsed) + 1)
+    setWord(m, mCount, word(m, mCount) + 1)
+    e + 8 + 8 * word(m, mKeySlots)
+}
+
+pub extern effect fn rtMapGet(m: Int64, k0: Int64, k1: Int64) -> Int64 as "qk_mapGet" {
+    let at = mapFind(m, k0, k1)
+    if at < 0 { 0 } else { entryAt(m, at) + 8 + 8 * word(m, mKeySlots) }
+}
+
+pub extern effect fn rtMapRemove(m: Int64, k0: Int64, k1: Int64) as "qk_mapRemove" {
+    let at = mapFind(m, k0, k1)
+    if at < 0 {
+        return
+    }
+    setWord(entryAt(m, at), 0, 0) // its table slot stays: lookups go past it
+    setWord(m, mCount, word(m, mCount) - 1)
+    let removed = word(m, mUsed) - word(m, mCount)
+    if removed >= 16 and removed * 2 >= word(m, mUsed) {
+        mapCompact(m)
+    }
+}
+
+// a map of its own (a var's): the same keys and values, removed entries left out
+pub extern effect fn rtMapCopy(m: Int64) -> Int64 as "qk_mapCopy" {
+    let c = alloc(mapWords, 8)
+    copyBytes(c, m, 8 * mapWords)
+    setWord(c, mCount, 0)
+    setWord(c, mUsed, 0)
+    setWord(c, mCap, 0)
+    setWord(c, mTableCap, 0)
+    setWord(c, mEntries, 0)
+    setWord(c, mTable, 0)
+    if word(m, mCount) == 0 {
+        return c
+    }
+    setWord(c, mCap, word(m, mCount))
+    setWord(c, mEntries, alloc(word(m, mCount), entryBytes(m)))
+    for i in 0..word(m, mUsed) {
+        let e = entryAt(m, i)
+        if word(e, 0) != 0 {
+            copyBytes(entryAt(c, word(c, mUsed)), e, entryBytes(m))
+            setWord(c, mUsed, word(c, mUsed) + 1)
+        }
+    }
+    setWord(c, mCount, word(c, mUsed))
+    var tableCap = 16
+    while tableCap < word(c, mUsed) * 2 {
+        tableCap *= 2
+    }
+    mapRehash(c, tableCap)
+    c
+}
+
+pub extern effect fn rtMapLen(m: Int64) -> Int64 as "qk_mapLen" = word(m, mCount)
+
+pub extern effect fn rtMapUsed(m: Int64) -> Int64 as "qk_mapUsed" = word(m, mUsed)
+
+// entry i's key (its value keySlots on), or 0 when it was removed
+pub extern effect fn rtMapEntry(m: Int64, i: Int64) -> Int64 as "qk_mapEntry" {
+    let e = entryAt(m, i)
+    if word(e, 0) != 0 { e + 8 } else { 0 }
+}
+
+// keys(m), values(m): [count][each one's slots]
+fn mapList(m: Int, keys: Bool) -> Int {
+    let each = if keys { word(m, mKeyBytes) } else { word(m, mValueBytes) }
+    let p = alloc(1 + (word(m, mCount) * each + 7) / 8, 8)
+    setWord(p, 0, word(m, mCount))
+    var w = p + 8
+    for i in 0..word(m, mUsed) {
+        let e = entryAt(m, i)
+        if word(e, 0) != 0 {
+            copyBytes(w, if keys { e + 8 } else { e + 8 + 8 * word(m, mKeySlots) }, each)
+            w += each
+        }
+    }
+    p
+}
+
+pub extern effect fn rtMapKeys(m: Int64) -> Int64 as "qk_mapKeys" = mapList(m, true)
+
+pub extern effect fn rtMapValues(m: Int64) -> Int64 as "qk_mapValues" = mapList(m, false)

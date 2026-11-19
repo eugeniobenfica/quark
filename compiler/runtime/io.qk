@@ -1,0 +1,180 @@
+// Files read and written a part at a time (a File: C's stream, opened by the system's layer with a UTF-8 name), TCP
+// sockets (a Socket: the system's, never blocking: a read, write or accept that would wait gives the task's turn
+// back, or waits here outside a task: tasks.qk waitSocket), and the local time's offset. The system's layer
+// (windows.qk, linux.qk, macos.qk) gives the qkos* calls.
+use base
+use arena
+use text
+use print
+use tasks
+
+extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fclose(f: Int64) -> Int32
+extern effect fn fflush(f: Int64) -> Int32
+extern effect fn ferror(f: Int64) -> Int32
+extern effect fn osOpen(path: Int64, mode: Int64) -> Int64 as "qkosOpen" // a FILE*, or 0 (errno set)
+extern effect fn osSeek(f: Int64, at: Int64, from: Int64) -> Int64 as "qkosSeek" // the place now, or -1 (errno set)
+
+// a listening socket on host:port (host "" or zero: every address), or -1 with why (zero-ended) in why
+extern effect fn osListen(host: Int64, port: Int64, why: Int64) -> Int64 as "qkosListen"
+extern effect fn osConnect(host: Int64, port: Int64, why: Int64) -> Int64 as "qkosConnect" // connected, or -1
+extern effect fn osAccept(s: Int64, why: Int64) -> Int64 as "qkosAccept" // a socket, -1 none waiting, -2 (why)
+extern effect fn osRecv(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosRecv" // bytes, -1 would wait, -2
+extern effect fn osSend(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosSend" // bytes, -1 would wait, -2
+extern effect fn osCloseSocket(s: Int64) as "qkosCloseSocket"
+extern effect fn osLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" // seconds east of UTC, then
+
+fn failed(what: Text, why: Int) -> Int = errResult(message().text(what).text(": ").zeroText(why))
+
+// ---- files ----
+// openFile(path, mode) -> File!: "r" read, "w" written from nothing, "a" added to, "r+" read and written (bytes, as
+// they are: no line endings changed)
+pub extern effect fn rtOpenFile(path: Int64, pathLen: Int64, mode: Int64, modeLen: Int64) -> Int64 as "qk_openFile" {
+    let name = cString(path, pathLen)
+    let m = if modeLen == 1 and byte(mode, 0) == 'r' {
+        "rb\0"
+    } else if modeLen == 1 and byte(mode, 0) == 'w' {
+        "wb\0"
+    } else if modeLen == 1 and byte(mode, 0) == 'a' {
+        "ab\0"
+    } else if modeLen == 2 and byte(mode, 0) == 'r' and byte(mode, 1) == '+' {
+        "r+b\0"
+    } else if modeLen == 2 and byte(mode, 0) == 'w' and byte(mode, 1) == '+' {
+        "w+b\0"
+    } else {
+        return errResult(
+            message().text("openFile: the mode is \"r\", \"w\", \"a\", \"r+\" or \"w+\", not \"").bytes(mode, modeLen).text(
+                "\"",
+            ),
+        )
+    }
+    let f = osOpen(name, textAt(m))
+    if f == 0 {
+        return errResult(message().text("cannot open ").zeroText(name).text(": ").zeroText(strerror(osErrno())))
+    }
+    okResult(f, 0)
+}
+
+// readChunk(file, most) -> Bytes!: up to most bytes from where it is (none: its end)
+pub extern effect fn rtReadChunk(f: Int64, most: Int64) -> Int64 as "qk_readChunk" {
+    if most <= 0 {
+        return okResult(0, 0)
+    }
+    let p = allocRaw(most, 1)
+    let n = fread(p, 1, most, f)
+    if n < most and ferror(f) != 0 {
+        return errResult(message().text("cannot read: ").zeroText(strerror(osErrno())))
+    }
+    okResult(p, n)
+}
+
+// writeChunk(file, bytes) -> Unit!: every byte, where it is
+pub extern effect fn rtWriteChunk(f: Int64, p: Int64, n: Int64) -> Int64 as "qk_writeChunk" {
+    if n > 0 and fwrite(p, 1, n, f) != n {
+        return errResult(message().text("cannot write: ").zeroText(strerror(osErrno())))
+    }
+    okResult(0, 0)
+}
+
+// seekFile(file, at, from) -> Int!: from 0 the start, 1 where it is, 2 the end; the place it is now
+pub extern effect fn rtSeekFile(f: Int64, at: Int64, from: Int64) -> Int64 as "qk_seekFile" {
+    let now = osSeek(f, at, from)
+    if now < 0 {
+        return errResult(message().text("cannot seek: ").zeroText(strerror(osErrno())))
+    }
+    okResult(now, 0)
+}
+
+// closeFile(file): written out and closed
+pub extern effect fn rtCloseFile(f: Int64) as "qk_closeFile" {
+    let _ = fflush(f)
+    let _ = fclose(f)
+}
+
+// ---- sockets ----
+fn why() -> Int {
+    let w = alloc(256, 1)
+    setByte(w, 0, 0)
+    w
+}
+
+// listen(host, port) -> Socket!
+pub extern effect fn rtListen(host: Int64, hostLen: Int64, port: Int64) -> Int64 as "qk_listen" {
+    let w = why()
+    let s = osListen(cString(host, hostLen), port, w)
+    if s < 0 {
+        return errResult(message().text("cannot listen on port ").int(port).text(": ").zeroText(w))
+    }
+    okResult(s, 0)
+}
+
+// connect(host, port) -> Socket!
+pub extern effect fn rtConnect(host: Int64, hostLen: Int64, port: Int64) -> Int64 as "qk_connect" {
+    let w = why()
+    let name = cString(host, hostLen)
+    let s = osConnect(name, port, w)
+    if s < 0 {
+        return errResult(message().text("cannot connect to ").zeroText(name).text(":").int(port).text(": ").zeroText(w))
+    }
+    okResult(s, 0)
+}
+
+// accept(listener) -> Socket!: the next connection (the task waits for one)
+pub extern effect fn rtAccept(s: Int64) -> Int64 as "qk_accept" {
+    let w = why()
+    while true {
+        let c = osAccept(s, w)
+        if c >= 0 {
+            return okResult(c, 0)
+        }
+        if c == -2 {
+            return failed("cannot accept", w)
+        }
+        waitSocket(s, false)
+    }
+    0
+}
+
+// readSocket(socket, most) -> Bytes!: what came, up to most bytes (the task waits for some); none: the other end
+// closed it
+pub extern effect fn rtReadSocket(s: Int64, most: Int64) -> Int64 as "qk_readSocket" {
+    let w = why()
+    let p = allocRaw(if most > 0 { most } else { 1 }, 1)
+    while true {
+        let n = osRecv(s, p, most, w)
+        if n >= 0 {
+            return okResult(p, n)
+        }
+        if n == -2 {
+            return failed("cannot read from the socket", w)
+        }
+        waitSocket(s, false)
+    }
+    0
+}
+
+// writeSocket(socket, bytes) -> Unit!: every byte sent (the task waits while the system's buffer is full)
+pub extern effect fn rtWriteSocket(s: Int64, p: Int64, n: Int64) -> Int64 as "qk_writeSocket" {
+    let w = why()
+    var at = 0
+    while at < n {
+        let k = osSend(s, p + at, n - at, w)
+        if k == -2 {
+            return failed("cannot write to the socket", w)
+        }
+        if k < 0 {
+            waitSocket(s, true)
+        } else {
+            at += k
+        }
+    }
+    okResult(0, 0)
+}
+
+// closeSocket(socket)
+pub extern effect fn rtCloseSocket(s: Int64) as "qk_closeSocket" = osCloseSocket(s)
+
+// localOffset(seconds) -> Int: the local time's offset from UTC at that moment, in seconds (east positive)
+pub extern effect fn rtLocalOffset(seconds: Float64) -> Int64 as "qk_localOffset" =
+    osLocalOffset(seconds)

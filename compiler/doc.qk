@@ -1,0 +1,238 @@
+// Documentation: the pub declarations of a program's files (the file given and the ones its
+// uses name), each with its signature and the comment above it, as Markdown or as one HTML page. A type's own
+// functions (fn Vec2.length) are listed under the type.
+use ast
+use types
+use format
+use graph
+
+fn fnSignature(p: Program, d: Decl) -> Text {
+    let a = p.ast
+    // effect: declared, or worked out from its body (a reader sees what a function may do either way)
+    var out = (if d.isExtern { "extern " } else { "" })
+        + (if d.isEffect or d.effectDeclared { "effect " } else { "" })
+        + "fn "
+        + d.name
+    let typeParams = if d.impliedTypes { 0 } else { len(d.typeParams) }
+    for i in 0..typeParams {
+        out += (if i > 0 { ", " } else { "<" }) + d.typeParams[i]
+    }
+    out += if typeParams > 0 { ">(" } else { "(" }
+    for (i, k) in d.params.enumerate() {
+        let prm = a.params[k]
+        if i == 0 and (prm.ty < 0 or d.impliedSelf) {
+            // fn Vec2.length(self), fn Parser.next(var self)
+            out += (if prm.isVar { "var " } else { "" }) + prm.name
+            continue
+        }
+        out += (if i > 0 { ", " } else { "" }) + prm.name + ": " + (if prm.ty >= 0 { typeText(a, prm.ty) } else { "" })
+        if prm.fallback >= 0 {
+            out += " = " + exprText(a, prm.fallback, 0)
+        }
+    }
+    if d.variadic {
+        out += if len(d.params) > 0 { ", ..." } else { "..." }
+    }
+    out += ")"
+    if d.ret >= 0 {
+        out += " -> " + typeText(a, d.ret)
+    } else if d.retType >= 0 and not p.types[d.retType].kind is Void | Error {
+        out += " -> " + p.typeName(d.retType) // worked out from its body
+    }
+    if d.externLib != "" {
+        out += " in \"{d.externLib}\"" // C's: its library, its symbol
+    }
+    if d.externSymbol != "" {
+        out += " as \"{d.externSymbol}\""
+    }
+    out
+}
+
+// a declaration as the formatter writes it, without its comments (and a function without its body)
+fn signature(p: Program, at: Int) -> Text {
+    let d = p.ast.decls[at]
+    if d.kind == DeclKind.Fn {
+        return "pub " + fnSignature(p, d)
+    }
+    if d.opaque {
+        var out = "pub opaque type " + d.name
+        for (i, t) in d.typeParams.enumerate() {
+            out += (if i > 0 { ", " } else { "<" }) + t
+        }
+        return out + (if len(d.typeParams) > 0 { ">" } else { "" })
+    }
+    var a = p.ast
+    var bare = d with { leading: "", trailing: None, isPub: false, module: 0 }
+    if d.kind == DeclKind.Const and d.body >= 0 and a.exprs[d.body].node is Lambda(_, _) {
+        bare.body = -1
+    }
+    a.decls[at] = bare
+    var text = declText(a, at)
+    while text.endsWith("\n") {
+        text = text[..len(text) - 1]
+    }
+    "pub " + text
+}
+
+fn kindWord(d: Decl) -> Text = match d.kind {
+    Fn => if d.owner != "" { "method" } else { "fn" }
+    Enum => "enum"
+    Const => "const"
+    _ => if d.isInterface {
+        "interface"
+    } else if d.isExtern {
+        "extern type"
+    } else {
+        "type"
+    }
+}
+
+fn html(s: Text) -> Text =
+    s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+
+// an anchor: the name with its dot made a dash (Vec2.length -> Vec2-length)
+fn anchor(name: Text) -> Text = name.replace(".", "-")
+
+// the comment above it: its lines as paragraphs (an empty line between them)
+fn comment(text: Text, asHtml: Bool) -> Text {
+    if text == "" {
+        return ""
+    }
+    if not asHtml {
+        return text + "\n\n"
+    }
+    "<p>" + html(text).replace("\n\n", "</p>\n<p>").replace("\n", " ").replace("</p> <p>", "</p>\n<p>") + "</p>\n"
+}
+
+fn entry(p: Program, at: Int, asHtml: Bool, level: Int) -> Text {
+    let d = p.ast.decls[at]
+    let sig = signature(p, at)
+    if asHtml {
+        return "<section class=\"decl\" id=\"{anchor(d.name)}\">\n<h{level}><span class=\"kind\">{kindWord(d)}</span> {html(d.name)}</h{level}>\n<pre><code>{html(sig)}</code></pre>\n"
+            + comment(d.leading, true)
+            + "</section>\n"
+    }
+    "#" * level + " {kindWord(d)} {d.name}\n\n```quark\n{sig}\n```\n\n" + comment(d.leading, false)
+}
+
+fn shown(d: Decl) -> Bool =
+    d.isPub
+        and not d.fromPrelude
+        and not d.builtin
+        and d.templateOf < 0
+        and not d.lifted
+        and not d.isTest
+        and d.kind != DeclKind.Use
+
+const style = "<style>\n:root \{ color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; --code: #f5f5f7; --accent: #5b4bdb; \}\n@media (prefers-color-scheme: dark) \{ :root \{ --fg: #e8e8ed; --bg: #161618; --muted: #9a9aa2; --code: #232326; --accent: #a99cff; \} \}\nbody \{ font: 16px/1.55 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 52rem; margin: 0 auto; padding: 2rem 1rem; \}\nnav \{ font-size: 14px; \} nav ul \{ columns: 2; padding-left: 1.2rem; \} a \{ color: var(--accent); \}\nh1 \{ margin-bottom: .2rem; \} h2.file \{ border-bottom: 1px solid var(--muted); padding-bottom: .3rem; margin-top: 2.5rem; \}\n.kind \{ color: var(--muted); font-weight: normal; font-size: .8em; margin-right: .3em; \}\npre \{ background: var(--code); padding: .7rem 1rem; border-radius: 6px; overflow-x: auto; \}\ncode \{ font: 14px/1.45 ui-monospace, Consolas, monospace; \}\n.methods \{ margin-left: 1.2rem; \}\n</style>\n"
+
+pub fn docOf(p: Program, asHtml: Bool) -> Text {
+    let files = max(len(p.modules), 1)
+    let path0 = if len(p.modules) > 0 { p.modules[0].path } else { "" }
+    // the title: the file's name, without its folder and .qk
+    var start = 0
+    for (i, c) in path0.bytes().enumerate() {
+        if c == '/' or c == '\\' {
+            start = i + 1
+        }
+    }
+    var title = path0[start..]
+    if len(title) > 3 and title.endsWith(".qk") {
+        title = title[..len(title) - 3]
+    }
+    var out = ""
+    if asHtml {
+        out += "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{html(title)}</title>\n"
+            + style
+            + "</head>\n<body>\n<h1>{html(title)}</h1>\n<nav><ul>\n"
+        for at in p.decls {
+            let d = p.ast.decls[at]
+            if shown(d) and d.owner == "" {
+                out += "<li><a href=\"#{anchor(d.name)}\">{html(d.name)}</a></li>\n"
+            }
+        }
+        out += "</ul></nav>\n"
+    } else {
+        out += "# {title}\n\n"
+    }
+    for m in 0..files {
+        if not p.decls.any(at => shown(p.ast.decls[at]) and p.ast.decls[at].module == m) {
+            continue
+        }
+        let path = if len(p.modules) > 0 { p.modules[m].path } else { "" }
+        out += if asHtml {
+            "<h2 class=\"file\">{html(path)}</h2>\n"
+        } else {
+            "## {path}\n\n"
+        }
+        for at in p.decls {
+            let d = p.ast.decls[at]
+            if not shown(d) or d.module != m {
+                continue
+            }
+            // a type's function goes under its type, when the type is shown
+            if d.owner != ""
+                and p.decls.any(
+                    k => p.ast.decls[k].kind != DeclKind.Fn and shown(p.ast.decls[k]) and p.ast.decls[k].name == d.owner,
+                ) {
+                continue
+            }
+            out += entry(p, at, asHtml, 3)
+            if d.kind == DeclKind.Fn {
+                continue
+            }
+            var any = false
+            for k in p.decls {
+                let f = p.ast.decls[k]
+                if not shown(f) or f.owner == "" or f.owner != d.name {
+                    continue
+                }
+                if asHtml and not any {
+                    out += "<div class=\"methods\">\n"
+                }
+                any = true
+                out += entry(p, k, asHtml, 4)
+            }
+            if asHtml and any {
+                out += "</div>\n"
+            }
+        }
+    }
+    if asHtml {
+        out += "</body>\n</html>\n"
+    }
+    out
+}
+
+// quark doc FILE [-o out.md|out.html]: Markdown on standard output, or to -o: .html for a page, else Markdown
+pub fn docCommand(given: [Text]) -> Int {
+    let o = options(given, 1, true)
+    if o.bad != "" or o.json or o.layout != "" {
+        printErr("quark: unknown option {o.bad}")
+        return 2
+    }
+    if len(o.files) == 0 {
+        return 2
+    }
+    let path = o.files[0]
+    let Ok(text) = readFile(path) else {
+        printErr("quark: cannot read {path}")
+        return 1
+    }
+    // checked for the result types it works out; a program with errors still has its docs
+    let read = readProgram(path, text, o.prelude, true)
+    if not read.parsed {
+        return 1
+    }
+    let asHtml = len(o.out) > 5 and (o.out.endsWith(".html") or o.out.endsWith(".htm"))
+    let out = docOf(read.program, asHtml)
+    if o.out != "" {
+        if writeFile(o.out, out) is Err(_) {
+            printErr("quark: cannot write {o.out}")
+            return 1
+        }
+        return 0
+    }
+    emit(out)
+    0
+}

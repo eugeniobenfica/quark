@@ -1,0 +1,36 @@
+// quark: the compiler written in Quark, its command line (compiler/cli.qk) on Linux: memory from mmap, C's functions
+// from the process (dlsym). compiler/main.qk is the same on Windows.
+//   quark build compiler/mainlinux.qk --release -o build/quarkq
+use cli
+use imagecli
+
+extern effect fn mmap(p: Int64, n: UInt64, prot: Int32, flags: Int32, fd: Int32, offset: Int64) -> Int64
+extern effect fn mprotect(p: Int64, n: UInt64, prot: Int32) -> Int32
+extern effect fn dlsym(h: Int64, name: CText) -> Int64
+extern effect fn fopen(path: CText, mode: CText) -> Int64
+extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fclose(f: Int64) -> Int32
+
+fn mapMemory(n: Int) -> Int {
+    let p = mmap(0, n, 3, 34, -1, 0) // read, write; private, anonymous
+    if p == -1 { 0 } else { p }
+}
+
+// (the kernel makes a page's instruction cache coherent when the page becomes runnable)
+fn protectCode(p: Int, n: Int) -> Bool = mprotect(p, n, 5) == 0
+
+fn cFunction(name: Text) -> Int = dlsym(0, name) // RTLD_DEFAULT: the C library, libm, what the process has loaded
+
+// the processor this program was built for, from its own ELF header (e_machine: 183, AArch64)
+fn arm() -> Bool {
+    let f = fopen("/proc/self/exe", "rb")
+    if f == 0 {
+        return false
+    }
+    let header = malloc(64)
+    let read = fread(header, 1, 20, f)
+    let _ = fclose(f)
+    read == 20 and Pointer<UInt8>(header)[18] == 183
+}
+
+fn main() -> Int = cliMain(Host(.Linux, mapMemory, protectCode, cFunction, arm(), "/proc/self/exe"))

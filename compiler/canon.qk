@@ -1,0 +1,78 @@
+// The canonical form's rewrites that need the program's types (quark fmt, the editor's formatting): made on a file's
+// parsed tree when the program checks, from what the checker found out about each node (a file parsed alone has the
+// node indices the checked program gives it: what it uses comes after). A program that does not check is only laid
+// out.
+//  - a built-in that works on a subject is written as its method: replace(word, "a", "b") is word.replace("a", "b"),
+//    contains(seen, k) is seen.contains(k) (len, min, max, the math functions and the effects stay calls);
+//  - toArray() that only hands its values on to a function that takes any loop goes: xs.map(f).toArray().join(",")
+//    is xs.map(f).join(","), without the array made in between.
+use ast
+use source
+use types
+use module
+use check
+
+// the built-ins written as methods: their first argument is what they work on
+const methodNames = [
+    "map", "filter", "fold", "sum", "any", "all", "toArray", "push", "split", "trim", "parseInt", "parseFloat", "words",
+    "lines", "contains", "indexOf", "startsWith", "endsWith", "replace", "upper", "lower", "join", "sorted", "sortedBy",
+    "reversed", "first", "last", "count", "minBy", "maxBy", "keys", "values", "remove", "index", "parallelMap", "take",
+    "skip", "countBy", "mean", "get", "add", "toSet", "enumerate", "mapErr", "codePoints", "pop", "parallelFold",
+    "toText",
+]
+
+// the built-ins that take any loop as what they work on (a toArray() before them makes an array for nothing)
+const loopConsumers = [
+    "map", "filter", "fold", "sum", "any", "all", "contains", "indexOf", "join", "sorted", "sortedBy", "reversed",
+    "first", "last", "count", "minBy", "maxBy", "parallelMap", "take", "skip", "countBy", "mean", "toSet", "enumerate",
+    "parallelFold", "len", "min", "max",
+]
+
+fn builtinIds(names: [Text]) -> [Int] = names
+    .map(n => builtinNames.indexOf(n) ?? -1)
+    .filter(b => b > 0)
+    .toArray()
+
+// the file's tree in canonical form (src: its text, as read); the same tree when the program does not check
+pub fn canonical(a: Ast, src: Source) -> Ast {
+    let loaded = loadProgram(src, None)
+    if not loaded.ok {
+        return a
+    }
+    let checked = checkProgram(loaded.program, loaded.errors, false, None)
+    if not checked.ok {
+        return a
+    }
+    let p = checked.program
+    let methods = builtinIds(methodNames)
+    let consumers = builtinIds(loopConsumers)
+    let toArray = builtinNames.indexOf("toArray") ?? -1
+    var out = a
+    let n = len(a.exprs)
+    for e in 0..n {
+        let Call(name, qualifier, args, names, method, dotted) = out.exprs[e].node else {
+            continue
+        }
+        let b = p.ast.exprs[e].builtin
+        if b <= 0 or len(args) == 0 or qualifier != "" or dotted or (names.get(0) ?? "") != "" {
+            continue
+        }
+        var given = args
+        let r = given[0]
+        if consumers.contains(b)
+            and r < n
+            and p.ast.exprs[r].builtin == toArray
+            and out.exprs[r].node is Call(_, rq, rargs, rnames, _, rdotted)
+            and len(rargs) == 1
+            and rq == ""
+            and not rdotted
+            and (rnames.get(0) ?? "") == "" {
+            given[0] = rargs[0]
+        }
+        let asMethod = method or methods.contains(b)
+        if given != args or asMethod != method {
+            out.exprs[e].node = .Call(name, qualifier, given, names, asMethod, dotted)
+        }
+    }
+    out
+}

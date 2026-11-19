@@ -65,13 +65,10 @@ void qkVmHost(QkVm* vm, const char* name, void* function);
 extern char* (*qkModuleReader)(const char* path, size_t* len);
 /* What the programs compiled from now on may call that reaches outside them (NULL, the default: everything).
  * A list of names, by spaces or commas: host functions ("moveBy say"), all of a type's or a prefix's
- * ("Object.*", "net*"), and the built-in groups print, files, env, args, exit, stdin, clock. A program that calls
+ * ("Object.*", "net*"), and the built-in groups print, files, process, env, args, exit, stdin, clock, random, tasks. A program that calls
  * anything else does not compile: "moveBy is not given to this program". One machine per level of trust, or a
  * list set before each qkCompile: a third-party plugin gets less than the application's own scripts. */
 void qkVmCapabilities(QkVm* vm, const char* list);
-/* Int + - * stop the call with a panic when they go past the limits (overflow), instead of wrapping around
- * (false, the default: as fast as C's). For development builds, say. */
-void qkVmChecked(QkVm* vm, bool checked);
 /* At most this many bytes of memory for the machine's programs (0: no limit, the default); past it a call stops
  * with "used more memory than it is given", and the host goes on. */
 void qkVmMemoryLimit(QkVm* vm, int64_t bytes);
@@ -130,11 +127,14 @@ typedef struct QkStaticProgram {
     const QkStaticFn* fns;
     int64_t externCount;
     const char* const* externs;
+    const char* const* externLibs; /* each one's library: "" the host's, else the C library; or the one in "lib" names */
 } QkStaticProgram;
 QkModule* qkModuleStatic(QkVm* vm, QkStaticProgram* p);
 /* A function as a task (a coroutine: a long job, a conversation, a workflow that waits): it runs a step at a time,
- * on a stack of its own. qkTaskResume runs it until it calls yield() or wait(seconds), or ends: 1 it gave its turn
- * back (resume it when the host is ready), 0 it is done, -1 it stopped (qkLastError says why). It gives nothing. */
+ * on a stack of its own. qkTaskResume runs it until it calls yield() or sleep(seconds), or ends: 1 it gave its turn
+ * back (resume it when the host is ready), 0 it is done, -1 it stopped (qkLastError says why). It gives nothing.
+ * It allocates in an arena of its own (calls go on resetting the machine's); args are used as they are, so a text or
+ * array among them must outlive the task (the host's memory, not an earlier call's result). */
 typedef struct QkTaskHandle QkTaskHandle;
 QkTaskHandle* qkTaskStart(QkModule* m, int fn, const QkValue* args, int argSlots);
 int qkTaskResume(QkTaskHandle* t);

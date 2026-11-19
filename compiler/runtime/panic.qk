@@ -1,0 +1,98 @@
+// Stopping: a panic's message (the line, and for code run with a trace the calls it went through), then back to
+// the call the host (or start) made, through the code's escape, or the end of the process.
+use std.machine as machine
+use base
+use print
+use trace
+
+extern effect fn debugUnwind() as "qkDebugUnwind" // the debugger's calls (debug.qk): gone
+extern effect fn debugFinish() as "qkDebugFinish" // --trace: the values, written
+
+fn lineOf(line: Int) -> Int = line & 4294967295 // the inlined calls ride above the line
+
+// the program's path as its messages start with it: the command line's (gRunPath), else "program"
+fn named() -> Buf {
+    let b = bufAt(panicText(), panicTextSize)
+    let path = gGet(gRunPath)
+    if path != 0 { b.zeroText(path) } else { b.text("program") }
+}
+
+fn at(line: Int) -> Buf = named().text(":").int(lineOf(line)).text(": ")
+
+pub extern effect fn rtPanic(code: Int64, line: Int64, a: Int64, b: Int64) as "qk_panic" {
+    let m = match code {
+        1 => at(line).text("index ").int(a).text(" is outside the array (its length is ").int(b).text(")")
+        2 => at(line).text("division by zero")
+        3 => at(line).text("the program ran too long (its budget ran out)")
+        5 => at(line).text("min, max, minBy, maxBy or mean of nothing (the list is empty)")
+        6 => at(line).text("an array of ").int(a).text(" elements cannot be made")
+        7 => at(line).text("a slice to ").int(a).text(" goes past the end (the length is ").int(b - 1).text(")")
+        8 => at(line).text("a slice from ").int(a).text(" starts after its end ").int(b - 1)
+        10 => at(line).text("a slice at byte ").int(a - 1).text(
+            " cuts a character in two (texts are UTF-8: codePoints(t) gives the characters)",
+        )
+        14 => at(line).text("randomInt(").int(a).text(", ").int(b).text(
+            ") has no Int to give (the end is not included)",
+        )
+        13 => at(line).text("this Float is too big for an Int (or not a number)")
+        15 => at(line).text("there is no task ").int(a).text(" (step goes on until it is done, then it is gone)")
+        16 => at(line).text("NaN cannot be a map's key (it is equal to nothing)")
+        17 => at(line).int(a).text(" is not a Unicode code point (0 to 0x10FFFF, without 0xD800 to 0xDFFF)")
+        18 => at(line).int(a).text(" is not a byte (0 to 255)")
+        19 => at(line).text("a map holds at most ").int(a).text(" entries")
+        21 => at(line).text("every task waits on a channel, and none is left to send on it (a deadlock)")
+        22 => at(line).text("send on channel ").int(a).text(", which was closed")
+        23 => at(line).text("there is no channel ").int(a)
+        20 => at(line).text("a block of memory was ").text(if b == 1 { "held" } else { "let go of" }).text(
+            " after it was given back at line ",
+        ).int(a).text(" (QUARK_VALIDATE)")
+        12 => at(line).text("an Int went past its limits (overflow; +% -% *% wrap around)")
+        11 => named().text(": the program used more memory than it is given (").int(a >> 20).text(" MB)")
+        9 => at(line).text("too many calls deep (the stack is full): does a function call itself without end?")
+        _ => at(line).text("stopped (").int(code).text(")")
+    }
+    let _ = m
+    appendTrace(line >> 32)
+    escapeOrEnd(true)
+}
+
+// back to the call (its trampoline gives 1), else the message and the end: status 1
+fn escapeOrEnd(say: Bool) {
+    debugUnwind()
+    let c = ctx()
+    if word(c, ctxEscapeRsp) != 0 and word(c, ctxEscapeStub) != 0 {
+        let _ = machine.call(Pointer<UInt8>(word(c, ctxEscapeStub)), 0, 0, 0, 0) // never returns
+    }
+    debugFinish()
+    flush()
+    if say {
+        let t = panicText()
+        let n = panicTextLen()
+        setByte(t, n, '\n')
+        osWrite(2, t, n + 1)
+        setByte(t, n, 0)
+    }
+    cExit(1)
+}
+
+pub extern effect fn rtStop() as "qkrtStop" = escapeOrEnd(true)
+
+// x? in main, a failed assert: "path:line: message"
+pub extern effect fn rtFail(p: Int64, n: Int64, line: Int64) as "qk_fail" {
+    let _ = at(line).bytes(p, if n < 400 { n } else { 400 })
+    appendTrace(line >> 32)
+    escapeOrEnd(true)
+}
+
+pub extern effect fn rtFuelOut(line: Int64) as "qk_fuelOut" = rtPanic(3, line, 0, 0)
+
+pub extern effect fn rtExit(code: Int64) as "qk_exit" {
+    flush()
+    if gGet(gExitEnds) == 0 and ctxGet(ctxEscapeRsp) != 0 and ctxGet(ctxEscapeStub) != 0 {
+        // a host's call: it ends
+        let _ = named().text(": exit(").int(code).text(")")
+        let _ = machine.call(Pointer<UInt8>(ctxGet(ctxEscapeStub)), 0, 0, 0, 0)
+    }
+    debugFinish()
+    cExit(code)
+}

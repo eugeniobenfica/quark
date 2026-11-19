@@ -1,0 +1,992 @@
+// Loops: a mark at the start, and what the turns made that the vars still hold, copied out. A loop's frame: [0] the
+// mark's block, [1] its used bytes, [2] what had been allocated at the mark, [3] how much may be made before the next
+// collection, [4] the mark's time, [5] its generations (below), [6...] the vars' slots. Spawn copies what a task
+// captured the same way.
+//
+// Generations: what a collection kept is old to the next one, which copies only what the turns made since (a minor
+// collection), and what old values were changed to hold. When what minor collections kept since the last full one
+// is as much as that one kept (16 MB at least), the next is full: everything since the mark, so garbage among the old
+// values goes too, and a loop that runs for ever stays at a few times what its vars hold.
+use base
+use arena
+use text
+use map
+
+const frameBlock = 0
+const frameUsed = 1
+const frameAllocated = 2
+const frameLimit = 3
+const frameTime = 4
+const frameGen = 5
+const frameRoots = 6
+
+// a loop's first collection after 4 MB made, then after up to 16 MB (a loop that runs briefly never collects: an
+// outer one takes back what it left); with a memory limit (--memory), at most a sixteenth of it, from 64 KB
+const loopFirstLimit = 4194304
+const nurseryMost = 16777216
+const nurseryLeast = 65536
+
+fn limited(a: Int, n: Int) -> Int {
+    let budget = word(a, aLimit) / 16
+    if budget == 0 or n <= budget { n } else { max(budget, nurseryLeast) }
+}
+
+// a frame's generations: the last collection's time, what minor ones kept since the last full one, what that one
+// kept, the survivor block being filled (old values are copied into it, one minor collection after another)
+const gLast = 0
+const gPromoted = 1
+const gLive = 2
+const gBlock = 3
+const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
+const genWords = 5
+
+pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
+    let a = arena()
+    if word(a, aCurrent) == 0 {
+        let _ = alloc(1, 16) // a block to mark (the first allocations may all have been large)
+    }
+    let f = alloc(frameRoots + rootSlots, 8)
+    let gen = alloc(genWords, 8)
+    setWord(f, frameGen, gen)
+    let cur = word(a, aCurrent)
+    setWord(f, frameBlock, cur)
+    setWord(f, frameUsed, word(cur, bUsed))
+    setWord(f, frameAllocated, word(a, aAllocated))
+    setWord(f, frameLimit, limited(a, loopFirstLimit))
+    setWord(a, aClock, word(a, aClock) + 1)
+    setWord(f, frameTime, word(a, aClock))
+    setWord(gen, gLast, word(a, aClock))
+    setWord(gen, gArena, a)
+    setMark(a, cur, word(cur, bUsed))
+    f
+}
+
+pub extern effect fn rtLoopCheck(f: Int64) -> Int64 as "qk_loopCheck" = if word(arena(), aAllocated) - word(
+    f,
+    frameAllocated,
+) > word(f, frameLimit) {
+    1
+} else {
+    0
+}
+
+// ---- the copier's words ----
+const cA = 0
+const cTime = 1
+const cNow = 2 // the survivor being filled
+const cTotal = 3 // bytes copied, and of large blocks kept and looked into
+const cMoved = 4 // (from, length, kind, to): what was copied already, by address
+const cMovedCap = 5
+const cMovedCount = 6
+pub const cPending = 7 // (slots, shape): boxes copied, their insides not yet
+pub const cPendingCount = 8
+pub const cPendingCap = 9
+const cYoung = 10 // (lo, hi, large block or 0): what the turns made, by address, sorted
+const cYoungCount = 11
+const cYoungCap = 12
+const cAll = 13
+const cRooms = 14 // (address, bytes): copies that keep their room to grow
+const cRoomCount = 15
+const cRoomCap = 16
+const cMade = 17 // bytes of the survivor blocks made (a block twice the last, from 64 KB up to 1 MB)
+const cShapes = 18 // (description, base, kind, shape): the shapes worked out, open addressing
+const cShapeCap = 19
+const cShapeCount = 20
+const cShapesMade = 21 // every shape made, to free
+const cFromData = 22 // copying out of another thread's copy of the program: its data, where a map's description is
+const cDataLen = 23
+const cToData = 24 // ... and this program's, where the copy's description goes
+const cSides = 25 // for each young range (as cYoung is sorted), its side table or 0 (movedSlot)
+const cLastRange = 26 // the young range youngAt found last (the next address is most often in it too), or 0
+const copierWords = 27
+
+pub fn copierNew(a: Int, time: Int) -> Int {
+    let c = calloc(copierWords, 8)
+    setWord(c, cA, a)
+    setWord(c, cTime, time)
+    c
+}
+
+pub fn freeCopier(c: Int) {
+    forgetSides(c)
+    free(word(c, cPending))
+    free(word(c, cMoved))
+    free(word(c, cYoung))
+    free(word(c, cRooms))
+    var s = word(c, cShapesMade)
+    while s != 0 {
+        let next = word(s, sNextMade)
+        free(word(s, sPtrs))
+        free(word(s, sCaseFrom))
+        free(s)
+        s = next
+    }
+    free(word(c, cShapes))
+    free(c)
+}
+
+// a list of n-word items in the copier: listAt, countAt, capAt are its words
+pub fn grow(c: Int, listAt: Int, countAt: Int, capAt: Int, words: Int) -> Int {
+    if word(c, countAt) == word(c, capAt) {
+        let cap = if word(c, capAt) != 0 { word(c, capAt) * 2 } else { 16 }
+        setWord(c, listAt, realloc(word(c, listAt), cap * 8 * words))
+        setWord(c, capAt, cap)
+    }
+    let at = word(c, listAt) + 8 * words * word(c, countAt)
+    setWord(c, countAt, word(c, countAt) + 1)
+    at
+}
+
+// ---- shapes: where a type's values point, worked out once from its description ----
+// A shape's words: its slots, its pointers (count, room, the list: ptrWords each), an enum's cases and where each
+// one's pointers start (cases + 1 of them: the tag at slot 0), where its description ends, the next shape made.
+pub const sSlots = 0
+pub const sCount = 1
+const sCap = 2
+pub const sPtrs = 3
+pub const sCases = 4
+pub const sCaseFrom = 5
+pub const sEnd = 6
+const sNextMade = 7
+const shapeWords = 8
+
+// a pointer's words: its slot, its kind (T A M B C E P), the description of what it holds (A: the element's; B, P: the
+// type's), the whole description that one's references count from, and the shape (E: the enum's; A, B, P: the
+// element's, once worked out)
+pub const pAt = 0
+pub const pKind = 1
+pub const pDesc = 2
+pub const pBase = 3
+pub const pSub = 4
+pub const ptrWords = 5
+
+fn descRefIn(d: Int, base: Int) -> Int {
+    var at = 0
+    for i in 0..3 {
+        at = at * 64 + byte(d, i) - '0'
+    }
+    base + at
+}
+
+fn shapeAdd(s: Int, at: Int, kind: Int, desc: Int, base: Int, sub: Int) {
+    if word(s, sCount) == word(s, sCap) {
+        let cap = if word(s, sCap) != 0 { word(s, sCap) * 2 } else { 4 }
+        setWord(s, sPtrs, realloc(word(s, sPtrs), cap * 8 * ptrWords))
+        setWord(s, sCap, cap)
+    }
+    let q = word(s, sPtrs) + 8 * ptrWords * word(s, sCount)
+    setWord(q, pAt, at)
+    setWord(q, pKind, kind)
+    setWord(q, pDesc, desc)
+    setWord(q, pBase, base)
+    setWord(q, pSub, sub)
+    setWord(s, sCount, word(s, sCount) + 1)
+}
+
+fn shapeMake(c: Int) -> Int {
+    let s = calloc(shapeWords, 8)
+    setWord(s, sNextMade, word(c, cShapesMade))
+    setWord(c, cShapesMade, s)
+    s
+}
+
+// one type at d laid into s from slot at: its slot count, and where its description ends (descBase is base)
+fn shapeLay(c: Int, s: Int, at: Int, d0: Int, base: Int) -> Desc {
+    let k = byte(d0, 0)
+    let d = d0 + 1
+    if k == 'T' {
+        shapeAdd(s, at, 'T', 0, base, 0)
+        return Desc(2, d)
+    }
+    if k == 'A' {
+        shapeAdd(s, at, 'A', d, base, 0)
+        return Desc(2, skipDesc(d))
+    }
+    if k == 'M' {
+        shapeAdd(s, at, 'M', d0, base, 0)
+        return Desc(1, skipDesc(skipDesc(d)))
+    }
+    if k == 'B' or k == 'P' {
+        shapeAdd(s, at, k, d, base, 0)
+        return Desc(1, skipDesc(d))
+    }
+    if k == 'C' {
+        shapeAdd(s, at, 'C', 0, base, 0)
+        return Desc(1, d)
+    }
+    if k == 'R' {
+        return Desc(shapeLay(c, s, at, descRefIn(d, base), base).n, d + 3)
+    }
+    if k == '(' {
+        var n = 0
+        var q = d
+        while byte(q, 0) != ')' {
+            let f = shapeLay(c, s, at + n, q, base)
+            n += f.n
+            q = f.d
+        }
+        return Desc(n, q + 1)
+    }
+    if k == 'E' {
+        let e = shapeMake(c)
+        let cases = byte(d, 0) - 32
+        setWord(e, sCases, cases)
+        let from = malloc(8 * (cases + 1))
+        setWord(e, sCaseFrom, from)
+        let n = descNumber(d + 1) // then each case: where its data starts, its fields, '.'
+        var q = d + 4
+        for i in 0..cases {
+            setWord(from, i, word(e, sCount))
+            var slot = descNumber(q)
+            q += 3
+            while byte(q, 0) != '.' {
+                let f = shapeLay(c, e, slot, q, base)
+                slot += f.n
+                q = f.d
+            }
+            q += 1 // the case's end
+        }
+        setWord(from, cases, word(e, sCount))
+        setWord(e, sSlots, n)
+        if word(e, sCount) > 0 {
+            shapeAdd(s, at, 'E', 0, base, e)
+        }
+        return Desc(n, q)
+    }
+    Desc(1, d) // I, F
+}
+
+fn shapeHash(d: Int, base: Int, kind: Int) -> Int = mix(d ^ base * 31 ^ kind)
+
+// the shape of the type at d (kind 0), or of the types from d to its end (kind 'S': a frame's vars, from slot 0;
+// kind 'C': a closure's captured values, from slot 1)
+pub fn shapeOf(c: Int, d: Int, base: Int, kind: Int) -> Int {
+    if word(c, cShapeCount) * 2 >= word(c, cShapeCap) {
+        let cap = if word(c, cShapeCap) != 0 { word(c, cShapeCap) * 2 } else { 64 }
+        let grown = calloc(cap, 32)
+        let old = word(c, cShapes)
+        for i in 0..word(c, cShapeCap) {
+            let e = old + 32 * i
+            if word(e, 0) != 0 {
+                var k = shapeHash(word(e, 0), word(e, 1), word(e, 2)) & (cap - 1)
+                while word(grown, 4 * k) != 0 {
+                    k = (k + 1) & (cap - 1)
+                }
+                copyBytes(grown + 32 * k, e, 32)
+            }
+        }
+        free(old)
+        setWord(c, cShapes, grown)
+        setWord(c, cShapeCap, cap)
+    }
+    let table = word(c, cShapes)
+    let mask = word(c, cShapeCap) - 1
+    var k = shapeHash(d, base, kind) & mask
+    while word(table, 4 * k) != 0 {
+        let e = table + 32 * k
+        if word(e, 0) == d and word(e, 1) == base and word(e, 2) == kind {
+            return word(e, 3)
+        }
+        k = (k + 1) & mask
+    }
+    let saved = descBase()
+    setDescBase(base)
+    let s = shapeMake(c)
+    if kind != 0 {
+        var n = if kind == 'C' { 1 } else { 0 }
+        var q = d
+        while byte(q, 0) != 0 {
+            let f = shapeLay(c, s, n, q, base)
+            n += f.n
+            q = f.d
+        }
+        setWord(s, sSlots, n)
+        setWord(s, sEnd, q)
+    } else {
+        let f = shapeLay(c, s, 0, d, base)
+        setWord(s, sSlots, f.n)
+        setWord(s, sEnd, f.d)
+    }
+    setDescBase(saved)
+    let e = table + 32 * k
+    setWord(e, 0, d)
+    setWord(e, 1, base)
+    setWord(e, 2, kind)
+    setWord(e, 3, s)
+    setWord(c, cShapeCount, word(c, cShapeCount) + 1)
+    s
+}
+
+// ---- what the turns made: ranges by address ----
+// the range p is in (its address: lo, hi, large block or 0), or 0
+fn youngAt(c: Int, p: Int) -> Int {
+    let last = word(c, cLastRange)
+    if last != 0 and not below(p, word(last, 0)) and below(p, word(last, 1)) {
+        return last
+    }
+    let r = youngSearch(c, p)
+    if r != 0 {
+        setWord(c, cLastRange, r)
+    }
+    r
+}
+
+fn youngSearch(c: Int, p: Int) -> Int {
+    let young = word(c, cYoung)
+    var lo = 0
+    var hi = word(c, cYoungCount)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let r = young + 24 * mid
+        if below(p, word(r, 0)) {
+            hi = mid
+        } else if not below(p, word(r, 1)) {
+            lo = mid + 1
+        } else {
+            return r
+        }
+    }
+    0
+}
+
+fn isYoung(c: Int, p: Int) -> Bool = word(c, cAll) != 0 or youngAt(c, p) != 0
+
+// made by the turns and not kept: a large block the collection reached stays
+fn goneAt(c: Int, p: Int) -> Bool {
+    let r = youngAt(c, p)
+    r != 0 and (word(r, 2) == 0 or word(word(r, 2), bigMarked) == 0)
+}
+
+// the large block of the turns' that p is in (not when copying everything), or 0
+fn largeAt(c: Int, p: Int) -> Int {
+    if word(c, cAll) != 0 {
+        return 0
+    }
+    let r = youngAt(c, p)
+    if r != 0 { word(r, 2) } else { 0 }
+}
+
+fn addYoung(c: Int, lo: Int, hi: Int, large: Int) {
+    if lo >= hi {
+        return
+    }
+    setWord(c, cLastRange, 0) // the list may move
+    let at = grow(c, cYoung, cYoungCount, cYoungCap, 3)
+    setWord(at, 0, lo)
+    setWord(at, 1, hi)
+    setWord(at, 2, large)
+}
+
+fn sortYoung(c: Int) {
+    setWord(c, cLastRange, 0)
+    // by low address: an insertion sort
+    let y = word(c, cYoung)
+    for i in 1..word(c, cYoungCount) {
+        let lo = word(y, 3 * i)
+        let hi = word(y, 3 * i + 1)
+        let large = word(y, 3 * i + 2)
+        var j = i
+        while j > 0 and below(lo, word(y, 3 * (j - 1))) {
+            copyBytes(y + 24 * j, y + 24 * (j - 1), 24)
+            j -= 1
+        }
+        setWord(y, 3 * j, lo)
+        setWord(y, 3 * j + 1, hi)
+        setWord(y, 3 * j + 2, large)
+    }
+}
+
+fn survive(c: Int, bytes0: Int) -> Int {
+    var bytes = align16(bytes0)
+    if bytes == 0 {
+        bytes = 16
+    }
+    if bytes >= largeFrom {
+        // a large block of its own, made now: the next collection keeps it in place
+        setWord(c, cMade, word(c, cMade) + bytes)
+        setWord(c, cTotal, word(c, cTotal) + bytes)
+        return word(largeNew(word(c, cA), bytes, word(c, cTime)), bigData)
+    }
+    var now = word(c, cNow)
+    if now == 0 or word(now, xUsed) + bytes > word(now, xSize) {
+        // small blocks first: an inner loop that keeps a little, collected at each call, makes a little
+        var step = if now != 0 { word(now, xSize) * 2 } else { 65536 }
+        if step > 1048576 {
+            step = 1048576
+        }
+        let size = if bytes > step { bytes } else { step }
+        let x = calloc(1, size + 64)
+        if x == 0 {
+            panicNow(panicSize, 0, bytes, 0)
+        }
+        setWord(x, xSize, size)
+        setWord(x, xTime, word(c, cTime))
+        setWord(x, xData, align16(x + 40))
+        let a = word(c, cA)
+        setWord(x, xNext, word(a, aExtras))
+        setWord(a, aExtras, x)
+        setWord(c, cNow, x)
+        setWord(c, cMade, word(c, cMade) + size)
+        now = x
+    }
+    let p = word(now, xData) + word(now, xUsed)
+    setWord(now, xUsed, word(now, xUsed) + bytes)
+    setWord(c, cTotal, word(c, cTotal) + bytes)
+    p
+}
+
+fn keepRoom(c: Int, p: Int, bytes: Int) {
+    let at = grow(c, cRooms, cRoomCount, cRoomCap, 2)
+    setWord(at, 0, p)
+    setWord(at, 1, bytes)
+}
+
+// the place of (from, length, kind) in the moved table: its `to` word's address, and whether it was there
+type Slot { to: Int, found: Bool }
+
+fn movedHash(from: Int, n: Int, kind: Int) -> Int = mix(from ^ n * 31 ^ kind)
+
+// The young ranges' side table: 16 bytes for each 16 of a range, (to, (n * 256 + kind) * 16 + epoch) of what was
+// copied from the address there. Blocks are copied mostly in the order they were made, so it is walked in order (a
+// hash table's places are scattered over all of it: a cache miss each). One for the arena, kept from a collection to
+// the next: an entry of an earlier collection (another epoch) is empty, so it is cleared once in 15. cSides: each
+// range's offset in it (-1: none, past 64 MB).
+const sideMost = 67108864
+
+fn sideSlot(c: Int, from: Int, n: Int, kind: Int) -> Slot? {
+    if from & 15 != 0 or word(c, cAll) != 0 {
+        return None
+    }
+    let r = youngAt(c, from)
+    if r == 0 {
+        return None
+    }
+    if word(c, cSides) == 0 {
+        sidesStart(c)
+    }
+    let i = (r - word(c, cYoung)) / 24
+    let off = word(word(c, cSides), i)
+    if off < 0 {
+        return None
+    }
+    let a = word(c, cA)
+    let e = word(a, aSide) + off + shr(from - word(r, 0), 4) * 16
+    let epoch = word(a, aSideEpoch)
+    let key = (n * 256 + kind) * 16 + epoch
+    let had = word(e, 1)
+    if had & 15 != epoch {
+        setWord(e, 1, key) // empty (another collection's)
+        return Some(Slot(e, false))
+    }
+    if had == key {
+        return Some(Slot(e, true))
+    }
+    None // another length from the same address (a slice): the hash table
+}
+
+// each young range's place in the arena's side table (grown if it is too small), and this collection's epoch
+fn sidesStart(c: Int) {
+    let a = word(c, cA)
+    let count = word(c, cYoungCount)
+    let offsets = calloc(count + 1, 8)
+    setWord(c, cSides, offsets)
+    var total = 0
+    for i in 0..count {
+        let r = word(c, cYoung) + 24 * i
+        let size = word(r, 1) - word(r, 0)
+        if size > sideMost {
+            setWord(offsets, i, -1)
+        } else {
+            setWord(offsets, i, total)
+            total += (size / 16 + 1) * 16
+        }
+    }
+    var epoch = word(a, aSideEpoch) + 1
+    if total > word(a, aSideBytes) {
+        free(word(a, aSide))
+        let bytes = max(total, 2 * word(a, aSideBytes))
+        setWord(a, aSide, calloc(bytes, 1))
+        setWord(a, aSideBytes, bytes)
+        epoch = 1
+    } else if epoch == 16 {
+        zeroBytes(word(a, aSide), word(a, aSideBytes)) // every epoch used: cleared, and the first again
+        epoch = 1
+    }
+    setWord(a, aSideEpoch, epoch)
+}
+
+// what was copied forgotten: the next copy is of another epoch
+fn forgetSides(c: Int) {
+    if word(c, cSides) != 0 {
+        free(word(c, cSides))
+        setWord(c, cSides, 0)
+    }
+}
+
+fn movedSlot(c: Int, from: Int, n: Int, kind: Int) -> Slot {
+    if sideSlot(c, from, n, kind) is Some(s) {
+        return s
+    }
+    if word(c, cMovedCount) * 2 >= word(c, cMovedCap) {
+        let cap = if word(c, cMovedCap) != 0 { word(c, cMovedCap) * 2 } else { 1024 }
+        let grown = calloc(cap, 32)
+        let old = word(c, cMoved)
+        for i in 0..word(c, cMovedCap) {
+            let m = old + 32 * i
+            if word(m, 0) != 0 {
+                var k = movedHash(word(m, 0), word(m, 1), word(m, 2)) & (cap - 1)
+                while word(grown, 4 * k) != 0 {
+                    k = (k + 1) & (cap - 1)
+                }
+                copyBytes(grown + 32 * k, m, 32)
+            }
+        }
+        free(old)
+        setWord(c, cMoved, grown)
+        setWord(c, cMovedCap, cap)
+    }
+    let table = word(c, cMoved)
+    let mask = word(c, cMovedCap) - 1
+    var k = movedHash(from, n, kind) & mask
+    while word(table, 4 * k) != 0 {
+        let m = table + 32 * k
+        if word(m, 0) == from and word(m, 1) == n and word(m, 2) == kind {
+            return Slot(m + 24, true)
+        }
+        k = (k + 1) & mask
+    }
+    let m = table + 32 * k
+    setWord(m, 0, from)
+    setWord(m, 1, n)
+    setWord(m, 2, kind)
+    setWord(m, 3, 0)
+    setWord(c, cMovedCount, word(c, cMovedCount) + 1)
+    Slot(m + 24, false)
+}
+
+// the insides of a map: its entries' keys and values
+fn copyEntries(c: Int, n: Int) {
+    let desc = word(n, mDesc)
+    let key = shapeOf(c, desc + 1, desc, 0)
+    let value = shapeOf(c, word(key, sEnd), desc, 0)
+    if word(key, sCount) == 0 and word(value, sCount) == 0 {
+        return
+    }
+    for i in 0..word(n, mUsed) {
+        let e = entryAt(n, i)
+        if word(e, 0) != 0 {
+            copyShape(c, e + 8, key)
+            copyShape(c, e + 8 + 8 * word(n, mKeySlots), value)
+        }
+    }
+}
+
+fn copyMapInto(c: Int, slot: Int) {
+    let m = word(slot, 0)
+    if m == 0 or not isYoung(c, m) {
+        return
+    }
+    let to = movedSlot(c, m, 0, 'M')
+    if to.found {
+        setWord(slot, 0, word(to.to, 0))
+        return
+    }
+    let n = survive(c, 8 * mapWords)
+    setWord(to.to, 0, n)
+    setWord(slot, 0, n)
+    copyBytes(n, m, 8 * mapWords)
+    let d = word(n, mDesc)
+    if word(c, cDataLen) != 0 and d >= word(c, cFromData) and d < word(c, cFromData) + word(c, cDataLen) {
+        setWord(n, mDesc, d - word(c, cFromData) + word(c, cToData))
+    }
+    setWord(n, mCap, if word(m, mCount) != 0 { word(m, mCount) } else { 1 })
+    setWord(n, mUsed, 0)
+    setWord(n, mEntries, survive(c, word(n, mCap) * entryBytes(m)))
+    for i in 0..word(m, mUsed) {
+        let e = entryAt(m, i)
+        if word(e, 0) != 0 {
+            copyBytes(entryAt(n, word(n, mUsed)), e, entryBytes(m))
+            setWord(n, mUsed, word(n, mUsed) + 1)
+        }
+    }
+    setWord(n, mCount, word(n, mUsed))
+    copyEntries(c, n)
+    var tableCap = 16
+    while tableCap < word(n, mUsed) * 2 {
+        tableCap *= 2
+    }
+    setWord(n, mTableCap, tableCap)
+    setWord(n, mTable, survive(c, tableCap * 8))
+    zeroBytes(word(n, mTable), tableCap * 8)
+    for i in 0..word(n, mUsed) {
+        mapPlace(n, i)
+    }
+}
+
+fn copyText(c: Int, slots: Int) {
+    let n = word(slots, 1)
+    let p = word(slots, 0)
+    if n <= 0 or p == 0 or not isYoung(c, p) and not isYoung(c, p + n - 1) {
+        // from before the mark: it stays
+        return
+    }
+    let large = largeAt(c, p)
+    if large != 0 {
+        // a long text: it stays where it is
+        setWord(large, bigMarked, 1)
+        return
+    }
+    let to = movedSlot(c, p, n, 'T')
+    if not to.found {
+        let room = textRoom(word(c, cA), p, n)
+        let q = survive(c, if room > n + 8 { room } else { n + 8 })
+        setWord(q, 0, n)
+        copyBytes(q + 8, p, n)
+        if room > n + 8 {
+            keepRoom(c, q, room)
+        }
+        setWord(to.to, 0, q + 8)
+    }
+    setWord(slots, 0, word(to.to, 0))
+}
+
+fn copyArray(c: Int, slots: Int, elem: Int) {
+    let each = word(elem, sSlots) * 8
+    let n = word(slots, 1)
+    if n <= 0 or word(slots, 0) == 0 {
+        // nothing to keep: not an address the arena may give out again
+        setWord(slots, 0, ctx() + 8 * ctxScratch + 120) // a word nothing writes
+        return
+    }
+    let from = word(slots, 0)
+    if not isYoung(c, from) {
+        return
+    }
+    let to = movedSlot(c, from, n, 'A')
+    if to.found {
+        setWord(slots, 0, word(to.to, 0))
+        return
+    }
+    var p = from
+    let large = largeAt(c, from)
+    if large != 0 {
+        // a long array: it stays where it is (with its room), and only what it holds is copied
+        if word(large, bigMarked) == 0 and word(elem, sCount) > 0 {
+            setWord(c, cTotal, word(c, cTotal) + word(large, bigSize))
+        }
+        setWord(large, bigMarked, 1)
+    } else {
+        var room = growingRoom(word(c, cA), from)
+        if room < n * each {
+            room = 0
+        }
+        p = survive(c, if room != 0 { room } else { n * each })
+        copyBytes(p, from, n * each)
+        if room != 0 {
+            keepRoom(c, p, room)
+        }
+        setWord(slots, 0, p)
+    }
+    setWord(to.to, 0, p) // before the elements: the table may grow while they are copied
+    if word(elem, sCount) > 0 {
+        for i in 0..n {
+            copyShape(c, p + i * each, elem)
+        }
+    }
+}
+
+fn copyBox(c: Int, slots: Int, inner: Int) {
+    let from = word(slots, 0)
+    if from == 0 or not isYoung(c, from) {
+        return
+    }
+    let n = word(inner, sSlots)
+    let to = movedSlot(c, from, n, 'B')
+    if to.found {
+        setWord(slots, 0, word(to.to, 0))
+        return
+    }
+    let p = survive(c, n * 8)
+    copyBytes(p, from, n * 8)
+    setWord(slots, 0, p)
+    setWord(to.to, 0, p)
+    if word(inner, sCount) == 0 {
+        return
+    }
+    let at = grow(c, cPending, cPendingCount, cPendingCap, 2)
+    setWord(at, 0, p)
+    setWord(at, 1, inner)
+}
+
+// a lambda's captured values: [their description][their slots], copied, then copied into
+fn copyClosure(c: Int, slots: Int) {
+    let from = word(slots, 0)
+    if from == 0 or not isYoung(c, from) {
+        return
+    }
+    let desc = word(from, 0)
+    let s = shapeOf(c, desc, desc, 'C')
+    let n = word(s, sSlots)
+    let to = movedSlot(c, from, n, 'C')
+    if to.found {
+        setWord(slots, 0, word(to.to, 0))
+        return
+    }
+    let p = survive(c, n * 8)
+    copyBytes(p, from, n * 8)
+    setWord(slots, 0, p)
+    setWord(to.to, 0, p)
+    copyShape(c, p, s)
+}
+
+// copies what slot q (a pointer's words) of a value at slots points to when the turns made it, and points it at the copy
+fn copyPtr(c: Int, slots: Int, q: Int) {
+    let at = slots + 8 * word(q, pAt)
+    let k = word(q, pKind)
+    if k == 'T' {
+        copyText(c, at)
+    } else if k == 'A' {
+        if word(q, pSub) == 0 {
+            setWord(q, pSub, shapeOf(c, word(q, pDesc), word(q, pBase), 0))
+        }
+        copyArray(c, at, word(q, pSub))
+    } else if k == 'M' {
+        copyMapInto(c, at)
+    } else if k == 'B' {
+        if word(q, pSub) == 0 {
+            setWord(q, pSub, shapeOf(c, word(q, pDesc), word(q, pBase), 0))
+        }
+        copyBox(c, at, word(q, pSub))
+    } else if k == 'C' {
+        copyClosure(c, at)
+    } else if k == 'P' {
+        // a var in memory: what it holds, there
+        if word(q, pSub) == 0 {
+            setWord(q, pSub, shapeOf(c, word(q, pDesc), word(q, pBase), 0))
+        }
+        if word(at, 0) != 0 {
+            copyShape(c, word(at, 0), word(q, pSub))
+        }
+    } else if k == 'E' {
+        // the pointers of the case the tag says
+        let e = word(q, pSub)
+        let tag = word(at, 0)
+        if tag >= 0 and tag < word(e, sCases) {
+            let from = word(e, sCaseFrom)
+            for j in word(from, tag)..word(from, tag + 1) {
+                copyPtr(c, at, word(e, sPtrs) + 8 * ptrWords * j)
+            }
+        }
+    }
+}
+
+// copies what the slots point to (as the shape says) when the turns made it, and points them at the copies
+fn copyShape(c: Int, slots: Int, s: Int) {
+    let ptrs = word(s, sPtrs)
+    for i in 0..word(s, sCount) {
+        copyPtr(c, slots, ptrs + 8 * ptrWords * i)
+    }
+}
+
+fn copyPending(c: Int) {
+    while word(c, cPendingCount) > 0 {
+        // the boxes' insides, one after another
+        setWord(c, cPendingCount, word(c, cPendingCount) - 1)
+        let w = word(c, cPending) + 16 * word(c, cPendingCount)
+        copyShape(c, word(w, 0), word(w, 1))
+    }
+}
+
+// the vars' values in the frame, as desc describes them
+fn copyRoots(c: Int, slots: Int, desc: Int) {
+    copyShape(c, slots, shapeOf(c, desc, desc, 'S'))
+    copyPending(c)
+}
+
+// a container from before the mark that the loop changed in place: what it holds that the turns made, copied
+fn lookAgain(c: Int, r: Int, since: Int) {
+    let desc = word(r, rDesc)
+    if byte(desc, 0) == 'A' {
+        let elem = shapeOf(c, desc + 1, desc, 0)
+        var cards = shr(word(r, rLen) + 15, cardShift)
+        if cards > word(r, rCardCap) {
+            cards = word(r, rCardCap)
+        }
+        if word(elem, sCount) > 0 {
+            let each = 8 * word(elem, sSlots)
+            for k in 0..cards {
+                // the cards written since
+                if word(word(r, rCards), k) < since {
+                    continue
+                }
+                var i = k * 16
+                while i < k * 16 + 16 and i < word(r, rLen) {
+                    copyShape(c, word(r, rPtr) + i * each, elem)
+                    i += 1
+                }
+                setWord(c, cTotal, word(c, cTotal) + 16 * each) // looked into: the next collection waits as long
+            }
+        }
+    } else {
+        let m = word(r, rPtr)
+        if word(m, mEntries) != 0 and isYoung(c, word(m, mEntries)) {
+            let e = survive(c, word(m, mCap) * entryBytes(m))
+            copyBytes(e, word(m, mEntries), word(m, mUsed) * entryBytes(m))
+            setWord(m, mEntries, e)
+        }
+        if word(m, mTable) != 0 and isYoung(c, word(m, mTable)) {
+            let t = survive(c, word(m, mTableCap) * 8)
+            copyBytes(t, word(m, mTable), word(m, mTableCap) * 8)
+            setWord(m, mTable, t)
+        }
+        copyEntries(c, m)
+        setWord(c, cTotal, word(c, cTotal) + word(m, mUsed) * entryBytes(m))
+    }
+    copyPending(c)
+}
+
+// the loop's turns made enough: what its vars hold of that, to a survivor, and the arena back to the mark
+pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
+    let a = arena()
+    let gen = word(f, frameGen)
+    let full = word(gen, gPromoted) >= max(word(gen, gLive), limited(a, nurseryMost))
+    // young: made at this time or later (a full collection: since the mark)
+    let since = if full { word(f, frameTime) } else { word(gen, gLast) }
+    setWord(a, aClock, word(a, aClock) + 1)
+    let c = copierNew(a, word(a, aClock))
+    if not full {
+        setWord(c, cNow, word(gen, gBlock)) // old values go on where the last ones went
+    }
+    let mark = word(f, frameBlock)
+    let used = word(f, frameUsed)
+    var b = mark
+    while b != 0 {
+        addYoung(c, if b == mark { word(b, bData) + used } else { word(b, bData) }, word(b, bData) + word(b, bSize), 0)
+        b = word(b, bNext)
+    }
+    var x = word(a, aExtras)
+    while x != 0 and word(x, xTime) >= since {
+        // survivors of inner loops' collections (and, when full, of this loop's): the list is newest first
+        addYoung(c, word(x, xData), word(x, xData) + word(x, xSize), 0)
+        x = word(x, xNext)
+    }
+    var lb = word(a, aLarge)
+    while lb != 0 and word(lb, bigTime) >= since {
+        // large blocks made since: the list is newest first
+        addYoung(c, word(lb, bigData), word(lb, bigData) + word(lb, bigSize), lb)
+        lb = word(lb, bigNext)
+    }
+    sortYoung(c)
+    copyRoots(c, f + 8 * frameRoots, desc)
+    let cap = word(a, aRememberedCap)
+    for i in 0..cap {
+        let r = word(a, aRemembered) + 8 * rememberedWords * i
+        if word(r, rPtr) != 0 and word(r, rTime) >= since and not isYoung(c, word(r, rPtr)) {
+            lookAgain(c, r, since)
+        }
+    }
+    // what goes: its rooms and remembered containers are forgotten (a large block kept keeps its room)
+    var kept = 0
+    for i in 0..word(a, aRememberedCap) {
+        let r = word(a, aRemembered) + 8 * rememberedWords * i
+        if word(r, rPtr) != 0 and isYoung(c, word(r, rPtr)) {
+            setWord(r, rPtr, 0)
+            free(word(r, rCards))
+            setWord(r, rCards, 0)
+            setWord(r, rCardCap, 0)
+        } else if word(r, rPtr) != 0 {
+            kept += 1
+        }
+    }
+    if kept != word(a, aRememberedCount) {
+        setWord(a, aRememberedCount, kept)
+        rememberedGrow(a, word(a, aRememberedCap)) // the same size, without the holes
+    }
+    let growing = word(a, aGrowing)
+    for i in 0..growingSlots() {
+        let p = word(growing, 2 * i)
+        if p != 0 and goneAt(c, p) {
+            setWord(growing, 2 * i, 0)
+        }
+    }
+    var gone = freeExtras(a, since - 1, word(c, cTime)) // inner loops' survivors (and, when full, this loop's)
+    gone += freeLarge(a, since, word(c, cTime)) // (those made now hold what was copied)
+    gone += word(mark, bUsed) - used
+    var after = word(mark, bNext)
+    while after != 0 and word(after, bUsed) != 0 {
+        gone += word(after, bUsed)
+        after = word(after, bNext)
+    }
+    setWord(a, aAllocated, word(a, aAllocated) + word(c, cMade) - gone) // what the arena holds now: an outer loop counts only what this one kept
+    resetTo(a, mark, used)
+    setMark(a, mark, used)
+    setWord(a, aLastText, 0)
+    for i in 0..word(c, cRoomCount) {
+        let r = word(c, cRooms) + 16 * i
+        growingAdd(a, word(r, 0), word(r, 1))
+    }
+    if full {
+        setWord(gen, gLive, word(c, cTotal))
+        setWord(gen, gPromoted, 0)
+    } else {
+        setWord(gen, gPromoted, word(gen, gPromoted) + word(c, cTotal))
+    }
+    setWord(gen, gBlock, word(c, cNow))
+    setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was kept
+    setWord(gen, gLast, word(a, aClock))
+    setWord(f, frameAllocated, word(a, aAllocated))
+    // the next one after twice what this one copied, the turns' own making growing to 16 MB (each collection looks
+    // through tables of a fixed size: they run no more often than that)
+    setWord(f, frameLimit, max(2 * word(c, cTotal), min(2 * word(f, frameLimit), limited(a, nurseryMost))))
+    freeCopier(c)
+}
+
+// A copier of values, with all they point to, into arena to (copyValue for each, then copierDone). A map's description
+// in [fromData, fromData + dataLen) (another thread's copy of the program, unloaded after) is moved to the same place
+// in toData.
+pub fn copierInto(to: Int, fromData: Int, dataLen: Int, toData: Int) -> Int {
+    setWord(to, aClock, word(to, aClock) + 1)
+    let c = copierNew(to, word(to, aClock))
+    setWord(c, cAll, 1)
+    setWord(c, cFromData, fromData)
+    setWord(c, cDataLen, dataLen)
+    setWord(c, cToData, toData)
+    c
+}
+
+// the value at slots (desc: an array of its type's description), copied, and the slots pointed at the copy
+pub fn copyValue(c: Int, slots: Int, desc: Int) {
+    copyShape(c, slots, shapeOf(c, desc + 1, desc, 0))
+    copyPending(c)
+}
+
+// what was copied is forgotten: its addresses may hold other values from now on (a thread's memory cleared)
+pub fn copierForget(c: Int) {
+    forgetSides(c)
+    if word(c, cMovedCount) != 0 {
+        zeroBytes(word(c, cMoved), 32 * word(c, cMovedCap))
+        setWord(c, cMovedCount, 0)
+    }
+}
+
+pub fn copierDone(c: Int) {
+    let to = word(c, cA)
+    setWord(to, aAllocated, word(to, aAllocated) + word(c, cMade))
+    freeCopier(c)
+}
+
+// a task's own copy of what its function captured (env: [description][slots]), in the task's arena
+pub fn copyIntoArena(to: Int, env: Int) -> Int {
+    if env == 0 {
+        return 0
+    }
+    setWord(to, aClock, word(to, aClock) + 1)
+    let c = copierNew(to, word(to, aClock))
+    setWord(c, cAll, 1)
+    let cell = ctx() + 8 * ctxScratch + 112
+    setWord(cell, 0, env)
+    copyClosure(c, cell)
+    copyPending(c)
+    freeCopier(c)
+    word(cell, 0)
+}

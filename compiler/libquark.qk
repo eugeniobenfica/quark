@@ -1,0 +1,126 @@
+// libquark's writer: the embedding API (compiler/api.qk) and the runtime, both written in Quark, compiled by the
+// compiler written in Quark into one object whose addresses the linker gives (quark object --linked), then written
+// as an archive a C host links (gcc host.c libquark.a): no C compiler and no ar make it.
+//   quark build compiler/libquark.qk -o build/libq/libquark.exe
+//   libquark [--target x86_64-windows | x86_64-linux | arm64-linux] [-o libquark.a] [--object libquark.o]
+// The object exports include/quark.h's functions and variables (qkAbi, qkModuleReader); the executables' entries the
+// runtime has (wmain, main, qkWinEntry...) are left out, so the host's own main is the one.
+use imagecli
+use image
+use ir
+
+// the runtime's entries for executables and quarkimg run: not a library's
+const hidden = ["wmain", "main", "qkWinEntry", "qkMemoryMain", "qkStart", "qkStartMemory"]
+
+// C's variables: each one's name, and the text in the data that is its place (compiler/api.qk's cells)
+const variables = [
+    ("qkAbi", "qkAbi=library-variable-cell-0001"),
+    ("qkModuleReader", "qkModuleReader=library-variable-cell-0002"),
+]
+
+fn find(b: Bytes, part: Bytes) -> Int {
+    var i = 0
+    while i + len(part) <= len(b) {
+        var k = 0
+        while k < len(part) and b[i + k] == part[k] {
+            k += 1
+        }
+        if k == len(part) {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn usage() -> Int {
+    printErr(
+        "usage: libquark [--target x86_64-windows | x86_64-linux | arm64-linux] [-o libquark.a] [--object libquark.o] [--map FILE]",
+    )
+    2
+}
+
+fn main() -> Int {
+    var target = "x86_64-windows"
+    var out = "libquark.a"
+    var objectPath = ""
+    var mapPath = ""
+    let given = args()
+    var i = 0
+    while i < len(given) {
+        if i + 1 >= len(given) or not given[i] is "--target" | "-o" | "--object" | "--map" {
+            return usage()
+        }
+        let v = given[i + 1]
+        if given[i] == "--target" {
+            target = v
+        } else if given[i] == "-o" {
+            out = v
+        } else if given[i] == "--map" {
+            mapPath = v
+        } else {
+            objectPath = v
+        }
+        i += 2
+    }
+    let windows = target == "x86_64-windows"
+    if not target is "x86_64-windows" | "x86_64-linux" | "arm64-linux" {
+        return usage()
+    }
+    let root = if windows {
+        "compiler/apiwindows.qk"
+    } else {
+        "compiler/apilinux.qk"
+    }
+    let Some(dump) = compileSource(root, target, .Windows, true, true, false, false) else {
+        return 1
+    }
+    let mc = machineCode(dump.prog)
+    var o = layout(mc, dump.prog, dump.info)
+    if mapPath != "" {
+        // each function's place in the code (a debugger's view of the object)
+        var lines = ""
+        for (k, f) in dump.prog.fns.enumerate() {
+            lines += "{mc.fnAt[k]} {f.name}\n"
+        }
+        let _ = writeFile(mapPath, lines)
+    }
+    var exports: [Text] = []
+    var exportAt: [Int] = []
+    for (k, e) in o.exports.enumerate() {
+        if not hidden.contains(e) {
+            exports.push(e)
+            exportAt.push(o.exportAt[k])
+        }
+    }
+    o.exports = exports
+    o.exportAt = exportAt
+    for (name, cell) in variables {
+        let at = find(o.data, cell.bytes())
+        if at < 0 {
+            printErr("libquark: {root} has no place for {name}")
+            return 1
+        }
+        // C's value at the start: 0 (qkAbi on Linux: 1, System V)
+        let first = if name == "qkAbi" and not windows { 1 } else { 0 }
+        o.data = o.data[..at] + [first, 0, 0, 0, 0, 0, 0, 0] + o.data[at + 8..]
+        o.dataExports.push(name)
+        o.dataExportAt.push(at)
+    }
+    let symbol = "qkLibraryProgram"
+    let Some(obj) = objectOf(mc, o, dump.info, symbol, dump.prog.target.arch == .Arm64) else {
+        printErr("libquark: no object for {target}")
+        return 1
+    }
+    if objectPath != "" and writeBytes(objectPath, obj) is Err(_) {
+        printErr("libquark: cannot write {objectPath}")
+        return 1
+    }
+    let lib = archive([Member("libquark.o", obj, o.exports + o.dataExports + [symbol])])
+    if writeBytes(out, lib) is Err(_) {
+        printErr("libquark: cannot write {out}")
+        return 1
+    }
+    printErr("libquark: wrote {out} ({len(mc.code)} bytes of machine code, {len(o.exports)} functions)")
+    0
+}

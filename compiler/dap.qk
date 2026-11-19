@@ -1,0 +1,487 @@
+// A debug adapter: a debugger client (VS Code, or any other that speaks the Debug Adapter Protocol) talks to it over
+// the standard input and output, as `quark dap [--prelude P]`. It checks the program, runs it under the debugger
+// (debugger.qk: compiled so every statement says its line and every name its value, run in memory), and where it
+// stops (a breakpoint, a step) answers the client's questions: the calls, their names and values. The program's
+// own output goes to the client as output events; the program reads no standard input (that is the client's). It
+//
+//
+// Requests: initialize, launch {program, args, stopOnEntry}, setBreakpoints (by line), configurationDone, threads,
+// stackTrace, scopes, variables, evaluate (a name), continue, next, stepIn, stepOut, disconnect. The client's
+// requests are read while the program is stopped (or before it starts, or after it ends).
+use source
+use types
+use ast
+use module
+use check
+use format
+use json
+use debugger
+use imagecli
+
+enum Mode { Run, StepIn, StepOver, StepOut, Entry }
+
+// what serving the client ends with: the program goes on (or starts), or the adapter ends
+enum Served { Go, Quit }
+
+// a breakpoint: the runtime knows only lines, so it stops at any of them, and here the file decides
+type Break { path: Text, line: Int }
+
+type Adapter {
+    wire: Wire = Wire()
+    seq: Int = 1
+    prelude: Text = ""
+    breaks: [Break] = []
+    mode: Mode = Mode.Run
+    modeDepth: Int = 0
+    ended: Bool = false
+    programPath: Text = ""
+    program: Program? = None
+    args: [Text] = []
+    stopOnEntry: Bool = false
+    dbg: Debuggee = Debuggee()
+    running: Bool = false
+    host: Host? = None // what running in memory needs of the system (the command line's)
+}
+
+pub fn serveDap(prelude: Text) -> Int = serveDapWith(prelude, None)
+
+// the adapter, running its programs in memory with what host gives (compiler/cli.qk's quark dap)
+pub fn serveDapWith(prelude: Text, host: Host?) -> Int {
+    var a = Adapter(prelude: prelude, host: host)
+    if a.serve() == Served.Quit {
+        return a.quit()
+    }
+    let status = a.run()
+    a.ended = true
+    a.running = false
+    a.event("exited", "\{\"exitCode\": {status}}")
+    a.event("terminated", "")
+    a.serve() // until disconnect
+    a.quit()
+}
+
+// ---- messages ----------------------------------------------------------------------------------------------------
+fn Adapter.next(var self) -> Int {
+    let n = self.seq
+    self.seq += 1
+    n
+}
+
+fn Adapter.respond(var self, requestSeq: Int, command: Text, body: Text) {
+    let n = self.next()
+    let tail = if body != "" { ", \"body\": " + body } else { "" }
+    send(
+        "\{\"seq\": {n}, \"type\": \"response\", \"request_seq\": {requestSeq}, \"success\": true, \"command\": {jsonString(command)}{tail}}",
+    )
+}
+
+fn Adapter.refuse(var self, requestSeq: Int, command: Text, message: Text) {
+    let n = self.next()
+    send(
+        "\{\"seq\": {n}, \"type\": \"response\", \"request_seq\": {requestSeq}, \"success\": false, \"command\": {jsonString(command)}, \"message\": {jsonString(message)}}",
+    )
+}
+
+fn Adapter.event(var self, name: Text, body: Text) {
+    let n = self.next()
+    let tail = if body != "" { ", \"body\": " + body } else { "" }
+    send("\{\"seq\": {n}, \"type\": \"event\", \"event\": \"{name}\"{tail}}")
+}
+
+fn Adapter.output(var self, category: Text, text: Text) {
+    self.event("output", "\{\"category\": \"{category}\", \"output\": {jsonString(text)}}")
+}
+
+// the program's output so far, to the client (in pieces of at most 4096 bytes, as the C adapter reads them)
+fn Adapter.flushOutput(var self) {
+    let text = self.dbg.output()
+    let b = text.bytes()
+    var at = 0
+    while at < len(b) {
+        var end = min(at + 4096, len(b))
+        while end < len(b) and end > at + 1 and b[end] & 0xC0 == 0x80 {
+            end -= 1 // not in the middle of a character
+        }
+        self.output("stdout", text[at..end])
+        at = end
+    }
+}
+
+fn Adapter.quit(var self) -> Never {
+    self.flushOutput()
+    exit(0)
+}
+
+// ---- the program -------------------------------------------------------------------------------------------------
+// the file a function comes from (its frame's): the program's own, or a module it uses
+fn Adapter.fileOf(self, function: Text) -> Text {
+    let Some(p) = self.program else {
+        return self.programPath
+    }
+    for d in p.decls {
+        let x = p.ast.decls[d]
+        if x.kind == DeclKind.Fn and x.name == function {
+            return if x.module > 0 and x.module < len(p.modules) {
+                p.modules[x.module].path
+            } else {
+                self.programPath
+            }
+        }
+    }
+    self.programPath
+}
+
+fn slashed(c: Int) -> Int = if c == '\\' { '/' } else { c }
+
+fn lowered(c: Int) -> Int = if c >= 'A' and c <= 'Z' { c + 32 } else { c }
+
+// the same file, however it is written: \ or /, a relative path or the whole one, the case on Windows
+fn samePath(a: Text, b: Text) -> Bool {
+    let (longer, shorter) = if len(a) >= len(b) {
+        (a.bytes(), b.bytes())
+    } else {
+        (b.bytes(), a.bytes())
+    }
+    let ls = len(shorter)
+    let ll = len(longer)
+    if ls == 0 {
+        return false
+    }
+    let windows = env("OS") == Some("Windows_NT")
+    for i in 0..ls {
+        var x = slashed(longer[ll - ls + i])
+        var y = slashed(shorter[i])
+        if windows {
+            x = lowered(x)
+            y = lowered(y)
+        }
+        if x != y {
+            return false
+        }
+    }
+    if ls == ll {
+        return true
+    }
+    let before = longer[ll - ls - 1]
+    before == '/' or before == '\\' or shorter[0] == '/' or shorter[0] == '\\'
+}
+
+fn Adapter.breakAt(self, path: Text, line: Int) -> Bool {
+    for b in self.breaks {
+        if b.line == line and samePath(b.path, path) {
+            return true
+        }
+    }
+    false
+}
+
+fn Adapter.breakLines(self) -> [Int] = self.breaks.map(b => b.line).toArray()
+
+fn Adapter.setBreakpoints(var self, requestSeq: Int, m: Json, args: Int) {
+    let path = m.text(m.get(m.get(args, "source"), "path")) ?? ""
+    var kept: [Break] = [] // this file's breakpoints are all given anew
+    for b in self.breaks {
+        if not samePath(b.path, path) {
+            kept.push(b)
+        }
+    }
+    self.breaks = kept
+    var out = "\{\"breakpoints\": ["
+    let list = m.get(args, "breakpoints")
+    if m.kind(list) == JKind.Arr {
+        for (i, item) in m.items(list).enumerate() {
+            let at = m.int(m.get(item, "line"), 0)
+            self.breaks.push(Break(path, at))
+            out += (if i > 0 { ", " } else { "" }) + "\{\"id\": {len(self.breaks)}, \"verified\": true, \"line\": {at}}"
+        }
+    }
+    self.respond(requestSeq, "setBreakpoints", out + "]\}")
+}
+
+// the calls: a frame's id is its depth + 1 (the outermost is 1), so 0 means none
+fn Adapter.stackTrace(var self, requestSeq: Int) {
+    let depth = if self.running { self.dbg.depth() } else { 0 }
+    var out = "\{\"stackFrames\": ["
+    var i = depth - 1
+    while i >= 0 {
+        let f = self.dbg.frame(i)
+        let file = self.fileOf(f.name)
+        let fb = file.bytes()
+        var base = 0
+        for (k, c) in fb.enumerate() {
+            if c == '/' or c == '\\' {
+                base = k + 1
+            }
+        }
+        let name = if f.name != "" { f.name } else { "?" }
+        out += (if i == depth - 1 { "" } else { ", " })
+            + "\{\"id\": {i + 1}, \"name\": {jsonString(name)}, \"source\": \{\"name\": {jsonString(file[base..])}, \"path\": {jsonString(file)}}, \"line\": {f.line}, \"column\": 1}"
+        i -= 1
+    }
+    self.respond(requestSeq, "stackTrace", out + "], \"totalFrames\": {depth}}")
+}
+
+fn Adapter.valuesAt(self, depth: Int) -> [Value] = if self.running and depth >= 0 and depth < self.dbg.depth() {
+    self.dbg.vars(depth)
+} else {
+    []
+}
+
+fn Adapter.variables(var self, requestSeq: Int, frame: Int) {
+    var out = "\{\"variables\": ["
+    for (i, v) in self.valuesAt(frame - 1).enumerate() {
+        out += (if i > 0 { ", " } else { "" })
+            + "\{\"name\": {jsonString(v.name)}, \"value\": {jsonString(v.value)}, \"variablesReference\": 0}"
+    }
+    self.respond(requestSeq, "variables", out + "]\}")
+}
+
+// a name's value, in the frame asked about (the innermost when none is)
+fn Adapter.evaluate(var self, requestSeq: Int, m: Json, args: Int) {
+    let frame = m.get(args, "frameId")
+    let depth = if frame >= 0 {
+        m.int(frame, 0) - 1
+    } else {
+        (if self.running { self.dbg.depth() } else { 0 }) - 1
+    }
+    var want = m.text(m.get(args, "expression")) ?? ""
+    while want.startsWith(" ") {
+        want = want[1..]
+    }
+    let values = self.valuesAt(depth)
+    var i = len(values) - 1
+    while i >= 0 {
+        if values[i].name == want {
+            self.respond(
+                requestSeq,
+                "evaluate",
+                "\{\"result\": {jsonString(values[i].value)}, \"variablesReference\": 0}",
+            )
+            return
+        }
+        i -= 1
+    }
+    self.refuse(requestSeq, "evaluate", "{want} has no value here yet (the debugger shows names, not expressions)")
+}
+
+// an error as said, without the line and the caret under it: "path:line:col: message"
+fn errorHead(shown: Text) -> Text {
+    let b = shown.bytes()
+    let first = b.indexOf('\n') ?? return shown
+    let head = shown[..first]
+    // the line is the number after the path: a caret follows when it is not 0
+    var end = len(head)
+    var colons: [Int] = []
+    var i = 0
+    while i < len(head) {
+        if b[i] == ':' and i + 1 < len(head) and b[i + 1] is '0'..='9' {
+            colons.push(i)
+        }
+        i += 1
+    }
+    if len(colons) >= 2 and head[colons[len(colons) - 2] + 1..colons[len(colons) - 1]] == "0" {
+        return shown // line 0: no caret, the message is all of it
+    }
+    var cuts = 0
+    end = len(b)
+    while end > 0 and cuts < 2 {
+        end -= 1
+        if b[end] == '\n' {
+            cuts += 1
+        }
+    }
+    shown[..end]
+}
+
+fn Adapter.launch(var self, requestSeq: Int, m: Json, args: Int) -> Bool {
+    let Some(path) = m.text(m.get(args, "program")) else {
+        self.refuse(requestSeq, "launch", "launch needs \"program\": the .qk file to run")
+        return false
+    }
+    self.stopOnEntry = m.isBool(m.get(args, "stopOnEntry"), true)
+    let argv = m.get(args, "args")
+    if m.kind(argv) == JKind.Arr {
+        // args(): the program's
+        self.args = []
+        for item in m.items(argv) {
+            if m.text(item) is Some(t) {
+                self.args.push(t)
+            }
+        }
+    }
+    let Ok(text) = readFile(path) else {
+        self.refuse(requestSeq, "launch", "cannot read {path}")
+        return false
+    }
+    var host: Source? = None
+    if self.prelude != "" {
+        host = Source(self.prelude, readFile(self.prelude) ?? "")
+    }
+    let loaded = loadProgram(Source(path, text), host)
+    var errors = loaded.errors.shown
+    var ok = loaded.ok
+    var program = loaded.program
+    if ok {
+        let checked = checkProgram(loaded.program, loaded.errors, true, None)
+        errors = checked.errors.shown
+        ok = checked.ok
+        program = checked.program
+    }
+    for e in errors {
+        self.output("stderr", errorHead(e) + "\n")
+    }
+    if not ok {
+        self.refuse(requestSeq, "launch", "the program does not compile")
+        return false
+    }
+    self.programPath = path
+    self.program = program
+    true
+}
+
+// Answers the client until a request lets the program go on (Go), or the client is gone (Quit).
+fn Adapter.serve(var self) -> Served {
+    while true {
+        let Some(body) = self.wire.read(true) else {
+            return Served.Quit
+        }
+        let Some(m) = parseJson(body) else {
+            continue
+        }
+        let cmd = m.text(m.get(0, "command")) ?? ""
+        let rs = m.int(m.get(0, "seq"), 0)
+        let args = m.get(0, "arguments")
+        if cmd == "initialize" {
+            self.respond(
+                rs,
+                cmd,
+                "\{\"supportsConfigurationDoneRequest\": true, \"supportsEvaluateForHovers\": true, \"supportsTerminateRequest\": true\}",
+            )
+            self.event("initialized", "")
+        } else if cmd == "launch" {
+            if self.launch(rs, m, args) {
+                self.respond(rs, cmd, "")
+            }
+        } else if cmd == "setBreakpoints" {
+            self.setBreakpoints(rs, m, args)
+        } else if cmd == "setExceptionBreakpoints" {
+            self.respond(rs, cmd, "\{\"breakpoints\": []\}")
+        } else if cmd == "configurationDone" {
+            self.respond(rs, cmd, "")
+            if not self.running and not self.ended and self.programPath != "" {
+                return Served.Go // the program starts
+            }
+        } else if cmd == "threads" {
+            self.respond(rs, cmd, if self.ended {
+                "\{\"threads\": []\}"
+            } else {
+                "\{\"threads\": [\{\"id\": 1, \"name\": \"main\"\}]\}"
+            })
+        } else if cmd == "stackTrace" {
+            self.stackTrace(rs)
+        } else if cmd == "scopes" {
+            let frame = m.get(args, "frameId")
+            let id = if frame >= 0 { m.int(frame, 0) } else { 0 }
+            self.respond(
+                rs,
+                cmd,
+                "\{\"scopes\": [\{\"name\": \"Locals\", \"variablesReference\": {id}, \"expensive\": false}]}",
+            )
+        } else if cmd == "variables" {
+            self.variables(rs, m.int(m.get(args, "variablesReference"), 0))
+        } else if cmd == "evaluate" {
+            self.evaluate(rs, m, args)
+        } else if cmd is "continue" | "next" | "stepIn" | "stepOut" {
+            if not self.running or self.dbg.depth() == 0 {
+                self.refuse(rs, cmd, "the program is not running")
+                continue
+            }
+            self.mode = match cmd {
+                "continue" => Mode.Run
+                "next" => Mode.StepOver
+                "stepIn" => Mode.StepIn
+                _ => Mode.StepOut
+            }
+            self.modeDepth = self.dbg.depth()
+            self.respond(rs, cmd, if cmd == "continue" {
+                "\{\"allThreadsContinued\": true\}"
+            } else {
+                ""
+            })
+            return Served.Go
+        } else if cmd == "pause" {
+            self.respond(rs, cmd, "") // the program runs in this thread: it stops only where it is told to
+        } else if cmd is "disconnect" | "terminate" {
+            self.respond(rs, cmd, "")
+            if not self.ended {
+                self.event("terminated", "")
+            }
+            return Served.Quit
+        } else {
+            self.refuse(rs, cmd, "not handled")
+        }
+    }
+    Served.Quit
+}
+
+// The program run under the debugger, stopping where the client asked: its exit code.
+fn Adapter.run(var self) -> Int {
+    let Some(p) = self.program else {
+        return 1
+    }
+    let started = startDebuggee(self.host, p, self.programPath, self.args)
+    if started is Err(why) {
+        self.output("stderr", why + "\n")
+        return 1
+    }
+    self.dbg = started ?? Debuggee()
+    self.running = true
+    self.mode = if self.stopOnEntry { Mode.Entry } else { Mode.Run }
+    while true {
+        let stepping = self.mode != Mode.Run
+        match self.dbg.resume(self.breakLines(), stepping) {
+            Stopped(line) => {
+                if not self.stopsAt(line) {
+                    continue
+                }
+            }
+            Ended(code) => {
+                self.flushOutput()
+                return code
+            }
+            Panicked(message) => {
+                self.flushOutput()
+                self.output("stderr", message + "\n")
+                return 1
+            }
+        }
+    }
+    1
+}
+
+// whether the program stops at this line (and, when it does, the client's questions answered until it goes on)
+fn Adapter.stopsAt(var self, line: Int) -> Bool {
+    let depth = self.dbg.depth()
+    let file = self.fileOf(self.dbg.frame(depth - 1).name)
+    var reason = ""
+    let stepped = match self.mode {
+        Entry | StepIn => true
+        StepOver => depth <= self.modeDepth
+        StepOut => depth < self.modeDepth
+        Run => false
+    }
+    if stepped {
+        reason = if self.mode == Mode.Entry { "entry" } else { "step" }
+    } else if self.breakAt(file, line) {
+        reason = "breakpoint"
+    }
+    if reason == "" {
+        return false
+    }
+    self.flushOutput()
+    self.event("stopped", "\{\"reason\": \"{reason}\", \"threadId\": 1, \"allThreadsStopped\": true}")
+    if self.serve() == Served.Quit {
+        self.quit() // the client is gone
+    }
+    true
+}

@@ -1,0 +1,168 @@
+// Copies of a syntax tree, as the parser made it (nothing resolved). A generic function, or one that takes a
+// function, is a template: each use gets a copy of its body, checked with that use's types and lambdas, so it costs
+// what hand-written code would. A copy's nodes are new ones (new indices); types as written are shared.
+use ast
+
+pub fn Ast.cloneExpr(var self, e: Int) -> Int {
+    if e < 0 {
+        return -1
+    }
+    let x = self.exprs[e]
+    let node = match x.node {
+        Call(name, qualifier, args, names, method, dotted) => ExprNode.Call(
+            name,
+            qualifier,
+            self.cloneList(args),
+            names,
+            method,
+            dotted,
+        )
+        Field(target, name) => ExprNode.Field(self.cloneExpr(target), name)
+        Index(target, index) => {
+            let t = self.cloneExpr(target)
+            ExprNode.Index(t, self.cloneExpr(index))
+        }
+        Unary(op, operand) => ExprNode.Unary(op, self.cloneExpr(operand))
+        Binary(op, left, right) => {
+            let l = self.cloneExpr(left)
+            ExprNode.Binary(op, l, self.cloneExpr(right))
+        }
+        Range(low, high) => {
+            let l = self.cloneExpr(low)
+            ExprNode.Range(l, self.cloneExpr(high))
+        }
+        If(cond, then, otherwise) => {
+            let c = self.cloneExpr(cond)
+            let t = self.cloneBlock(then)
+            ExprNode.If(c, t, self.cloneExpr(otherwise))
+        }
+        Match(subject, arms, chain) => {
+            let s = self.cloneExpr(subject)
+            ExprNode.Match(s, self.cloneArms(arms), chain)
+        }
+        Lambda(params, body) => {
+            let ps = self.cloneParams(params)
+            ExprNode.Lambda(ps, self.cloneExpr(body))
+        }
+        ArrayLit(items) => ExprNode.ArrayLit(self.cloneList(items))
+        BlockExpr(block, jump) => ExprNode.BlockExpr(self.cloneBlock(block), jump)
+        Case(name, target, dotted) => ExprNode.Case(name, self.cloneExpr(target), dotted)
+        With(target, values, fields) => {
+            let t = self.cloneExpr(target)
+            ExprNode.With(t, self.cloneList(values), fields)
+        }
+        Interp(values, parts, raws, formats, multiline) => ExprNode.Interp(
+            self.cloneList(values),
+            parts,
+            raws,
+            formats,
+            multiline,
+        )
+        Try(value) => ExprNode.Try(self.cloneExpr(value))
+        MapLit(items) => ExprNode.MapLit(self.cloneList(items))
+        Is(value, pattern) => {
+            let v = self.cloneExpr(value)
+            ExprNode.Is(v, self.cloneArm(pattern))
+        }
+        other => other
+    }
+    self.exprs.push(Expr(node, x.line, x.col, implicit: x.implicit, place: x.place, callee: x.callee, spread: x.spread))
+    len(self.exprs) - 1
+}
+
+pub fn Ast.cloneList(var self, es: [Int]) -> [Int] {
+    var out: [Int] = []
+    for e in es {
+        out.push(self.cloneExpr(e))
+    }
+    out
+}
+
+pub fn Ast.cloneParams(var self, ps: [Int]) -> [Int] {
+    var out: [Int] = []
+    for p in ps {
+        let prm = self.params[p]
+        let fallback = self.cloneExpr(prm.fallback)
+        out.push(self.param(prm with { binding: -1, fallback: fallback }))
+    }
+    out
+}
+
+pub fn Ast.cloneArm(var self, a: Int) -> Int {
+    if a < 0 {
+        return -1
+    }
+    let arm = self.arms[a]
+    let intPattern = self.cloneExpr(arm.intPattern)
+    let intHigh = self.cloneExpr(arm.intHigh)
+    let textPattern = self.cloneExpr(arm.textPattern)
+    let guard = self.cloneExpr(arm.guard)
+    let body = self.cloneExpr(arm.body)
+    let subs = self.cloneArms(arm.subs)
+    let alternatives = self.cloneArms(arm.alternatives)
+    self.arm(
+        arm with { intPattern: intPattern, intHigh: intHigh, textPattern: textPattern, guard: guard, body: body, subs: subs, alternatives: alternatives, bindings: [
+            
+        ], wholeBinding: -1, caseIndex: 0 },
+    )
+}
+
+fn Ast.cloneArms(var self, arms: [Int]) -> [Int] {
+    var out: [Int] = []
+    for a in arms {
+        out.push(self.cloneArm(a))
+    }
+    out
+}
+
+fn Ast.cloneStmt(var self, s: Int) -> Int {
+    let st = self.stmts[s]
+    let node = match st.node {
+        Let(mutable, name, ty, value, pattern, otherwise) => {
+            let v = self.cloneExpr(value)
+            let p = self.cloneArm(pattern)
+            StmtNode.Let(mutable, name, ty, v, p, if otherwise >= 0 { self.cloneBlock(otherwise) } else { -1 })
+        }
+        Assign(target, op, value) => {
+            let t = self.cloneExpr(target)
+            StmtNode.Assign(t, op, self.cloneExpr(value))
+        }
+        ExprStmt(value) => StmtNode.ExprStmt(self.cloneExpr(value))
+        For(name, pattern, iter, body) => {
+            let p = self.cloneArm(pattern)
+            let i = self.cloneExpr(iter)
+            StmtNode.For(name, p, i, self.cloneBlock(body))
+        }
+        While(cond, body) => {
+            let c = self.cloneExpr(cond)
+            StmtNode.While(c, self.cloneBlock(body))
+        }
+        Return(value) => StmtNode.Return(self.cloneExpr(value))
+        Defer(body) => StmtNode.Defer(self.cloneBlock(body))
+        other => other
+    }
+    self.stmt(st with { node: node, binding: -1, opValue: -1 })
+}
+
+pub fn Ast.cloneBlock(var self, b: Int) -> Int {
+    let block = self.blocks[b]
+    var stmts: [Int] = []
+    for s in block.stmts {
+        stmts.push(self.cloneStmt(s))
+    }
+    self.block(Block(stmts, block.closingComment))
+}
+
+// a declaration's copy: its parameters (fields, cases' data) and body new, what checking worked out reset
+pub fn Ast.cloneDecl(var self, d: Int) -> Decl {
+    let decl = self.decls[d]
+    let params = self.cloneParams(decl.params)
+    var caseFields: [[Int]] = []
+    for fields in decl.caseFields {
+        caseFields.push(self.cloneParams(fields))
+    }
+    let body = self.cloneExpr(decl.body)
+    decl with { params: params, caseFields: caseFields, body: body, ty: -1, retType: -1, cTypes: [], state: 0, instances: [
+        
+    ], pristine: -1, returnsEarly: false }
+}

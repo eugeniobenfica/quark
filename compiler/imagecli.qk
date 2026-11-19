@@ -1,0 +1,88 @@
+// What the compiler needs of the system it runs on (Host: each compiler/main*.qk gives it), and a program compiled
+// from its source into IR and machine code for an object (compileSource: libquark's writer).
+use std.machine as machine
+use source
+use module
+use check
+use ir
+use lower
+use release
+use x64
+use arm64
+use image
+
+pub extern effect fn malloc(n: UInt64) -> Int64
+
+// What running in memory needs of the system: memory to write (then made code), and C's functions by name.
+pub type Host {
+    os: Os
+    mapMemory: effect (Int) -> Int // n bytes, read and write; 0 when there are none
+    protectCode: effect (Int, Int) -> Bool // the first n bytes at p: read and run
+    cFunction: effect (Text) -> Int // a C function's address, 0 when the system has none
+    arm: Bool = false // the processor: ARM64, else x86-64
+    selfPath: Text = "" // the compiler's own executable: what it is, for the runtimes it keeps made ("": none kept)
+}
+
+pub type Dump { prog: IrProgram, info: ImageInfo }
+
+// A program compiled from its source: for this machine (AVX as the processor has it), or for target (its baseline);
+// for objects (each address from a table) when object, and linked (the runtime's own table, filled by the linker)
+// when linked (libquark's writer, compiler/libquark.qk).
+pub fn compileSource(path: Text, target: Text, os: Os, object: Bool, linked: Bool, release: Bool, fuel: Bool) -> Dump? {
+    let Ok(text) = readFile(path) else {
+        printErr("quark: cannot read {path}")
+        return None
+    }
+    let cpu = machine.cpu()
+    let arm = target.startsWith("arm64")
+    let avx = target == "" and cpu & 1 != 0
+    let sysv = if target == "" { os != .Windows } else { target != "x86_64-windows" }
+    let loaded = loadProgram(Source(path, text), None)
+    if not loaded.ok {
+        for e in loaded.errors.shown {
+            printErr(e)
+        }
+        return None
+    }
+    let checked = checkProgram(loaded.program, loaded.errors, false, None)
+    for e in checked.errors.shown {
+        printErr(e)
+    }
+    if not checked.ok {
+        return None
+    }
+    let arch = if arm { Arch.Arm64 } else { Arch.X64 }
+    let low = lowerProgram(checked.program, LowerOptions(fuel: fuel, linked: linked, arch: arch, sysv: sysv))
+    var prog = low.program
+    let lanes = if arm {
+        2
+    } else if avx and cpu & 2 != 0 {
+        4
+    } else {
+        2
+    }
+    prog.target = Target(
+        arch: arch,
+        sysv: sysv,
+        objectMode: object,
+        avx: avx,
+        lanes: lanes,
+        sse42: cpu & 4 != 0 and target == "",
+    )
+    prog.optimize(release)
+    let targetOs = if target == "" {
+        os
+    } else if target.endsWith("windows") {
+        Os.Windows
+    } else if target.endsWith("linux") {
+        Os.Linux
+    } else {
+        Os.Macos
+    }
+    Dump(prog, ImageInfo(targetOs, linked, if avx { 1 } else { 0 }, low.data, runtimeNames))
+}
+
+pub fn machineCode(p: IrProgram) -> MachineCode = match p.target.arch {
+    X64 => genX64(p)
+    Arm64 => genArm64(p)
+}

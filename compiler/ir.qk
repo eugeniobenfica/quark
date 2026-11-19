@@ -1,0 +1,514 @@
+// The intermediate code (IrIns, IrFn, IrProgram): a small register machine per function, the
+// lowering's output, the optimizers' input and output, and what the backends turn into machine code. Virtual
+// registers are numbers, each of a kind ('I' an Int or any 64 bits, 'F' a Float, 'V' a vector of lanes);
+// labels are numbers too, placed by a Label instruction.
+// What an instruction does.
+pub enum Op {
+    Const
+    Mov
+    Add
+    Sub
+    Mul
+    Div
+    Mod
+    Neg
+    Fadd
+    Fsub
+    Fmul
+    Fdiv
+    Fneg
+    Sqrt
+    Fmin
+    Fmax
+    Cmp
+    Fcmp
+    Not
+    IntToFloat
+    FloatToInt
+    Round
+    Load
+    Store
+    Bounds
+    Label
+    Jmp
+    Jz
+    Jnz
+    Call
+    RtCall
+    Ret
+    Fuel
+    HostCall
+    Nop
+    And
+    Or
+    Xor
+    Shl
+    Sar
+    Vload
+    Vstore
+    Vsplat
+    Vop
+    Vlane
+    Vend
+    Ctx
+}
+
+// dst = imm (an int, or a float's bits); c = 1: the data block's address + imm; c = 2: function imm's address
+// dst = a
+// ints, wrapping (cond = 1: checked, a panic past the limits)
+// floored; cond & 2: neither operand negative, nor the divisor zero
+// dst = a <cond> b, ints
+// dst = a <cond> b, floats
+// dst = a == 0
+// truncates; cond = 1: a Float too big for an Int (or NaN) stops with a panic
+// imm: 0 nearest, 1 floor, 2 ceil; 3 to a C float, 4 a C float widened
+// dst = [a + b * imm + c]; cond: the width (memU8...), 0: 8 bytes
+// [a + b * imm + c] = dst
+// a (index) < b (length), unsigned, else panic imm
+// jump to label imm if a is zero
+// rets = function imm (args); a >= 0: the function whose address a holds
+// rets = runtime function imm (args)
+// return args
+// one unit of the budget
+// rets = host function imm (args), C calling convention
+// a shifted by b, b taken modulo 64
+// dst = the lanes at [a + b * imm + c]
+// dst = a in every lane
+// dst = a <imm> b lane by lane, imm a scalar op
+// dst (scalar) = lane c of a
+// after a vector loop
+// dst = the machine's context (a register of its own: x86-64's r15, ARM64's x28); cond = 1: the register = a
+pub const allOps = [
+    Op.Const, .Mov, .Add, .Sub, .Mul, .Div, .Mod, .Neg, .Fadd, .Fsub, .Fmul, .Fdiv, .Fneg, .Sqrt, .Fmin, .Fmax, .Cmp,
+    .Fcmp, .Not, .IntToFloat, .FloatToInt, .Round, .Load, .Store, .Bounds, .Label, .Jmp, .Jz, .Jnz, .Call, .RtCall,
+    .Ret, .Fuel, .HostCall, .Nop, .And, .Or, .Xor, .Shl, .Sar, .Vload, .Vstore, .Vsplat, .Vop, .Vlane, .Vend, .Ctx,
+]
+
+// the op whose number is n
+pub fn opOf(n: Int) -> Op = allOps.get(n) ?? panic("no IR op {n}")
+
+// Cmp / Fcmp's cond
+pub const condEq = 0
+pub const condNe = 1
+pub const condLt = 2
+pub const condLe = 3
+pub const condGt = 4
+pub const condGe = 5
+
+// Load / Store's cond: what is in memory (loads widen to 64 bits; stores keep the low bytes). memF32: a C float,
+// widened to a Float / rounded from one; memF32Bits: its 32 bits as they are, low in a float register.
+pub const mem64 = 0
+pub const memU8 = 1
+pub const memI8 = 2
+pub const memU16 = 3
+pub const memI16 = 4
+pub const memU32 = 5
+pub const memI32 = 6
+pub const memF32 = 7
+pub const memF32Bits = 8
+
+// Div / Mod's cond & divNonNeg: neither operand can be negative, nor the divisor zero
+pub const divNonNeg = 2
+
+// IrFn.machine: std.machine's built-ins, code of the backend's own
+pub const machineNone = 0
+pub const machineSwitchStack = 1
+pub const machineFrame = 2
+pub const machineCpu = 3
+pub const machineCall = 4 // call(f, a, b, c, d): C's call of f with four integers
+pub const machineAddress = 5 // address(t): a text's bytes, where they are (no code)
+pub const machineContext = 6 // context(): the context register (Ctx)
+pub const machineSetContext = 7 // setContext(c)
+pub const machineFillRuntime = 8 // fillRuntime(table): each runtime function's address, by its number
+
+// the runtime's functions, by their number (qk_<name>: the runtime's Quark functions, called the Quark way); its
+// length is runtimeCount in runtime/start.qk (the table the runtime fills)
+pub const runtimeNames = [
+    "panic", "printInt", "printFloat", "printBool", "printText", "printSep", "printEnd", "alloc", "grow", "copy", "now",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow", "fuelOut", "printHandle", "textJoin",
+    "textCompare", "textOfInt", "textOfFloat", "push", "readFile", "writeFile", "readLine", "args", "split", "trim",
+    "parseInt", "parseFloat", "fail", "exit", "printTo", "words", "lines", "upper", "lower", "startsWith", "endsWith",
+    "replace", "repeat", "join", "find", "textFixed", "pad", "env", "listDir", "pathExists", "time", "mapNew", "mapSet",
+    "mapGet", "mapRemove", "mapCopy", "mapLen", "mapUsed", "mapEntry", "mapKeys", "mapValues", "loopStart", "loopCheck",
+    "loopCollect", "textCut", "arrayJoin", "parallelMap", "random", "randomInt", "seedRandom", "spawn", "step", "yield",
+    "wait", "captureBegin", "captureEnd", "debugEnter", "debugLeave", "debugLine", "debugValue", "codePointCount",
+    "joinTask", "remember", "valueEqual", "textOfBytes", "bytesPush", "printBytes", "char", "readBytes", "appendFile",
+    "makeDir", "removePath", "runProcess", "arrayAppend", "sort", "cText", "textOfC", "printPointer", "parallelFold",
+    "joinInt", "openFile", "readChunk", "writeChunk", "seekFile", "closeFile", "listen", "connect", "accept",
+    "readSocket", "writeSocket", "closeSocket", "go", "runTasks", "channel", "send", "receive", "closeChannel",
+    "localOffset",
+]
+
+// the runtime functions the backends call by name, by number
+pub const rtPanic = 0
+pub const rtFail = 36
+
+// a panic's code (the runtime's message for it)
+pub const panicDivide = 2
+pub const panicFuel = 3
+pub const panicStack = 9
+pub const panicOverflow = 12
+pub const panicTooBig = 13
+
+pub type IrIns {
+    op: Op
+    cond: Int = 0
+    dst: Int = -1
+    a: Int = -1
+    b: Int = -1
+    c: Int = 0
+    imm: Int = 0
+    line: Int = 0
+    inl: Int = 0
+    from: Int = 0 // a call's arguments, then its results: its function's operands from here (IrFn.argsOf, retsOf)
+    argCount: Int = 0
+    retCount: Int = 0
+}
+
+// An instruction is words only (no memory of its own): code is copied as a block, and a loop's collection never looks
+// into it. Calls' registers are in their function's operands, each call's side by side.
+pub fn IrFn.arg(self, ins: IrIns, i: Int) -> Int = self.operands[ins.from + i]
+
+pub fn IrFn.ret(self, ins: IrIns, i: Int) -> Int = self.operands[ins.from + ins.argCount + i]
+
+pub fn IrFn.argsOf(self, ins: IrIns) -> [Int] = self.operands[ins.from..ins.from + ins.argCount]
+
+pub fn IrFn.retsOf(self, ins: IrIns) -> [Int] =
+    self.operands[ins.from + ins.argCount..ins.from + ins.argCount + ins.retCount]
+
+// instruction k's arguments and results from now on (at the operands' end: the ones it had stay, unused)
+pub fn IrFn.setOperands(var self, k: Int, args: [Int], rets: [Int]) {
+    self.code[k].from = len(self.operands)
+    self.code[k].argCount = len(args)
+    self.code[k].retCount = len(rets)
+    for v in args {
+        self.operands.push(v)
+    }
+    for v in rets {
+        self.operands.push(v)
+    }
+}
+
+pub fn IrFn.setArgs(var self, k: Int, args: [Int]) {
+    let rets = self.retsOf(self.code[k])
+    self.setOperands(k, args, rets)
+}
+
+pub fn IrFn.setRets(var self, k: Int, rets: [Int]) {
+    let args = self.argsOf(self.code[k])
+    self.setOperands(k, args, rets)
+}
+
+pub fn IrFn.setArg(var self, k: Int, i: Int, v: Int) {
+    self.operands[self.code[k].from + i] = v
+}
+
+pub fn IrFn.setRet(var self, k: Int, i: Int, v: Int) {
+    self.operands[self.code[k].from + self.code[k].argCount + i] = v
+}
+
+// the functions inlined where it is (an inline call), 0: none
+// One function. Its virtual registers are 0 until len(kinds); isConst: an Int register defined once, by a constant
+// (constValue), that instructions take as an immediate. A C entry (cArgs given) is a function C calls: its
+// parameters and results are C's slots ('I', 'F', or 'M' for a slot of a record C passes on the stack).
+pub type IrFn {
+    name: Text
+    line: Int = 0
+    params: [Int] = []
+    resultCount: Int = 0
+    labelCount: Int = 0
+    maxOut: Int = 0
+    machine: Int = 0
+    cHidden: Bool = false
+    cArgs: Bytes? = None
+    cRets: Bytes = []
+    exportName: Text? = None
+    kinds: Bytes = []
+    weight: [Float] = []
+    isConst: [Bool] = []
+    constValue: [Int] = []
+    code: [IrIns] = []
+    operands: [Int] = []
+}
+
+// where it is declared (a panic on the way in: too deep)
+// slots of the largest call's arguments or results
+// its first argument is where C wants a record returned
+// how much each register is used, loops counting more
+// A C function the program calls (IR HostCall's imm): its arguments' and results' slots, 'I' / 'F' ('M': a slot of a
+// record System V passes on the stack).
+pub type IrExtern {
+    name: Text
+    lib: Text? = None
+    retHidden: Bool = false
+    argKinds: Bytes = []
+    retKinds: Bytes = []
+    fixed: Int = -1 // C's variadic function: the slots before its variadic arguments (-1: not one)
+}
+
+// a C record that comes back through a hidden pointer, whatever its slots
+// A runtime function's signature: 'I' or 'F' per argument, and its result ('I', 'F' or 'V').
+pub type RtSig { args: Bytes, ret: Int }
+pub enum Arch { X64, Arm64 }
+
+// What the code is made for: the processor, System V calls into C (else Windows x64), object mode (every address
+// read from a table, pc-relative), AVX, the vector loops' lanes (4 AVX2, 2 SSE and NEON; in IR before the optimizers,
+// the lanes the optimizing tier would use), and whether 2-lane loops may compare Ints (SSE4.2's pcmpgtq).
+pub type Target {
+    arch: Arch = .X64
+    sysv: Bool = false
+    objectMode: Bool = false
+    avx: Bool = false
+    lanes: Int = 0
+    sse42: Bool = false
+    apple: Bool = false // macOS, iOS: ARM64's variadic arguments on the stack
+    checks: Bool = false // QUARK_VALIDATE=1: the counting calls mark the panic's frame (their checks say where)
+}
+
+// the runtime's counting functions (runtime/counted.qk: dup ... dropContents), by number
+pub fn countingCall(id: Int) -> Bool = id >= 103 and id <= 112
+
+// An interface table in the data block: at `at`, the address of each function (fns, their indices). The optimizing
+// tier calls through a table it knows directly.
+pub type IrTable { at: Int, fns: [Int] }
+
+pub type IrProgram {
+    target: Target = Target()
+    fns: [IrFn] = []
+    mainIndex: Int = -1
+    dataLen: Int = 0
+    fuel: Bool = false
+    externs: [IrExtern] = []
+    runtime: [RtSig] = []
+    tables: [IrTable] = []
+    cSigs: [IrExtern] = [] // the C functions called through an address (HostCall with a: the address): their slots
+}
+
+// ---- machine code ----
+// Reloc.kind: what the 8-byte address at `at` is
+pub const relocRuntime = 0 // a runtime function (target: its id)
+pub const relocData = 1 // the data block (+ target)
+pub const relocFuel = 2
+pub const relocHost = 3 // a C function (target: the extern's index)
+pub const relocEscape = 4
+pub const relocPanicFrame = 5
+pub const relocStackLimit = 6
+
+pub type Reloc { at: Int, kind: Int, target: Int }
+
+// A call between Quark functions: where it returns to, its line, who calls whom, and the inlined code it is in.
+pub type CallSite { ret: Int, line: Int, caller: Int, callee: Int, inl: Int }
+
+// The code, the addresses a loader writes into it, the calls' return places, each function's offset, and the way in
+// from C (enter) and out of a panic (escape).
+pub type MachineCode {
+    code: Bytes = []
+    relocs: [Reloc] = []
+    sites: [CallSite] = []
+    fnAt: [Int] = []
+    enter: Int = 0
+    escape: Int = 0
+}
+
+// A change to code already written: value's `width` low bytes ORed in at `at` (a jump's distance, once its target
+// is known). Writing them all at the end keeps the code a Bytes that only grows.
+pub type Patch { at: Int, value: Int, width: Int }
+
+// the code with every patch in, each piece copied once
+pub fn patched(code: Bytes, patches: [Patch]) -> Bytes {
+    var out: Bytes = []
+    var from = 0
+    for p in patches.sortedBy(p => p.at) {
+        out += code[from..p.at]
+        for i in 0..p.width {
+            out.push((code[p.at + i] | p.value >> (8 * i)) & 255)
+        }
+        from = p.at + p.width
+    }
+    out += code[from..]
+    out
+}
+
+// v's low 4 and 8 bytes, little-endian
+pub fn le32(v: Int) -> Bytes = [v & 255, v >> 8 & 255, v >> 16 & 255, v >> 24 & 255]
+
+// v's low 32 bits, as a signed number (C's (int32_t)v)
+pub fn int32(v: Int) -> Int = v & 0xFFFFFFFF ^ 0x80000000 - 0x80000000
+
+// unsigned a < b
+pub fn below(a: Int, b: Int) -> Bool = a ^ minInt < b ^ minInt
+
+pub const minInt = -9223372036854775807 - 1
+pub const maxInt = 9223372036854775807
+
+// The magic multiplier and shift that divide by d (d >= 2) without a division (Hacker's Delight, 10-1), in 64-bit
+// unsigned arithmetic.
+pub fn magic(d: Int) -> (Int, Int) {
+    let ad = d
+    let anc = maxInt - (maxInt % ad + 1) % ad // 2^63 - 1 - 2^63 % ad
+    var (q1, r1) = twoTo63By(anc)
+    var (q2, r2) = twoTo63By(ad)
+    var p = 63
+    var delta = 0
+    while true {
+        p += 1
+        q1 *%= 2
+        r1 *%= 2
+        if not below(r1, anc) {
+            q1 +%= 1
+            r1 -%= anc
+        }
+        q2 *%= 2
+        r2 *%= 2
+        if not below(r2, ad) {
+            q2 +%= 1
+            r2 -%= ad
+        }
+        delta = ad -% r2
+        if not (below(q1, delta) or q1 == delta and r1 == 0) {
+            break
+        }
+    }
+    (q2 +% 1, p - 64)
+}
+
+// 2^63 / n and 2^63 % n, for 0 < n < 2^63
+fn twoTo63By(n: Int) -> (Int, Int) {
+    let q = maxInt / n
+    let r = maxInt - q * n + 1
+    if r == n { (q + 1, 0) } else { (q, r) }
+}
+
+// the k with 2^k = d (d a power of two)
+pub fn log2(d: Int) -> Int {
+    var k = 0
+    while 1 << k < d {
+        k += 1
+    }
+    k
+}
+
+// ---- what both backends work out of a function ----
+// a call's argument kind i ('I', 'F', 'M'), 0 past the end
+pub fn kindAt(kinds: Bytes, i: Int) -> Int = kinds.get(i) ?? 0
+
+// Each virtual register's first and last mention, stretched over the loops it is alive across (alive at a loop's
+// top and read inside it: alive until the jump back). The parameters are there before the first instruction.
+pub fn liveRanges(f: IrFn) -> ([Int], [Int]) {
+    let n = len(f.kinds)
+    var first = [2147483647] * n
+    var last = [-1] * n
+    for p in f.params {
+        first[p] = min(first[p], -1)
+        last[p] = max(last[p], -1)
+    }
+    var labelAt = [0] * (f.labelCount + 1)
+    for (k, ins) in f.code.enumerate() {
+        if ins.op == .Label {
+            labelAt[ins.imm] = k
+            continue
+        }
+        if ins.op == .Jmp {
+            continue
+        }
+        if ins.dst >= 0 {
+            first[ins.dst] = min(first[ins.dst], k)
+            last[ins.dst] = max(last[ins.dst], k)
+        }
+        if ins.op != .Const {
+            if ins.a >= 0 {
+                first[ins.a] = min(first[ins.a], k)
+                last[ins.a] = max(last[ins.a], k)
+            }
+            if ins.b >= 0 {
+                first[ins.b] = min(first[ins.b], k)
+                last[ins.b] = max(last[ins.b], k)
+            }
+        }
+        for j in ins.from..ins.from + ins.argCount + ins.retCount {
+            let v = f.operands[j]
+            first[v] = min(first[v], k)
+            last[v] = max(last[v], k)
+        }
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for (k, ins) in f.code.enumerate() {
+            if not ins.op is Jmp | Jz | Jnz {
+                continue
+            }
+            let top = labelAt[ins.imm]
+            if top >= k {
+                continue
+            }
+            for v in 0..n {
+                if first[v] < top and last[v] >= top and last[v] < k {
+                    last[v] = k
+                    changed = true
+                }
+            }
+        }
+    }
+    (first, last)
+}
+
+// the registers that are alive across an instruction the test picks (from after it starts, or at it)
+// (the instructions' places in order, then each register's first one after its start, by halving: no register is
+// looked at once per instruction)
+pub fn aliveAt(f: IrFn, first: [Int], last: [Int], at: (IrIns) -> Bool, strict: Bool) -> [Bool] {
+    let n = len(f.kinds)
+    var out = [false] * n
+    var points: [Int] = []
+    for (k, ins) in f.code.enumerate() {
+        if at(ins) {
+            points.push(k)
+        }
+    }
+    if len(points) == 0 {
+        return out
+    }
+    for v in 0..n {
+        if last[v] < 0 or first[v] == 2147483647 {
+            continue
+        }
+        let from = if strict { first[v] + 1 } else { first[v] }
+        var lo = 0
+        var hi = len(points)
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if points[mid] < from {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        out[v] = lo < len(points) and points[lo] <= last[v]
+    }
+    out
+}
+
+// how often each virtual register is read
+pub fn useCounts(f: IrFn) -> [Int] {
+    var uses = [0] * len(f.kinds)
+    for ins in f.code {
+        if ins.op is Label | Jmp {
+            continue
+        }
+        if ins.op is Store | Vstore and ins.dst >= 0 {
+            uses[ins.dst] += 1
+        }
+        if ins.op != .Const {
+            if ins.a >= 0 {
+                uses[ins.a] += 1
+            }
+            if ins.b >= 0 {
+                uses[ins.b] += 1
+            }
+        }
+        for j in ins.from..ins.from + ins.argCount {
+            uses[f.operands[j]] += 1
+        }
+    }
+    uses
+}

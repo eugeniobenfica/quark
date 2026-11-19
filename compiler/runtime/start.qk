@@ -1,0 +1,166 @@
+// The start of a built executable ( job): quark build writes this program (the runtime and nothing of
+// the compiler), then the program's machine code, data and relocations, the C functions it calls, then a trailer
+// that says where they are. It reads only those bytes of its own file, loads them and runs main.
+use std.machine as machine
+use base
+use arena
+use print
+use panic
+use text
+use map
+use loops
+use numbers
+use files
+use io
+use loader
+use tasks
+use threads
+use debug
+
+extern effect fn fseek(f: Int64, offset: Int32, whence: Int32) -> Int32
+extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
+extern effect fn fclose(f: Int64) -> Int32
+extern effect fn osOpen(path: Int64, mode: Int64) -> Int64 as "qkosOpen"
+extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction"
+
+// ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
+// ---- each runtime function's address, by its number: its Quark function, which the
+// program calls the Quark way ----
+const runtimeCount = 122 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+
+fn runtimeTable() -> Int {
+    let t = calloc(runtimeCount, 8)
+    machine.fillRuntime(Pointer<Int64>(t))
+    t
+}
+
+// ---- the start ----
+const trailerBytes = 104
+
+fn say(t: Text) {
+    flush()
+    osWrite(2, textAt(t), len(t))
+}
+
+// the process's state, its first context and arena: what every runtime function finds through osCtx
+pub fn begin(argc: Int, argv: Int) {
+    let g = calloc(gWords, 8)
+    setWord(cell(), 0, g)
+    let c = calloc(ctxWords, 8)
+    setWord(c, ctxFuel, -1 - intMin)
+    setWord(c, ctxGlobals, g)
+    setWord(c, ctxArena, arenaNew())
+    setCtx(c)
+    setWord(g, gMainCtx, c)
+    setWord(g, gMainArena, word(c, ctxArena))
+    setWord(g, gOutBuf, malloc(65536))
+    setWord(g, gOutFd, 1)
+    setWord(g, gExitEnds, 1)
+    let count = if argc > 1 {
+        argc - 1 // everything after the executable's own name
+    } else {
+        0
+    }
+    let args = malloc(16 * count + 16)
+    for i in 0..count {
+        let s = word(argv, i + 1)
+        setWord(args, 2 * i, s)
+        setWord(args, 2 * i + 1, strlen(s))
+    }
+    setWord(g, gArgs, args)
+    setWord(g, gArgCount, count)
+    setWord(g, gRuntime, runtimeTable())
+}
+
+// runs the program this executable carries: its exit status
+pub extern effect fn qkStart(argc: Int64, argv: Int64, self: Int64) -> Int64 as "qkStart" {
+    begin(argc, argv)
+    let f = if self != 0 { osOpen(self, textAt("rb\0")) } else { 0 }
+    let t = calloc(1, trailerBytes)
+    if f == 0
+        or fseek(f, -trailerBytes, 2) != 0
+        or fread(t, trailerBytes, 1, f) != 1
+        or not sameBytes(t, textAt("QUARKPRG"), 8)
+        or fseek(f, -(trailerBytes + word(t, 12)), 2) != 0 {
+        say("this executable carries no Quark program\n")
+        return 1
+    }
+    let payloadSize = word(t, 12)
+    let payload = malloc(payloadSize + 1)
+    if payload == 0 or fread(payload, 1, payloadSize, f) != payloadSize {
+        return 1
+    }
+    let _ = fclose(f)
+    runProgram(t, payload, true)
+}
+
+// runs a program from memory (quarkimg run, compiler/image.qk): its payload (payloadSize + 1 bytes of the caller's)
+// and trailer laid out as a built executable carries them; its exit status
+pub extern effect fn qkStartMemory(argc: Int64, argv: Int64, payload: Int64, trailer: Int64) -> Int64 as "qkStartMemory" {
+    begin(argc, argv)
+    runProgram(trailer, payload, false)
+}
+
+// the program a trailer describes, from its payload (freed once loaded when it is the start's own)
+fn runProgram(t: Int, payload: Int, owned: Bool) -> Int {
+    let codeLen = word(t, 1)
+    let dataLen = word(t, 2)
+    let relocCount = word(t, 3)
+    let entry = word(t, 4)
+    let fuel = word(t, 7)
+    let memory = word(t, 8)
+    let features = word(t, 9)
+    let externCount = word(t, 10)
+    let payloadSize = word(t, 12)
+    if fuel > 0 {
+        ctxSet(ctxFuel, fuel)
+    }
+    if memory > 0 {
+        setLimit(arena(), memory)
+    }
+    let cpu = machine.cpu()
+    if features & 1 != 0 and cpu & 1 == 0 or features & 2 != 0 and cpu & 2 == 0 or features & 4 != 0 and cpu & 4 == 0 {
+        say("this program was built for processors with AVX (or AVX2, SSE4.2), and this one has none\n")
+        return 1
+    }
+    setByte(payload, payloadSize, 0)
+    let code = payload
+    let data = code + codeLen
+    let relocs = data + dataLen
+    // the C functions it calls, from their libraries: each one's name, then its library ("" for the C library)
+    var names = relocs + 16 * relocCount
+    let hosts = calloc(if externCount != 0 { externCount } else { 1 }, 8)
+    let why = calloc(1, 512)
+    for i in 0..externCount {
+        let name = names
+        names += strlen(names) + 1
+        let lib = if byte(names, 0) != 0 { names } else { 0 }
+        names += strlen(names) + 1
+        let address = osCFunction(name, lib, why)
+        if address == 0 {
+            flush()
+            let n = strlen(why)
+            setByte(why, n, '\n')
+            osWrite(2, why, n + 1)
+            return 1
+        }
+        setWord(hosts, i, address)
+    }
+    let l = load(code, codeLen, data, dataLen, relocs, relocCount, word(t, 5), word(t, 6), hosts)
+    if l == 0 {
+        return 1
+    }
+    if owned {
+        free(payload) // loaded: the code and data have places of their own
+    }
+    let ok = runEntry(l, word(l, lCode) + entry, 0, 0, 0, 0)
+    flush()
+    if not ok {
+        let p = panicText()
+        let n = panicTextLen()
+        setByte(p, n, '\n')
+        osWrite(2, p, n + 1)
+        return 1
+    }
+    0
+}

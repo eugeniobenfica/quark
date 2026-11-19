@@ -1,0 +1,561 @@
+// The optimizers' results kept by content: each function's optimized IR under a key made from what it was made from
+// (its lowered IR, the target, the interface tables, the compiler itself), so a build that lowers a function as an
+// earlier one did takes the result instead of optimizing it again (quark run / build --release; QUARK_CACHE=off
+// keeps none).
+//
+// A function's IR names other things by where they are in this build: functions by index, the data block by offset,
+// C functions by index, inlined calls by number, its lines by line. An edit elsewhere moves all of them, so the key
+// says them by what they are (a function's name, a data item's bytes, a C function's name, a line from the
+// function's own), and so does what is kept: each reference is the n-th thing the lowered function names, and goes
+// back to where that thing is in the build that takes it. The optimizers do no arithmetic on any of them (a data
+// address is only ever a Const marked as data; constant registers hold plain numbers), so this is exact: a function
+// taken from the cache is the one the optimizers would make, to the byte.
+use ir
+use opt
+use release
+
+// What every key in a build says: the compiler, the target and tier, the tables; and how to name a function, a data
+// item, a C function
+pub type KeyContext {
+    salt: Text
+    fnNames: [Text] // by index: name#n, the n-th of that name
+    dataHash: [Int: Text] // a data item's bytes' hash, by offset (an item: to the next offset any code names)
+    externNames: [Text]
+    sigNames: [Text] // the C functions called through an address: their slots
+    tables: [IrTable]
+    release: Bool
+    lanes: Int
+    fuel: Bool
+    arch: Arch
+    sse42: Bool
+}
+
+// The things a lowered function names, in the order it first names them (the tables' functions after: what
+// devirtualizing may call)
+type Refs {
+    fns: [Int] = []
+    fnAt: [Int: Int] = [:]
+    data: [Int] = []
+    dataAt: [Int: Int] = [:]
+    externs: [Int] = []
+    externAt: [Int: Int] = [:]
+    inls: [Int] = []
+    inlAt: [Int: Int] = [:]
+    sigs: [Int] = []
+    sigAt: [Int: Int] = [:]
+}
+
+fn Refs.addFn(var self, i: Int) {
+    if not self.fnAt.contains(i) {
+        self.fnAt[i] = len(self.fns)
+        self.fns.push(i)
+    }
+}
+
+fn refsOf(f: IrFn, tables: [IrTable]) -> Refs {
+    var r = Refs()
+    for ins in f.code {
+        if ins.op == .Call and ins.a < 0 or ins.op == .Const and ins.c == 2 {
+            r.addFn(ins.imm)
+        } else if ins.op == .Const and ins.c == 1 and not r.dataAt.contains(ins.imm) {
+            r.dataAt[ins.imm] = len(r.data)
+            r.data.push(ins.imm)
+        } else if ins.op == .HostCall and ins.a >= 0 {
+            if not r.sigAt.contains(ins.imm) {
+                r.sigAt[ins.imm] = len(r.sigs)
+                r.sigs.push(ins.imm)
+            }
+        } else if ins.op == .HostCall and not r.externAt.contains(ins.imm) {
+            r.externAt[ins.imm] = len(r.externs)
+            r.externs.push(ins.imm)
+        }
+        if ins.inl != 0 and not r.inlAt.contains(ins.inl) {
+            r.inlAt[ins.inl] = len(r.inls)
+            r.inls.push(ins.inl)
+        }
+    }
+    for t in tables {
+        for i in t.fns {
+            r.addFn(i)
+        }
+    }
+    r
+}
+
+// ---- words in bytes: zigzag LEB128 ----
+type Out { b: Bytes = [] }
+
+fn Out.int(var self, v: Int) {
+    var u = v << 1 ^ v >> 63
+    while u < 0 or u >= 128 {
+        self.b.push(u & 127 | 128)
+        u = u >> 7 & 0x1FFFFFFFFFFFFFF
+    }
+    self.b.push(u)
+}
+
+fn Out.bool(var self, v: Bool) {
+    self.b.push(if v { 1 } else { 0 })
+}
+
+fn Out.text(var self, t: Text) {
+    let b = t.bytes()
+    self.int(len(b))
+    self.b += b
+}
+
+fn Out.bytes(var self, b: Bytes) {
+    self.int(len(b))
+    self.b += b
+}
+
+fn Out.ints(var self, xs: [Int]) {
+    self.int(len(xs))
+    for x in xs {
+        self.int(x)
+    }
+}
+
+// a Float, exactly: an Int mantissa and a power of two (x = m * 2^e)
+fn Out.float(var self, x: Float) {
+    if x == 0.0 or x != x {
+        self.int(0)
+        self.int(if x == 0.0 { 0 } else { 1 })
+        return
+    }
+    var m = if x < 0.0 { -x } else { x }
+    var e = 0
+    while m >= 9007199254740992.0 {
+        m = m / 2.0
+        e += 1
+    }
+    while m < 4503599627370496.0 {
+        m = m * 2.0
+        e -= 1
+    }
+    self.int(if x < 0.0 { -toInt(m) } else { toInt(m) })
+    self.int(e)
+}
+
+type In { b: Bytes, at: Int = 0, ok: Bool = true }
+
+fn In.int(var self) -> Int {
+    var u = 0
+    var shift = 0
+    while true {
+        if self.at >= len(self.b) or shift > 63 {
+            self.ok = false
+            return 0
+        }
+        let c = self.b[self.at]
+        self.at += 1
+        u = u | c & 127 << shift
+        shift += 7
+        if c < 128 {
+            break
+        }
+    }
+    u >> 1 & 0x7FFFFFFFFFFFFFFF ^ -(u & 1)
+}
+
+fn In.bool(var self) -> Bool = self.int() != 0
+
+fn In.bytes(var self) -> Bytes {
+    let n = self.int()
+    if n < 0 or self.at + n > len(self.b) {
+        self.ok = false
+        return []
+    }
+    let out = self.b[self.at..self.at + n]
+    self.at += n
+    out
+}
+
+fn In.text(var self) -> Text = Text(self.bytes()) ?? ""
+
+fn In.ints(var self) -> [Int] {
+    let n = self.int()
+    var xs: [Int] = []
+    var i = 0
+    while i < n and self.ok {
+        xs.push(self.int())
+        i += 1
+    }
+    xs
+}
+
+fn In.float(var self) -> Float {
+    let m = self.int()
+    let e = self.int()
+    if m == 0 {
+        return if e == 0 { 0.0 } else { 0.0 / 0.0 }
+    }
+    var x = toFloat(m)
+    var k = e
+    while k > 0 {
+        x = x * 2.0
+        k -= 1
+    }
+    while k < 0 {
+        x = x / 2.0
+        k += 1
+    }
+    x
+}
+
+// ---- a function, its references said by their place in refs ----
+// how an instruction's imm is said: a function's (0), a data item's (1), a C function's (2), as it is (3)
+fn immKind(ins: IrIns) -> Int = if ins.op == .Call and ins.a < 0 or ins.op == .Const and ins.c == 2 {
+    0
+} else if ins.op == .Const and ins.c == 1 {
+    1
+} else if ins.op == .HostCall and ins.a >= 0 {
+    4
+} else if ins.op == .HostCall {
+    2
+} else {
+    3
+}
+
+// f, its references as refs' places (None when it names something refs does not have)
+fn encode(f: IrFn, r: Refs, withName: Bool) -> Bytes? {
+    var o = Out()
+    if withName {
+        o.text(f.name)
+    }
+    o.ints(f.params)
+    o.int(f.resultCount)
+    o.int(f.labelCount)
+    o.int(f.maxOut)
+    o.int(f.machine)
+    o.bool(f.cHidden)
+    o.bool(f.cArgs != None)
+    o.bytes(f.cArgs ?? [])
+    o.bytes(f.cRets)
+    o.bool(f.exportName != None)
+    o.text(f.exportName ?? "")
+    o.bytes(f.kinds)
+    o.int(len(f.weight))
+    for w in f.weight {
+        o.float(w)
+    }
+    o.int(len(f.isConst))
+    for (i, c) in f.isConst.enumerate() {
+        o.bool(c)
+        o.int(f.constValue.get(i) ?? 0)
+    }
+    o.int(len(f.code))
+    for ins in f.code {
+        o.int(ins.op.index())
+        o.int(ins.cond)
+        o.int(ins.dst)
+        o.int(ins.a)
+        o.int(ins.b)
+        o.int(ins.c)
+        let imm = match immKind(ins) {
+            0 => r.fnAt[ins.imm] ?? -1
+            1 => r.dataAt[ins.imm] ?? -1
+            2 => r.externAt[ins.imm] ?? -1
+            4 => r.sigAt[ins.imm] ?? -1
+            _ => ins.imm
+        }
+        if immKind(ins) != 3 and imm < 0 {
+            return None
+        }
+        o.int(imm)
+        o.int(if ins.line == 0 {
+            0 // from the function's own: an edit above moves both
+        } else {
+            ins.line - f.line
+        })
+        o.bool(ins.line == 0)
+        let inl = if ins.inl == 0 { 0 } else { (r.inlAt[ins.inl] ?? -1) + 1 }
+        if inl < 0 {
+            return None
+        }
+        o.int(inl)
+        o.int(ins.from)
+        o.int(ins.argCount)
+        o.int(ins.retCount)
+    }
+    o.ints(f.operands)
+    Some(o.b)
+}
+
+// what encode wrote, for the function as it was lowered in this build (its name, line, and references' places)
+fn decode(b: Bytes, lowered: IrFn, r: Refs) -> IrFn? {
+    var i = In(b)
+    var f = IrFn(lowered.name, line: lowered.line)
+    f.params = i.ints()
+    f.resultCount = i.int()
+    f.labelCount = i.int()
+    f.maxOut = i.int()
+    f.machine = i.int()
+    f.cHidden = i.bool()
+    let hasArgs = i.bool()
+    let cArgs = i.bytes()
+    f.cArgs = if hasArgs { Some(cArgs) } else { None }
+    f.cRets = i.bytes()
+    let hasExport = i.bool()
+    let export = i.text()
+    f.exportName = if hasExport { Some(export) } else { None }
+    f.kinds = i.bytes()
+    let nw = i.int()
+    var k = 0
+    while k < nw and i.ok {
+        f.weight.push(i.float())
+        k += 1
+    }
+    let nc = i.int()
+    k = 0
+    while k < nc and i.ok {
+        f.isConst.push(i.bool())
+        f.constValue.push(i.int())
+        k += 1
+    }
+    let n = i.int()
+    k = 0
+    while k < n and i.ok {
+        let op = i.int()
+        if op < 0 or op >= len(allOps) {
+            return None
+        }
+        var ins = IrIns(allOps[op], cond: i.int(), dst: i.int(), a: i.int(), b: i.int(), c: i.int())
+        let imm = i.int()
+        ins.imm = match immKind(ins) {
+            0 => r.fns.get(imm) ?? -1
+            1 => r.data.get(imm) ?? -1
+            2 => r.externs.get(imm) ?? -1
+            4 => r.sigs.get(imm) ?? -1
+            _ => imm
+        }
+        if immKind(ins) != 3 and ins.imm < 0 {
+            return None
+        }
+        let rel = i.int()
+        let none = i.bool()
+        ins.line = if none { 0 } else { rel + lowered.line }
+        let inl = i.int()
+        ins.inl = if inl == 0 { 0 } else { r.inls.get(inl - 1) ?? -1 }
+        if ins.inl < 0 {
+            return None
+        }
+        ins.from = i.int()
+        ins.argCount = i.int()
+        ins.retCount = i.int()
+        f.code.push(ins)
+        k += 1
+    }
+    f.operands = i.ints()
+    if i.ok and i.at == len(b) { Some(f) } else { None }
+}
+
+// ---- keys ----
+// 128 bits of bytes: FNV-1a and a multiply-xorshift, side by side
+pub type Hash128 { a: Int = -3750763034362895579, b: Int = 6364136223846793005 }
+
+pub fn Hash128.add(var self, bytes: Bytes) {
+    for c in bytes {
+        self.a = (self.a ^ c) *% 1099511628211
+        self.b = (self.b +% c) *% -7046029254386353131
+        self.b = self.b ^ self.b >> 29 & 0x7FFFFFFFF
+    }
+}
+
+pub fn Hash128.text(self) -> Text = hex64(self.a) + hex64(self.b)
+
+pub fn hex64(v: Int) -> Text {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for k in 0..16 {
+        let d = v >> (60 - 4 * k) & 15
+        out += digits[d..d + 1]
+    }
+    out
+}
+
+// the build's key context: compiler (salt), target, tier, and every function's, data item's and C function's name
+pub fn keyContext(p: IrProgram, data: Bytes, release: Bool, lanes: Int, salt: Text) -> KeyContext {
+    var seen: [Text: Int] = [:]
+    var fnNames: [Text] = []
+    for f in p.fns {
+        let n = seen[f.name] ?? 0
+        seen[f.name] = n + 1
+        fnNames.push("{f.name}#{n}")
+    }
+    // the data items: from each offset some code names (or a table is at) to the next
+    var starts: [Int] = [len(data)]
+    for f in p.fns {
+        for ins in f.code {
+            if ins.op == .Const and ins.c == 1 {
+                starts.push(ins.imm)
+            }
+        }
+    }
+    for t in p.tables {
+        starts.push(t.at)
+    }
+    let sorted = starts.sorted()
+    var dataHash: [Int: Text] = [:]
+    for (k, at) in sorted.enumerate() {
+        if k + 1 < len(sorted) and at >= 0 and at <= len(data) {
+            var h = Hash128()
+            h.add(data[at..min(sorted[k + 1], len(data))])
+            dataHash[at] = h.text()
+        }
+    }
+    KeyContext(
+        salt,
+        fnNames,
+        dataHash,
+        p.externs.map(x => "{x.name}|{x.lib ?? ""}|{x.argKinds}|{x.retKinds}|{x.fixed}|{x.retHidden}"),
+        p.cSigs.map(x => "{x.argKinds}>{x.retKinds}|{x.retHidden}"),
+        p.tables,
+        release,
+        lanes,
+        p.fuel,
+        p.target.arch,
+        p.target.sse42,
+    )
+}
+
+// a lowered function's key: what it is with its references said by what they are, and the context
+pub fn fnKey(f: IrFn, ctx: KeyContext) -> Text {
+    let r = refsOf(f, ctx.tables)
+    var h = Hash128()
+    var o = Out()
+    o.text(ctx.salt)
+    o.bool(ctx.release)
+    o.int(ctx.lanes)
+    o.bool(ctx.fuel)
+    o.int(ctx.arch.index())
+    o.bool(ctx.sse42)
+    for t in ctx.tables {
+        o.text(ctx.dataHash[t.at] ?? "?")
+        o.int(len(t.fns))
+        for i in t.fns {
+            o.text(ctx.fnNames.get(i) ?? "?")
+        }
+    }
+    for i in r.fns {
+        o.text(ctx.fnNames.get(i) ?? "?")
+    }
+    for at in r.data {
+        o.text(ctx.dataHash[at] ?? "?")
+    }
+    for x in r.externs {
+        o.text(ctx.externNames.get(x) ?? "?")
+    }
+    for x in r.sigs {
+        o.text(ctx.sigNames.get(x) ?? "?")
+    }
+    h.add(o.b)
+    h.add(encode(f, r, true) ?? [0])
+    h.text()
+}
+
+// ---- the optimizers, with the cache ----
+// The pack a program's builds keep: "QKC2", the hash of the rest (a pack written half, or by two builds at once, is
+// not read), then each entry's key (32 hex digits) and its bytes
+fn readPack(b: Bytes) -> [Text: Bytes] {
+    var out: [Text: Bytes] = [:]
+    if len(b) < 36 or b[..4] != "QKC2".bytes() {
+        return out
+    }
+    var h = Hash128()
+    h.add(b[36..])
+    if b[4..36] != h.text().bytes() {
+        return out
+    }
+    var i = In(b, at: 36)
+    let n = i.int()
+    var k = 0
+    while k < n and i.ok {
+        let key = i.text()
+        let value = i.bytes()
+        if i.ok {
+            out[key] = value
+        }
+        k += 1
+    }
+    out
+}
+
+fn writePack(entries: [(Text, Bytes)]) -> Bytes {
+    var o = Out()
+    o.int(len(entries))
+    for (key, value) in entries {
+        o.text(key)
+        o.bytes(value)
+    }
+    var h = Hash128()
+    h.add(o.b)
+    "QKC2".bytes() + h.text().bytes() + o.b
+}
+
+// a kept function's bytes, and the function as this build lowered it
+type Kept { b: Bytes, f: IrFn }
+
+// what one function's optimizing made: its key, and its result as kept (empty when it cannot be kept)
+type Made { f: IrFn, kept: Bytes }
+
+fn optimizedKept(f: IrFn, ctx: KeyContext) -> Made {
+    var g = f
+    if ctx.release {
+        g.releaseOptimize(ctx.lanes, ctx.fuel, ctx.tables, ctx.arch, ctx.sse42)
+    }
+    g.quickOptimize()
+    Made(g, encode(g, refsOf(f, ctx.tables), false) ?? [])
+}
+
+fn decoded(b: Bytes, f: IrFn, ctx: KeyContext) -> IrFn? = decode(b, f, refsOf(f, ctx.tables))
+
+// The program's functions optimized as IrProgram.optimize does, those whose key the pack at path has taken from it;
+// the pack then holds this build's (so it does not grow past one program's). Its hits and the functions.
+pub effect fn IrProgram.optimizeCached(var self, release: Bool, data: Bytes, path: Text, salt: Text) -> (Int, Int) {
+    let lanes = self.target.lanes
+    self.target.lanes = 0
+    let ctx = keyContext(self, data, release, lanes, salt)
+    let threads = self.size() >= threadsFrom
+    let keys = if threads {
+        self.fns.parallelMap(f => fnKey(f, ctx))
+    } else {
+        self.fns.map(f => fnKey(f, ctx)).toArray()
+    }
+    let pack = if readBytes(path) is Ok(b) { readPack(b) } else { [:] }
+    // the functions the pack has: taken from it, on the processor's threads
+    let found = (0..len(keys)).filter(i => pack.contains(keys[i])).toArray()
+    let kept = found.map(i => Kept(pack[keys[i]] ?? [], self.fns[i])).toArray()
+    let taken = if threads {
+        kept.parallelMap(k => decoded(k.b, k.f, ctx))
+    } else {
+        kept.map(k => decoded(k.b, k.f, ctx)).toArray()
+    }
+    var hit = [false] * len(keys)
+    var entries: [(Text, Bytes)] = []
+    for (j, i) in found.enumerate() {
+        if taken[j] is Some(g) {
+            self.fns[i] = g
+            hit[i] = true
+            entries.push((keys[i], pack[keys[i]] ?? []))
+        }
+    }
+    let misses = (0..len(keys)).filter(i => not hit[i]).toArray()
+    let inputs = misses.map(i => self.fns[i]).toArray()
+    let made = if threads {
+        inputs.parallelMap(f => optimizedKept(f, ctx))
+    } else {
+        inputs.map(f => optimizedKept(f, ctx)).toArray()
+    }
+    for (j, i) in misses.enumerate() {
+        self.fns[i] = made[j].f
+        if len(made[j].kept) > 0 {
+            entries.push((keys[i], made[j].kept))
+        }
+    }
+    if release {
+        self.target.lanes = lanes
+    }
+    let _ = writeBytes(path, writePack(entries))
+    (len(keys) - len(misses), len(keys))
+}

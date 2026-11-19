@@ -1,0 +1,214 @@
+// Loading machine code: the code and data in memory of their own, every address it needs written in (the runtime's
+// functions, the data, the C functions, and this thread's cells: the budget, the escape, the panic's frame, the
+// stack's limit), and calls into it through its trampoline. Then the start of a built executable (
+// job): the program after this one in its own file, loaded and run.
+use std.machine as machine
+use base
+use arena
+use print
+
+extern effect fn osMapCode(n: Int64) -> Int64 as "qkosMapCode" // writable memory for code
+extern effect fn osProtectCode(p: Int64, n: Int64) as "qkosProtectCode" // ... made code: run, not written
+extern effect fn osUnmapCode(p: Int64, n: Int64) as "qkosUnmapCode"
+extern effect fn osStackLow() -> Int64 as "qkosStackLow" // the lowest address the thread's stack may reach, or 0
+
+// a C function: its address, or 0 and why (in why, 512 bytes)
+extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction"
+
+// a Loaded's words
+pub const lCode = 0
+pub const lCodeLen = 1
+pub const lData = 2
+pub const lEnter = 3
+pub const lEscape = 4
+pub const lSource = 6 // what another thread's copy is loaded from: code, then data
+pub const lDataLen = 7
+pub const lRelocs = 8
+pub const lRelocCount = 9
+pub const lEnterAt = 10
+pub const lEscapeAt = 11
+pub const lHosts = 12
+pub const lHostCount = 13
+pub const loadedWords = 16
+const relocRuntime = 0
+const relocData = 1
+const relocFuel = 2
+const relocHost = 3
+const relocEscape = 4
+const relocPanicFrame = 5
+const relocStackLimit = 6
+
+// the address a reloc stands for, on this thread
+pub fn relocTarget(kind: Int, target: Int, data: Int, hosts: Int) -> Int {
+    let c = ctx()
+    if kind == relocRuntime {
+        return word(gGet(gRuntime), target)
+    }
+    if kind == relocData {
+        return data + target
+    }
+    if kind == relocFuel {
+        return c + 8 * ctxFuel
+    }
+    if kind == relocHost {
+        return if hosts != 0 { word(hosts, target) } else { 0 }
+    }
+    if kind == relocEscape {
+        return c + 8 * ctxEscapeRsp
+    }
+    if kind == relocPanicFrame {
+        return c + 8 * ctxPanicFrame
+    }
+    if kind == relocStackLimit {
+        return c + 8 * ctxStackLimit
+    }
+    0
+}
+
+// relocs: (at: Int32, kind: Int32, target: Int64), 16 bytes each; a Loaded, or 0
+pub fn load(
+    code: Int,
+    codeLen: Int,
+    data: Int,
+    dataLen: Int,
+    relocs: Int,
+    relocCount: Int,
+    enter: Int,
+    escape: Int,
+    hosts: Int,
+) -> Int {
+    let dataCopy = malloc(dataLen + 16)
+    if dataCopy == 0 {
+        return 0
+    }
+    copyBytes(dataCopy, data, dataLen)
+    let mem = osMapCode(codeLen)
+    if mem == 0 {
+        free(dataCopy)
+        return 0
+    }
+    copyBytes(mem, code, codeLen)
+    for i in 0..relocCount {
+        let r = relocs + 16 * i
+        setWord(mem + int32At(r, 0), 0, relocTarget(int32At(r, 1), word(r, 1), dataCopy, hosts))
+    }
+    osProtectCode(mem, codeLen)
+    let l = calloc(loadedWords, 8)
+    setWord(l, lCode, mem)
+    setWord(l, lCodeLen, codeLen)
+    setWord(l, lData, dataCopy)
+    let source = malloc(codeLen + dataLen + 16)
+    copyBytes(source, code, codeLen)
+    copyBytes(source + codeLen, data, dataLen)
+    setWord(l, lSource, source)
+    let rs = malloc(16 * relocCount + 16)
+    copyBytes(rs, relocs, 16 * relocCount)
+    setWord(l, lRelocs, rs)
+    setWord(l, lRelocCount, relocCount)
+    setWord(l, lDataLen, dataLen)
+    setWord(l, lEnterAt, enter)
+    setWord(l, lEscapeAt, escape)
+    var hostCount = 0
+    for i in 0..relocCount {
+        let r = relocs + 16 * i
+        if int32At(r, 1) == relocHost and word(r, 1) + 1 > hostCount {
+            hostCount = word(r, 1) + 1
+        }
+    }
+    setWord(l, lHostCount, hostCount)
+    let hs = calloc(if hostCount != 0 { hostCount } else { 1 }, 8)
+    if hosts != 0 {
+        copyBytes(hs, hosts, 8 * hostCount)
+    }
+    setWord(l, lHosts, hs)
+    setWord(l, lEnter, mem + enter)
+    setWord(l, lEscape, mem + escape)
+    l
+}
+
+// another thread's copy: the same code, its addresses this thread's
+pub fn loadAgain(l: Int) -> Int {
+    let s = word(l, lSource)
+    load(
+        s,
+        word(l, lCodeLen),
+        s + word(l, lCodeLen),
+        word(l, lDataLen),
+        word(l, lRelocs),
+        word(l, lRelocCount),
+        word(l, lEnterAt),
+        word(l, lEscapeAt),
+        word(l, lHosts),
+    )
+}
+
+pub fn unload(l: Int) {
+    osUnmapCode(word(l, lCode), word(l, lCodeLen))
+    free(word(l, lData))
+    free(word(l, lSource))
+    free(word(l, lRelocs))
+    free(word(l, lHosts))
+    free(l)
+}
+
+// the lowest address this thread's stack may reach, keeping room for the runtime (a panic prints, C calls)
+fn stackLimit() -> Int {
+    let room = 262144
+    let here = machine.frame().address
+    let taskLow = ctxGet(ctxTaskStackLow)
+    if taskLow != 0 {
+        return taskLow + 65536 // a task: its own stack
+    }
+    let low = osStackLow()
+    if low != 0 and here > low + room {
+        return low + room
+    }
+    if here > 1048576 {
+        here - 1048576 + room // unknown: a megabyte from here
+    } else {
+        0
+    }
+}
+
+// calls fn (in l's code) through the trampoline; false when it panicked (the panic text says why)
+pub fn runEntry(l: Int, f: Int, args: Int, argCount: Int, results: Int, resultCount: Int) -> Bool {
+    let c = ctx()
+    if word(c, ctxEscapeRsp) == 0 {
+        arenaReset()
+    }
+    setWord(c, ctxStackLimit, stackLimit())
+    let savedStub = word(c, ctxEscapeStub)
+    setWord(c, ctxEscapeStub, word(l, lEscape))
+    setByte(panicText(), 0, 0)
+    let e = malloc(40) // fn, args, argCount, results, resultCount
+    setWord(e, 0, f)
+    setWord(e, 1, args)
+    setWord(e, 2, argCount)
+    setWord(e, 3, results)
+    setWord(e, 4, resultCount)
+    let wasRunning = word(c, ctxRunning)
+    let wasEntry = word(c, ctxRunningEntry)
+    setWord(c, ctxRunning, l)
+    setWord(c, ctxRunningEntry, f - word(l, lCode))
+    setWord(c, ctxPanicFrame, 0)
+    let stopped = machine.call(Pointer<UInt8>(word(l, lEnter)), e, 0, 0, 0)
+    let c2 = ctx() // (the same thread: a task's switch leaves it as it was)
+    setWord(c2, ctxEscapeStub, savedStub)
+    setWord(c2, ctxRunning, wasRunning)
+    setWord(c2, ctxRunningEntry, wasEntry)
+    free(e)
+    stopped == 0
+}
+
+pub extern effect fn qkRunEntry(
+    l: Int64,
+    f: Int64,
+    args: Int64,
+    argCount: Int64,
+    results: Int64,
+    resultCount: Int64,
+) -> Int64 as "qkRunEntry" = if runEntry(l, f, args, argCount, results, resultCount) {
+    1
+} else {
+    0
+}

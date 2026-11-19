@@ -1,0 +1,309 @@
+// Modules: `use geometry` in a file brings in the pub declarations of geometry.qk, the file next to it (`use
+// shapes.round`: shapes/round.qk), or of a package quark.toml names (`use geom.shapes`: .quark/pkg/geom/shapes.qk,
+// checked against quark.lock: package.qk). Every file of a program is parsed into the one tree, each declaration marked with
+// the file (module) it comes from; the checker lets a file see its own declarations, the host's, and the pub ones of
+// the files it uses (not the files those use). `use std.json`: the standard library, std/json.qk.
+use ast
+use source
+use parser
+use types
+use package
+use stdlib
+
+// a program read: its files parsed into one tree (the host's declarations first, when it gives some), the errors
+// said, and whether there was none
+pub type Loaded { program: Program, errors: Errors, ok: Bool }
+
+// The program in a file's text, after the host's declarations (prelude), with the files its uses name. at: where
+// the file is, when its name is not its path (the language server's file:///... texts); "": src.path. hostFiles: the
+// texts of the files a host gives (qkModuleReader, compiler/api.qk): then every file the program uses but the
+// standard library's comes from them, none from the disk.
+pub fn loadProgram(src: Source, prelude: Source?, at: Text = "", hostFiles: [Text: Text]? = None) -> Loaded {
+    var errors = Errors()
+    let first = parse(src)
+    errors.shown += first.errors
+    if not first.ok {
+        return Loaded(newProgram(first.ast, []), errors, false)
+    }
+    var tree = first.ast
+    if prelude is Some(host) {
+        let own = len(tree.decls)
+        let pre = parse(host)
+        errors.shown += pre.errors
+        if not pre.ok {
+            return Loaded(newProgram(tree, []), errors, false)
+        }
+        tree.append(pre.ast)
+        var given = tree.decls[own..]
+        for i in 0..len(given) {
+            given[i].fromPrelude = true
+        }
+        tree.decls = given + tree.decls[..own]
+    }
+    var modules = [Module(if at != "" { at } else { src.path }, src)]
+    var ok = true
+    var packages = Packages()
+    var m = 0
+    while m < len(modules) {
+        // the list grows as files name more files
+        var i = 0
+        while i < len(tree.decls) {
+            let d = tree.decls[i]
+            i += 1
+            if d.kind != DeclKind.Use or d.module != m {
+                continue
+            }
+            let from = modules[m].src
+            let std = d.name.startsWith("std.")
+            var file = modulePath(if std { "" } else { modules[m].path }, d.name)
+            if not std {
+                // geom.shapes, geom in quark.toml: .quark/pkg/geom/shapes.qk (compiler/package.qk)
+                let pkg = packages.fileFor(modules[m].path, d.name)
+                if pkg.error is Some(why) {
+                    errors.add(from, d.line, d.col, "use {d.name}: {why}")
+                    ok = false
+                    continue
+                }
+                if pkg.file is Some(f) {
+                    file = f
+                }
+            }
+            var found = -1
+            for (k, mod) in modules.enumerate() {
+                if found < 0 and mod.path == file {
+                    found = k
+                }
+            }
+            if found == m {
+                errors.add(from, d.line, d.col, "a file cannot use itself")
+                ok = false
+                continue
+            }
+            if found < 0 {
+                let Some(text) = readModule(file, std, hostFiles) else {
+                    errors.add(from, d.line, d.col, "use {d.name}: cannot read {file}")
+                    ok = false
+                    continue
+                }
+                let sub = Source(file, text)
+                let before = len(tree.decls)
+                let parsed = parse(sub)
+                errors.shown += parsed.errors
+                if not parsed.ok {
+                    ok = false
+                    continue
+                }
+                tree.append(parsed.ast)
+                modules.push(Module(file, sub, useName: d.name))
+                found = len(modules) - 1
+                for k in before..len(tree.decls) {
+                    tree.decls[k].module = found
+                }
+            }
+            if modules[m].uses.contains(found) {
+                errors.add(from, d.line, d.col, "{d.name} is used twice")
+                ok = false
+            } else {
+                modules[m].uses.push(found)
+                modules[m].aliases.push(d.alias)
+            }
+        }
+        m += 1
+    }
+    if not src.path.startsWith(embeddedRuntime) {
+        // the language's own declarations (compiler/prelude.qk), after the program's: a program's own name hides one
+        let pre = Source(preludePath, preludeText())
+        let before = len(tree.decls)
+        let parsed = parse(pre)
+        errors.shown += parsed.errors
+        if parsed.ok {
+            tree.append(parsed.ast)
+            modules.push(Module(preludePath, pre))
+            for k in before..len(tree.decls) {
+                tree.decls[k].module = len(modules) - 1
+                tree.decls[k].builtin = true
+            }
+        } else {
+            ok = false
+        }
+    }
+    Loaded(newProgram(tree, modules), errors, ok)
+}
+
+pub const preludePath = "<quark>/prelude.qk"
+
+// where the runtime's files are, as the compiler keeps them (compiler/stdlib.qk): quark run and quark build compile
+// "<quark>/runtime/windows.qk" (or linux.qk) and the files it uses from there
+pub const embeddedRuntime = "<quark>/runtime/"
+
+// a file's text: the standard library's as the compiler keeps it (compiler/stdlib.qk; else from std/ next to where
+// quark runs, or $QUARK_STD), the runtime's as the compiler keeps it, another one from disk
+fn readModule(file: Text, std: Bool, hostFiles: [Text: Text]?) -> Text? {
+    if std and stdText(file[4..len(file) - 3]) is Some(text) {
+        return text
+    }
+    if file.startsWith(embeddedRuntime) {
+        return runtimeText(file[len(embeddedRuntime)..len(file) - 3])
+    }
+    if not std and hostFiles is Some(files) {
+        return files[file] // the host's reader's (compiler/api.qk)
+    }
+    if readFile(file) is Ok(text) {
+        return text
+    }
+    if not std {
+        return None
+    }
+    let dir = env("QUARK_STD") ?? return None
+    if readFile(dir + "/" + file[4..]) is Ok(text) {
+        return text
+    }
+    None
+}
+
+// dir of `from` + name with its dots as folders + ".qk"
+pub fn modulePath(from: Text, name: Text) -> Text {
+    let b = from.bytes()
+    var slash = -1
+    for (i, c) in b.enumerate() {
+        if c is '/' | '\\' {
+            slash = i
+        }
+    }
+    from[..slash + 1] + name.replace(".", "/") + ".qk"
+}
+
+// ---- trees put together ----------------------------------------------------------------------------------------
+// Another file's tree added to this one: its nodes after this tree's, every index in them moved by as much.
+fn Ast.append(var self, other: Ast) {
+    let at = Shift(
+        len(self.exprs),
+        len(self.stmts),
+        len(self.blocks),
+        len(self.arms),
+        len(self.params),
+        len(self.types),
+    )
+    for x in other.exprs {
+        self.exprs.push(x with { node: at.exprNode(x.node) })
+    }
+    for s in other.stmts {
+        self.stmts.push(s with { node: at.stmtNode(s.node) })
+    }
+    for b in other.blocks {
+        self.blocks.push(b with { stmts: at.list(b.stmts, at.stmts) })
+    }
+    for a in other.arms {
+        let subs = at.list(a.subs, at.arms)
+        let alternatives = at.list(a.alternatives, at.arms)
+        self.arms.push(
+            a with { subs: subs, alternatives: alternatives, intPattern: at.e(a.intPattern), intHigh: at.e(a.intHigh), textPattern: at.e(
+                a.textPattern,
+            ), guard: at.e(a.guard), body: at.e(a.body) },
+        )
+    }
+    for p in other.params {
+        self.params.push(p with { ty: at.t(p.ty), fallback: at.e(p.fallback) })
+    }
+    for t in other.types {
+        self.types.push(t with { node: at.typeNode(t.node) })
+    }
+    for d in other.decls {
+        var caseFields: [[Int]] = []
+        for fields in d.caseFields {
+            caseFields.push(at.list(fields, at.params))
+        }
+        self.decls.push(
+            d with { params: at.list(d.params, at.params), ret: at.t(d.ret), body: at.e(d.body), caseFields: caseFields },
+        )
+    }
+}
+
+// where another tree's nodes go: each kind's first index
+type Shift { exprs: Int, stmts: Int, blocks: Int, arms: Int, params: Int, types: Int }
+
+fn moved(i: Int, by: Int) -> Int = if i >= 0 { i + by } else { i }
+
+fn Shift.list(self, xs: [Int], by: Int) -> [Int] {
+    var out: [Int] = []
+    for x in xs {
+        out.push(moved(x, by))
+    }
+    out
+}
+
+fn Shift.e(self, i: Int) -> Int = moved(i, self.exprs)
+
+fn Shift.t(self, i: Int) -> Int = moved(i, self.types)
+
+fn Shift.b(self, i: Int) -> Int = moved(i, self.blocks)
+
+fn Shift.a(self, i: Int) -> Int = moved(i, self.arms)
+
+fn Shift.exprNode(self, node: ExprNode) -> ExprNode = match node {
+    Call(name, qualifier, args, names, method, dotted) => ExprNode.Call(
+        name,
+        qualifier,
+        self.list(args, self.exprs),
+        names,
+        method,
+        dotted,
+    )
+    Field(target, name) => ExprNode.Field(self.e(target), name)
+    Index(target, index) => ExprNode.Index(self.e(target), self.e(index))
+    Unary(op, operand) => ExprNode.Unary(op, self.e(operand))
+    Binary(op, left, right) => ExprNode.Binary(op, self.e(left), self.e(right))
+    Range(low, high) => ExprNode.Range(self.e(low), self.e(high))
+    If(cond, then, otherwise) => ExprNode.If(self.e(cond), self.b(then), self.e(otherwise))
+    Match(subject, arms, chain) => ExprNode.Match(self.e(subject), self.list(arms, self.arms), chain)
+    Lambda(params, body) => ExprNode.Lambda(self.list(params, self.params), self.e(body))
+    ArrayLit(items) => ExprNode.ArrayLit(self.list(items, self.exprs))
+    BlockExpr(block, jump) => ExprNode.BlockExpr(self.b(block), jump)
+    Case(name, target, dotted) => ExprNode.Case(name, self.e(target), dotted)
+    With(target, values, fields) => ExprNode.With(self.e(target), self.list(values, self.exprs), fields)
+    Interp(values, parts, raws, formats, multiline) => ExprNode.Interp(
+        self.list(values, self.exprs),
+        parts,
+        raws,
+        formats,
+        multiline,
+    )
+    Try(value) => ExprNode.Try(self.e(value))
+    MapLit(items) => ExprNode.MapLit(self.list(items, self.exprs))
+    Is(value, pattern) => ExprNode.Is(self.e(value), self.a(pattern))
+    other => other
+}
+
+fn Shift.stmtNode(self, node: StmtNode) -> StmtNode = match node {
+    Let(mutable, name, ty, value, pattern, otherwise) => StmtNode.Let(
+        mutable,
+        name,
+        self.t(ty),
+        self.e(value),
+        self.a(pattern),
+        self.b(otherwise),
+    )
+    Assign(target, op, value) => StmtNode.Assign(self.e(target), op, self.e(value))
+    ExprStmt(value) => StmtNode.ExprStmt(self.e(value))
+    For(name, pattern, iter, body) => StmtNode.For(name, self.a(pattern), self.e(iter), self.b(body))
+    While(cond, body) => StmtNode.While(self.e(cond), self.b(body))
+    Return(value) => StmtNode.Return(self.e(value))
+    Defer(body) => StmtNode.Defer(self.b(body))
+    other => other
+}
+
+fn Shift.typeNode(self, node: TypeNode) -> TypeNode = match node {
+    Named(name, args) => TypeNode.Named(name, self.list(args, self.types))
+    Array(elem) => TypeNode.Array(self.t(elem))
+    Map(key, value) => TypeNode.Map(self.t(key), self.t(value))
+    Fn(params, names, result, isEffect, external) => TypeNode.Fn(
+        self.list(params, self.types),
+        names,
+        self.t(result),
+        isEffect,
+        external,
+    )
+    Tuple(items) => TypeNode.Tuple(self.list(items, self.types))
+    Optional(inner) => TypeNode.Optional(self.t(inner))
+    Result(inner, error) => TypeNode.Result(self.t(inner), self.t(error))
+}

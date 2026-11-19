@@ -1,0 +1,47 @@
+// quark debug and quark run --trace: the program compiled for the debugger (every statement says its line, every
+// name its value) and run in memory (compiler/memory.qk), with the runtime's debugger made for
+// it (compiler/runtime/debug.qk): quark debug stops at the breakpoints (or the first line) and reads commands, as
+// --trace writes every name's last value, by graph key, when the program ends.
+use memory
+use imagecli
+
+pub fn debugCommand(host: Host, o: RunOptions) -> Int {
+    let interactive = o.command == "debug"
+    var compiled: Compiled? = None
+    var mapped: Mapped? = None
+    for k in 0..2 {
+        if k == 0 {
+            compiled = compileFile(host, o.path, o, Purpose(needMain: true, debug: true))
+            if compiled == None {
+                return 1
+            }
+        } else {
+            mapped = loadRuntime(host)
+        }
+    }
+    let Some(c) = compiled else {
+        return 1
+    }
+    let Some(m) = mapped else {
+        return 1
+    }
+    m.begin(o.path, o.programArgs)
+    let d = m.call(
+        "qkHostDebug",
+        if interactive { 1 } else { 0 },
+        if o.tracePath != "" { cText(o.tracePath) } else { 0 },
+        0,
+        0,
+    )
+    for line in o.breaks {
+        let _ = m.call("qkHostDebugBreak", line, 0, 0, 0)
+    }
+    pokeWord(d, 1, if interactive and len(o.breaks) == 0 {
+        1 // stepping: from the first line
+    } else {
+        0
+    })
+    let status = runProgram(host, m, c, o)
+    let _ = m.call("qkHostDebugFinish", 0, 0, 0, 0) // --trace: the values, written
+    status
+}

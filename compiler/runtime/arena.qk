@@ -1,0 +1,544 @@
+// The arena: memory comes from blocks, by bumping a pointer. Blocks after the current one are empty, so the list is
+// in the order things were made, and going back to a mark frees everything made after it at once (loops.qk). A large
+// allocation (largeFrom bytes or more) gets a block of its own, outside the list: a loop keeps it in place while its
+// vars reach it. Arrays and texts that grow keep their room in a table by address; containers from before a loop's
+// mark that the loop changes in place are remembered, an array's by its cards (16 elements each).
+use base
+
+// an arena's words
+pub const aBlocks = 0
+pub const aCurrent = 1
+pub const aExtras = 2 // survivors: what loops copied out, outside the blocks
+pub const aClock = 3
+pub const aAllocated = 4 // bytes handed out, ever
+pub const aGrowing = 5 // the rooms: growingEntries (address, bytes) pairs
+pub const aGrowingNext = 6
+pub const aGrowingUsed = 7
+pub const aLastText = 8 // the last text made: s + t appends in place while it is the top
+pub const aReserved = 9
+pub const aLimit = 10
+pub const aMarkBlock = 11
+pub const aMarkUsed = 12
+pub const aMarked = 13
+pub const aRemembered = 14 // remembered entries (rememberedWords each) by address, open addressing
+pub const aRememberedCap = 15
+pub const aRememberedCount = 16
+pub const aLarge = 17 // the large blocks, the latest first
+pub const aSpare = 18 // large blocks given back, kept for one of the same size (a few: memory touched already)
+pub const aSpareCount = 19
+pub const aUnused20 = 20 // (free)
+pub const aUnused21 = 21 // (free)
+pub const aSide = 22 // the loop collections' side table (loops.qk sideSlot), kept from one to the next
+pub const aSideBytes = 23
+pub const aSideEpoch = 24 // the collection its entries are of (1 to 15): an entry of another is empty
+pub const arenaWords = 25
+
+// a block's words, then its bytes (16-aligned)
+pub const bNext = 0
+pub const bSize = 1
+pub const bUsed = 2
+pub const bData = 3
+
+// a survivor's
+pub const xNext = 0
+pub const xTime = 1
+pub const xSize = 2
+pub const xUsed = 3
+pub const xData = 4
+
+// a large block's words (its time: the clock when it was made; marked: reached by the collection under way), then its
+// bytes (16-aligned)
+pub const bigNext = 0
+pub const bigTime = 1
+pub const bigSize = 2
+pub const bigMarked = 3
+pub const bigData = 4
+pub const largeFrom = 65536
+const largeSpare = 4
+const growingBuckets = 1024
+const growingWays = 4
+const blockSize = 16777216
+
+pub fn arena() -> Int = ctxGet(ctxArena)
+
+pub fn arenaNew() -> Int {
+    let a = calloc(1, 8 * arenaWords)
+    if a != 0 {
+        setWord(a, aGrowing, calloc(growingBuckets * growingWays, 16))
+    }
+    a
+}
+
+// an arena for code the running program's (a task's, a thread's)
+pub fn arenaLike() -> Int = arenaNew()
+
+// the memory an arena may use (--memory, a host's limit)
+pub fn setLimit(a: Int, bytes: Int) {
+    setWord(a, aLimit, if bytes > 0 { bytes } else { 0 })
+}
+
+pub extern effect fn qkArenaNew() -> Int64 as "qkArenaNew" = arenaNew()
+
+pub extern effect fn qkArenaLimit(a: Int64, bytes: Int64) as "qkArenaLimit" {
+    if a != 0 {
+        setLimit(a, bytes)
+    }
+}
+
+// survivors made in (after, before): their bytes
+pub fn freeExtras(a: Int, after: Int, before: Int) -> Int {
+    var at = a + 8 * aExtras // the word that points to the next one (newest first: the older ones stay)
+    var bytes = 0
+    while word(at, 0) != 0 and word(word(at, 0), xTime) > after {
+        let x = word(at, 0)
+        if word(x, xTime) < before {
+            setWord(at, 0, word(x, xNext))
+            bytes += word(x, xSize)
+            free(x)
+        } else {
+            at = x + 8 * xNext
+        }
+    }
+    bytes
+}
+
+// the large blocks made in [from, before) that no collection marked: their bytes (marks are cleared)
+pub fn freeLarge(a: Int, from: Int, before: Int) -> Int {
+    var at = a + 8 * aLarge // newest first: the older ones stay, and only younger ones are marked
+    var bytes = 0
+    while word(at, 0) != 0 and word(word(at, 0), bigTime) >= from {
+        let x = word(at, 0)
+        if word(x, bigTime) < before and word(x, bigMarked) == 0 {
+            setWord(at, 0, word(x, bigNext))
+            bytes += word(x, bigSize)
+            setWord(a, aReserved, word(a, aReserved) - word(x, bigSize))
+            if word(a, aSpareCount) < largeSpare and before != -1 - intMin {
+                setWord(x, bigNext, word(a, aSpare))
+                setWord(a, aSpare, x)
+                setWord(a, aSpareCount, word(a, aSpareCount) + 1)
+            } else {
+                free(x)
+            }
+        } else {
+            setWord(x, bigMarked, 0)
+            at = x + 8 * bigNext
+        }
+    }
+    bytes
+}
+
+// a large block of bytes, made at time
+pub fn freeSpare(a: Int) {
+    while word(a, aSpare) != 0 {
+        let x = word(a, aSpare)
+        setWord(a, aSpare, word(x, bigNext))
+        free(x)
+    }
+    setWord(a, aSpareCount, 0)
+}
+
+pub fn largeNew(a: Int, bytes: Int, time: Int) -> Int {
+    var x = 0
+    var at = a + 8 * aSpare
+    while x == 0 and word(at, 0) != 0 {
+        let s = word(at, 0)
+        if word(s, bigSize) == bytes {
+            // a block given back of this size: zeroed again
+            x = s
+            setWord(at, 0, word(s, bigNext))
+            setWord(a, aSpareCount, word(a, aSpareCount) - 1)
+            zeroBytes(word(s, bigData), bytes)
+            setWord(s, bigMarked, 0)
+        } else {
+            at = s + 8 * bigNext
+        }
+    }
+    if x == 0 {
+        x = calloc(1, bytes + 64)
+    }
+    if x == 0 {
+        panicNow(panicSize, 0, bytes, 0)
+    }
+    setWord(x, bigSize, bytes)
+    setWord(x, bigTime, time)
+    setWord(x, bigData, align16(x + 40))
+    setWord(x, bigNext, word(a, aLarge))
+    setWord(a, aLarge, x)
+    setWord(a, aReserved, word(a, aReserved) + bytes)
+    x
+}
+
+// the remembered containers, and their cards, gone
+pub fn rememberedFree(a: Int) {
+    let r = word(a, aRemembered)
+    for i in 0..word(a, aRememberedCap) {
+        free(word(r + 8 * rememberedWords * i, rCards))
+    }
+    free(r)
+    setWord(a, aRemembered, 0)
+    setWord(a, aRememberedCap, 0)
+    setWord(a, aRememberedCount, 0)
+}
+
+pub fn arenaFree(a: Int) {
+    if a == 0 {
+        return
+    }
+    var b = word(a, aBlocks)
+    while b != 0 {
+        let next = word(b, bNext)
+        free(b)
+        b = next
+    }
+    let _ = freeExtras(a, intMin, -1 - intMin)
+    let _ = freeLarge(a, intMin, -1 - intMin)
+    freeSpare(a)
+    rememberedFree(a)
+    free(word(a, aGrowing))
+    free(word(a, aSide))
+    free(a)
+}
+
+pub extern effect fn qkArenaFree(a: Int64) as "qkArenaFree" = arenaFree(a)
+
+// count elements of bytesEach bytes, zeroed, 16-aligned
+// the usual allocation: small, and room in the current block (no division, no loop); allocSlow for the rest
+pub fn alloc(count: Int, bytesEach: Int) -> Int {
+    if count >= 0 and count < 16777216 and bytesEach >= 0 and bytesEach < 65536 {
+        let bytes = align16(count * bytesEach)
+        let a = arena()
+        let cur = word(a, aCurrent)
+        if bytes != 0 and bytes < largeFrom and cur != 0 and word(cur, bUsed) + bytes <= word(cur, bSize) {
+            let used = word(cur, bUsed)
+            setWord(cur, bUsed, used + bytes)
+            setWord(a, aAllocated, word(a, aAllocated) + bytes)
+            return word(cur, bData) + used
+        }
+    }
+    allocSlow(count, bytesEach)
+}
+
+// count of bytesEach for what the caller writes all of (a text's bytes)
+pub fn allocRaw(count: Int, bytesEach: Int) -> Int = alloc(count, bytesEach)
+
+fn allocSlow(count: Int, bytesEach: Int) -> Int {
+    let a = arena()
+    if count < 0 or count != 0 and bytesEach > 1099511627776 / count {
+        panicNow(panicSize, 0, count, 0)
+    }
+    var bytes = align16(count * bytesEach)
+    if bytes == 0 {
+        bytes = 16
+    }
+    if bytes >= largeFrom and (word(a, aLimit) == 0 or word(a, aReserved) + bytes <= word(a, aLimit)) {
+        // a block of its own (else the room the limit leaves)
+        setWord(a, aAllocated, word(a, aAllocated) + bytes)
+        return word(largeNew(a, bytes, word(a, aClock)), bigData)
+    }
+    var cur = word(a, aCurrent)
+    while cur != 0 and word(cur, bUsed) + bytes > word(cur, bSize) {
+        let next = word(cur, bNext)
+        if next == 0 or word(next, bSize) < bytes {
+            break
+        }
+        cur = next // blocks after the current one are empty and zeroed
+    }
+    if cur == 0 or word(cur, bUsed) + bytes > word(cur, bSize) {
+        var size = if bytes > blockSize { bytes } else { blockSize }
+        let limit = word(a, aLimit)
+        if limit != 0 and word(a, aReserved) + size > limit {
+            if word(a, aReserved) + bytes > limit {
+                panicNow(panicMemory, 0, limit, 0)
+            }
+            size = bytes // the last room the limit leaves
+        }
+        let blk = calloc(1, size + 64)
+        if blk == 0 {
+            panicNow(panicSize, 0, count, 0)
+        }
+        setWord(blk, bSize, size)
+        setWord(a, aReserved, word(a, aReserved) + size)
+        setWord(blk, bData, align16(blk + 32))
+        if cur != 0 {
+            // in after the current block
+            setWord(blk, bNext, word(cur, bNext))
+            setWord(cur, bNext, blk)
+        } else {
+            setWord(a, aBlocks, blk)
+        }
+        cur = blk
+    }
+    setWord(a, aCurrent, cur)
+    let p = word(cur, bData) + word(cur, bUsed)
+    setWord(cur, bUsed, word(cur, bUsed) + bytes)
+    setWord(a, aAllocated, word(a, aAllocated) + bytes)
+    p
+}
+
+// back to a mark (block, used): what was made after it goes, zeroed again
+pub fn resetTo(a: Int, block: Int, used: Int) {
+    var b = if block != 0 { word(block, bNext) } else { word(a, aBlocks) }
+    while b != 0 and word(b, bUsed) != 0 {
+        zeroBytes(word(b, bData), word(b, bUsed))
+        setWord(b, bUsed, 0)
+        b = word(b, bNext)
+    }
+    if block != 0 {
+        zeroBytes(word(block, bData) + used, word(block, bUsed) - used)
+        setWord(block, bUsed, used)
+    }
+    setWord(a, aCurrent, if block != 0 { block } else { word(a, aBlocks) })
+}
+
+// everything the last call allocated goes; the memory stays
+pub fn arenaReset() {
+    let a = arena()
+    resetTo(a, 0, 0)
+    let _ = freeExtras(a, intMin, -1 - intMin)
+    let _ = freeLarge(a, intMin, -1 - intMin)
+    freeSpare(a)
+    if word(a, aGrowingUsed) != 0 {
+        zeroBytes(word(a, aGrowing), growingBuckets * growingWays * 16)
+    }
+    setWord(a, aGrowingUsed, 0)
+    rememberedFree(a)
+    setWord(a, aMarked, 0)
+    setWord(a, aMarkBlock, 0)
+    setWord(a, aLastText, 0)
+}
+
+pub extern effect fn qkArenaReset() as "qkArenaReset" = arenaReset()
+
+// ---- room to grow: arrays that push, long texts made by s + t, by address (four to a bucket) ----
+fn growingBucket(a: Int, p: Int) -> Int {
+    var h = shr(p, 4)
+    h ^= shr(h, 17)
+    h *%= -7046029254386353131
+    word(a, aGrowing) + shr(h, 54) * growingWays * 16 // the top 10 bits: one of 1024 buckets
+}
+
+// the room known at p (bytes), or 0
+pub fn growingRoom(a: Int, p: Int) -> Int {
+    let b = growingBucket(a, p)
+    for i in 0..growingWays {
+        if word(b, 2 * i) == p {
+            return word(b, 2 * i + 1)
+        }
+    }
+    0
+}
+
+pub fn growingForget(a: Int, p: Int) {
+    let b = growingBucket(a, p)
+    for i in 0..growingWays {
+        if word(b, 2 * i) == p {
+            setWord(b, 2 * i, 0)
+        }
+    }
+}
+
+pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
+    let b = growingBucket(a, p)
+    var at = -1
+    for i in 0..growingWays {
+        if at < 0 and (word(b, 2 * i) == 0 or word(b, 2 * i) == p) {
+            at = i
+        }
+    }
+    if at < 0 {
+        // a full bucket: the smallest room gives its place (a lost room costs a copy of what it holds)
+        at = 0
+        for i in 1..growingWays {
+            if word(b, 2 * i + 1) < word(b, 2 * at + 1) {
+                at = i
+            }
+        }
+    }
+    setWord(b, 2 * at, p)
+    setWord(b, 2 * at + 1, capBytes)
+    setWord(a, aGrowingUsed, word(a, aGrowingUsed) + 1)
+}
+
+// clears the rooms of what is in [lo, hi) for which young says so (loops.qk)
+pub fn growingSlots() -> Int = growingBuckets * growingWays
+
+// ---- the runtime's functions the code calls ----
+pub extern effect fn rtAlloc(count: Int64, bytesEach: Int64) -> Int64 as "qk_alloc" =
+    alloc(count, bytesEach)
+
+pub extern effect fn rtGrow(p: Int64, oldCount: Int64, newCount: Int64, bytesEach: Int64) -> Int64 as "qk_grow" {
+    let q = alloc(newCount, bytesEach)
+    copyBytes(q, p, oldCount * bytesEach)
+    q
+}
+
+pub extern effect fn rtCopy(p: Int64, count: Int64, bytesEach: Int64) -> Int64 as "qk_copy" {
+    let q = alloc(count, bytesEach)
+    copyBytes(q, p, count * bytesEach)
+    q
+}
+
+// xs.push(v): the array's address with room for one more (in place, or moved to twice the room)
+pub extern effect fn rtPush(p: Int64, n: Int64, bytesEach: Int64) -> Int64 as "qk_push" {
+    let a = arena()
+    if p != 0 {
+        let room = growingRoom(a, p)
+        if (n + 1) * bytesEach <= room {
+            return p
+        }
+        if room != 0 {
+            growingForget(a, p) // it moves: its room is known by its new address
+        }
+    }
+    let cap = if n * 2 > 8 { n * 2 } else { 8 }
+    let q = alloc(cap, bytesEach)
+    copyBytes(q, p, n * bytesEach)
+    growingAdd(a, q, cap * bytesEach)
+    q
+}
+
+// xs + ys: a new array
+pub extern effect fn rtArrayJoin(x: Int64, xn: Int64, y: Int64, yn: Int64, bytesEach: Int64) -> Int64 as "qk_arrayJoin" {
+    let p = alloc(xn + yn, bytesEach)
+    copyBytes(p, x, xn * bytesEach)
+    copyBytes(p + xn * bytesEach, y, yn * bytesEach)
+    p
+}
+
+// xs += ys on a var: in xs's room when it has it, else moved to twice the room
+pub extern effect fn rtArrayAppend(x: Int64, xn: Int64, y: Int64, yn: Int64, bytesEach: Int64) -> Int64 as "qk_arrayAppend" {
+    let a = arena()
+    let n = xn + yn
+    var p = x
+    let room = if x != 0 { growingRoom(a, x) } else { 0 }
+    if x == 0 or n * bytesEach > room {
+        if room != 0 {
+            growingForget(a, x)
+        }
+        let cap = if n * 2 > 8 { n * 2 } else { 8 }
+        p = alloc(cap, bytesEach)
+        copyBytes(p, x, xn * bytesEach)
+        growingAdd(a, p, cap * bytesEach)
+    }
+    moveBytes(p + xn * bytesEach, y, yn * bytesEach)
+    p
+}
+
+// ---- containers loops must look into again ----
+pub fn setMark(a: Int, block: Int, used: Int) {
+    setWord(a, aMarkBlock, block)
+    setWord(a, aMarkUsed, used)
+    setWord(a, aMarked, 1)
+}
+
+// made after the latest mark: above it in its block, or in the block allocation is in now
+fn newSinceMark(a: Int, p: Int) -> Bool {
+    let b = word(a, aMarkBlock)
+    let data = word(b, bData)
+    if p >= data + word(a, aMarkUsed) and p < data + word(b, bSize) {
+        return true
+    }
+    let c = word(a, aCurrent)
+    c != b and p >= word(c, bData) and p < word(c, bData) + word(c, bSize)
+}
+
+// a remembered entry: its address, its length (an array's elements written so far, at most), its description (A<elem>
+// or M<key><value>), the clock when it last changed, then an array's cards: (malloc'd) the clock when one of elements
+// k * 16 to k * 16 + 15 was last written (0: never), and how many there is room for: a loop looks again only at the
+// cards written since its mark, not at the whole array
+pub const rPtr = 0
+pub const rLen = 1
+pub const rDesc = 2
+pub const rTime = 3
+pub const rCards = 4
+pub const rCardCap = 5
+pub const rememberedWords = 6
+pub const cardShift = 4
+
+pub fn rememberedAt(r: Int, cap: Int, p: Int) -> Int {
+    var k = mix(p) & (cap - 1)
+    while word(r, rememberedWords * k) != 0 and word(r, rememberedWords * k) != p {
+        k = (k + 1) & (cap - 1)
+    }
+    r + 8 * rememberedWords * k
+}
+
+pub fn rememberedGrow(a: Int, cap: Int) {
+    let grown = calloc(cap, 8 * rememberedWords)
+    if grown == 0 {
+        panicNow(panicSize, 0, cap, 0)
+    }
+    let old = word(a, aRemembered)
+    for i in 0..word(a, aRememberedCap) {
+        let e = old + 8 * rememberedWords * i
+        if word(e, rPtr) != 0 {
+            copyBytes(rememberedAt(grown, cap, word(e, rPtr)), e, 8 * rememberedWords)
+        }
+    }
+    free(old)
+    setWord(a, aRemembered, grown)
+    setWord(a, aRememberedCap, cap)
+}
+
+pub fn remember(p: Int, n: Int, desc: Int) {
+    let a = arena()
+    if word(a, aMarked) == 0 or p == 0 or newSinceMark(a, p) {
+        return
+    }
+    if (word(a, aRememberedCount) + 1) * 2 > word(a, aRememberedCap) {
+        rememberedGrow(a, if word(a, aRememberedCap) != 0 {
+            word(a, aRememberedCap) * 2
+        } else {
+            256
+        })
+    }
+    let r = rememberedAt(word(a, aRemembered), word(a, aRememberedCap), p)
+    let clock = word(a, aClock)
+    var from = if n > 0 {
+        n - 1 // the element written (a map's: 0, all of it)
+    } else {
+        0
+    }
+    if word(r, rPtr) == 0 {
+        zeroBytes(r, 8 * rememberedWords)
+        setWord(r, rPtr, p)
+        setWord(r, rLen, n)
+        setWord(r, rDesc, desc)
+        setWord(r, rTime, clock)
+        setWord(a, aRememberedCount, word(a, aRememberedCount) + 1)
+    } else {
+        if n > word(r, rLen) {
+            // longer: what was pushed or appended since, all of it written
+            if word(r, rLen) < from {
+                from = word(r, rLen)
+            }
+            setWord(r, rLen, n)
+        }
+        setWord(r, rDesc, desc)
+        setWord(r, rTime, clock)
+    }
+    if byte(desc, 0) != 'A' {
+        return
+    }
+    let last = if n > 0 { shr(n - 1, cardShift) } else { 0 }
+    if last >= word(r, rCardCap) {
+        var cap = if word(r, rCardCap) != 0 { word(r, rCardCap) } else { 4 }
+        while cap <= last {
+            cap *= 2
+        }
+        let cards = realloc(word(r, rCards), cap * 8)
+        if cards == 0 {
+            panicNow(panicSize, 0, cap, 0)
+        }
+        zeroBytes(cards + 8 * word(r, rCardCap), 8 * (cap - word(r, rCardCap)))
+        setWord(r, rCards, cards)
+        setWord(r, rCardCap, cap)
+    }
+    let cards = word(r, rCards)
+    for k in shr(from, cardShift)..last + 1 {
+        setWord(cards, k, clock)
+    }
+}
+
+pub extern effect fn rtRemember(p: Int64, n: Int64, desc: Int64) as "qk_remember" =
+    remember(p, n, desc)

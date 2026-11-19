@@ -1,0 +1,2677 @@
+// The optimizing tier: quark run / build / object --release. The quick tier (opt.qk) stays the
+// default; this one takes longer to make code that runs faster.
+//
+// Each function is analysed as a control-flow graph of basic blocks, with its dominator tree, its natural loops and
+// the IR in SSA form (every value defined once, phis where control flow joins, copies folded into the values they
+// copy). The passes, in order:
+//  - escape analysis: a small record or array that never leaves the function (only loaded from and stored to at
+//    constant places) is not allocated: its fields live in registers;
+//  - devirtualization: a call through a function value that SSA shows is one known function is a direct call (an
+//    interface whose concrete type is known);
+//  - range analysis: every Int value's interval, refined on the branches that test it (i < n inside the loop),
+//    widened at loop heads; it drops the bounds checks that cannot fail (also r * 3 + 2 < len when r < len / 3) and
+//    the checks repeated where an identical one already passed, and the floored-division fix-ups (and zero checks)
+//    of divisions whose operands cannot be negative;
+//  - loop-invariant code motion: pure computations of values that do not change in a loop move before it;
+//  - overflow checks that cannot fail (the operands' intervals say so) dropped: i + 1 where i < n is plain arithmetic;
+//  - SIMD: a counted loop over arrays (a fused map / filter / sum / ... pipeline on Int or Float) runs 4 (AVX2) or 2
+//    (SSE, NEON) elements at a time, the rest in the original loop; Float sums keep their order (the same result
+//    as without SIMD), Int sums are added by lane. An Int + - * that is checked records which lanes went past the
+//    limits, and the loop stops the program after its vector part when one did (at that operation's line);
+//  - strength reduction: i * k in a loop is a value of its own, increased by k when i is;
+//  - address folding: [base + (i + k) * 8] is [base + i * 8 + 8k];
+//  - block layout: a loop's way out (a return, a break) after the function, the loop falling through.
+// Then the quick tier's passes (opt.qk) and the backends' register allocation, as for every build.
+use ir
+use opt
+
+const rtAlloc = 7 // the runtime's allocation
+
+// The optimizers on a program: the optimizing tier first when asked for (release), then the quick tier, on every
+// function. The lowered IR's lanes are the ones the optimizing tier would use; the
+// result's, the ones it did (none without it).
+pub fn optimizeIr(p: IrProgram, release: Bool) -> IrProgram {
+    var q = p
+    q.optimize(release)
+    q
+}
+
+// the same, in place. Each function is optimized on its own (the tables are only read), so the optimizing tier's
+// functions are shared out to the processor's threads: the result is the same as one after the other. The quick
+// tier alone runs here: its passes take less than the threads' start and the copies of their results.
+pub fn IrProgram.optimize(var self, release: Bool) {
+    let lanes = self.target.lanes
+    self.target.lanes = 0
+    if release {
+        let fuel = self.fuel
+        let tables = self.tables
+        let arch = self.target.arch
+        let sse42 = self.target.sse42
+        if self.size() >= threadsFrom {
+            self.fns = self.fns.parallelMap(f => releasedFn(f, lanes, fuel, tables, arch, sse42))
+        } else {
+            for i in 0..len(self.fns) {
+                self.fns[i] = releasedFn(self.fns[i], lanes, fuel, tables, arch, sse42)
+            }
+        }
+        self.target.lanes = lanes
+    } else {
+        for i in 0..len(self.fns) {
+            self.fns[i].quickOptimize()
+        }
+    }
+}
+
+// the instructions a program's functions have
+pub fn IrProgram.size(self) -> Int = self.fns.map(f => len(f.code)).sum()
+
+// a program this big (in instructions) or more is optimized on the processor's threads: a smaller one takes less
+// than the threads take to start (each loads the compiler's code again)
+pub const threadsFrom = 20000
+
+fn releasedFn(f: IrFn, lanes: Int, fuel: Bool, tables: [IrTable], arch: Arch, sse42: Bool) -> IrFn {
+    var g = f
+    g.releaseOptimize(lanes, fuel, tables, arch, sse42)
+    g.quickOptimize()
+    g
+}
+
+// ---- the IR's shape ----
+fn isBranch(op: Op) -> Bool = op is Jmp | Jz | Jnz
+
+// the registers an instruction reads: slot 0 its a, 1 its b, 2 a store's value, 3... its arguments
+fn useSlots(ins: IrIns) -> Int = 3 + ins.argCount
+
+fn IrFn.useReg(self, ins: IrIns, s: Int) -> Int {
+    if s == 0 {
+        return if ins.op is Const | Label | Jmp { -1 } else { ins.a }
+    }
+    if s == 1 {
+        return if ins.op is Const | Label | Jmp { -1 } else { ins.b }
+    }
+    if s == 2 {
+        return if ins.op is Store | Vstore { ins.dst } else { -1 }
+    }
+    self.operands[ins.from + s - 3]
+}
+
+fn mk(op: Op, dst: Int, a: Int, b: Int) -> IrIns = IrIns(op, dst: dst, a: a, b: b)
+
+// an instruction that is only a place: a label, a jump
+fn mark(op: Op, imm: Int) -> IrIns = IrIns(op, dst: -1, a: -1, b: -1, imm: imm)
+
+// instructions inserted before others, all at once: at[i] is the place (an instruction's index, or the count: the
+// end)
+type Edit { at: [Int] = [], ins: [IrIns] = [] }
+
+fn Edit.add(var self, at: Int, ins: IrIns) {
+    self.at.push(at)
+    self.ins.push(ins)
+}
+
+// the edits in (in the order added, before the instruction at their place), and the Nops out
+fn IrFn.apply(var self, e: Edit) {
+    if len(e.at) == 0 {
+        return
+    }
+    let order = (0..len(e.at)).sortedBy(i => e.at[i])
+    var code: [IrIns] = []
+    var next = 0
+    let count = len(self.code)
+    for k in 0..count + 1 {
+        while next < len(order) and e.at[order[next]] == k {
+            code.push(e.ins[order[next]])
+            next += 1
+        }
+        if k < count and self.code[k].op != .Nop {
+            code.push(self.code[k])
+        }
+    }
+    self.code = code
+}
+
+fn IrFn.dropNops(var self) {
+    var code: [IrIns] = []
+    for k in 0..len(self.code) {
+        if self.code[k].op != .Nop {
+            code.push(self.code[k])
+        }
+    }
+    self.code = code
+}
+
+// ---- the control-flow graph, dominators, loops ----
+//
+// Everything is in flat arrays held by one value: per block (its index), per loop, per SSA value, and lists of
+// blocks (predecessors, the dominator tree's children, phis) as one array each with where each block's list
+// starts (xAt[b] to xAt[b + 1]).
+type Loop { header: Int, size: Int = 1, parent: Int = -1, preAt: Int = -1, preBlock: Int = -1 }
+
+// where code before the loop goes (an instruction's index), -1: nowhere
+// an SSA value: no definition (0), a parameter, an instruction's dst, a call's result (blk: which), a phi (argAt:
+// where its value from each predecessor starts in phiArgs)
+const valUndef = 0
+const valParam = 1
+const valIns = 2
+const valRet = 3
+const valPhi = 4
+
+type Val { kind: Int, ins: Int, reg: Int, blk: Int, argAt: Int = 0 }
+
+type Analysis {
+    n: Int = 0
+    nb: Int = 0
+    start: [Int] = []
+    end: [Int] = []
+    succ: [Int] = []
+    nsucc: [Int] = []
+    idom: [Int] = []
+    order: [Int] = []
+    pre: [Int] = []
+    post: [Int] = []
+    loopOf: [Int] = []
+    condIns: [Int] = []
+    condTrue: [Bool] = []
+    predAt: [Int] = []
+    pred: [Int] = []
+    kidsAt: [Int] = []
+    kids: [Int] = []
+    phiAt: [Int] = []
+    phis: [Int] = []
+    blockOf: [Int] = []
+    labelBlock: [Int] = []
+    rpo: [Int] = []
+    loops: [Loop] = []
+    loopIn: [Bool] = []
+    defCount: [Int] = []
+    v: [Val] = []
+    phiArgs: [Int] = []
+    useAt: [Int] = []
+    useV: [Int] = []
+    defV: [Int] = []
+    retAt: [Int] = []
+    retV: [Int] = []
+}
+
+// per block
+// its instructions, [start, end)
+// two per block (-1: none, or a label never placed)
+// -1: the entry, or not reachable
+// reverse postorder number, -1: not reachable
+// the dominator tree's numbering: a dominates b when a.pre <= b.pre and b.post <= a.post
+// the innermost loop it is in, -1: none
+// entered only by one side of this branch (-1: no)
+// ... the side taken when the tested value is not zero
+// loop li holds block x: loopIn[li * nb + x]
+// per register: its definitions anywhere (and parameters)
+// per instruction: where its slots start in useV
+// per instruction: the value its dst holds after it (-1: none)
+fn predsOf(a: Analysis, b: Int) -> [Int] = a.pred[a.predAt[b]..a.predAt[b + 1]]
+
+fn phisOf(a: Analysis, b: Int) -> [Int] = a.phis[a.phiAt[b]..a.phiAt[b + 1]]
+
+fn inLoop(a: Analysis, li: Int, x: Int) -> Bool = a.loopIn[li * a.nb + x]
+
+fn dominates(a: Analysis, x: Int, y: Int) -> Bool {
+    if a.order[x] < 0 or a.order[y] < 0 {
+        return false
+    }
+    a.pre[x] <= a.pre[y] and a.post[y] <= a.post[x]
+}
+
+// lists per block, from (block, item) pairs in the order they came: where each block's list starts, and the items
+fn grouped(nb: Int, keys: [Int], items: [Int]) -> ([Int], [Int]) {
+    var at = [0] * (nb + 1)
+    for k in keys {
+        at[k + 1] += 1
+    }
+    for b in 0..nb {
+        at[b + 1] += at[b]
+    }
+    var fill = [0] * (nb + 1)
+    for b in 0..nb {
+        fill[b] = at[b]
+    }
+    var out = [0] * len(items)
+    for (i, k) in keys.enumerate() {
+        out[fill[k]] = items[i]
+        fill[k] += 1
+    }
+    (at, out)
+}
+
+fn analyse(f: IrFn) -> Analysis = buildSsa(buildCfg(f) with { defCount: definitions(f) }, f)
+
+fn buildCfg(f: IrFn) -> Analysis {
+    var a = Analysis()
+    let n = len(f.code)
+    a.n = n
+    a.blockOf = [0] * (n + 1)
+    a.labelBlock = [-1] * (f.labelCount + 1)
+    var leader = [false] * (n + 1)
+    if n > 0 {
+        leader[0] = true
+    }
+    for k in 0..n {
+        let op = f.code[k].op
+        if op == .Label and (k == 0 or f.code[k - 1].op != .Label) {
+            leader[k] = true
+        }
+        if (isBranch(op) or op == .Ret) and k + 1 < n {
+            leader[k + 1] = true
+        }
+    }
+    var start: [Int] = []
+    var cur = -1
+    for k in 0..n {
+        if leader[k] {
+            cur += 1
+            start.push(k)
+        }
+        a.blockOf[k] = cur
+        if f.code[k].op == .Label {
+            a.labelBlock[f.code[k].imm] = cur
+        }
+    }
+    let nb = len(start)
+    a.nb = nb
+    var end = [n] * nb
+    for i in 1..nb {
+        end[i - 1] = start[i]
+    }
+    var succ = [-1] * (2 * nb)
+    var nsucc = [0] * nb
+    for i in 0..nb {
+        let last = end[i] - 1
+        let op = f.code[last].op
+        if op == .Jmp {
+            succ[2 * i] = a.labelBlock[f.code[last].imm]
+            nsucc[i] = 1
+        } else if op is Jz | Jnz {
+            succ[2 * i] = a.labelBlock[f.code[last].imm]
+            nsucc[i] = 1
+            if i + 1 < nb {
+                succ[2 * i + 1] = i + 1
+                nsucc[i] = 2
+            }
+        } else if op != .Ret and i + 1 < nb {
+            succ[2 * i] = i + 1
+            nsucc[i] = 1
+        }
+    }
+    var pk: [Int] = []
+    var pi: [Int] = []
+    for i in 0..nb {
+        for s in 0..nsucc[i] {
+            let y = succ[2 * i + s]
+            if y >= 0 {
+                pk.push(y)
+                pi.push(i)
+            }
+        }
+    }
+    let (predAt, pred) = grouped(nb, pk, pi)
+    a.start = start
+    a.end = end
+    a.succ = succ
+    a.nsucc = nsucc
+    a.predAt = predAt
+    a.pred = pred
+    var order = [-1] * nb
+    var idomOf = [-1] * nb
+    var pre = [0] * nb
+    var post = [0] * nb
+    var loopOf = [-1] * nb
+    var condIns = [-1] * nb
+    var condTrue = [false] * nb
+    if nb == 0 {
+        a.kidsAt = [0]
+        a.phiAt = [0]
+        return a
+    }
+    // reverse postorder, from the entry
+    var stack = [0]
+    var next = [0] * nb
+    var seen = [false] * nb
+    var postorder: [Int] = []
+    seen[0] = true
+    while len(stack) > 0 {
+        let x = stack[len(stack) - 1]
+        if next[x] < nsucc[x] {
+            let y = succ[2 * x + next[x]]
+            next[x] += 1
+            if y >= 0 and not seen[y] {
+                seen[y] = true
+                stack.push(y)
+            }
+        } else {
+            postorder.push(x)
+            stack.pop()
+        }
+    }
+    let np = len(postorder)
+    var rpo = [0] * np
+    for i in 0..np {
+        rpo[i] = postorder[np - 1 - i]
+        order[rpo[i]] = i
+    }
+    // dominators (Cooper, Harvey, Kennedy)
+    var idom = [-1] * nb
+    idom[0] = 0
+    var changed = true
+    while changed {
+        changed = false
+        for r in 1..np {
+            let x = rpo[r]
+            var nd = -1
+            for p in predAt[x]..predAt[x + 1] {
+                let y = pred[p]
+                if idom[y] < 0 {
+                    continue
+                }
+                if nd < 0 {
+                    nd = y
+                    continue
+                }
+                var u = y
+                var w = nd
+                while u != w {
+                    while order[u] > order[w] {
+                        u = idom[u]
+                    }
+                    while order[w] > order[u] {
+                        w = idom[w]
+                    }
+                }
+                nd = u
+            }
+            if nd >= 0 and idom[x] != nd {
+                idom[x] = nd
+                changed = true
+            }
+        }
+    }
+    var kk: [Int] = []
+    var ki: [Int] = []
+    for r in 1..np {
+        let x = rpo[r]
+        idomOf[x] = idom[x]
+        kk.push(idom[x])
+        ki.push(x)
+    }
+    let (kidsAt, kids) = grouped(nb, kk, ki)
+    // the dominator tree's numbering
+    var counter = 1
+    next = [0] * nb
+    stack = [0]
+    pre[0] = 0
+    while len(stack) > 0 {
+        let x = stack[len(stack) - 1]
+        if next[x] < kidsAt[x + 1] - kidsAt[x] {
+            let y = kids[kidsAt[x] + next[x]]
+            next[x] += 1
+            pre[y] = counter
+            counter += 1
+            stack.push(y)
+        } else {
+            post[x] = counter
+            counter += 1
+            stack.pop()
+        }
+    }
+    // entered by one side of a branch
+    for i in 0..nb {
+        if order[i] < 0 or predAt[i + 1] - predAt[i] != 1 {
+            continue
+        }
+        let p = pred[predAt[i]]
+        let last = end[p] - 1
+        let op = f.code[last].op
+        if not op is Jz | Jnz or nsucc[p] != 2 or succ[2 * p] == succ[2 * p + 1] {
+            continue
+        }
+        condIns[i] = last
+        condTrue[i] = (op == .Jnz) == (succ[2 * p] == i)
+    }
+    a.order = order
+    a.idom = idomOf
+    a.pre = pre
+    a.post = post
+    a.kidsAt = kidsAt
+    a.kids = kids
+    a.condIns = condIns
+    a.condTrue = condTrue
+    a.rpo = rpo
+    // natural loops
+    var loops: [Loop] = []
+    var loopIn: [Bool] = []
+    var headerLoop = [-1] * nb
+    var work: [Int] = []
+    for u in 0..nb {
+        if order[u] < 0 {
+            continue
+        }
+        for s in 0..nsucc[u] {
+            let h = succ[2 * u + s]
+            if h < 0 or not dominates(a, h, u) {
+                continue
+            }
+            var li = headerLoop[h]
+            if li < 0 {
+                li = len(loops)
+                loops.push(Loop(h))
+                for _ in 0..nb {
+                    loopIn.push(false)
+                }
+                loopIn[li * nb + h] = true
+                headerLoop[h] = li
+            }
+            let base = li * nb
+            if not loopIn[base + u] {
+                loopIn[base + u] = true
+                loops[li].size += 1
+                work.push(u)
+            }
+            while len(work) > 0 {
+                let x = work.pop() ?? 0
+                for p in predAt[x]..predAt[x + 1] {
+                    let y = pred[p]
+                    if order[y] < 0 or loopIn[base + y] {
+                        continue
+                    }
+                    loopIn[base + y] = true
+                    loops[li].size += 1
+                    work.push(y)
+                }
+            }
+        }
+    }
+    for i in 0..len(loops) {
+        let size = loops[i].size
+        let header = loops[i].header
+        var best = -1
+        for j in 0..len(loops) {
+            if j != i
+                and loopIn[j * nb + header]
+                and loops[j].size > size
+                and (best < 0 or loops[j].size < loops[best].size) {
+                best = j
+            }
+        }
+        loops[i].parent = best
+        for x in 0..nb {
+            if loopIn[i * nb + x] and (loopOf[x] < 0 or loops[loopOf[x]].size > size) {
+                loopOf[x] = i
+            }
+        }
+        // the one way in from outside: code before the loop goes at its end
+        var outside = 0
+        var p = -1
+        for q in predAt[header]..predAt[header + 1] {
+            if not loopIn[i * nb + pred[q]] and order[pred[q]] >= 0 {
+                outside += 1
+                p = pred[q]
+            }
+        }
+        if outside != 1 {
+            continue
+        }
+        let e = end[p]
+        var at = e
+        let lastOp = f.code[e - 1].op
+        if isBranch(lastOp) {
+            at = e - 1
+            if lastOp != .Jmp
+                and at - 1 >= start[p]
+                and f.code[at - 1].op is Cmp | Fcmp
+                and f.code[at - 1].dst == f.code[e - 1].a {
+                at -= 1
+            }
+        }
+        loops[i].preAt = at
+        loops[i].preBlock = p
+    }
+    a.loops = loops
+    a.loopIn = loopIn
+    a.loopOf = loopOf
+    a
+}
+
+// ---- SSA ----
+fn definesReg(ins: IrIns) -> Bool = defines(ins)
+
+fn buildSsa(given: Analysis, f: IrFn) -> Analysis {
+    var a = given
+    let nr = max(len(f.kinds), 1)
+    let n = a.n
+    let nb = a.nb
+    var useAt = [0] * (n + 1)
+    var retAt = [0] * (n + 1)
+    var slots = 0
+    var rets = 0
+    for k in 0..n {
+        useAt[k] = slots
+        retAt[k] = rets
+        slots += useSlots(f.code[k])
+        rets += f.code[k].retCount
+    }
+    var useV = [0] * (slots + 1)
+    var retV = [0] * (rets + 1)
+    var defV = [-1] * (n + 1)
+    var vals = [Val(valUndef, -1, -1, -1)] // 0: no definition reaches
+    var phiArgs: [Int] = []
+    a.useAt = useAt
+    a.retAt = retAt
+    if nb == 0 {
+        a.v = vals
+        a.useV = useV
+        a.retV = retV
+        a.defV = defV
+        return a
+    }
+    // registers read in a block before it defines them: the ones phis are for
+    var global = [false] * nr
+    var stamp = [-1] * nr
+    var dk: [Int] = []
+    var db: [Int] = []
+    for p in f.params {
+        dk.push(p)
+        db.push(0)
+    }
+    for bi in 0..nb {
+        if a.order[bi] < 0 {
+            continue
+        }
+        for k in a.start[bi]..a.end[bi] {
+            for s in 0..useSlots(f.code[k]) {
+                let r = f.useReg(f.code[k], s)
+                if r >= 0 and stamp[r] != bi {
+                    global[r] = true
+                }
+            }
+            if definesReg(f.code[k]) {
+                let r = f.code[k].dst
+                if stamp[r] != bi {
+                    dk.push(r)
+                    db.push(bi)
+                }
+                stamp[r] = bi
+            }
+            for r in f.retsOf(f.code[k]) {
+                if stamp[r] != bi {
+                    dk.push(r)
+                    db.push(bi)
+                }
+                stamp[r] = bi
+            }
+        }
+    }
+    let (defAt, defBlocks) = grouped(nr, dk, db)
+    // dominance frontiers
+    var fk: [Int] = []
+    var fb: [Int] = []
+    var lastDf = [-1] * nb
+    for bi in 0..nb {
+        if a.order[bi] < 0 or a.predAt[bi + 1] - a.predAt[bi] < 2 {
+            continue
+        }
+        let idom = a.idom[bi]
+        for p in a.predAt[bi]..a.predAt[bi + 1] {
+            var runner = a.pred[p]
+            if a.order[runner] < 0 {
+                continue
+            }
+            while runner >= 0 and runner != idom {
+                if lastDf[runner] != bi {
+                    fk.push(runner)
+                    fb.push(bi)
+                    lastDf[runner] = bi
+                }
+                runner = a.idom[runner]
+            }
+        }
+    }
+    let (dfAt, df) = grouped(nb, fk, fb)
+    // phis
+    var hasPhi = [-1] * nb
+    var inWork = [-1] * nb
+    var work: [Int] = []
+    var phk: [Int] = []
+    var phv: [Int] = []
+    for r in 0..len(f.kinds) {
+        if not global[r] or defAt[r + 1] == defAt[r] {
+            continue
+        }
+        for i in defAt[r]..defAt[r + 1] {
+            work.push(defBlocks[i])
+            inWork[defBlocks[i]] = r
+        }
+        while len(work) > 0 {
+            let d = work.pop() ?? 0
+            for j in dfAt[d]..dfAt[d + 1] {
+                let y = df[j]
+                if hasPhi[y] == r {
+                    continue
+                }
+                hasPhi[y] = r
+                let pv = len(vals)
+                vals.push(Val(valPhi, -1, r, y, len(phiArgs)))
+                for _ in 0..max(a.predAt[y + 1] - a.predAt[y], 1) {
+                    phiArgs.push(0)
+                }
+                phk.push(y)
+                phv.push(pv)
+                if inWork[y] != r {
+                    inWork[y] = r
+                    work.push(y)
+                }
+            }
+        }
+    }
+    let (phiAt, phis) = grouped(nb, phk, phv)
+    // renaming, down the dominator tree
+    var cur = [0] * nr
+    for (i, p) in f.params.enumerate() {
+        cur[p] = len(vals)
+        vals.push(Val(valParam, i, p, 0))
+    }
+    var logReg: [Int] = []
+    var logOld: [Int] = []
+    var mark = [0] * (nb + 1)
+    var stack = [0]
+    while len(stack) > 0 {
+        let e = stack.pop() ?? 0
+        if e < 0 {
+            // leaving block -e - 1
+            let bi = -e - 1
+            while len(logReg) > mark[bi] {
+                let r = logReg.pop() ?? 0
+                cur[r] = logOld.pop() ?? 0
+            }
+            continue
+        }
+        mark[e] = len(logReg)
+        for i in phiAt[e]..phiAt[e + 1] {
+            let pv = phis[i]
+            let r = vals[pv].reg
+            logReg.push(r)
+            logOld.push(cur[r])
+            cur[r] = pv
+        }
+        for k in a.start[e]..a.end[e] {
+            let base = useAt[k]
+            for s in 0..useSlots(f.code[k]) {
+                let r = f.useReg(f.code[k], s)
+                useV[base + s] = if r >= 0 { cur[r] } else { -1 }
+            }
+            let op = f.code[k].op
+            let dst = f.code[k].dst
+            let ia = f.code[k].a
+            if op == .Mov and ia >= 0 and f.kinds[ia] == f.kinds[dst] {
+                let val = cur[ia]
+                defV[k] = val
+                logReg.push(dst)
+                logOld.push(cur[dst])
+                cur[dst] = val
+            } else if definesReg(f.code[k]) {
+                let val = len(vals)
+                vals.push(Val(valIns, k, dst, e))
+                defV[k] = val
+                logReg.push(dst)
+                logOld.push(cur[dst])
+                cur[dst] = val
+            }
+            for (i, r) in f.retsOf(f.code[k]).enumerate() {
+                let val = len(vals)
+                vals.push(Val(valRet, k, r, i))
+                retV[retAt[k] + i] = val
+                logReg.push(r)
+                logOld.push(cur[r])
+                cur[r] = val
+            }
+        }
+        for s in 0..a.nsucc[e] {
+            let y = a.succ[2 * e + s]
+            if y < 0 {
+                continue
+            }
+            for p in 0..a.predAt[y + 1] - a.predAt[y] {
+                if a.pred[a.predAt[y] + p] != e {
+                    continue
+                }
+                for i in phiAt[y]..phiAt[y + 1] {
+                    let pv = phis[i]
+                    phiArgs[vals[pv].argAt + p] = cur[vals[pv].reg]
+                }
+            }
+        }
+        stack.push(-e - 1)
+        var i = a.kidsAt[e + 1] - 1
+        while i >= a.kidsAt[e] {
+            stack.push(a.kids[i])
+            i -= 1
+        }
+    }
+    a.v = vals
+    a.phiArgs = phiArgs
+    a.phiAt = phiAt
+    a.phis = phis
+    a.useV = useV
+    a.retV = retV
+    a.defV = defV
+    a
+}
+
+// the instruction defining the value, when it is one (-1: none)
+fn defIns(a: Analysis, v: Int) -> Int {
+    if v < 0 or a.v[v].kind != valIns {
+        return -1
+    }
+    a.v[v].ins
+}
+
+// the value's Int constant, when it is one
+fn constVal(a: Analysis, f: IrFn, v: Int) -> Int? {
+    let d = defIns(a, v)
+    if d < 0 or f.code[d].op != .Const or f.code[d].c >= 1 or f.kinds[f.code[d].dst] != 'I' {
+        return None
+    }
+    f.code[d].imm
+}
+
+fn useOf(a: Analysis, k: Int, slot: Int) -> Int = a.useV[a.useAt[k] + slot]
+
+// ---- escape analysis: records that never leave, in registers ----
+fn IrFn.scalarReplace(var self, a: Analysis) -> Bool {
+    let nr = len(self.kinds)
+    for k in 0..len(self.code) {
+        if self.code[k].op != .RtCall
+            or self.code[k].imm != rtAlloc
+            or self.code[k].argCount != 2
+            or self.code[k].retCount != 1 {
+            continue
+        }
+        if a.blockOf[k] < 0 or a.order[a.blockOf[k]] < 0 {
+            continue
+        }
+        let Some(count) = constVal(a, self, useOf(a, k, 3)) else {
+            continue
+        }
+        let Some(each) = constVal(a, self, useOf(a, k, 4)) else {
+            continue
+        }
+        if count <= 0 or each <= 0 or count * each > 256 or count * each % 8 != 0 {
+            continue
+        }
+        let slots = count * each / 8
+        let p = self.ret(self.code[k], 0)
+        if a.defCount[p] != 1 {
+            continue
+        }
+        // the registers that hold the pointer: p, and copies of it (each set once)
+        var alias = [false] * nr
+        alias[p] = true
+        var grew = true
+        while grew {
+            grew = false
+            for j in 0..len(self.code) {
+                if self.code[j].op == .Mov and alias[self.code[j].a] and not alias[self.code[j].dst] {
+                    alias[self.code[j].dst] = true
+                    grew = true
+                }
+            }
+        }
+        var ok = true
+        let blk = a.blockOf[k]
+        let inLoop = a.loopOf[blk] >= 0
+        var kind = [0] * slots
+        var j = 0
+        while j < len(self.code) and ok {
+            let op = self.code[j].op
+            var mentions = false
+            for s in 0..useSlots(self.code[j]) {
+                let r = self.useReg(self.code[j], s)
+                if r >= 0 and alias[r] {
+                    mentions = true
+                }
+            }
+            let dst = self.code[j].dst
+            let ma = self.code[j].a
+            let mb = self.code[j].b
+            let defsAlias = definesReg(self.code[j]) and alias[dst] and j != k
+            if not mentions and not defsAlias {
+                j += 1
+                continue
+            }
+            if inLoop and (a.blockOf[j] != blk or j < k) {
+                ok = false
+            }
+            if op == .Mov and alias[ma] and alias[dst] {
+                if a.defCount[dst] != 1 {
+                    ok = false
+                }
+                j += 1
+                continue
+            }
+            if defsAlias {
+                ok = false
+                break
+            }
+            if op is Load | Store
+                and self.code[j].cond == 0
+                and ma >= 0
+                and alias[ma]
+                and mb >= 0
+                and not alias[mb]
+                and not (op == .Store and dst >= 0 and alias[dst]) {
+                if constVal(a, self, useOf(a, j, 1)) is Some(idx) {
+                    let off = idx * self.code[j].imm + self.code[j].c
+                    if off < 0 or off % 8 != 0 or off / 8 >= slots {
+                        ok = false
+                        break
+                    }
+                    let kd = self.kinds[dst]
+                    if kind[off / 8] != 0 and kind[off / 8] != kd {
+                        ok = false
+                    }
+                    kind[off / 8] = kd
+                    j += 1
+                    continue
+                }
+            }
+            ok = false
+            j += 1
+        }
+        if not ok {
+            continue
+        }
+        // fields in registers, zero at first (the memory would have been)
+        let line = self.code[k].line
+        let weight = self.weight[p]
+        var field = [0] * slots
+        var e = Edit()
+        for s in 0..slots {
+            field[s] = self.addReg(if kind[s] != 0 { kind[s] } else { 'I' }, weight)
+            e.add(k, mk(.Const, field[s], -1, -1) with { line: line })
+        }
+        for j2 in 0..len(self.code) {
+            if j2 == k {
+                continue
+            }
+            let op = self.code[j2].op
+            if op == .Mov and alias[self.code[j2].dst] {
+                self.code[j2].op = .Nop
+                continue
+            }
+            if op is Load | Store and self.code[j2].a >= 0 and alias[self.code[j2].a] {
+                let idx = constVal(a, self, useOf(a, j2, 1)) ?? 0
+                let s = (idx * self.code[j2].imm + self.code[j2].c) / 8
+                let mline = self.code[j2].line
+                let minl = self.code[j2].inl
+                let mdst = self.code[j2].dst
+                self.code[j2] = if op == .Load {
+                    IrIns(.Mov, dst: mdst, a: field[s], b: -1, line: mline, inl: minl)
+                } else {
+                    IrIns(.Mov, dst: field[s], a: mdst, b: -1, line: mline, inl: minl)
+                }
+            }
+        }
+        self.code[k].op = .Nop
+        self.apply(e)
+        return true // the analysis is stale: once more from the start
+    }
+    false
+}
+
+// ---- devirtualization ----
+// A load from an interface table the code knows (the table of the type a value was made from): the function there.
+fn tableFunction(a: Analysis, f: IrFn, tables: [IrTable], k: Int, load: Int) -> Int {
+    let ld = a.v[useOf(a, k, 0)].ins
+    let base = defIns(a, useOf(a, ld, 0))
+    if base < 0 or f.code[base].op != .Const or f.code[base].c != 1 {
+        return -1
+    }
+    let Some(index) = constVal(a, f, useOf(a, ld, 1)) else {
+        return -1
+    }
+    let at = f.code[base].imm + index * f.code[load].imm + f.code[load].c
+    for t in tables {
+        if at >= t.at and at < t.at + 8 * len(t.fns) and (at - t.at) % 8 == 0 {
+            return t.fns[(at - t.at) / 8]
+        }
+    }
+    -1
+}
+
+fn IrFn.devirtualize(var self, a: Analysis, tables: [IrTable]) -> Bool {
+    var changed = false
+    for k in 0..a.n {
+        if self.code[k].op != .Call or self.code[k].a < 0 or a.order[a.blockOf[k]] < 0 {
+            continue
+        }
+        let d = defIns(a, useOf(a, k, 0))
+        let callee = if d >= 0 and self.code[d].op == .Const and self.code[d].c == 2 {
+            self.code[d].imm
+        } else if d >= 0 and self.code[d].op == .Load {
+            tableFunction(a, self, tables, k, d)
+        } else {
+            -1
+        }
+        if callee < 0 {
+            continue
+        }
+        self.code[k].imm = callee // the one function it can be: called directly
+        self.code[k].a = -1
+        changed = true
+    }
+    changed
+}
+
+// ---- range analysis ----
+fn isInt(a: Analysis, f: IrFn, v: Int) -> Bool =
+    v > 0 and a.v[v].reg >= 0 and f.kinds[a.v[v].reg] == 'I'
+
+// the relation a REL b, as cond; on the false side, its negation
+const negated = [condNe, condEq, condGe, condGt, condLe, condLt]
+const swapped = [condEq, condNe, condGt, condGe, condLt, condLe]
+
+// What the branch block bi is entered by says about value x: x REL y
+fn edgeFact(a: Analysis, f: IrFn, bi: Int, x: Int) -> (Int, Int)? {
+    let ci = a.condIns[bi]
+    if ci < 0 {
+        return None
+    }
+    var t = useOf(a, ci, 0)
+    var truth = a.condTrue[bi]
+    var c = defIns(a, t)
+    while c >= 0 and f.code[c].op == .Not {
+        // !x
+        truth = not truth
+        t = useOf(a, a.v[t].ins, 0)
+        c = defIns(a, t)
+    }
+    if c < 0 or f.code[c].op != .Cmp {
+        return None
+    }
+    let k = a.v[t].ins
+    let u = useOf(a, k, 0)
+    let w = useOf(a, k, 1)
+    let cond = if truth { f.code[c].cond } else { negated[f.code[c].cond] }
+    if u == x {
+        return (cond, w)
+    }
+    if w == x {
+        return (swapped[cond], u)
+    }
+    None
+}
+
+// each value's interval (lo > hi: nothing known yet)
+type Ranges { lo: [Int], hi: [Int], visits: [Int] }
+
+fn Ranges.of(self, a: Analysis, f: IrFn, v: Int) -> (Int, Int) {
+    if v <= 0 or not isInt(a, f, v) {
+        return (minInt, maxInt)
+    }
+    (self.lo[v], self.hi[v])
+}
+
+// v's range where block bi runs: its own, narrowed by the branches that lead there
+fn Ranges.at(self, a: Analysis, f: IrFn, v: Int, bi: Int) -> (Int, Int) {
+    var (lo, hi) = self.of(a, f, v)
+    if lo > hi {
+        return (lo, hi)
+    }
+    var d = bi
+    var depth = 0
+    while d >= 0 and depth < 48 {
+        if edgeFact(a, f, d, v) is Some((rel, y)) {
+            let (ylo, yhi) = self.of(a, f, y)
+            if ylo <= yhi {
+                if rel == condLt {
+                    if yhi != minInt and yhi - 1 < hi {
+                        hi = yhi - 1
+                    }
+                } else if rel == condLe {
+                    if yhi < hi {
+                        hi = yhi
+                    }
+                } else if rel == condGt {
+                    if ylo != maxInt and ylo + 1 > lo {
+                        lo = ylo + 1
+                    }
+                } else if rel == condGe {
+                    if ylo > lo {
+                        lo = ylo
+                    }
+                } else if rel == condEq {
+                    if ylo > lo {
+                        lo = ylo
+                    }
+                    if yhi < hi {
+                        hi = yhi
+                    }
+                }
+            }
+        }
+        d = a.idom[d]
+        depth += 1
+    }
+    (lo, hi)
+}
+
+fn Ranges.transfer(self, a: Analysis, f: IrFn, k: Int, bi: Int) -> (Int, Int) {
+    let op = f.code[k].op
+    var alo = 0
+    var ahi = 0
+    var blo = 0
+    var bhi = 0
+    if op != .Const {
+        if f.code[k].a >= 0 {
+            let (l, h) = self.at(a, f, useOf(a, k, 0), bi)
+            alo = l
+            ahi = h
+        }
+        if f.code[k].b >= 0 {
+            let (l, h) = self.at(a, f, useOf(a, k, 1), bi)
+            blo = l
+            bhi = h
+        }
+        if f.code[k].a >= 0 and alo > ahi or f.code[k].b >= 0 and blo > bhi {
+            // not known yet
+            return (1, 0)
+        }
+    }
+    match op {
+        Const => {
+            if f.code[k].c < 1 {
+                return (f.code[k].imm, f.code[k].imm)
+            }
+        }
+        Add => {
+            if not addOverflows(alo, blo) and not addOverflows(ahi, bhi) {
+                return (alo + blo, ahi + bhi)
+            }
+        }
+        Sub => {
+            if not subOverflows(alo, bhi) and not subOverflows(ahi, blo) {
+                return (alo - bhi, ahi - blo)
+            }
+        }
+        Mul => {
+            if not (mulOverflows(alo, blo) or mulOverflows(alo, bhi) or mulOverflows(ahi, blo) or mulOverflows(ahi, bhi)) {
+                let c0 = alo * blo
+                let c1 = alo * bhi
+                let c2 = ahi * blo
+                let c3 = ahi * bhi
+                return (min(min(c0, c1), min(c2, c3)), max(max(c0, c1), max(c2, c3)))
+            }
+        }
+        Neg => {
+            if alo != minInt {
+                return (-ahi, -alo)
+            }
+        }
+        Div => {
+            if blo >= 1 {
+                // Quark's division is floored, as the IR's
+                return (min(alo / blo, alo / bhi), max(ahi / blo, ahi / bhi))
+            }
+        }
+        Mod => {
+            if blo >= 1 {
+                var hi = bhi - 1
+                if alo >= 0 and ahi < hi {
+                    hi = ahi
+                }
+                return (0, hi)
+            }
+        }
+        And => {
+            if alo >= 0 and blo >= 0 {
+                return (0, min(ahi, bhi))
+            }
+            if alo >= 0 {
+                return (0, ahi)
+            }
+            if blo >= 0 {
+                return (0, bhi)
+            }
+        }
+        Or | Xor => {
+            if alo >= 0 and blo >= 0 {
+                let m = max(ahi, bhi)
+                var p = 1
+                while p <= m and p < 1 << 62 {
+                    p = p << 1
+                }
+                if p > m {
+                    return (0, p - 1)
+                }
+            }
+        }
+        Sar => {
+            if blo == bhi and blo >= 0 and blo < 64 {
+                return (alo >> blo, ahi >> blo)
+            }
+        }
+        Cmp | Fcmp | Not => {
+            return (0, 1)
+        }
+        _ => {}
+    }
+    (minInt, maxInt)
+}
+
+fn ranges(a: Analysis, f: IrFn) -> Ranges {
+    let nv = len(a.v)
+    var r = Ranges([minInt] * (nv + 1), [maxInt] * (nv + 1), [0] * (nv + 1))
+    for v in 0..nv {
+        if a.v[v].kind == valPhi or a.v[v].kind == valIns {
+            // nothing known yet: empty
+            r.lo[v] = 1
+            r.hi[v] = 0
+        }
+    }
+    r.settle(a, f)
+    r
+}
+
+fn Ranges.settle(var self, a: Analysis, f: IrFn) {
+    let nv = len(a.v)
+    var changed = true
+    var round = 0
+    while changed and round < 40 {
+        changed = false
+        for bi in a.rpo {
+            for pv in phisOf(a, bi) {
+                if not isInt(a, f, pv) {
+                    continue
+                }
+                var lo = 1
+                var hi = 0
+                for p in 0..len(predsOf(a, bi)) {
+                    let pb = predsOf(a, bi)[p]
+                    if a.order[pb] < 0 {
+                        continue
+                    }
+                    let (l, h) = self.at(a, f, a.phiArgs[a.v[pv].argAt + p], pb)
+                    if l > h {
+                        continue
+                    }
+                    if lo > hi {
+                        lo = l
+                        hi = h
+                    } else {
+                        lo = min(lo, l)
+                        hi = max(hi, h)
+                    }
+                }
+                if lo > hi {
+                    continue
+                }
+                let olo = self.lo[pv]
+                let ohi = self.hi[pv]
+                if olo <= ohi {
+                    // grows only; widened after a few rounds
+                    lo = min(lo, olo)
+                    hi = max(hi, ohi)
+                    self.visits[pv] += 1
+                    if self.visits[pv] > 3 {
+                        if lo < olo {
+                            lo = minInt
+                        }
+                        if hi > ohi {
+                            hi = maxInt
+                        }
+                    }
+                }
+                if lo != olo or hi != ohi {
+                    self.lo[pv] = lo
+                    self.hi[pv] = hi
+                    changed = true
+                }
+            }
+            for k in a.start[bi]..a.end[bi] {
+                let dv = a.defV[k]
+                if dv <= 0 or a.v[dv].kind != valIns or a.v[dv].ins != k or f.kinds[f.code[k].dst] != 'I' {
+                    continue
+                }
+                var (lo, hi) = self.transfer(a, f, k, bi)
+                if lo > hi {
+                    continue
+                }
+                let olo = self.lo[dv]
+                let ohi = self.hi[dv]
+                if olo <= ohi {
+                    lo = min(lo, olo)
+                    hi = max(hi, ohi)
+                }
+                if lo != olo or hi != ohi {
+                    self.lo[dv] = lo
+                    self.hi[dv] = hi
+                    changed = true
+                }
+            }
+        }
+        round += 1
+    }
+    for v in 0..nv {
+        // never reached (or not settled): anything
+        if self.lo[v] > self.hi[v] or changed {
+            self.lo[v] = minInt
+            self.hi[v] = maxInt
+        }
+    }
+}
+
+// the value y = len / k (k >= 1)
+fn quotientOf(a: Analysis, f: IrFn, y: Int, limit: Int) -> Int? {
+    let q = defIns(a, y)
+    if q < 0 or f.code[q].op != .Div or useOf(a, a.v[y].ins, 0) != limit {
+        return None
+    }
+    constVal(a, f, useOf(a, a.v[y].ins, 1))
+}
+
+// x < len wherever block bi runs, from the branches that lead there (and x = y - k, x = r * k + c with r < len / k)
+fn lessThan(a: Analysis, f: IrFn, r: Ranges, x: Int, limit: Int, bi: Int, depth: Int) -> Bool {
+    if depth > 4 or x <= 0 {
+        return false
+    }
+    let (xlo, _) = r.at(a, f, x, bi)
+    let (llo, _) = r.at(a, f, limit, bi)
+    if xlo < 0 {
+        return false
+    }
+    var d = bi
+    var steps = 0
+    while d >= 0 and steps < 48 {
+        if edgeFact(a, f, d, x) is Some((rel, y)) {
+            if rel == condLt and y == limit {
+                return true
+            }
+            if rel == condLt {
+                // x < y, y = len / k (k >= 1, len >= 0 when x >= 0 is below it): y <= len
+                if quotientOf(a, f, y, limit) is Some(k) and k >= 1 {
+                    return true
+                }
+            }
+            if rel == condLe and llo >= 0 {
+                // x <= len - 1 (len - k does not wrap)
+                let s = defIns(a, y)
+                if s >= 0 and f.code[s].op is Sub | Add and useOf(a, a.v[y].ins, 0) == limit {
+                    if constVal(a, f, useOf(a, a.v[y].ins, 1)) is Some(k) {
+                        if f.code[s].op == .Sub and k >= 1 or f.code[s].op == .Add and k <= -1 and k > minInt {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+        d = a.idom[d]
+        steps += 1
+    }
+    let di = defIns(a, x)
+    if di < 0 {
+        return false
+    }
+    let op = f.code[di].op
+    let k = a.v[x].ins
+    let u = useOf(a, k, 0)
+    let w = useOf(a, k, 1)
+    // x = y + c (c <= 0) or y - c (c >= 0): x <= y
+    if op == .Add {
+        if constVal(a, f, w) is Some(c) and c <= 0 {
+            return lessThan(a, f, r, u, limit, bi, depth + 1)
+        }
+        if constVal(a, f, u) is Some(c) and c <= 0 {
+            return lessThan(a, f, r, w, limit, bi, depth + 1)
+        }
+    }
+    if op == .Sub {
+        if constVal(a, f, w) is Some(c) and c >= 0 {
+            return lessThan(a, f, r, u, limit, bi, depth + 1)
+        }
+    }
+    // x = r * m + c, 0 <= c < m, 0 <= r < len / m: x <= (len / m - 1) * m + m - 1 < len
+    var mulV = -1
+    var clo = 0
+    var chi = 0
+    if op == .Mul {
+        mulV = x
+    } else if op == .Add {
+        let du = defIns(a, u)
+        let dw = defIns(a, w)
+        if du >= 0 and f.code[du].op == .Mul {
+            mulV = u
+            let (l, h) = r.at(a, f, w, bi)
+            clo = l
+            chi = h
+        } else if dw >= 0 and f.code[dw].op == .Mul {
+            mulV = w
+            let (l, h) = r.at(a, f, u, bi)
+            clo = l
+            chi = h
+        }
+    }
+    if mulV < 0 {
+        return false
+    }
+    let mi = a.v[mulV].ins
+    var rv = useOf(a, mi, 0)
+    var mv = useOf(a, mi, 1)
+    var m = 0
+    if constVal(a, f, mv) is Some(c) {
+        m = c
+    } else {
+        let t = rv
+        rv = mv
+        mv = t
+        let Some(c) = constVal(a, f, mv) else {
+            return false
+        }
+        m = c
+    }
+    if m < 1 or clo < 0 or chi >= m {
+        return false
+    }
+    let (rlo, _) = r.at(a, f, rv, bi)
+    if rlo < 0 {
+        return false
+    }
+    var dd = bi
+    var steps2 = 0
+    while dd >= 0 and steps2 < 48 {
+        if edgeFact(a, f, dd, rv) is Some((rel, y)) and rel == condLt {
+            if quotientOf(a, f, y, limit) is Some(qk) and qk == m {
+                return true
+            }
+        }
+        dd = a.idom[dd]
+        steps2 += 1
+    }
+    false
+}
+
+type Check { idx: Int, limit: Int, blk: Int, at: Int }
+
+fn IrFn.boundsAndDivisions(var self, a: Analysis) -> Bool {
+    let r = ranges(a, self)
+    var changed = false
+    var done: [Check] = []
+    for bi in a.rpo {
+        for k in a.start[bi]..a.end[bi] {
+            let op = self.code[k].op
+            if op == .Bounds {
+                let x = useOf(a, k, 0)
+                let limit = useOf(a, k, 1)
+                let (xlo, xhi) = r.at(a, self, x, bi)
+                let (llo, _) = r.at(a, self, limit, bi)
+                var safe = xlo >= 0 and (xhi < llo or lessThan(a, self, r, x, limit, bi, 0))
+                var i = 0
+                while i < len(done) and not safe {
+                    // an identical check (or one of a constant as big) passed
+                    let c = done[i]
+                    i += 1
+                    if c.limit != limit or not (if c.blk == bi { c.at < k } else { dominates(a, c.blk, bi) }) {
+                        continue
+                    }
+                    if c.idx == x {
+                        safe = true
+                    } else if constVal(a, self, x) is Some(kx) and kx >= 0 {
+                        if constVal(a, self, c.idx) is Some(kc) and kc >= kx {
+                            safe = true
+                        }
+                    }
+                }
+                if safe {
+                    self.code[k].op = .Nop
+                    changed = true
+                } else {
+                    done.push(Check(x, limit, bi, k))
+                }
+            } else if op is Add | Sub | Mul and self.code[k].cond != 0 and self.kinds[self.code[k].dst] == 'I' {
+                // an overflow check that cannot fail (i + 1 where i < n, r * 3 + 2 where r < len / 3): plain
+                // arithmetic, which the loop passes after this one may move, reduce and vectorize
+                let (alo, ahi) = r.at(a, self, useOf(a, k, 0), bi)
+                let (blo, bhi) = r.at(a, self, useOf(a, k, 1), bi)
+                let known = alo <= ahi and blo <= bhi
+                let safe = known and (match op {
+                    Add => not addOverflows(alo, blo) and not addOverflows(ahi, bhi)
+                    Sub => not subOverflows(alo, bhi) and not subOverflows(ahi, blo)
+                    _ => not (mulOverflows(alo, blo)
+                        or mulOverflows(alo, bhi)
+                        or mulOverflows(ahi, blo)
+                        or mulOverflows(ahi, bhi))
+                })
+                if safe {
+                    self.code[k].cond = 0
+                    changed = true
+                }
+            } else if op is Div | Mod and self.code[k].cond & 2 == 0 {
+                let (xlo, _) = r.at(a, self, useOf(a, k, 0), bi)
+                let (ylo, _) = r.at(a, self, useOf(a, k, 1), bi)
+                if xlo >= 0 and ylo >= 1 {
+                    // truncated is floored, and no zero to check
+                    self.code[k].cond = self.code[k].cond | divNonNeg
+                    changed = true
+                }
+            }
+        }
+    }
+    changed
+}
+
+// ---- loop-invariant code motion ----
+fn hoistable(a: Analysis, f: IrFn, k: Int) -> Bool = match f.code[k].op {
+    Const => true
+    Add | Sub | Mul => f.code[k].cond == 0
+    Neg | And | Or | Xor | Shl | Sar | Fadd | Fsub | Fmul | Fdiv | Fneg | Sqrt | Fmin | Fmax | Cmp | Fcmp | Not => true
+    IntToFloat | Round => true
+    FloatToInt => f.code[k].cond == 0
+    Div | Mod => {
+        // by a constant other than 0: nothing to stop for
+        let d = constVal(a, f, useOf(a, k, 1))
+        d != None and d != 0
+    }
+    _ => false
+}
+
+fn IrFn.licm(var self, a: Analysis) -> Bool {
+    let nr = max(len(self.kinds), 1)
+    let count = len(self.code)
+    var moved = [false] * (count + 1)
+    for li in 0..len(a.loops) {
+        let preAt = a.loops[li].preAt
+        if preAt < 0 {
+            continue
+        }
+        var defIn = [0] * nr
+        for bi in 0..a.nb {
+            if not inLoop(a, li, bi) {
+                continue
+            }
+            for k in a.start[bi]..a.end[bi] {
+                if definesReg(self.code[k]) {
+                    defIn[self.code[k].dst] += 1
+                }
+                for r in self.retsOf(self.code[k]) {
+                    defIn[r] += 1
+                }
+            }
+        }
+        if preAt < count and self.code[preAt].op is Cmp | Fcmp {
+            defIn[self.code[preAt].dst] += 1
+        }
+        var any = false
+        var grew = true
+        while grew {
+            grew = false
+            for k in 0..count {
+                if moved[k]
+                    or not inLoop(a, li, a.blockOf[k])
+                    or not hoistable(a, self, k)
+                    or a.defCount[self.code[k].dst] != 1 {
+                    continue
+                }
+                var inv = true
+                for s in 0..2 {
+                    let r = self.useReg(self.code[k], s)
+                    if r >= 0 and defIn[r] != 0 {
+                        inv = false
+                    }
+                }
+                if not inv {
+                    continue
+                }
+                moved[k] = true
+                defIn[self.code[k].dst] = 0
+                grew = true
+                any = true
+            }
+        }
+        if not any {
+            continue
+        }
+        var e = Edit()
+        for k in 0..count {
+            if moved[k] and inLoop(a, li, a.blockOf[k]) and self.code[k].op != .Nop {
+                e.add(preAt, self.code[k])
+                self.code[k].op = .Nop
+            }
+        }
+        self.apply(e)
+        return true // one loop at a time: the graph changed
+    }
+    false
+}
+
+// ---- strength reduction ----
+fn IrFn.strengthReduce(var self, a: Analysis) -> Bool {
+    let nr = max(len(self.kinds), 1)
+    var defAt = [0] * nr
+    for li in 0..len(a.loops) {
+        let preAt = a.loops[li].preAt
+        if preAt < 0 {
+            continue
+        }
+        var defIn = [0] * nr
+        for bi in 0..a.nb {
+            if not inLoop(a, li, bi) {
+                continue
+            }
+            for k in a.start[bi]..a.end[bi] {
+                if definesReg(self.code[k]) {
+                    defIn[self.code[k].dst] += 1
+                    defAt[self.code[k].dst] = k
+                }
+                for r in self.retsOf(self.code[k]) {
+                    defIn[r] += 2
+                }
+            }
+        }
+        for bi in 0..a.nb {
+            if not inLoop(a, li, bi) {
+                continue
+            }
+            for k in a.start[bi]..a.end[bi] {
+                let op = self.code[k].op
+                if not op is Mul | Shl
+                    or self.code[k].cond != 0
+                    or self.kinds[self.code[k].dst] != 'I'
+                    or a.defCount[self.code[k].dst] != 1 {
+                    continue
+                }
+                var m = 0
+                var i = -1
+                if constVal(a, self, useOf(a, k, 1)) is Some(c) {
+                    m = c
+                    i = self.code[k].a
+                } else if op == .Mul and constVal(a, self, useOf(a, k, 0)) is Some(c) {
+                    m = c
+                    i = self.code[k].b
+                }
+                if i < 0 or defIn[i] != 1 {
+                    continue
+                }
+                if op == .Shl {
+                    if m < 0 or m > 62 {
+                        continue
+                    }
+                    m = 1 << m
+                }
+                if m is 0 | 1 | 2 | 4 | 8 {
+                    // free in an address, or cheaper as it is
+                    continue
+                }
+                // i: a basic induction value, i = i + s once in the loop
+                let ik = defAt[i]
+                if self.code[ik].op != .Add or self.code[ik].cond != 0 {
+                    continue
+                }
+                var step = 0
+                if self.code[ik].a == i and constVal(a, self, useOf(a, ik, 1)) is Some(s) {
+                    step = s
+                } else if self.code[ik].b == i and constVal(a, self, useOf(a, ik, 0)) is Some(s) {
+                    step = s
+                } else {
+                    continue
+                }
+                let w = self.weight[self.code[k].dst]
+                let t2 = self.addReg('I', w)
+                let km = self.addReg('I', 0.0)
+                let ks = self.addReg('I', 0.0)
+                let line = self.code[k].line
+                var e = Edit()
+                e.add(preAt, mk(.Const, km, -1, -1) with { imm: m })
+                e.add(preAt, mk(.Const, ks, -1, -1) with { imm: step * m })
+                e.add(preAt, mk(.Mul, t2, i, km) with { line: line })
+                e.add(ik + 1, mk(.Add, t2, t2, ks) with { line: self.code[ik].line })
+                // t = i * m is t2, read in place when no step of i comes between (same block, after it)
+                let t = self.code[k].dst
+                var rename = true
+                let blk = a.blockOf[k]
+                var j = 0
+                while j < len(self.code) and rename {
+                    for sl in 0..useSlots(self.code[j]) {
+                        if self.useReg(self.code[j], sl) == t
+                            and (a.blockOf[j] != blk or j < k or ik > k and ik < j and a.blockOf[ik] == blk) {
+                            rename = false
+                        }
+                    }
+                    j += 1
+                }
+                if rename {
+                    for j2 in k + 1..a.end[blk] {
+                        if self.code[j2].op != .Const {
+                            if self.code[j2].a == t {
+                                self.code[j2].a = t2
+                            }
+                            if self.code[j2].b == t {
+                                self.code[j2].b = t2
+                            }
+                        }
+                        if self.code[j2].op is Store | Vstore and self.code[j2].dst == t {
+                            self.code[j2].dst = t2
+                        }
+                        for q in 0..self.code[j2].argCount {
+                            if self.arg(self.code[j2], q) == t {
+                                self.setArg(j2, q, t2)
+                            }
+                        }
+                    }
+                    self.code[k].op = .Nop
+                } else {
+                    self.code[k] = mk(.Mov, t, t2, -1) with { line: line }
+                }
+                self.apply(e)
+                return true
+            }
+        }
+    }
+    false
+}
+
+// ---- address folding: [b + (x + k) * s + c] is [b + x * s + c + k * s] ----
+fn IrFn.foldAddresses(var self, a: Analysis) -> Bool {
+    var changed = false
+    for k in 0..len(self.code) {
+        if not self.code[k].op is Load | Store or self.code[k].b < 0 {
+            continue
+        }
+        let dv = useOf(a, k, 1)
+        let dk = defIns(a, dv)
+        if dk < 0 or not self.code[dk].op is Add | Sub or self.code[dk].cond != 0 {
+            continue
+        }
+        if a.blockOf[dk] != a.blockOf[k] or dk > k {
+            continue
+        }
+        var c = 0
+        var x = 0
+        if constVal(a, self, useOf(a, dk, 1)) is Some(v) {
+            c = v
+            x = self.code[dk].a
+        } else if self.code[dk].op == .Add and constVal(a, self, useOf(a, dk, 0)) is Some(v) {
+            c = v
+            x = self.code[dk].b
+        } else {
+            continue
+        }
+        if self.code[dk].op == .Sub {
+            if c == minInt {
+                continue
+            }
+            c = 0 - c
+        }
+        let scale = self.code[k].imm
+        if mulOverflows(c, scale) or addOverflows(c * scale, self.code[k].c) {
+            continue
+        }
+        let off = c * scale + self.code[k].c
+        if off < -1073741824 or off > 1073741823 {
+            continue
+        }
+        var kept = self.code[dk].dst != x // x unchanged from the add to here (len = len + 1 changes it there)
+        var j = dk + 1
+        while j < k and kept {
+            if definesReg(self.code[j]) and self.code[j].dst == x {
+                kept = false
+            }
+            for r in self.retsOf(self.code[j]) {
+                if r == x {
+                    kept = false
+                }
+            }
+            j += 1
+        }
+        if not kept or self.kinds[x] != 'I' {
+            continue
+        }
+        self.code[k].b = x
+        self.code[k].c = off
+        changed = true
+    }
+    changed
+}
+
+// ---- SIMD ----
+// A counted loop, as the pipelines lower:
+//       jmp C
+//   T:  body (loads and stores at [base + i * 8], arithmetic, filters' jumps forward, sums)
+//       i = i + 1 (and other indices counting with it)
+//   C:  t = i < n
+//       jnz t, T
+// becomes, before it, the same loop on vectors of W elements while W are left; the original loop does the rest.
+const roleNone = 0
+const roleIv = 1
+const roleRed = 2
+const roleMask = 3
+const roleTemp = 4
+
+// The vector loop being made: its instructions (inserted before the jump into the scalar loop), the registers it
+// makes (numbered from base), what each scalar register is as a vector, and the invariants' splats.
+type Vec {
+    at: Int
+    base: Int
+    kinds: Bytes = []
+    weights: [Float] = []
+    e: Edit = Edit()
+    vecOf: [Int]
+    splat: [Int]
+    pre: [IrIns] = []
+    body: [IrIns] = []
+    vregs: Int = 0
+    intCompares: Int = 0
+    ovf: Int = -1 // the lanes whose sign bit says a checked Int op went past the limits (-1: no checked op)
+    ovfLine: Int = 0 // the first such op's line: the panic's
+}
+
+// the most vector registers alive at once in the loop: one made before it (a splat, a sum's lanes) or read before
+// it is set in the body (carried from one turn to the next) lives all through; any other, from where it is set to
+// where it is last read (the backend gives registers by liveness)
+fn Vec.mostLive(self) -> Int {
+    let n = len(self.kinds)
+    var first = [-1] * n
+    var last = [-1] * n
+    var always = [false] * n
+    for ins in self.pre {
+        if ins.dst >= self.base {
+            always[ins.dst - self.base] = true
+        }
+    }
+    for (k, ins) in self.body.enumerate() {
+        for r in [ins.a, ins.b] {
+            if r >= self.base and self.kinds[r - self.base] == 'V' {
+                if first[r - self.base] < 0 {
+                    always[r - self.base] = true // read before set: from the turn before
+                }
+                last[r - self.base] = k
+            }
+        }
+        let stores = ins.op == .Vstore
+        let d = ins.dst
+        if d >= self.base and self.kinds[d - self.base] == 'V' {
+            if stores {
+                last[d - self.base] = k // a store's dst is the value stored
+            } else if first[d - self.base] < 0 {
+                first[d - self.base] = k
+            }
+        }
+    }
+    var most = 0
+    for k in 0..len(self.body) {
+        var live = 0
+        for r in 0..n {
+            if self.kinds[r] == 'V' and (always[r] or first[r] >= 0 and first[r] <= k and k <= max(last[r], first[r])) {
+                live += 1
+            }
+        }
+        most = max(most, live)
+    }
+    most
+}
+
+// t's lanes (those cur lets through: a filtered-out lane's value is never used) whose sign bit is set went past the
+// limits: kept in ovf, for the check after the vector loop
+fn Vec.overflowed(var self, t: Int, cur: Int, line: Int) {
+    var x = t
+    if cur >= 0 {
+        x = self.vNew()
+        self.vop(.And, x, t, cur)
+    }
+    if self.ovf < 0 {
+        self.ovf = self.vNew()
+        let z = self.vConst('I', 0)
+        self.pre.push(mk(.Vsplat, self.ovf, z, -1))
+        self.ovfLine = line
+    }
+    self.vop(.Or, self.ovf, self.ovf, x)
+}
+
+// x + y (add) or x - y in d, checked: the lanes where the result's sign is not the operands' went past the limits
+fn Vec.checkedAddSub(var self, add: Bool, d: Int, x: Int, y: Int, cur: Int, line: Int) {
+    let t1 = self.vNew()
+    let t2 = self.vNew()
+    let t = self.vNew()
+    if add {
+        self.vop(.Xor, t1, x, d) // (x ^ r) & (y ^ r) < 0
+        self.vop(.Xor, t2, y, d)
+    } else {
+        self.vop(.Xor, t1, x, y) // (x ^ y) & (x ^ r) < 0
+        self.vop(.Xor, t2, x, d)
+    }
+    self.vop(.And, t, t1, t2)
+    self.overflowed(t, cur, line)
+}
+
+fn Vec.newReg(var self, kind: Int, weight: Float) -> Int {
+    self.kinds.push(kind)
+    self.weights.push(weight)
+    self.base + len(self.kinds) - 1
+}
+
+fn Vec.emit(var self, ins: IrIns) {
+    self.e.add(self.at, ins)
+}
+
+fn Vec.vNew(var self) -> Int {
+    self.vregs += 1
+    self.newReg('V', 1e300)
+}
+
+fn Vec.vConst(var self, kind: Int, bits: Int) -> Int {
+    let r = self.newReg(kind, 1.0)
+    self.emit(mk(.Const, r, -1, -1) with { imm: bits })
+    r
+}
+
+fn Vec.splatOf(var self, scalar: Int) -> Int {
+    if self.splat[scalar] >= 0 {
+        return self.splat[scalar]
+    }
+    let d = self.vNew()
+    self.pre.push(mk(.Vsplat, d, scalar, -1))
+    self.splat[scalar] = d
+    d
+}
+
+fn Vec.operand(var self, r: Int) -> Int {
+    if self.vecOf[r] >= 0 {
+        return self.vecOf[r]
+    }
+    self.splatOf(r)
+}
+
+fn Vec.vop(var self, op: Op, d: Int, x: Int, y: Int) {
+    self.body.push(IrIns(.Vop, dst: d, a: x, b: y, imm: op.index()))
+}
+
+fn Vec.vshl(var self, d: Int, x: Int, by: Int) {
+    self.body.push(IrIns(.Vop, dst: d, a: x, b: -1, c: by, imm: Op.Shl.index()))
+}
+
+fn popcount(m: Int) -> Int {
+    var n = 0
+    var x = m
+    for _ in 0..64 {
+        n += x & 1
+        x = x >> 1
+    }
+    n
+}
+
+// a constant multiplier W can do as shifts and adds (no 64-bit vector multiply before AVX-512)
+fn mulPlan(m: Int) -> Bool {
+    if m < 0 {
+        return false
+    }
+    if popcount(m) <= 3 {
+        return true
+    }
+    m < maxInt and popcount(m + 1) == 1
+}
+
+fn IrFn.vectorizeLoop(var self, a: Analysis, li: Int, lanes: Int, arch: Arch, sse42: Bool) -> Bool {
+    let header = a.loops[li].header
+    let hStart = a.start[header]
+    let hEnd = a.end[header]
+    var hk = hStart
+    while hk < hEnd and self.code[hk].op == .Label {
+        hk += 1
+    }
+    if hEnd - hk != 2 {
+        return false
+    }
+    let cmp = hk
+    let jnz = hk + 1
+    if self.code[cmp].op != .Cmp
+        or self.code[cmp].cond != condLt
+        or self.code[jnz].op != .Jnz
+        or self.code[jnz].a != self.code[cmp].dst {
+        return false
+    }
+    let tb = a.labelBlock[self.code[jnz].imm]
+    if tb < 0 or not inLoop(a, li, tb) {
+        return false
+    }
+    let bodyStart = a.start[tb]
+    let bodyEnd = hStart
+    if bodyStart >= bodyEnd or bodyStart < 1 {
+        return false
+    }
+    // the loop is exactly the code from T to the jnz, entered only by the jmp before T
+    for bi in 0..a.nb {
+        let inside = a.start[bi] >= bodyStart and a.start[bi] < hEnd
+        if inside != inLoop(a, li, bi) {
+            return false
+        }
+    }
+    let entry = bodyStart - 1
+    if self.code[entry].op != .Jmp or a.labelBlock[self.code[entry].imm] != header or a.loops[li].preAt != entry {
+        return false
+    }
+    for p in predsOf(a, tb) {
+        if not inLoop(a, li, p) {
+            return false
+        }
+    }
+    let nr = len(self.kinds)
+    var defIn = [0] * nr
+    var usesAll = [0] * nr
+    var usesIn = [0] * nr
+    for k in 0..len(self.code) {
+        let inLoop = k >= bodyStart and k < hEnd
+        for s in 0..useSlots(self.code[k]) {
+            let r = self.useReg(self.code[k], s)
+            if r < 0 {
+                continue
+            }
+            usesAll[r] += 1
+            if inLoop {
+                usesIn[r] += 1
+            }
+        }
+        if inLoop and definesReg(self.code[k]) {
+            defIn[self.code[k].dst] += 1
+        }
+        if inLoop and self.code[k].retCount > 0 {
+            return false
+        }
+    }
+    let i = self.code[cmp].a
+    let n = self.code[cmp].b
+    if defIn[n] != 0 or self.kinds[i] != 'I' {
+        return false
+    }
+    // regions: each forward jump of a filter opens one, its label closes it
+    let size = bodyEnd - bodyStart
+    var region = [0] * (size + 1)
+    var parent = [0] * (size + 2)
+    var closeAt = [0] * (size + 2)
+    var nreg = 1
+    var curR = 0
+    parent[0] = -1
+    closeAt[0] = -1
+    var labelUses = [0] * (self.labelCount + 1)
+    for k in 0..len(self.code) {
+        if isBranch(self.code[k].op) {
+            labelUses[self.code[k].imm] += 1
+        }
+    }
+    var role = [roleNone] * nr
+    var lastWork = -1
+    var firstInc = bodyEnd
+    for k in bodyStart..bodyEnd {
+        let op = self.code[k].op
+        if op == .Label {
+            var inner = 0
+            while curR > 0 and closeAt[curR] == self.code[k].imm {
+                curR = parent[curR]
+                inner += 1
+            }
+            // a jump to it from elsewhere (a continue); T's own labels: the jump back
+            if a.labelBlock[self.code[k].imm] != tb and labelUses[self.code[k].imm] != inner {
+                return false
+            }
+            region[k - bodyStart] = curR
+            continue
+        }
+        region[k - bodyStart] = curR
+        if op is Jz | Jnz {
+            let t = a.labelBlock[self.code[k].imm]
+            if t < 0 or a.start[t] <= k or a.start[t] >= bodyEnd {
+                return false
+            }
+            parent[nreg] = curR
+            closeAt[nreg] = self.code[k].imm
+            curR = nreg
+            nreg += 1
+            lastWork = k
+            continue
+        }
+        let dst = self.code[k].dst
+        if op == .Add and dst >= 0 and dst == self.code[k].a and self.code[k].cond == 0 {
+            if constVal(a, self, useOf(a, k, 1)) == 1 and defIn[dst] == 1 and curR == 0 and self.kinds[dst] == 'I' {
+                role[dst] = roleIv
+                if k < firstInc {
+                    firstInc = k
+                }
+                continue
+            }
+        }
+        lastWork = k
+    }
+    if curR != 0 or role[i] != roleIv or lastWork > firstInc {
+        return false
+    }
+    // every instruction of the body, then: what it is, and whether vectors do it
+    for k in bodyStart..bodyEnd {
+        let op = self.code[k].op
+        let rg = region[k - bodyStart]
+        if op is Label | Jz | Jnz | Nop {
+            continue
+        }
+        let dst = self.code[k].dst
+        let ia = self.code[k].a
+        let ib = self.code[k].b
+        if dst >= 0 and role[dst] == roleIv and op == .Add and k >= firstInc {
+            continue
+        }
+        // operands: an index only as an index
+        for s in 0..useSlots(self.code[k]) {
+            let r = self.useReg(self.code[k], s)
+            if r >= 0 and role[r] == roleIv and not (op is Load | Store and s == 1) {
+                return false
+            }
+        }
+        match op {
+            Load | Store => {
+                if ib < 0 or role[ib] != roleIv or self.code[k].imm != 8 or defIn[ia] != 0 {
+                    return false
+                }
+                if op == .Store and rg != 0 {
+                    return false
+                }
+                if op == .Load and defIn[dst] != 1 {
+                    return false
+                }
+            }
+            Add | Sub => {
+                if self.kinds[dst] != 'I' {
+                    return false
+                }
+            }
+            And | Or | Xor | Neg => {
+                if self.code[k].cond != 0 or self.kinds[dst] != 'I' {
+                    return false
+                }
+            }
+            Mul => {
+                let m1 = constVal(a, self, useOf(a, k, 1))
+                let m0 = constVal(a, self, useOf(a, k, 0))
+                let plan1 = if m1 is Some(m) { mulPlan(m) } else { false }
+                let plan0 = if m0 is Some(m) { mulPlan(m) } else { false }
+                if not plan1 and not plan0 {
+                    return false
+                }
+                // checked: x * (2^a + 2^b + ...) past the limits exactly when a shift or an add of its terms is (they
+                // all have x's sign); 2^p - 1 subtracts, and x << p may go past them when the product does not
+                let m = if plan1 { m1 ?? 0 } else { m0 ?? 0 }
+                if self.code[k].cond != 0 and popcount(m) > 3 {
+                    return false
+                }
+            }
+            Shl => {
+                let Some(m) = constVal(a, self, useOf(a, k, 1)) else {
+                    return false
+                }
+                if m < 0 or m > 63 {
+                    return false
+                }
+            }
+            Fadd | Fsub | Fmul | Fdiv | Fmin | Fmax | Fneg | Sqrt => {}
+            Cmp => {
+                if arch == .X64 and lanes == 2 and not sse42 {
+                    return false
+                }
+                role[dst] = roleMask
+            }
+            Fcmp => {
+                role[dst] = roleMask
+            }
+            Mov => {
+                if self.kinds[dst] != self.kinds[ia] {
+                    return false
+                }
+            }
+            _ => {
+                return false
+            }
+        }
+        let d = if op == .Store { -1 } else { dst }
+        if d < 0 {
+            continue
+        }
+        if defIn[d] != 1 {
+            return false
+        }
+        if role[d] == roleMask {
+            // read only by the filter jumps of this body
+            var jumps = 0
+            for j in bodyStart..bodyEnd {
+                if self.code[j].op is Jz | Jnz and self.code[j].a == d {
+                    jumps += 1
+                }
+            }
+            if jumps != usesAll[d] {
+                return false
+            }
+            continue
+        }
+        // a sum: d = d + x, d read by nothing else in the loop
+        if op is Add | Fadd and (ia == d) != (ib == d) and usesIn[d] == 1 {
+            role[d] = roleRed
+            continue
+        }
+        if ia == d or ib == d {
+            return false
+        }
+        // a temporary: read only after it, in its region (or one inside it), and nowhere outside the loop
+        if usesAll[d] != usesIn[d] {
+            return false
+        }
+        role[d] = roleTemp
+        for j in bodyStart..bodyEnd {
+            for s in 0..useSlots(self.code[j]) {
+                if self.useReg(self.code[j], s) != d {
+                    continue
+                }
+                if j <= k {
+                    return false
+                }
+                var ur = region[j - bodyStart]
+                while ur > 0 and ur != rg {
+                    ur = parent[ur]
+                }
+                if ur != rg {
+                    return false
+                }
+            }
+        }
+    }
+    for k in bodyStart..bodyEnd {
+        // a filter's jump tests a comparison of this body
+        if self.code[k].op is Jz | Jnz and role[self.code[k].a] != roleMask {
+            return false
+        }
+    }
+    // ---- the vector loop ----
+    let room = nr + 16 * size + 64 // the registers the translation makes are looked up too
+    var v = Vec(bodyStart - 1, nr, vecOf: [-1] * room, splat: [-1] * room)
+    let vt = self.labelCount
+    let vc = self.labelCount + 1
+    let skip = self.labelCount + 2
+    let w = self.weight[i]
+    // n - (lanes - 1) must not wrap: n >= minInt + lanes
+    let kmin = v.vConst('I', minInt + lanes)
+    let g = v.newReg('I', 1.0)
+    v.emit(IrIns(.Cmp, cond: condLt, dst: g, a: n, b: kmin))
+    v.emit(IrIns(.Jnz, dst: -1, a: g, b: -1, imm: skip))
+    let kl = v.vConst('I', lanes - 1)
+    let lim = v.newReg('I', w)
+    v.emit(mk(.Sub, lim, n, kl))
+    let kW = v.vConst('I', lanes)
+    // the body, translated; splats collected for before the loop
+    var redVec = [-1] * nr
+    var redLine = [0] * nr // a checked Int sum: its line (0: not checked)
+    var maskStack: [Int] = []
+    var labelStack: [Int] = []
+    var zero = -1
+    var ones = -1
+    var negz = -1
+    for k in bodyStart..bodyEnd {
+        let op = self.code[k].op
+        var cur = if len(maskStack) > 0 { maskStack[len(maskStack) - 1] } else { -1 }
+        if op == .Label {
+            while len(labelStack) > 0 and labelStack[len(labelStack) - 1] == self.code[k].imm {
+                labelStack.pop()
+                maskStack.pop()
+            }
+            continue
+        }
+        if op is Jz | Jnz {
+            let m = v.vecOf[self.code[k].a]
+            var nm = m
+            if op == .Jz {
+                // on where the comparison holds
+                if cur >= 0 {
+                    nm = v.vNew()
+                    v.vop(.And, nm, cur, m)
+                }
+            } else {
+                // on where it does not
+                nm = v.vNew()
+                if cur < 0 {
+                    if ones < 0 {
+                        let k1 = v.vConst('I', -1)
+                        ones = v.splatOf(k1)
+                    }
+                    cur = ones
+                }
+                v.vop(.Not, nm, cur, m) // cur & ~m
+            }
+            maskStack.push(nm)
+            labelStack.push(self.code[k].imm)
+            continue
+        }
+        if op == .Nop {
+            continue
+        }
+        let d = self.code[k].dst
+        let ia = self.code[k].a
+        let ib = self.code[k].b
+        if d >= 0 and role[d] == roleIv and op == .Add and k >= firstInc {
+            continue
+        }
+        if op == .Load {
+            let vd = v.vNew()
+            v.body.push(IrIns(.Vload, dst: vd, a: ia, b: ib, c: self.code[k].c, imm: 8))
+            v.vecOf[d] = vd
+        } else if op == .Store {
+            let x = v.operand(d)
+            v.body.push(IrIns(.Vstore, dst: x, a: ia, b: ib, c: self.code[k].c, imm: 8))
+        } else if op == .Mov {
+            v.vecOf[d] = v.operand(ia)
+        } else if op is Add | Fadd and role[d] == roleRed {
+            var x = v.operand(if ia == d { ib } else { ia })
+            if op == .Add {
+                if cur >= 0 {
+                    let t = v.vNew()
+                    v.vop(.And, t, x, cur)
+                    x = t
+                }
+                if redVec[d] < 0 {
+                    redVec[d] = v.vNew()
+                    if zero < 0 {
+                        zero = v.vConst('I', 0)
+                    }
+                    v.pre.push(mk(.Vsplat, redVec[d], zero, -1))
+                }
+                if self.code[k].cond != 0 {
+                    let sum = v.vNew()
+                    v.vop(.Add, sum, redVec[d], x)
+                    v.checkedAddSub(true, sum, redVec[d], x, -1, self.code[k].line) // x's filtered-out lanes are 0
+                    redLine[d] = self.code[k].line
+                }
+                v.vop(.Add, redVec[d], redVec[d], x)
+            } else {
+                if cur >= 0 {
+                    // lanes filtered out add -0.0: x + -0.0 is x, for every x
+                    if negz < 0 {
+                        let kz = v.vConst('F', minInt)
+                        negz = v.splatOf(kz)
+                    }
+                    let t1 = v.vNew()
+                    let t2 = v.vNew()
+                    let t3 = v.vNew()
+                    v.vop(.And, t1, x, cur)
+                    v.vop(.Not, t2, negz, cur)
+                    v.vop(.Or, t3, t1, t2)
+                    x = t3
+                }
+                for l in 0..lanes {
+                    // in order: the same sum as one at a time
+                    let s = v.newReg('F', 1e299)
+                    v.body.push(IrIns(.Vlane, dst: s, a: x, b: -1, c: l))
+                    v.body.push(if ia == d { mk(.Fadd, d, d, s) } else { mk(.Fadd, d, s, d) })
+                }
+            }
+        } else if op is Add | Fadd | Sub | And | Or | Xor | Fsub | Fmul | Fdiv | Fmin | Fmax | Cmp | Fcmp {
+            let x = v.operand(ia)
+            let y = v.operand(ib)
+            let vd = v.vNew()
+            let checked = op is Add | Sub and self.code[k].cond != 0
+            v.body.push(
+                IrIns(
+                    .Vop,
+                    cond: if op is Add | Sub { 0 } else { self.code[k].cond },
+                    dst: vd,
+                    a: x,
+                    b: y,
+                    imm: op.index(),
+                ),
+            )
+            if op == .Cmp {
+                v.intCompares += 1
+            }
+            if checked {
+                v.checkedAddSub(op == .Add, vd, x, y, cur, self.code[k].line)
+            }
+            v.vecOf[d] = vd
+        } else if op == .Neg {
+            if zero < 0 {
+                zero = v.vConst('I', 0)
+            }
+            let vd = v.vNew()
+            let x = v.splatOf(zero)
+            let y = v.operand(ia)
+            v.vop(.Sub, vd, x, y)
+            v.vecOf[d] = vd
+        } else if op == .Fneg {
+            if negz < 0 {
+                let kz = v.vConst('F', minInt)
+                negz = v.splatOf(kz)
+            }
+            let vd = v.vNew()
+            let x = v.operand(ia)
+            v.vop(.Xor, vd, x, negz)
+            v.vecOf[d] = vd
+        } else if op == .Sqrt {
+            let vd = v.vNew()
+            let x = v.operand(ia)
+            v.vop(.Sqrt, vd, x, -1)
+            v.vecOf[d] = vd
+        } else if op == .Shl {
+            let m = constVal(a, self, useOf(a, k, 1)) ?? 0
+            let vd = v.vNew()
+            let x = v.operand(ia)
+            v.vshl(vd, x, m)
+            v.vecOf[d] = vd
+        } else if op == .Mul {
+            // by a constant: shifts and adds
+            var m = 0
+            var x = 0
+            let m1 = constVal(a, self, useOf(a, k, 1))
+            if m1 is Some(c) and mulPlan(c) {
+                m = c
+                x = v.operand(ia)
+            } else {
+                m = constVal(a, self, useOf(a, k, 0)) ?? m1 ?? 0
+                x = v.operand(ib)
+            }
+            var vd = -1
+            if m == 0 {
+                if zero < 0 {
+                    zero = v.vConst('I', 0)
+                }
+                vd = v.splatOf(zero)
+            } else if popcount(m) <= 3 {
+                let checked = self.code[k].cond != 0
+                let line = self.code[k].line
+                var top = 0
+                for bit in 0..63 {
+                    if m >> bit & 1 == 0 {
+                        continue
+                    }
+                    top = bit
+                    var term = x
+                    if bit != 0 {
+                        term = v.vNew()
+                        v.vshl(term, x, bit)
+                    }
+                    if vd < 0 {
+                        vd = term
+                    } else {
+                        let s = v.vNew()
+                        v.vop(.Add, s, vd, term)
+                        if checked {
+                            v.checkedAddSub(true, s, vd, term, cur, line)
+                        }
+                        vd = s
+                    }
+                }
+                // x << top past the limits: bit 63 not each of bits 63 - top ... 62, so x ^ (x << j) < 0 for a j
+                for j in 1..(if checked { top + 1 } else { 1 }) {
+                    let sh = v.vNew()
+                    let t = v.vNew()
+                    v.vshl(sh, x, j)
+                    v.vop(.Xor, t, x, sh)
+                    v.overflowed(t, cur, line)
+                }
+            } else {
+                // 2^p - 1
+                var p = 0
+                while 1 << p != m + 1 {
+                    p += 1
+                }
+                let t = v.vNew()
+                v.vshl(t, x, p)
+                vd = v.vNew()
+                v.vop(.Sub, vd, t, x)
+            }
+            v.vecOf[d] = vd
+        } else {
+            return false // not reached: checked above
+        }
+    }
+    // the registers made stay, whether the vector loop is kept or not
+    self.kinds += v.kinds
+    self.weight += v.weights
+    if v.vregs > 12 and v.mostLive() > 12 {
+        // too many to keep in registers at once: the scalar loop as it was
+        return false
+    }
+    let ovfOk = self.labelCount + 3
+    self.labelCount += if v.ovf >= 0 { 4 } else { 3 }
+    for ins in v.pre {
+        v.emit(ins)
+    }
+    v.emit(mark(.Jmp, vc))
+    v.emit(mark(.Label, vt))
+    for ins in v.body {
+        v.emit(ins)
+    }
+    for r in 0..nr {
+        if role[r] == roleIv {
+            v.emit(mk(.Add, r, r, kW))
+        }
+    }
+    v.emit(mark(.Label, vc))
+    let c2 = len(self.kinds)
+    self.kinds.push('I')
+    self.weight.push(w)
+    v.emit(IrIns(.Cmp, cond: condLt, dst: c2, a: i, b: lim))
+    v.emit(IrIns(.Jnz, dst: -1, a: c2, b: -1, imm: vt))
+    for r in 0..nr {
+        // the Int sums' lanes, added (in any order: the same)
+        if redVec[r] < 0 {
+            continue
+        }
+        for l in 0..lanes {
+            let s = len(self.kinds)
+            self.kinds.push('I')
+            self.weight.push(1.0)
+            v.emit(IrIns(.Vlane, dst: s, a: redVec[r], b: -1, c: l))
+            v.emit(IrIns(.Add, cond: if redLine[r] != 0 { 1 } else { 0 }, dst: r, a: r, b: s, line: redLine[r]))
+        }
+    }
+    var any = -1
+    if v.ovf >= 0 {
+        // a lane's sign bit set: an op went past the limits on it
+        any = len(self.kinds)
+        self.kinds.push('I')
+        self.weight.push(1.0)
+        v.emit(IrIns(.Vlane, dst: any, a: v.ovf, b: -1, c: 0))
+        for l in 1..lanes {
+            let s = len(self.kinds)
+            self.kinds.push('I')
+            self.weight.push(1.0)
+            v.emit(IrIns(.Vlane, dst: s, a: v.ovf, b: -1, c: l))
+            v.emit(mk(.Or, any, any, s))
+        }
+    }
+    v.emit(mark(.Vend, 0))
+    if any >= 0 {
+        // ... then the panic an op past the limits makes, at its line: maxInt + 1, checked
+        let z = len(self.kinds)
+        let went = z + 1
+        let top = z + 2
+        let one = z + 3
+        let past = z + 4
+        for _ in 0..5 {
+            self.kinds.push('I')
+            self.weight.push(1.0)
+        }
+        v.emit(mk(.Const, z, -1, -1))
+        v.emit(IrIns(.Cmp, cond: condLt, dst: went, a: any, b: z))
+        v.emit(IrIns(.Jz, dst: -1, a: went, b: -1, imm: ovfOk))
+        v.emit(mk(.Const, top, -1, -1) with { imm: maxInt })
+        v.emit(mk(.Const, one, -1, -1) with { imm: 1 })
+        v.emit(IrIns(.Add, cond: 1, dst: past, a: top, b: one, line: v.ovfLine))
+        v.emit(mark(.Label, ovfOk))
+    }
+    v.emit(mark(.Label, skip))
+    self.apply(v.e)
+    true
+}
+
+// tried: the header labels of the loops looked at already (the scalar loop left after a vector one, too)
+fn IrFn.vectorize(var self, a: Analysis, lanes: Int, tried: [Bool], arch: Arch, sse42: Bool) -> (Bool, [Bool]) {
+    var t = tried
+    for li in 0..len(a.loops) {
+        var inner = true
+        for j in 0..len(a.loops) {
+            if a.loops[j].parent == li {
+                inner = false
+            }
+        }
+        let first = a.start[a.loops[li].header]
+        if not inner or a.loops[li].preAt < 0 or self.code[first].op != .Label or (t.get(self.code[first].imm) ?? false) {
+            continue
+        }
+        let label = self.code[first].imm
+        while len(t) <= label {
+            t.push(false)
+        }
+        t[label] = true
+        if self.vectorizeLoop(a, li, lanes, arch, sse42) {
+            return (true, t)
+        }
+    }
+    (false, t)
+}
+
+// ---- block layout: a loop's way out (a return, a break) after the function, the loop falling through ----
+fn IrFn.dropUnreachable(var self, a: Analysis) {
+    for bi in 0..a.nb {
+        if a.order[bi] < 0 {
+            for k in a.start[bi]..a.end[bi] {
+                self.code[k].op = .Nop
+            }
+        }
+    }
+    self.dropNops()
+}
+
+fn IrFn.coldExits(var self, a: Analysis) -> Bool {
+    let count = len(self.code)
+    if count == 0 or not self.code[count - 1].op is Ret | Jmp {
+        // falls off its end
+        return false
+    }
+    var bi = 0
+    while bi + 2 < a.nb {
+        let b = bi
+        let x = bi + 1 // the branch's fall-through: the exit
+        bi += 1
+        let loop = a.loopOf[b]
+        if a.order[b] < 0 or loop < 0 or len(predsOf(a, x)) != 1 {
+            continue
+        }
+        let br = a.end[b] - 1
+        if not self.code[br].op is Jz | Jnz {
+            continue
+        }
+        if a.labelBlock[self.code[br].imm] != b + 2 or not inLoop(a, loop, b + 2) {
+            // jumps over it, staying in
+            continue
+        }
+        let last = a.end[x] - 1
+        let leaves = self.code[last].op == .Ret
+            or self.code[last].op == .Jmp
+                and not (a.labelBlock[self.code[last].imm] >= 0 and inLoop(a, loop, a.labelBlock[self.code[last].imm]))
+        if not leaves or self.code[a.start[x]].op == .Label {
+            continue
+        }
+        // jz c, L; exit...; L:  ->  jnz c, N; L: ... ; (after the function) N: exit...
+        let label = self.labelCount
+        self.labelCount += 1
+        var e = Edit()
+        e.add(count, mark(.Label, label))
+        for k in a.start[x]..a.end[x] {
+            e.add(count, self.code[k])
+            self.code[k].op = .Nop
+        }
+        self.code[br].op = if self.code[br].op == .Jz { .Jnz } else { .Jz }
+        self.code[br].imm = label
+        self.apply(e)
+        return true
+    }
+    false
+}
+
+// values nobody reads (a counter a lambda did not ask for): gone before the loops are looked at
+fn IrFn.deadCode(var self) {
+    let nr = max(len(self.kinds), 1)
+    var changed = true
+    while changed {
+        changed = false
+        var reads = [0] * nr // by instructions other than the one defining it
+        for k in 0..len(self.code) {
+            let defs = definesReg(self.code[k])
+            for s in 0..useSlots(self.code[k]) {
+                let r = self.useReg(self.code[k], s)
+                if r >= 0 and not (defs and self.code[k].dst == r) {
+                    reads[r] += 1
+                }
+            }
+        }
+        for k in 0..len(self.code) {
+            if not definesReg(self.code[k]) or reads[self.code[k].dst] != 0 {
+                continue
+            }
+            let dead = match self.code[k].op {
+                Const | Mov | Neg | And | Or | Xor | Shl | Sar | Fadd | Fsub | Fmul | Fdiv | Fneg | Sqrt | Fmin | Fmax => true
+                Cmp | Fcmp | Not | IntToFloat | Round | Load => true
+                Add | Sub | Mul | FloatToInt => self.code[k].cond == 0
+                // else it may stop with a panic
+                _ => false
+            }
+            if dead {
+                self.code[k].op = .Nop
+                changed = true
+            }
+        }
+    }
+    self.dropNops()
+}
+
+pub fn IrFn.releaseOptimize(var self, lanes: Int, fuel: Bool, tables: [IrTable], arch: Arch, sse42: Bool) {
+    if len(self.code) == 0 {
+        return
+    }
+    self.commonSubexpressions() // i * 3 written three times is one value before loops are looked at
+    self.deadCode()
+    // each pass on a fresh analysis when the one before changed the code
+    var round = 0
+    while round < 16 and self.scalarReplace(analyse(self)) {
+        self.dropNops()
+        round += 1
+    }
+    self.devirtualize(analyse(self), tables)
+    if self.boundsAndDivisions(analyse(self)) {
+        self.dropNops()
+    }
+    round = 0
+    while round < 32 and self.licm(analyse(self)) {
+        self.dropNops()
+        round += 1
+    }
+    if lanes != 0 and not fuel {
+        var tried = [false] * (self.labelCount + 1)
+        round = 0
+        while round < 16 {
+            let (done, t) = self.vectorize(analyse(self), lanes, tried, arch, sse42)
+            tried = t
+            if not done {
+                break
+            }
+            self.dropNops()
+            round += 1
+        }
+    }
+    round = 0
+    while round < 32 and self.strengthReduce(analyse(self)) {
+        self.dropNops()
+        round += 1
+    }
+    self.foldAddresses(analyse(self))
+    self.dropUnreachable(analyse(self))
+    round = 0
+    while round < 16 and self.coldExits(analyse(self)) {
+        self.dropNops()
+        round += 1
+    }
+}

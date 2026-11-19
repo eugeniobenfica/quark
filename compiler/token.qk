@@ -1,0 +1,228 @@
+// Tokens: what the lexer cuts a text into. A token is where it is in its text (an offset and a length), never
+// a copy of it: the parser reads a name's or a number's spelling from the text when it needs it. An operator
+// is one kind of token, Op, and says which one it is (Op): the syntax tree keeps the same Op.
+pub enum Tok {
+    Eof
+    Newline
+    Name
+    TypeName
+    IntLit
+    FloatLit
+    TextLit
+    Fn
+    Let
+    Var
+    Type
+    Enum
+    If
+    Else
+    Match
+    For
+    In
+    While
+    Return
+    Break
+    Continue
+    And
+    Or
+    Not
+    True
+    False
+    Extern
+    With
+    Effect
+    Use
+    Pub
+    Const
+    Defer
+    Interface
+    Is
+    LParen
+    RParen
+    LBrace
+    RBrace
+    LBracket
+    RBracket
+    Comma
+    Dot
+    DotDot
+    DotDotEq
+    Ellipsis
+    Colon
+    Arrow
+    FatArrow
+    Underscore
+    Question
+    Bang
+    Op
+}
+
+// an operator: one a token is (Assign to Tilde), or one only the syntax tree has (<< and >>, made by the parser
+// from < < and > > side by side, so Pair<A, Tree<B>> closes; and, or, not: keywords)
+pub enum Op {
+    Assign
+    PlusEq
+    MinusEq
+    StarEq
+    SlashEq
+    PercentEq
+    AmpEq
+    PipeEq
+    CaretEq
+    ShlEq
+    ShrEq
+    Plus
+    Minus
+    Star
+    Slash
+    Percent
+    Amp
+    Pipe
+    Caret
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+    Coalesce
+    Tilde
+    Shl
+    Shr
+    And
+    Or
+    Not
+    PlusWrap // +%, -%, *%: the result wraps around (a plain + - * past an Int's limits stops the program)
+    MinusWrap
+    StarWrap
+    PlusWrapEq
+    MinusWrapEq
+    StarWrapEq
+}
+
+// a token: its kind (and its operator, for an Op), its bytes in the text (at, len), and where it starts (line
+// and column, from 1)
+pub type Token { kind: Tok, op: Op?, at: Int, len: Int, line: Int, col: Int, blankBefore: Bool }
+
+// a comment, without its slashes: alone on its line (a leading one), or after code (a trailing one)
+pub type Comment { line: Int, ownLine: Bool, text: Text }
+
+// the 28 keywords, and the token each one is
+pub const keywords: [Text: Tok] = [
+    "fn": .Fn, "let": .Let, "var": .Var, "type": .Type, "enum": .Enum, "if": .If, "else": .Else, "match": .Match,
+    "for": .For, "in": .In, "while": .While, "return": .Return, "break": .Break, "continue": .Continue, "and": .And,
+    "or": .Or, "not": .Not, "true": .True, "false": .False, "extern": .Extern, "with": .With, "effect": .Effect,
+    "use": .Use, "pub": .Pub, "const": .Const, "defer": .Defer, "interface": .Interface, "is": .Is,
+]
+
+// what a message calls a token's kind: its spelling, or what it is
+pub fn Tok.name(self) -> Text = match self {
+    Eof => "end of file"
+    Newline => "end of line"
+    Name => "name"
+    TypeName => "type name"
+    IntLit | FloatLit => "number"
+    TextLit => "text"
+    Fn => "fn"
+    Let => "let"
+    Var => "var"
+    Type => "type"
+    Enum => "enum"
+    If => "if"
+    Else => "else"
+    Match => "match"
+    For => "for"
+    In => "in"
+    While => "while"
+    Return => "return"
+    Break => "break"
+    Continue => "continue"
+    And => "and"
+    Or => "or"
+    Not => "not"
+    True => "true"
+    False => "false"
+    Extern => "extern"
+    With => "with"
+    Effect => "effect"
+    Use => "use"
+    Pub => "pub"
+    Const => "const"
+    Defer => "defer"
+    Interface => "interface"
+    Is => "is"
+    LParen => "("
+    RParen => ")"
+    LBrace => "\{"
+    RBrace => "\}"
+    LBracket => "["
+    RBracket => "]"
+    Comma => ","
+    Dot => "."
+    DotDot => ".."
+    DotDotEq => "..="
+    Ellipsis => "..."
+    Colon => ":"
+    Arrow => "->"
+    FatArrow => "=>"
+    Underscore => "_"
+    Question => "?"
+    Bang => "!"
+    Op => "operator"
+}
+
+// an operator's spelling
+pub fn Op.name(self) -> Text = match self {
+    Assign => "="
+    PlusEq => "+="
+    MinusEq => "-="
+    StarEq => "*="
+    SlashEq => "/="
+    PercentEq => "%="
+    AmpEq => "&="
+    PipeEq => "|="
+    CaretEq => "^="
+    ShlEq => "<<="
+    ShrEq => ">>="
+    Plus => "+"
+    Minus => "-"
+    Star => "*"
+    Slash => "/"
+    Percent => "%"
+    Amp => "&"
+    Pipe => "|"
+    Caret => "^"
+    Eq => "=="
+    Ne => "!="
+    Lt => "<"
+    Le => "<="
+    Gt => ">"
+    Ge => ">="
+    Coalesce => "??"
+    Tilde => "~"
+    Shl => "<<"
+    Shr => ">>"
+    And => "and"
+    Or => "or"
+    Not => "not"
+    PlusWrap => "+%"
+    MinusWrap => "-%"
+    StarWrap => "*%"
+    PlusWrapEq => "+%="
+    MinusWrapEq => "-%="
+    StarWrapEq => "*%="
+}
+
+// what a message calls a token: an operator's spelling, or its kind's name
+pub fn Token.name(self) -> Text = if self.op is Some(o) { o.name() } else { self.kind.name() }
+
+// a token after which a line break ends the statement
+pub fn Tok.endsStatement(self) -> Bool =
+    self is Name | TypeName | IntLit | FloatLit | TextLit | True | False | RParen | RBracket | RBrace | Return | Break | Continue | Underscore | Question | Bang
+
+// = += -= ... >>= +%= -%= *%=: an assignment's operator
+pub fn Op.assigns(self) -> Bool =
+    self is Assign | PlusEq | MinusEq | StarEq | SlashEq | PercentEq | AmpEq | PipeEq | CaretEq | ShlEq | ShrEq | PlusWrapEq | MinusWrapEq | StarWrapEq
+
+// == != < <= > >=
+pub fn Op.compares(self) -> Bool = self is Eq | Ne | Lt | Le | Gt | Ge

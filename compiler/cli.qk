@@ -1,0 +1,525 @@
+// The command line of the compiler: every command, with its options (before or
+// after the file), its output and its exit status. compiler/main.qk (Windows) and compiler/mainlinux.qk (Linux)
+// start it with what running in memory needs of the system (imagecli.qk's Host).
+//   quark run FILE [--fuel N] [--time] [--memory MB] [--allow LIST] [--release] [--no-avx] [--abi sysv]
+//                  [--profile] [--trace OUT.json] [--prelude P] [-- ARGS...]   compiled, then run in memory
+//   quark build FILE [-o OUT] [--release] [--memory MB] [--fuel N] [--target T] [--libc L]   a native executable,
+//                  with no C compiler; for another machine with --target
+//   quark test FILE                       each test on its own; quark debug FILE [--break LINE]...; quark repl
+//   quark object FILE [-o FILE.o] [--symbol NAME] [--target T] [--linked]   an object file a host links
+//   quark fmt, check, consts, graph, text, diff, merge, doc, ir, code, catalog, lsp, dap, get   (their own files)
+use ir
+use source
+use parser
+use format
+use canon
+use ast
+use module
+use check
+use construn
+use lsp
+use graph
+use collab
+use cbind
+use doc
+use catalog
+use ircli
+use image
+use imagecli
+use memory
+use debugrun
+use dap
+use version
+use cachedir
+
+fn usage() -> Int {
+    printErr(
+        "Quark — a small compiled language whose programs are also node graphs.\n\n  quark debug file.qk [--break LINE]...   stop at lines, step, see the names' values\n  quark repl                                declarations, lets and expressions, line by line\n  quark code  file.qk [-o code.bin]         the machine code, raw, for a disassembler\n  quark object file.qk -o file.o [--symbol name]   an object file a host links (QkStaticProgram name)\n  quark run   file.qk [--fuel N] [--time] [--allow print,files,...] [-- args...]   compile to machine code and run it\n  quark build file.qk [-o file.exe] [--target arm64-linux]   make a standalone executable (for another machine)\n  --release           (run, build, object, ir, test) the optimizing tier: slower to compile, faster to run\n  quark test  file.qk [--filter part]       run its test \"...\" \{ \} blocks (those whose name has part)\n  quark lsp   [--prelude host.qk]           a language server (stdio), for editors\n  quark dap   [--prelude host.qk]           a debug adapter (stdio), for editors' debuggers\n  quark doc   file.qk [-o out.md|out.html]  documentation of its pub declarations and their comments\n  quark check file.qk                       report errors only\n  quark fmt   file.qk [--write]             print (or rewrite) the canonical text\n  quark graph file.qk [--json]              print the node graph (Quark Graph Notation, or JSON)\n  quark text  file.qgn                      turn a node graph (.qgn or .json) back into Quark\n  quark diff  a b [--json]                  the changes, by node key (.qk, .qgn or .json)\n  quark merge base ours theirs [-o out]     three-way merge by node key; conflicts by key\n  quark ir    file.qk                       print the intermediate code\n  quark catalog file.qk | -                 every node an editor can offer (JSON)\n  quark get   [dir]                         fetch the packages quark.toml names (git), write quark.lock\n  quark bind  header.h [--lib name] [--prefix P] [-I dir] [-o out.qk]   a C header's declarations as Quark's\n  quark clean                               remove the compiler's caches (quark-cache in the temporary folder)\n  quark version                             this compiler's version, and the versions of what it keeps stable\n\n  --prelude host.qk   the host's declarations (extern fn, extern type) for run, check, graph, catalog\n  --layout pos.json   graph: node positions by key, written into the nodes as \"pos\"",
+    )
+    2
+}
+
+pub fn cliMain(host: Host) -> Int {
+    let given = args()
+    if len(given) > 0 and given[0] == "dap" {
+        // the debug adapter, its programs run in memory (compiler/dap.qk, debugger.qk)
+        return serveDapWith(if len(given) >= 3 and given[1] == "--prelude" {
+            given[2]
+        } else {
+            ""
+        }, host)
+    }
+    if len(given) > 0 and given[0] is "lsp" | "get" {
+        return toolCommand(given) // the editor tools and packages (compiler/lsp.qk, dap.qk, package.qk)
+    }
+    if len(given) > 0 and given[0] == "repl" {
+        return repl(host)
+    }
+    if len(given) > 0 and given[0] == "bind" {
+        return bindCommand(given, host.os == Os.Windows) // a C header's declarations as Quark's (compiler/cbind.qk)
+    }
+    if len(given) > 0 and given[0] is "version" | "--version" {
+        let os = match host.os {
+            Windows => "windows"
+            Linux => "linux"
+            Macos => "macos"
+        }
+        return versionCommand(os, if host.arm { "arm64" } else { "x86_64" })
+    }
+    if len(given) > 0 and given[0] == "clean" {
+        return cleanCommand() // the compiler's caches (compiler/cachedir.qk)
+    }
+    if len(given) > 0 and given[0] is "diff" | "merge" {
+        return collabCommand(given) // versions side by side (compiler/collab.qk)
+    }
+    if len(given) < 2 {
+        return usage()
+    }
+    let command = given[0]
+    if command is "graph" | "text" {
+        return graphCommand(given) // node graphs (compiler/graph.qk)
+    }
+    if command == "doc" {
+        return docCommand(given) // documentation (compiler/doc.qk)
+    }
+    if command is "ir" | "code" {
+        return irCommand(given) // the back end: lowering, the optimizers, machine code (compiler/ircli.qk)
+    }
+    if command == "catalog" {
+        return catalogCommand(given) // every node an editor can offer (compiler/catalog.qk)
+    }
+    if command is "run" | "build" | "test" | "debug" | "object" | "bin" {
+        return compileCommand(host, given)
+    }
+    var path = ""
+    var write = false
+    var allowed: Text? = None
+    var prelude = ""
+    var i = 1
+    while i < len(given) {
+        let a = given[i]
+        i += 1
+        if a == "--write" {
+            write = true
+        } else if a == "--allow" and i < len(given) {
+            allowed = given[i] // a sandbox: print, clock...
+            i += 1
+        } else if a == "--prelude" and i < len(given) {
+            prelude = given[i] // the host's declarations
+            i += 1
+        } else if path == "" and not a.startsWith("-") {
+            path = a
+        } else {
+            printErr("quark: unknown option {a}")
+            return 2
+        }
+    }
+    if path == "" or not command is "fmt" | "parse-check" | "check" | "consts" {
+        return usage()
+    }
+    let Ok(text) = readFile(path) else {
+        printErr("quark: cannot read {path}")
+        return 1
+    }
+    if command == "check" or command == "consts" {
+        return checkFile(Source(path, text), prelude, allowed, command == "consts", host)
+    }
+    let loaded = load(Source(path, text))
+    for e in loaded.errors {
+        printErr(e)
+    }
+    if not loaded.ok {
+        return 1
+    }
+    if command == "parse-check" {
+        return 0
+    }
+    let out = format(canonical(loaded.ast, Source(path, text)))
+    if write {
+        if writeFile(path, out) is Err(_) {
+            printErr("quark: cannot write {path}")
+            return 1
+        }
+        return 0
+    }
+    if len(out) > 0 {
+        print(out[..len(out) - 1]) // print ends the line itself
+    }
+    0
+}
+
+// ---- run, build, test, debug, object: the options, before or after the file ----
+fn compileCommand(host: Host, given: [Text]) -> Int {
+    var o = RunOptions(command: given[0])
+    var i = 1
+    while i < len(given) {
+        let a = given[i]
+        i += 1
+        let more = i < len(given)
+        if a == "--" {
+            o.programArgs = given[i..] // the rest is the program's: args()
+            break
+        }
+        if a == "--filter" and more {
+            o.filter = given[i] // quark test: the tests whose name has it
+            i += 1
+        } else if a == "--fuel" and more {
+            o.fuel = given[i].parseInt() ?? 0
+            i += 1
+        } else if a == "--symbol" and more {
+            o.symbol = given[i]
+            i += 1
+        } else if a == "--target" {
+            if not more or given[i].startsWith("-") {
+                printErr("quark: --target needs a target name")
+                return 1
+            }
+            o.target = given[i]
+            i += 1
+        } else if a == "--libc" {
+            if not more or not given[i] is "glibc" | "musl" {
+                printErr("quark: --libc is glibc or musl")
+                return 1
+            }
+            o.libc = given[i]
+            i += 1
+        } else if a == "--profile" {
+            o.profile = true
+        } else if a == "--trace" and more {
+            o.tracePath = given[i] // the last value of every name, by graph key (JSON)
+            i += 1
+        } else if a == "--break" and more {
+            o.breaks.push(given[i].parseInt() ?? 0)
+            i += 1
+        } else if a == "--memory" and more {
+            o.memory = (given[i].parseInt() ?? 0) << 20
+            i += 1
+        } else if a == "--allow" and more {
+            o.allowed = given[i]
+            i += 1
+        } else if a == "--time" {
+            o.timed = true
+        } else if a is "--write" | "--json" | "--lowered" | "--image" | "--object" {
+            // the other commands' (fmt, ir): nothing here
+        } else if a == "--no-avx" {
+            o.noAvx = true
+        } else if a == "--release" {
+            o.release = true
+        } else if a == "--linked" {
+            o.linked = true
+        } else if a == "--abi" and more {
+            o.sysv = given[i] == "sysv"
+            i += 1
+        } else if a == "-o" and more {
+            o.outPath = given[i]
+            i += 1
+        } else if a == "--prelude" and more {
+            o.prelude = given[i]
+            i += 1
+        } else if a == "--layout" and more {
+            i += 1
+        } else if o.path == "" and (not a.startsWith("-") or a == "-") {
+            o.path = a
+        } else {
+            printErr("quark: unknown option {a}")
+            return 2
+        }
+    }
+    if o.path == "" {
+        return usage()
+    }
+    if o.command == "build" {
+        return build(host, o)
+    }
+    if o.command == "object" {
+        return object(host, o)
+    }
+    if o.command == "bin" {
+        return bin(host, o)
+    }
+    if o.command == "test" {
+        return runOrTest(host, o, true)
+    }
+    if o.command == "debug" or o.tracePath != "" {
+        return debugCommand(host, o) // compiled for the debugger (compiler/debugrun.qk)
+    }
+    runOrTest(host, o, false)
+}
+
+// quark run, quark test: the program compiled, the runtime mapped (each on its own turn of one loop: what the first
+// made goes back before the second), then run in memory
+fn runOrTest(host: Host, o: RunOptions, tests: Bool) -> Int {
+    var compiled: Compiled? = None
+    var mapped: Mapped? = None
+    for k in 0..2 {
+        if k == 0 {
+            compiled = compileFile(host, o.path, o, Purpose(needMain: not tests))
+            if compiled == None {
+                return 1
+            }
+        } else {
+            mapped = loadRuntime(host)
+        }
+    }
+    let Some(c) = compiled else {
+        return 1
+    }
+    let Some(m) = mapped else {
+        return 1
+    }
+    m.begin(o.path, o.programArgs)
+    if tests {
+        runTests(host, m, c, o)
+    } else {
+        runProgram(host, m, c, o)
+    }
+}
+
+// quark build: an executable for this machine, or (--target) for another
+fn build(host: Host, o: RunOptions) -> Int {
+    var target = ""
+    if o.target is Some(t) {
+        target = targetName(t)
+        if target == "" {
+            printErr(
+                "quark: --target is x86_64-windows, x86_64-linux, x86_64-macos, arm64-windows, arm64-linux or arm64-macos",
+            )
+            return 2
+        }
+    }
+    let Some(c) = compileFile(host, o.path, o, Purpose(target: target, needMain: true)) else {
+        return 1
+    }
+    buildExecutable(host, target, c, o)
+}
+
+// quark object: the program compiled ahead of time, for a host to link (--linked: the runtime's, its addresses the
+// linker's); for another machine with --target
+fn object(host: Host, o: RunOptions) -> Int {
+    var target = ""
+    if o.target is Some(t) {
+        target = targetName(t)
+        if target == "" {
+            printErr(
+                "quark: --target is x86_64-windows, x86_64-linux, x86_64-macos, arm64-windows, arm64-linux, arm64-macos or arm64-ios",
+            )
+            return 2
+        }
+    }
+    let Some(c) = compileFile(host, o.path, o, Purpose(target: target, object: true, linked: o.linked)) else {
+        return 1
+    }
+    let info = ImageInfo(c.os, o.linked, c.features, c.data, runtimeNames)
+    let Some(obj) = objectFile(c.mc, c.prog, info, o.symbol ?? "quarkProgram") else {
+        printErr("quark: no object format for this target yet")
+        return 1
+    }
+    if writeBytes(o.outPath ?? "program.o", obj) is Err(_) {
+        printErr("quark: cannot write the object file")
+        return 1
+    }
+    0
+}
+
+// the raw machine code, for a disassembler
+fn bin(host: Host, o: RunOptions) -> Int {
+    let Some(c) = compileFile(host, o.path, o, Purpose(needMain: true)) else {
+        return 1
+    }
+    let Some(out) = o.outPath else {
+        return 1
+    }
+    if writeBytes(out, c.mc.code) is Err(_) { 1 } else { 0 }
+}
+
+// ---- quark repl: declarations kept, lets kept, an expression's value printed ----
+type Session { decls: Text = "", lets: Text = "" }
+
+// the session as a program: its declarations, then main with its lets and this line; -1 when it does not compile
+fn replRun(host: Host, m: Mapped, decls: Text, lets: Text, line: Text, quiet: Bool) -> Int {
+    let text = "{decls}\nfn main() \{\n{lets}{line}\n}\n"
+    let Some(c) = compileText(host, Source("repl", text), RunOptions(), Purpose(needMain: true), quiet) else {
+        return -1
+    }
+    runProgram(host, m, c, RunOptions())
+}
+
+fn isDecl(t: Text) -> Bool =
+    t.startsWith("fn ")
+        or t.startsWith("type ")
+        or t.startsWith("enum ")
+        or t.startsWith("const ")
+        or t.startsWith("use ")
+        or t.startsWith("pub ")
+
+fn repl(host: Host) -> Int {
+    let Some(m) = loadRuntime(host) else {
+        return 1
+    }
+    m.begin("repl", [])
+    var s = Session()
+    var pending = ""
+    var depth = 0
+    m.out("Quark: declarations, lets and expressions; :quit to leave\n")
+    while true {
+        m.out(if depth > 0 { "... " } else { "> " })
+        m.flush()
+        let Some(read) = readLine() else {
+            break
+        }
+        var line = read
+        while len(line) > 0 and line.bytes()[len(line) - 1] is '\n' | '\r' {
+            line = line[..len(line) - 1]
+        }
+        if depth == 0 and line is ":quit" | ":q" {
+            break
+        }
+        for ch in line.bytes() {
+            if ch == '{' {
+                depth += 1
+            } else if ch == '}' {
+                depth -= 1
+            }
+        }
+        pending += line + "\n"
+        if depth > 0 {
+            continue // a block not closed yet
+        }
+        depth = 0
+        var t = pending
+        pending = ""
+        while t.startsWith(" ") {
+            t = t[1..]
+        }
+        while t.endsWith("\n") {
+            t = t[..len(t) - 1]
+        }
+        if t == "" {
+            continue
+        }
+        if isDecl(t) {
+            // kept when the whole compiles
+            let more = "{s.decls}{t}\n"
+            if replRun(host, m, more, "", "", false) != -1 {
+                s.decls = more
+            }
+        } else if t.startsWith("let ") or t.startsWith("var ") {
+            // kept, and run again before what follows
+            if replRun(host, m, s.decls, s.lets, t, false) == 0 {
+                s.lets += t + "\n"
+            }
+        } else if replRun(host, m, s.decls, s.lets, "print({t})", true) == -1 {
+            // an expression: its value printed; else a statement, run once
+            let _ = replRun(host, m, s.decls, s.lets, t, false)
+        }
+    }
+    m.flush()
+    0
+}
+
+// ---- fmt, check, consts ----
+// a program: its file parsed, then the files its uses name (each parsed in turn), as quark fmt and check read it
+type Formatted { ast: Ast, errors: [Text], ok: Bool }
+
+fn load(src: Source) -> Formatted {
+    let first = parse(src)
+    var errors = first.errors
+    if not first.ok {
+        return Formatted(first.ast, errors, false)
+    }
+    var ok = true
+    var paths = [src.path] // the files read, the program's first
+    var pending = [(src, first.ast)]
+    var at = 0
+    while at < len(pending) {
+        let (from, tree) = pending[at]
+        let here = at
+        at += 1
+        var usedHere: [Int] = []
+        for d in tree.decls {
+            if d.kind != DeclKind.Use or d.name.startsWith("std.") {
+                continue // the standard library is kept in the compiler
+            }
+            let file = modulePath(from.path, d.name)
+            var found = paths.indexOf(file) ?? -1
+            var said = Errors()
+            if found == here {
+                said.add(from, d.line, d.col, "a file cannot use itself")
+            } else if found < 0 {
+                let Ok(text) = readFile(file) else {
+                    said.add(from, d.line, d.col, "use {d.name}: cannot read {file}")
+                    errors += said.shown
+                    ok = false
+                    continue
+                }
+                let sub = Source(file, text)
+                let parsed = parse(sub)
+                errors += parsed.errors
+                if not parsed.ok {
+                    ok = false
+                    continue
+                }
+                paths.push(file)
+                pending.push((sub, parsed.ast))
+                found = len(paths) - 1
+            }
+            if found != here and usedHere.contains(found) {
+                said.add(from, d.line, d.col, "{d.name} is used twice")
+            }
+            usedHere.push(found)
+            if said.count > 0 {
+                errors += said.shown
+                ok = false
+            }
+        }
+    }
+    Formatted(first.ast, errors, ok)
+}
+
+// quark check: the program read (its files, the host's declarations), checked; its errors, or "ok"
+// consts: the constants' values instead of "ok" (quark consts, the oracle of the constant evaluator)
+fn checkFile(src: Source, preludePath: Text, allowed: Text?, consts: Bool, machine: Host) -> Int {
+    var host: Source? = None
+    if preludePath != "" {
+        let Ok(text) = readFile(preludePath) else {
+            printErr("quark: cannot read {preludePath}")
+            return 1
+        }
+        host = Source(preludePath, text)
+    }
+    let loaded = loadProgram(src, host)
+    if not loaded.ok {
+        for e in loaded.errors.shown {
+            printErr(e)
+        }
+        return 1
+    }
+    let checked = checkProgram(loaded.program, loaded.errors, false, allowed)
+    for e in checked.errors.shown {
+        printErr(e)
+    }
+    if not checked.ok {
+        return 1
+    }
+    var program = checked.program
+    let problems = program.runConsts(machine) // the constants, worked out: what could not be is an error too
+    if len(problems) > 0 {
+        var errors = Errors()
+        for problem in problems {
+            errors.add(program.modules[problem.module].src, problem.line, problem.col, problem.message)
+        }
+        for e in errors.shown {
+            printErr(e)
+        }
+        return 1
+    }
+    if consts {
+        let out = program.constsText()
+        if len(out) > 0 {
+            print(out[..len(out) - 1])
+        }
+        return 0
+    }
+    printErr("ok")
+    0
+}

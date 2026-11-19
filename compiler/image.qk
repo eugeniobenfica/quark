@@ -1,0 +1,1787 @@
+// The image layer: machine code made into what runs it. Objects (COFF for Windows x64, ELF for Linux, Mach-O for
+// macOS and iOS), native executables (PE32+ and ELF64, PIE) whose start is the runtime
+// written in Quark (compiler/runtime, compiled with `--linked`) and which import the C functions it calls, and the
+// same runtime laid out for memory (quarkimg run). The program itself rides behind the image as the payload and
+// trailer the runtime's start reads (compiler/runtime/start.qk), so an executable costs what its program does.
+use ir
+use sha256
+
+// ---- bytes, little-endian ----
+pub type Buf { b: Bytes = [] }
+
+pub fn Buf.u8(var self, v: Int) {
+    self.b.push(v & 255)
+}
+
+pub fn Buf.u16(var self, v: Int) {
+    self.b.push(v & 255)
+    self.b.push(v >> 8 & 255)
+}
+
+pub fn Buf.u32(var self, v: Int) {
+    for i in 0..4 {
+        self.b.push(v >> (8 * i) & 255)
+    }
+}
+
+pub fn Buf.u64(var self, v: Int) {
+    for i in 0..8 {
+        self.b.push(v >> (8 * i) & 255)
+    }
+}
+
+pub fn Buf.add(var self, x: Bytes) {
+    self.b += x
+}
+
+// a zero-ended text
+pub fn Buf.cText(var self, t: Text) {
+    self.b += t.bytes()
+    self.b.push(0)
+}
+
+// a name in a field of `width` bytes, zero-padded
+pub fn Buf.name(var self, t: Text, width: Int) {
+    let n = t.bytes()
+    for i in 0..width {
+        self.b.push(n.get(i) ?? 0)
+    }
+}
+
+pub fn Buf.zeros(var self, n: Int) {
+    for _ in 0..n {
+        self.b.push(0)
+    }
+}
+
+// zeros until the length is a multiple of n
+pub fn Buf.align(var self, n: Int) {
+    while len(self.b) % n != 0 {
+        self.b.push(0)
+    }
+}
+
+// zeros until the length is `at`
+pub fn Buf.padTo(var self, at: Int) {
+    while len(self.b) < at {
+        self.b.push(0)
+    }
+}
+
+pub fn Buf.len(self) -> Int = len(self.b)
+
+pub fn alignUp(n: Int, a: Int) -> Int = (n + a - 1) / a * a
+
+// A value written over bytes already there: its `width` low bytes at `at`.
+pub type Put { at: Int, value: Int, width: Int }
+
+// the bytes with every put in, each piece copied once
+pub fn written(b: Bytes, puts: [Put]) -> Bytes {
+    var out: Bytes = []
+    var from = 0
+    for p in puts.sortedBy(p => p.at) {
+        out += b[from..p.at]
+        for i in 0..p.width {
+            out.push(p.value >> (8 * i) & 255)
+        }
+        from = p.at + p.width
+    }
+    out += b[from..]
+    out
+}
+
+// ---- what the IR dump carries for images (`quark ir --json --image`: its last line) ----
+pub enum Os { Windows, Linux, Macos }
+
+pub type ImageInfo {
+    os: Os = .Windows
+    linked: Bool = false
+    features: Int = 0
+    data: Bytes = []
+    runtimeNames: [Text] = []
+}
+
+// the runtime functions' names, by number: a linked object's table names them qk_<name>
+// ---- objects: the data block ----
+// An 8-byte address in the data: to the code or the data + addend, or (linked) to a symbol the linker gives.
+pub type DataReloc { at: Int, toText: Bool, addend: Int, external: Int = -1 }
+
+pub type Layout {
+    data: Bytes = []
+    relocs: [DataReloc] = []
+    exports: [Text] = [] // pub extern fn: C calls them by name (each one's C entry, in the code)
+    exportAt: [Int] = []
+    externals: [Text] = [] // linked: the symbols the table's entries are
+    table: Int = 0
+    dataExports: [Text] = [] // C's variables in the data (libquark's qkAbi): each one's name and place
+    dataExportAt: [Int] = []
+}
+
+type LayoutOut {
+    d: Buf = Buf()
+    puts: [Put] = []
+    relocs: [DataReloc] = []
+    externals: [Text] = []
+}
+
+fn LayoutOut.word(var self, v: Int) {
+    self.d.u64(v)
+}
+
+fn LayoutOut.set(var self, at: Int, v: Int) {
+    self.puts.push(Put(at, v, 8))
+}
+
+fn LayoutOut.pointer(var self, at: Int, toText: Bool, addend: Int) {
+    self.relocs.push(DataReloc(at, toText, addend))
+    self.puts.push(Put(at, addend, 8)) // COFF keeps the addend in place; ELF's rela ignores it
+}
+
+fn LayoutOut.text(var self, s: Bytes) -> Int {
+    let at = self.d.len()
+    self.d.add(s)
+    self.d.u8(0)
+    at
+}
+
+fn LayoutOut.external(var self, name: Text) -> Int {
+    if self.externals.indexOf(name) is Some(i) {
+        return i
+    }
+    self.externals.push(name)
+    len(self.externals) - 1
+}
+
+// Linked (quark object --linked): the table is the linker's to fill. A C function is its symbol, a runtime function
+// the symbol qk_<name>, the data its place, and the budget, the escape, the panic's frame and the stack's limit cells
+// of the object's own.
+fn LayoutOut.linkTable(var self, mc: MachineCode, p: IrProgram, names: [Text], table: Int, data: Int) {
+    let cells = self.d.len()
+    self.word(maxInt) // the budget, the escape, the panic's frame, the stack's limit
+    self.word(0)
+    self.word(0)
+    self.word(0)
+    for (i, r) in mc.relocs.enumerate() {
+        let at = table + 8 * i
+        if r.kind == relocData {
+            self.pointer(at, false, data + r.target)
+        } else if r.kind == relocFuel {
+            self.pointer(at, false, cells)
+        } else if r.kind == relocEscape {
+            self.pointer(at, false, cells + 8)
+        } else if r.kind == relocPanicFrame {
+            self.pointer(at, false, cells + 16)
+        } else if r.kind == relocStackLimit {
+            self.pointer(at, false, cells + 24)
+        } else {
+            let name = if r.kind == relocHost {
+                p.externs[r.target].name
+            } else {
+                "qk_{names[r.target]}"
+            }
+            self.pointer(at, false, 0)
+            let k = self.external(name)
+            let n = len(self.relocs) - 1
+            self.relocs[n].external = k
+        }
+    }
+}
+
+// The .data section: the QkStaticProgram first (the symbol's place), then all it points to.
+pub fn layout(mc: MachineCode, p: IrProgram, info: ImageInfo) -> Layout {
+    var o = LayoutOut()
+    for _ in 0..15 {
+        o.word(0)
+    }
+    o.set(0, 0x316B72617551) // "Quark1"
+    o.set(8 * 2, len(mc.code))
+    o.set(8 * 3, mc.enter)
+    o.set(8 * 4, mc.escape)
+    o.set(8 * 6, len(mc.relocs))
+    o.set(8 * 9, len(info.data))
+    o.set(8 * 10, len(p.fns))
+    o.set(8 * 12, len(p.externs))
+    o.pointer(8 * 1, true, 0)
+    let table = o.d.len() // zeros: qkModuleStatic fills them
+    for _ in mc.relocs {
+        o.word(0)
+    }
+    o.pointer(8 * 5, false, table)
+    let relocs = o.d.len() // each table entry's kind and target
+    for r in mc.relocs {
+        o.word(r.kind)
+        o.word(r.target)
+    }
+    o.pointer(8 * 7, false, relocs)
+    let data = o.d.len()
+    o.d.add(info.data)
+    o.d.align(8)
+    o.pointer(8 * 8, false, data)
+    let fns = o.d.len() // name, offset, parameter slots, result slots, slot kinds
+    for _ in 0..5 * len(p.fns) {
+        o.word(0)
+    }
+    o.pointer(8 * 11, false, fns)
+    let externs = o.d.len()
+    for _ in p.externs {
+        o.word(0)
+    }
+    o.pointer(8 * 13, false, externs)
+    let libs = o.d.len()
+    for _ in p.externs {
+        o.word(0)
+    }
+    o.pointer(8 * 14, false, libs)
+    for (i, f) in p.fns.enumerate() {
+        let at = fns + 40 * i
+        let name = o.text(f.name.bytes())
+        var kinds: Bytes = []
+        for v in f.params {
+            kinds.push(f.kinds[v])
+        }
+        let kindsAt = o.text(kinds)
+        o.set(at + 8, mc.fnAt[i])
+        o.set(at + 16, len(f.params))
+        o.set(at + 24, f.resultCount)
+        o.pointer(at, false, name)
+        o.pointer(at + 32, false, kindsAt)
+    }
+    for (i, x) in p.externs.enumerate() {
+        let n = o.text(x.name.bytes())
+        o.pointer(externs + 8 * i, false, n)
+        let l = o.text((x.lib ?? "").bytes())
+        o.pointer(libs + 8 * i, false, l)
+    }
+    o.d.align(8)
+    if info.linked {
+        o.linkTable(mc, p, info.runtimeNames, table, data)
+    }
+    var exports: [Text] = []
+    var exportAt: [Int] = []
+    for (i, f) in p.fns.enumerate() {
+        if f.exportName is Some(e) {
+            exports.push(e)
+            exportAt.push(mc.fnAt[i])
+        }
+    }
+    Layout(written(o.d.b, o.puts), o.relocs, exports, exportAt, o.externals, table)
+}
+
+// ---- COFF (Windows x64) ----
+fn coff(mc: MachineCode, o: Layout, symbol: Text) -> Bytes {
+    var puts: [Put] = []
+    for (i, r) in mc.relocs.enumerate() {
+        puts.push(Put(r.at, o.table + 8 * i, 4)) // mov reg, [rip + disp32]: the addend is the entry's place
+    }
+    let code = written(mc.code, puts)
+    // past 65534 relocations a section says 0xFFFF, and its first relocation holds the count (libquark has them)
+    let textOver = len(mc.relocs) >= 0xFFFF
+    let dataOver = len(o.relocs) >= 0xFFFF
+    let textRelocs = len(mc.relocs) + (if textOver { 1 } else { 0 })
+    let dataRelocs = len(o.relocs) + (if dataOver { 1 } else { 0 })
+    let textAt = 20 + 2 * 40
+    let dataAt = textAt + len(code)
+    let textRelAt = dataAt + len(o.data)
+    let dataRelAt = textRelAt + 10 * textRelocs
+    let symAt = dataRelAt + 10 * dataRelocs
+    let exportCount = len(o.exports) + len(o.dataExports)
+    let names = o.exports + o.dataExports
+    let places = o.exportAt + o.dataExportAt
+    var out = Buf()
+    out.u16(0x8664)
+    out.u16(2)
+    out.u32(0)
+    out.u32(symAt)
+    out.u32(3 + exportCount + len(o.externals))
+    out.u16(0)
+    out.u16(0)
+    let sections = [".text", ".data"]
+    let sizes = [len(code), len(o.data)]
+    let raws = [textAt, dataAt]
+    let rels = [textRelAt, dataRelAt]
+    let counts = [if textOver { 0xFFFF } else { textRelocs }, if dataOver { 0xFFFF } else { dataRelocs }]
+    let over = [if textOver { 0x01000000 } else { 0 }, if dataOver { 0x01000000 } else { 0 }]
+    let flags = [0x60500020, 0xC0500040] // code, execute, read, 16-aligned; data, read, write, 16-aligned
+    for s in 0..2 {
+        out.name(sections[s], 8)
+        out.u32(0)
+        out.u32(0)
+        out.u32(sizes[s])
+        out.u32(raws[s])
+        out.u32(rels[s])
+        out.u32(0)
+        out.u16(counts[s])
+        out.u16(0)
+        out.u32(flags[s] | over[s])
+    }
+    out.add(code)
+    out.add(o.data)
+    if textOver {
+        out.u32(textRelocs)
+        out.u32(0)
+        out.u16(0)
+    }
+    for r in mc.relocs {
+        // REL32 to .data (symbol 1)
+        out.u32(r.at)
+        out.u32(1)
+        out.u16(4)
+    }
+    if dataOver {
+        out.u32(dataRelocs)
+        out.u32(0)
+        out.u16(0)
+    }
+    for r in o.relocs {
+        // ADDR64 to .text (0) or .data (1), or a symbol the linker finds
+        out.u32(r.at)
+        out.u32(if r.external >= 0 {
+            3 + exportCount + r.external
+        } else if r.toText {
+            0
+        } else {
+            1
+        })
+        out.u16(1)
+    }
+    for s in 0..2 {
+        // section symbols
+        out.name(sections[s], 8)
+        out.u32(0)
+        out.u16(s + 1)
+        out.u16(0)
+        out.u8(3) // static
+        out.u8(0)
+    }
+    var strings = Buf() // names longer than 8, after their length
+    for k in -1..exportCount + len(o.externals) {
+        let outside = k >= exportCount
+        let name = if k < 0 {
+            symbol
+        } else if outside {
+            o.externals[k - exportCount]
+        } else {
+            names[k]
+        }
+        let isData = k >= len(o.exports) and not outside
+        if len(name) <= 8 {
+            out.name(name, 8)
+        } else {
+            out.u32(0)
+            out.u32(4 + strings.len())
+            strings.cText(name)
+        }
+        out.u32(if k < 0 or outside { 0 } else { places[k] })
+        out.u16(if k < 0 or isData {
+            2
+        } else if outside {
+            0
+        } else {
+            1
+        })
+        out.u16(if k < 0 or outside or isData {
+            0 // a function
+        } else {
+            0x20
+        })
+        out.u8(2) // external
+        out.u8(0)
+    }
+    out.u32(4 + strings.len())
+    out.add(strings.b)
+    out.b
+}
+
+// ---- ELF (Linux x86-64, ARM64) ----
+fn elf(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
+    var rtext = Buf()
+    var rdata = Buf()
+    var sym = Buf()
+    var str = Buf()
+    var shstr = Buf()
+    str.u8(0)
+    for (i, r) in mc.relocs.enumerate() {
+        // the loads of the table's entries
+        let addend = o.table + 8 * i
+        if arm {
+            // adrp, then ldr: the page, then the place in it
+            rtext.u64(r.at)
+            rtext.u64(2 << 32 | 275)
+            rtext.u64(addend)
+            rtext.u64(r.at + 4)
+            rtext.u64(2 << 32 | 286)
+            rtext.u64(addend)
+        } else {
+            // rip + disp32: from the end of the field
+            rtext.u64(r.at)
+            rtext.u64(2 << 32 | 2)
+            rtext.u64(addend - 4)
+        }
+    }
+    let exportCount = len(o.exports) + len(o.dataExports)
+    for r in o.relocs {
+        // to .text (1), .data (2), or a symbol the linker finds (after the exports)
+        let s = if r.external >= 0 {
+            4 + exportCount + r.external
+        } else if r.toText {
+            1
+        } else {
+            2
+        }
+        rdata.u64(r.at)
+        rdata.u64(s << 32 | (if arm { 257 } else { 1 }))
+        rdata.u64(r.addend)
+    }
+    // symbols: none, .text, .data (local sections), then the program
+    sym.zeros(24)
+    for s in 1..3 {
+        sym.u32(0)
+        sym.u8(3) // local, section
+        sym.u8(0)
+        sym.u16(s)
+        sym.u64(0)
+        sym.u64(0)
+    }
+    sym.u32(str.len())
+    str.cText(symbol)
+    sym.u8(0x11) // global, object
+    sym.u8(0)
+    sym.u16(2)
+    sym.u64(0)
+    sym.u64(8 * 15)
+    for (k, e) in o.exports.enumerate() {
+        // the functions C calls: global, in .text
+        sym.u32(str.len())
+        str.cText(e)
+        sym.u8(0x12)
+        sym.u8(0)
+        sym.u16(1)
+        sym.u64(o.exportAt[k])
+        sym.u64(0)
+    }
+    for (k, e) in o.dataExports.enumerate() {
+        // C's variables: global, objects in .data
+        sym.u32(str.len())
+        str.cText(e)
+        sym.u8(0x11)
+        sym.u8(0)
+        sym.u16(2)
+        sym.u64(o.dataExportAt[k])
+        sym.u64(8)
+    }
+    for e in o.externals {
+        // linked: global, undefined
+        sym.u32(str.len())
+        str.cText(e)
+        sym.u8(0x10)
+        sym.u8(0)
+        sym.u16(0)
+        sym.u64(0)
+        sym.u64(0)
+    }
+    let secNames = [
+        "", ".text", ".data", ".rela.text", ".rela.data", ".symtab", ".strtab", ".shstrtab", ".note.GNU-stack",
+    ]
+    var nameAt: [Int] = []
+    for n in secNames {
+        nameAt.push(shstr.len())
+        shstr.cText(n)
+    }
+    let empty: Bytes = []
+    let contents = [empty, mc.code, o.data, rtext.b, rdata.b, sym.b, str.b, shstr.b, empty]
+    var offsets = [0] * 9
+    var body = Buf()
+    for i in 1..9 {
+        body.align(16) // (the body starts at 64: the same alignment)
+        offsets[i] = 64 + body.len()
+        body.add(contents[i])
+    }
+    body.align(8)
+    let shoff = 64 + body.len()
+    var out = Buf()
+    out.add([0x7F, 'E', 'L', 'F', 2, 1, 1, 0])
+    out.zeros(8)
+    out.u16(1)
+    out.u16(if arm { 183 } else { 62 })
+    out.u32(1)
+    out.u64(0)
+    out.u64(0)
+    out.u64(shoff)
+    out.u32(0)
+    out.u16(64)
+    out.u16(0)
+    out.u16(0)
+    out.u16(64)
+    out.u16(9)
+    out.u16(7)
+    out.add(body.b)
+    // section headers: name, type, flags, address, offset, size, link, info, alignment, entry size
+    let types = [0, 1, 1, 4, 4, 2, 3, 3, 1]
+    let secFlags = [0, 6, 3, 0x40, 0x40, 0, 0, 0, 0]
+    for i in 0..9 {
+        out.u32(nameAt[i])
+        out.u32(types[i])
+        out.u64(secFlags[i])
+        out.u64(0)
+        out.u64(offsets[i])
+        out.u64(len(contents[i]))
+        out.u32(if i == 3 or i == 4 {
+            5
+        } else if i == 5 {
+            6
+        } else {
+            0
+        })
+        out.u32(if i == 3 {
+            1
+        } else if i == 4 {
+            2
+        } else if i == 5 {
+            3
+        } else {
+            0
+        })
+        out.u64(if i == 1 or i == 2 {
+            16
+        } else if i > 0 {
+            8
+        } else {
+            0
+        })
+        out.u64(if i >= 3 and i <= 5 { 24 } else { 0 })
+    }
+    out.b
+}
+
+// ---- Mach-O (macOS, iOS: ARM64 and x86-64) ----
+// __TEXT,__text then __DATA,__data. The code's loads of the table are relocated against a local symbol at the data's
+// start: ARM64 an ADDEND before each PAGE21 (adrp) and PAGEOFF12 (ldr), x86-64 a SIGNED (rip + disp32) with the
+// offset in place. The data's pointers are UNSIGNED, by section, with the address in place.
+fn machoReloc(symbol: Int, pcrel: Bool, length: Int, external: Bool, kind: Int) -> Int =
+    symbol | (if pcrel { 1 } else { 0 }) << 24 | length << 25 | (if external { 1 } else { 0 }) << 27 | kind << 28
+
+fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
+    let dataAddr = alignUp(len(mc.code), 16)
+    var codePuts: [Put] = []
+    var rtext = Buf()
+    var rdata = Buf()
+    var str = Buf()
+    for (i, r) in mc.relocs.enumerate() {
+        let off = o.table + 8 * i
+        if arm {
+            // adrp at, ldr at + 4: each with its addend first
+            rtext.u32(r.at)
+            rtext.u32(machoReloc(off, false, 2, false, 10))
+            rtext.u32(r.at)
+            rtext.u32(machoReloc(0, true, 2, true, 3))
+            rtext.u32(r.at + 4)
+            rtext.u32(machoReloc(off, false, 2, false, 10))
+            rtext.u32(r.at + 4)
+            rtext.u32(machoReloc(0, false, 2, true, 4))
+        } else {
+            codePuts.push(Put(r.at, off, 4))
+            rtext.u32(r.at)
+            rtext.u32(machoReloc(0, true, 2, true, 1))
+        }
+    }
+    let code = written(mc.code, codePuts)
+    var dataPuts: [Put] = []
+    for r in o.relocs {
+        // the address in place: the section's own plus the offset
+        dataPuts.push(Put(r.at, if r.toText { r.addend } else { dataAddr + r.addend }, 8))
+        rdata.u32(r.at)
+        rdata.u32(machoReloc(if r.toText { 1 } else { 2 }, false, 3, false, 0))
+    }
+    let data = written(o.data, dataPuts)
+    str.u8(0)
+    let localName = str.len()
+    str.cText("ltmp1")
+    let globalName = str.len()
+    str.cText("_" + symbol)
+    var exportName: [Int] = []
+    for e in o.exports {
+        exportName.push(str.len())
+        str.cText("_" + e)
+    }
+    str.align(8)
+    let symbols = 2 + len(o.exports)
+    let sizeofcmds = 72 + 2 * 80 + 24 + 24 + 80
+    let textOff = alignUp(32 + sizeofcmds, 16)
+    let dataOff = textOff + dataAddr
+    let relText = alignUp(dataOff + len(data), 8)
+    let relData = relText + rtext.len()
+    let symOff = relData + rdata.len()
+    let strOff = symOff + symbols * 16
+    var out = Buf()
+    // the header
+    out.u32(0xFEEDFACF)
+    out.u32(if arm { 0x0100000C } else { 0x01000007 })
+    out.u32(if arm { 0 } else { 3 })
+    out.u32(1) // an object
+    out.u32(4)
+    out.u32(sizeofcmds)
+    out.u32(0x2000) // subsections via symbols
+    out.u32(0)
+    // LC_SEGMENT_64, its two sections
+    out.u32(0x19)
+    out.u32(72 + 2 * 80)
+    out.zeros(16)
+    out.u64(0)
+    out.u64(dataAddr + len(data))
+    out.u64(textOff)
+    out.u64(dataAddr + len(data))
+    out.u32(7)
+    out.u32(7)
+    out.u32(2)
+    out.u32(0)
+    let sects = ["__text", "__data"]
+    let segs = ["__TEXT", "__DATA"]
+    let addr = [0, dataAddr]
+    let size = [len(code), len(data)]
+    let off = [textOff, dataOff]
+    let rel = [relText, relData]
+    let nrel = [rtext.len() / 8, rdata.len() / 8]
+    let flags = [0x80000400, 0]
+    for s in 0..2 {
+        out.name(sects[s], 16)
+        out.name(segs[s], 16)
+        out.u64(addr[s])
+        out.u64(size[s])
+        out.u32(off[s])
+        out.u32(4) // 16-aligned
+        out.u32(rel[s])
+        out.u32(nrel[s])
+        out.u32(flags[s])
+        out.u32(0)
+        out.u32(0)
+        out.u32(0)
+    }
+    // LC_BUILD_VERSION: macOS 11
+    out.u32(0x32)
+    out.u32(24)
+    out.u32(1)
+    out.u32(11 << 16)
+    out.u32(11 << 16)
+    out.u32(0)
+    // LC_SYMTAB
+    out.u32(0x2)
+    out.u32(24)
+    out.u32(symOff)
+    out.u32(symbols)
+    out.u32(strOff)
+    out.u32(str.len())
+    // LC_DYSYMTAB: one local, the defined externals
+    out.u32(0xB)
+    out.u32(80)
+    out.u32(0)
+    out.u32(1)
+    out.u32(1)
+    out.u32(symbols - 1)
+    out.u32(symbols)
+    out.u32(0)
+    out.zeros(48)
+    out.padTo(textOff)
+    out.add(code)
+    out.padTo(dataOff)
+    out.add(data)
+    out.padTo(relText)
+    out.add(rtext.b)
+    out.add(rdata.b)
+    // the symbols: the data's start (local), the program (external), the functions C calls (in __text)
+    out.u32(localName)
+    out.u8(0x0E)
+    out.u8(2)
+    out.u16(0)
+    out.u64(dataAddr)
+    out.u32(globalName)
+    out.u8(0x0F)
+    out.u8(2)
+    out.u16(0)
+    out.u64(dataAddr)
+    for (k, e) in exportName.enumerate() {
+        out.u32(e)
+        out.u8(0x0F)
+        out.u8(1)
+        out.u16(0)
+        out.u64(o.exportAt[k])
+    }
+    out.add(str.b)
+    out.b
+}
+
+// quark object's file for the program: None for a target with no object format yet (Windows on ARM; Mach-O linked)
+pub fn objectFile(mc: MachineCode, p: IrProgram, info: ImageInfo, symbol: Text) -> Bytes? =
+    objectOf(mc, layout(mc, p, info), info, symbol, p.target.arch == .Arm64)
+
+// the object of a layout (libquark's writer changes its exports first)
+pub fn objectOf(mc: MachineCode, o: Layout, info: ImageInfo, symbol: Text, arm: Bool) -> Bytes? = match info.os {
+    Macos => if info.linked { None } else { macho(mc, o, symbol, arm) }
+    Windows => if arm { None } else { coff(mc, o, symbol) }
+    Linux => elf(mc, o, symbol, arm)
+}
+
+// ---- archives (ar, the GNU and System V format linkers read): members, and the index of the symbols each defines ----
+pub type Member { name: Text, bytes: Bytes, symbols: [Text] }
+
+fn arField(t: Text, width: Int) -> Bytes {
+    var b = t.bytes()
+    while len(b) < width {
+        b.push(' ')
+    }
+    b
+}
+
+fn arHeader(name: Text, size: Int) -> Bytes =
+    arField(name, 16)
+        + arField("0", 12)
+        + arField("0", 6)
+        + arField("0", 6)
+        + arField("644", 8)
+        + arField("{size}", 10)
+        + ['`', 10]
+
+fn bigEndian32(v: Int) -> Bytes = [v >> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255]
+
+pub fn archive(members: [Member]) -> Bytes {
+    // the index: the count, each symbol's member's place, the names
+    var count = 0
+    var names: Bytes = []
+    for m in members {
+        for s in m.symbols {
+            count += 1
+            names += s.bytes()
+            names.push(0)
+        }
+    }
+    let indexSize = 4 + 4 * count + len(names)
+    var at = 8 + 60 + indexSize + indexSize % 2
+    var index = bigEndian32(count)
+    for m in members {
+        for _ in m.symbols {
+            index += bigEndian32(at)
+        }
+        at += 60 + len(m.bytes) + len(m.bytes) % 2
+    }
+    index += names
+    var out = "!<arch>".bytes() + [10] + arHeader("/", indexSize) + index
+    if indexSize % 2 == 1 {
+        out.push(10)
+    }
+    for m in members {
+        out += arHeader(m.name + "/", len(m.bytes)) + m.bytes
+        if len(m.bytes) % 2 == 1 {
+            out.push(10)
+        }
+    }
+    out
+}
+
+// ---- the program a built executable carries: its payload and trailer ----
+// the code, the data, the relocations (at: Int32, kind: Int32, target: Int64), each C function's name and library
+// ("" for the C library), then the trailer: "QUARKPRG", the lengths and places, the budget, the memory limit, the
+// processor features, the payload's size
+pub fn payload(mc: MachineCode, p: IrProgram, info: ImageInfo, fuel: Int, memory: Int) -> Bytes? {
+    if p.mainIndex < 0 {
+        return None
+    }
+    var b = Buf()
+    b.add(mc.code)
+    b.add(info.data)
+    for r in mc.relocs {
+        b.u32(r.at)
+        b.u32(r.kind)
+        b.u64(r.target)
+    }
+    let externsAt = b.len()
+    for x in p.externs {
+        b.cText(x.name)
+        b.cText(x.lib ?? "")
+    }
+    let size = b.len()
+    b.add("QUARKPRG".bytes())
+    b.u64(len(mc.code))
+    b.u64(len(info.data))
+    b.u64(len(mc.relocs))
+    b.u64(mc.fnAt[p.mainIndex])
+    b.u64(mc.enter)
+    b.u64(mc.escape)
+    b.u64(fuel)
+    b.u64(memory)
+    b.u64(info.features)
+    b.u64(len(p.externs))
+    b.u64(size - externsAt)
+    b.u64(size)
+    b.b
+}
+
+pub const trailerBytes = 104
+
+// ---- the runtime linked: its code and data laid out at given places, every address it needs written in ----
+// What a C function's address is read from: a cell of the image's own (an import: the PE's IAT, the ELF's GOT, or
+// the cell the memory loader fills), one per symbol.
+// A piece of code of the linker's own (the ELF's _start, a C library function the system's library lacks), and the
+// addresses it needs: at `at`, a symbol's place (a text symbol: the code's; else the import cell's), as `how` says.
+pub type StubRef { at: Int, symbol: Text, how: Int }
+
+pub const refRel32 = 0 // x86-64 rip + disp32, from the end of the field
+pub const refAdrpLdr = 1 // ARM64 adrp at, ldr at + 4 (a cell)
+pub const refAdrpAdd = 2 // ARM64 adrp at, add at + 4 (an address)
+
+pub type Stub { name: Text, code: Bytes, refs: [StubRef] = [] }
+
+pub type Linked {
+    text: Bytes = [] // the runtime's code, then the stubs
+    data: Bytes = [] // the runtime's data, then the import cells
+    pointers: [Int] = [] // the data's 8-byte addresses (offsets in data): each the base + an offset in the image
+    imports: [Text] = [] // the C functions, each read from its cell (importAt + cellAt[i] in data)
+    importAt: Int = 0
+    cellAt: [Int] = []
+    symbols: [Text: Int] = [:] // text symbols: the runtime's exports and the stubs (offsets in text)
+}
+
+// the runtime's exports and the stubs, where they are in the linked code (the stubs after the code, 16-aligned),
+// and the code's size with them
+fn textSymbols(mc: MachineCode, o: Layout, stubs: [Stub]) -> ([Text: Int], Int) {
+    var symbols: [Text: Int] = [:]
+    for (k, e) in o.exports.enumerate() {
+        symbols[e] = o.exportAt[k]
+    }
+    var at = alignUp(len(mc.code), 16)
+    for s in stubs {
+        symbols[s.name] = at
+        at = alignUp(at + len(s.code), 16)
+    }
+    (symbols, at)
+}
+
+// the code's size, the stubs in: what the data's place depends on
+pub fn linkedTextSize(mc: MachineCode, o: Layout, stubs: [Stub]) -> Int =
+    textSymbols(mc, o, stubs).1
+
+// the C function a symbol names on this system (the C library's own name for it)
+pub fn importName(os: Os, name: Text) -> Text =
+    if os == .Windows and name == "time" { "_time64" } else { name }
+
+// a C symbol as Mach-O names it: with an underscore first
+fn machoName(name: Text) -> Text = "_" + name
+
+// the C functions the runtime and the stubs call: every symbol neither the runtime's nor a stub
+pub fn linkImports(mc: MachineCode, o: Layout, stubs: [Stub], os: Os) -> [Text] {
+    let symbols = textSymbols(mc, o, stubs).0
+    var imports: [Text] = []
+    for e in o.externals {
+        if not symbols.contains(e) and not imports.contains(importName(os, e)) {
+            imports.push(importName(os, e))
+        }
+    }
+    for s in stubs {
+        for r in s.refs {
+            if not symbols.contains(r.symbol) and not imports.contains(r.symbol) {
+                imports.push(r.symbol)
+            }
+        }
+    }
+    imports
+}
+
+// the data's size once linked, before the format's own: the runtime's data, then importBytes of cells
+pub fn linkedDataSize(o: Layout, importBytes: Int) -> Int = alignUp(len(o.data), 16) + importBytes
+
+fn u32At(b: Bytes, at: Int) -> Int = b[at] | b[at + 1] << 8 | b[at + 2] << 16 | b[at + 3] << 24
+
+pub fn u64At(b: Bytes, at: Int) -> Int {
+    var v = 0
+    for i in 0..8 {
+        v = v | b[at + i] << (8 * i)
+    }
+    v
+}
+
+// ARM64: adrp at `at` (its place `from`) to the page of `to`, then the low 12 bits in the next instruction (an ldr of
+// 8 bytes: scaled; an add: as they are)
+fn adrpPair(code: Bytes, at: Int, from: Int, to: Int, ldr: Bool) -> [Put] {
+    let delta = to >> 12 - from >> 12
+    let adrp = u32At(code, at) | delta & 3 << 29 | delta >> 2 & 0x7FFFF << 5
+    let low = if ldr { to & 0xFFF >> 3 } else { to & 0xFFF }
+    [Put(at, adrp, 4), Put(at + 4, u32At(code, at + 4) | low << 10, 4)]
+}
+
+// Links the runtime (its machine code made with --linked for objects, and its layout) with the stubs: the code at
+// textAt, the data at dataAt, both offsets from the image's base, which every address in the data adds (base 0 for
+// an image the system relocates, else where it is in memory). The C functions are read from cells (cellAt[i] after
+// the runtime's data, importBytes in all, zeros: the system's or the loader's to fill); the code's loads of the table
+// entries a linker would fill with them read the cells instead.
+pub fn link(
+    mc: MachineCode,
+    o: Layout,
+    stubs: [Stub],
+    os: Os,
+    arm: Bool,
+    imports: [Text],
+    cellAt: [Int],
+    importBytes: Int,
+    textAt: Int,
+    dataAt: Int,
+    base: Int,
+) -> Linked {
+    let symbols = textSymbols(mc, o, stubs).0
+    var text = Buf()
+    text.add(mc.code)
+    for s in stubs {
+        text.align(16)
+        text.add(s.code)
+    }
+    text.align(16)
+    var data = Buf()
+    data.add(o.data)
+    data.align(16)
+    let importAt = data.len()
+    data.zeros(importBytes)
+    // the data's addresses, and the table entries that are C functions
+    var dataPuts: [Put] = []
+    var pointers: [Int] = []
+    var entryImport = [-1] * len(mc.relocs)
+    for r in o.relocs {
+        if r.external >= 0 {
+            let name = o.externals[r.external]
+            if symbols[name] is Some(at) {
+                dataPuts.push(Put(r.at, base + textAt + at, 8))
+                pointers.push(r.at)
+            } else {
+                entryImport[(r.at - o.table) / 8] = imports.indexOf(importName(os, name)) ?? panic("no import {name}")
+            }
+        } else {
+            let section = if r.toText { textAt } else { dataAt }
+            dataPuts.push(Put(r.at, base + section + r.addend, 8))
+            pointers.push(r.at)
+        }
+    }
+    // the code's loads: of the table's entry, or of the import's cell
+    let code = text.b
+    var puts: [Put] = []
+    for (i, r) in mc.relocs.enumerate() {
+        let to = if entryImport[i] >= 0 {
+            dataAt + importAt + cellAt[entryImport[i]]
+        } else {
+            dataAt + o.table + 8 * i
+        }
+        if arm {
+            puts += adrpPair(code, r.at, textAt + r.at, to, true)
+        } else {
+            puts.push(Put(r.at, to - (textAt + r.at + 4), 4))
+        }
+    }
+    for s in stubs {
+        let at = symbols[s.name] ?? 0
+        for r in s.refs {
+            let to = if symbols[r.symbol] is Some(x) {
+                textAt + x
+            } else {
+                dataAt + importAt + cellAt[imports.indexOf(r.symbol) ?? 0]
+            }
+            let place = at + r.at
+            if r.how == refRel32 {
+                puts.push(Put(place, to - (textAt + place + 4), 4))
+            } else {
+                puts += adrpPair(code, place, textAt + place, to, r.how == refAdrpLdr)
+            }
+        }
+    }
+    Linked(written(code, puts), written(data.b, dataPuts), pointers, imports, importAt, cellAt, symbols)
+}
+
+// ---- the stubs: code of the linker's own ----
+fn bytesOfWords(words: [Int]) -> Bytes {
+    var b = Buf()
+    for w in words {
+        b.u32(w)
+    }
+    b.b
+}
+
+// x86-64 System V's process entry: the stack holds argc, then argv; __libc_start_main(main, argc, argv, 0, 0,
+// rtld_fini, stack_end) runs the C library's start, then main (the runtime's), then exit
+fn startX64() -> Stub {
+    let code: Bytes = [
+        0x31, 0xED, 0x49, 0x89, 0xD1, 0x5E, 0x48, 0x89, 0xE2, 0x48, 0x83, 0xE4, 0xF0, 0x50, 0x54, 0x45, 0x31, 0xC0,
+        0x31, 0xC9, 0x48, 0x8D, 0x3D, 0, 0, 0, 0, 0xFF, 0x15, 0, 0, 0, 0, 0xF4,
+    ]
+    // xor ebp, ebp
+    // mov r9, rdx (the dynamic linker's fini)
+    // pop rsi (argc)
+    // mov rdx, rsp (argv)
+    // and rsp, -16
+    // push rax
+    // push rsp (stack_end)
+    // xor r8d, r8d
+    // xor ecx, ecx
+    // lea rdi, [rip + main]
+    // call [rip + __libc_start_main's cell]
+    // hlt
+    Stub("_start", code, [StubRef(23, "main", refRel32), StubRef(29, "__libc_start_main", refRel32)])
+}
+
+fn startArm64() -> Stub {
+    let code = bytesOfWords(
+        [
+            0xD280001D, 0xD280001E, 0xAA0003E5, 0xF94003E1, 0x910023E2, 0x910003E6, 0x90000000, 0x91000000, 0xD2800003,
+            0xD2800004, 0x90000010, 0xF9400210, 0xD63F0200, 0xD4200000,
+        ],
+    )
+    // mov x29, #0
+    // mov x30, #0
+    // mov x5, x0 (the dynamic linker's fini)
+    // ldr x1, [sp] (argc)
+    // add x2, sp, #8 (argv)
+    // mov x6, sp (stack_end)
+    // adrp x0, main
+    // add x0, x0, :lo12:main
+    // mov x3, #0
+    // mov x4, #0
+    // adrp x16, the cell
+    // ldr x16, [x16, :lo12:]
+    // blr x16
+    // brk #0
+    Stub("_start", code, [StubRef(24, "main", refAdrpAdd), StubRef(40, "__libc_start_main", refAdrpLdr)])
+}
+
+// __clear_cache(from, to): GCC's, which no C library exports. x86-64 keeps its caches coherent; ARM64 cleans the
+// data cache to the point of unification and invalidates the instruction cache, line by line (CTR_EL0's sizes).
+fn clearCacheX64() -> Stub = Stub("__clear_cache", [0xC3])
+
+fn clearCacheArm64() -> Stub {
+    let code = bytesOfWords(
+        [
+            0xD53B0023, 0xD3504C64, 0xD2800085, 0x9AC420A4, 0x92400C66, 0x9AC620A6, 0xD1000487, 0x8A270002, 0xD50B7B22,
+            0x8B040042, 0xEB01005F, 0x54FFFFA3, 0xD5033B9F, 0xD10004C7, 0x8A270002, 0xD50B7522, 0x8B060042, 0xEB01005F,
+            0x54FFFFA3, 0xD5033B9F, 0xD5033FDF, 0xD65F03C0,
+        ],
+    )
+    // mrs x3, ctr_el0
+    // ubfx x4, x3, #16, #4 (DminLine)
+    // mov x5, #4
+    // lsl x4, x5, x4 (the data cache's line)
+    // and x6, x3, #15 (IminLine)
+    // lsl x6, x5, x6 (the instruction cache's line)
+    // sub x7, x4, #1
+    // bic x2, x0, x7
+    // dc cvau, x2
+    // add x2, x2, x4
+    // cmp x2, x1
+    // b.lo (the dc)
+    // dsb ish
+    // sub x7, x6, #1
+    // bic x2, x0, x7
+    // ic ivau, x2
+    // add x2, x2, x6
+    // cmp x2, x1
+    // b.lo (the ic)
+    // dsb ish
+    // isb
+    // ret
+    Stub("__clear_cache", code)
+}
+
+// snprintf(buf, size, format, precision, v) on Windows: the universal C runtime has it inline in its headers, over
+// __stdio_common_vsprintf(options, buf, size, format, locale, va_list); a va_list is where the variadic arguments
+// are, so the fourth argument's home slot, next to the fifth on the stack
+fn snprintfWindows() -> Stub {
+    let code: Bytes = [
+        0x4C, 0x89, 0x4C, 0x24, 0x20, 0x48, 0x8D, 0x44, 0x24, 0x20, 0x48, 0x83, 0xEC, 0x38, 0x4D, 0x89, 0xC1, 0x49,
+        0x89, 0xD0, 0x48, 0x89, 0xCA, 0xB9, 2, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0, 0x48, 0x89, 0x44,
+        0x24, 0x28, 0xFF, 0x15, 0, 0, 0, 0, 0x48, 0x83, 0xC4, 0x38, 0xC3,
+    ]
+    // mov [rsp + 32], r9
+    // lea rax, [rsp + 32] (the va_list)
+    // sub rsp, 56
+    // mov r9, r8 (format)
+    // mov r8, rdx (size)
+    // mov rdx, rcx (buf)
+    // mov ecx, 2 (C99's snprintf: the length it would write)
+    // mov qword [rsp + 32], 0 (the locale)
+    // mov [rsp + 40], rax
+    // call [rip + the cell]
+    // add rsp, 56
+    // ret
+    Stub("snprintf", code, [StubRef(44, "__stdio_common_vsprintf", refRel32)])
+}
+
+// The same on Windows ARM64: precision comes in w3 and the Float in d0 (the runtime declares them so), and a va_list
+// is the address of 8-byte slots, so they go side by side on the stack
+fn snprintfWindowsArm64() -> Stub {
+    let code = bytesOfWords(
+        [
+            0xD100C3FF, 0xA9007BFD, 0x910003FD, 0xF90013E3, 0xFD0017E0, 0x910083E5, 0xD2800004, 0xAA0203E3, 0xAA0103E2,
+            0xAA0003E1, 0xD2800040, 0x90000010, 0xF9400210, 0xD63F0200, 0xA9407BFD, 0x9100C3FF, 0xD65F03C0,
+        ],
+    )
+    // sub sp, sp, #48
+    // stp x29, x30, [sp]
+    // mov x29, sp
+    // str x3, [sp, #32] (the precision)
+    // str d0, [sp, #40] (the Float)
+    // add x5, sp, #32 (the va_list)
+    // mov x4, #0 (the locale)
+    // mov x3, x2 (format)
+    // mov x2, x1 (size)
+    // mov x1, x0 (buf)
+    // mov x0, #2 (C99's snprintf: the length it would write)
+    // adrp x16, the cell
+    // ldr x16, [x16, :lo12:]
+    // blr x16
+    // ldp x29, x30, [sp]
+    // add sp, sp, #48
+    // ret
+    Stub("snprintf", code, [StubRef(44, "__stdio_common_vsprintf", refAdrpLdr)])
+}
+
+// what the runtime of a system needs beside itself
+pub fn stubsFor(os: Os, arm: Bool) -> [Stub] = match os {
+    Windows => if arm { [snprintfWindowsArm64()] } else { [snprintfWindows()] }
+    Linux => if arm {
+        [startArm64(), clearCacheArm64()]
+    } else {
+        [startX64(), clearCacheX64()]
+    }
+    Macos => []
+}
+
+// ---- PE32+ (Windows x64) ----
+// the library a Windows symbol is in: the system's (kernel32, shell32) by its capital, else the universal C runtime
+pub fn dllOf(name: Text) -> Text {
+    if name == "CommandLineToArgvW" {
+        return "shell32.dll"
+    }
+    if name == "timeBeginPeriod" or name == "timeEndPeriod" {
+        return "winmm.dll" // the timer's resolution (--profile: a sample a millisecond)
+    }
+    if name is "WSAStartup" | "WSAGetLastError" | "WSAPoll" | "socket" | "bind" | "listen" | "accept" | "connect" | "recv" | "send" | "closesocket" | "ioctlsocket" | "setsockopt" | "getaddrinfo" | "freeaddrinfo" {
+        return "ws2_32.dll" // sockets (Winsock)
+    }
+    let c = name.bytes()[0]
+    if c >= 'A' and c <= 'Z' { "kernel32.dll" } else { "ucrtbase.dll" }
+}
+
+const imageBase = 0x140000000
+const sectionAlign = 0x1000
+const fileAlign = 0x200
+
+// The executable (x86-64, or ARM64 with arm): the runtime (its code and data, linked with --linked for objects) and
+// its C functions imported from their libraries, the entry point the runtime's qkWinEntry, its addresses relocated
+// where Windows puts it, a stack of 256 MB; then the program's payload and trailer, which the runtime's start reads
+// from its own file.
+pub fn peImage(mc: MachineCode, o: Layout, program: Bytes, arm: Bool) -> Bytes {
+    let stubs = stubsFor(.Windows, arm)
+    let imports = linkImports(mc, o, stubs, .Windows)
+    // the libraries, in order of first use
+    var dlls: [Text] = []
+    for f in imports {
+        if not dlls.contains(dllOf(f)) {
+            dlls.push(dllOf(f))
+        }
+    }
+    // the import address tables, one per library, each ended by a zero: the cells
+    var cellAt = [0] * len(imports)
+    var iatAt: [Int] = []
+    var at = 0
+    for d in dlls {
+        iatAt.push(at)
+        for (i, f) in imports.enumerate() {
+            if dllOf(f) == d {
+                cellAt[i] = at
+                at += 8
+            }
+        }
+        at += 8
+    }
+    let iatBytes = at
+    let headers = alignUp(64 + 4 + 20 + 240 + 3 * 40, fileAlign)
+    let textRva = sectionAlign
+    let dataRva = alignUp(textRva + linkedTextSize(mc, o, stubs), sectionAlign)
+    let l = link(mc, o, stubs, .Windows, arm, imports, cellAt, iatBytes, textRva, dataRva, imageBase)
+    // after the cells: the lookup tables (as the address tables are on disk), the names, the descriptors
+    var data = Buf()
+    data.add(l.data)
+    data.align(8)
+    let lookupAt = data.len()
+    data.zeros(iatBytes)
+    var nameRva = [0] * len(imports)
+    for (i, f) in imports.enumerate() {
+        data.align(2)
+        nameRva[i] = dataRva + data.len()
+        data.u16(0) // the hint
+        data.cText(f)
+    }
+    var dllRva: [Int] = []
+    for d in dlls {
+        dllRva.push(dataRva + data.len())
+        data.cText(d)
+    }
+    data.align(4)
+    let descriptorsAt = data.len()
+    for k in 0..len(dlls) {
+        data.u32(dataRva + lookupAt + iatAt[k]) // the lookup table
+        data.u32(0)
+        data.u32(0)
+        data.u32(dllRva[k])
+        data.u32(dataRva + l.importAt + iatAt[k]) // the address table
+    }
+    data.zeros(20)
+    let descriptorsSize = data.len() - descriptorsAt
+    var puts: [Put] = []
+    for i in 0..len(imports) {
+        puts.push(Put(l.importAt + cellAt[i], nameRva[i], 8))
+        puts.push(Put(lookupAt + cellAt[i], nameRva[i], 8))
+    }
+    let dataBytes = written(data.b, puts)
+    // the base relocations: a block per 4 KB page, an entry per 8-byte address (DIR64), padded to 4 bytes
+    var relocs = Buf()
+    let places = l.pointers.map(p => dataRva + p).sorted()
+    var k = 0
+    while k < len(places) {
+        let page = places[k] / 4096 * 4096
+        var n = 0
+        while k + n < len(places) and places[k + n] / 4096 * 4096 == page {
+            n += 1
+        }
+        let padded = n + n % 2
+        relocs.u32(page)
+        relocs.u32(8 + 2 * padded)
+        for j in 0..n {
+            relocs.u16(10 << 12 | (places[k + j] - page))
+        }
+        if padded > n {
+            relocs.u16(0)
+        }
+        k += n
+    }
+    let relocRva = alignUp(dataRva + len(dataBytes), sectionAlign)
+    let imageSize = alignUp(relocRva + relocs.len(), sectionAlign)
+    let textRawSize = alignUp(len(l.text), fileAlign)
+    let dataRaw = headers + textRawSize
+    let dataRawSize = alignUp(len(dataBytes), fileAlign)
+    let relocRaw = dataRaw + dataRawSize
+    let relocRawSize = alignUp(relocs.len(), fileAlign)
+    var out = Buf()
+    // the DOS header: its magic, and where the PE header is
+    out.u16(0x5A4D)
+    out.zeros(58)
+    out.u32(64)
+    out.add("PE".bytes())
+    out.u16(0)
+    // the file header: x86-64 or ARM64, three sections, an executable for a large address space
+    out.u16(if arm { 0xAA64 } else { 0x8664 })
+    out.u16(3)
+    out.u32(0)
+    out.u32(0)
+    out.u32(0)
+    out.u16(240)
+    out.u16(0x22)
+    // the optional header (PE32+)
+    out.u16(0x20B)
+    out.u8(14)
+    out.u8(0)
+    out.u32(textRawSize)
+    out.u32(dataRawSize + relocRawSize)
+    out.u32(0)
+    out.u32(textRva + (l.symbols["qkWinEntry"] ?? panic("the runtime has no qkWinEntry")))
+    out.u32(textRva)
+    out.u64(imageBase)
+    out.u32(sectionAlign)
+    out.u32(fileAlign)
+    out.u16(6) // the system's version: Vista and after
+    out.u16(0)
+    out.u16(0)
+    out.u16(0)
+    out.u16(6)
+    out.u16(0)
+    out.u32(0)
+    out.u32(imageSize)
+    out.u32(headers)
+    out.u32(0)
+    out.u16(3) // the console
+    out.u16(0x8160) // a dynamic base (high entropy), no running of data, terminal-server aware
+    out.u64(0x10000000) // the stack: 256 MB reserved, as quark build's executables have
+    out.u64(0x1000)
+    out.u64(0x100000)
+    out.u64(0x1000)
+    out.u32(0)
+    out.u32(16)
+    for d in 0..16 {
+        if d == 1 {
+            out.u32(dataRva + descriptorsAt)
+            out.u32(descriptorsSize)
+        } else if d == 5 {
+            out.u32(relocRva)
+            out.u32(relocs.len())
+        } else if d == 12 {
+            out.u32(dataRva + l.importAt)
+            out.u32(iatBytes)
+        } else {
+            out.u64(0)
+        }
+    }
+    // the sections: name, size in memory, place, size in the file, place in it, flags
+    let names = [".text", ".data", ".reloc"]
+    let sizes = [len(l.text), len(dataBytes), relocs.len()]
+    let rvas = [textRva, dataRva, relocRva]
+    let rawSizes = [textRawSize, dataRawSize, relocRawSize]
+    let raws = [headers, dataRaw, relocRaw]
+    let flags = [0x60000020, 0xC0000040, 0x42000040]
+    for s in 0..3 {
+        out.name(names[s], 8)
+        out.u32(sizes[s])
+        out.u32(rvas[s])
+        out.u32(rawSizes[s])
+        out.u32(raws[s])
+        out.u32(0)
+        out.u32(0)
+        out.u16(0)
+        out.u16(0)
+        out.u32(flags[s])
+    }
+    out.padTo(headers)
+    out.add(l.text)
+    out.padTo(dataRaw)
+    out.add(dataBytes)
+    out.padTo(relocRaw)
+    out.add(relocs.b)
+    out.padTo(relocRaw + relocRawSize)
+    out.add(program)
+    out.b
+}
+
+// ---- ELF64 executables (Linux x86-64, ARM64): position-independent, dynamically linked ----
+pub enum Libc { Glibc, Musl }
+
+fn interpreter(libc: Libc, arm: Bool) -> Text = match libc {
+    Glibc => if arm {
+        "/lib/ld-linux-aarch64.so.1"
+    } else {
+        "/lib64/ld-linux-x86-64.so.2"
+    }
+    Musl => if arm {
+        "/lib/ld-musl-aarch64.so.1"
+    } else {
+        "/lib/ld-musl-x86_64.so.1"
+    }
+}
+
+fn neededLibs(libc: Libc) -> [Text] = match libc {
+    Glibc => ["libc.so.6", "libm.so.6"]
+    Musl => ["libc.so"]
+}
+
+const elfPage = 0x10000 // the largest page an ARM64 Linux has: the segments' alignment
+
+type Phdr { kind: Int, flags: Int, off: Int, addr: Int, size: Int, align: Int }
+
+// The executable: the headers, the interpreter's name and the code (read, run) in one segment; the data, the cells of
+// the C functions (GLOB_DAT), the dynamic symbols and relocations (each address in the data RELATIVE) and the
+// dynamic section in another (read, write); the entry the linker's _start, which runs the C library's start and the
+// runtime's main; then the program's payload and trailer.
+pub fn elfImage(mc: MachineCode, o: Layout, program: Bytes, arm: Bool, libc: Libc) -> Bytes {
+    let stubs = stubsFor(.Linux, arm)
+    let imports = linkImports(mc, o, stubs, .Linux)
+    var cellAt: [Int] = []
+    for i in 0..len(imports) {
+        cellAt.push(8 * i)
+    }
+    let phnum = 6
+    let interp = interpreter(libc, arm)
+    let interpAt = 64 + 56 * phnum
+    let textAt = alignUp(interpAt + len(interp) + 1, 16)
+    let textEnd = textAt + linkedTextSize(mc, o, stubs)
+    let dataOff = alignUp(textEnd, 16)
+    let dataAt = alignUp(textEnd, elfPage) + dataOff % elfPage
+    let l = link(mc, o, stubs, .Linux, arm, imports, cellAt, 8 * len(imports), textAt, dataAt, 0)
+    var data = Buf()
+    data.add(l.data)
+    // the dynamic strings: the libraries, then the symbols
+    data.align(8)
+    let strAt = data.len()
+    var str = Buf()
+    str.u8(0)
+    var neededAt: [Int] = []
+    for n in neededLibs(libc) {
+        neededAt.push(str.len())
+        str.cText(n)
+    }
+    var symName: [Int] = []
+    for f in imports {
+        symName.push(str.len())
+        str.cText(f)
+    }
+    data.add(str.b)
+    data.align(8)
+    // the symbols: none, then each C function (global, a function, undefined)
+    let symAt = data.len()
+    data.zeros(24)
+    for n in symName {
+        data.u32(n)
+        data.u8(0x12)
+        data.u8(0)
+        data.u16(0)
+        data.u64(0)
+        data.u64(0)
+    }
+    // a hash table of one bucket, empty: nothing is looked up in the executable
+    let hashAt = data.len()
+    data.u32(1)
+    data.u32(1 + len(imports))
+    data.zeros(4 * (2 + len(imports)))
+    data.align(8)
+    // the relocations: each address in the data (RELATIVE), each C function's cell (GLOB_DAT)
+    let relaAt = data.len()
+    let relative = if arm { 1027 } else { 8 }
+    let globDat = if arm { 1025 } else { 6 }
+    for p in l.pointers {
+        data.u64(dataAt + p)
+        data.u64(relative)
+        data.u64(u64At(l.data, p))
+    }
+    for i in 0..len(imports) {
+        data.u64(dataAt + l.importAt + cellAt[i])
+        data.u64((i + 1) << 32 | globDat)
+        data.u64(0)
+    }
+    let relaSize = data.len() - relaAt
+    // the dynamic section: the libraries, the tables, bound now, a position-independent executable
+    let dynAt = data.len()
+    for n in neededAt {
+        data.u64(1)
+        data.u64(n)
+    }
+    let tags = [4, 5, 6, 7, 8, 9, 10, 11, 21, 30, 0x6FFFFFFB, 0]
+    let values = [
+        dataAt + hashAt,
+        dataAt + strAt,
+        dataAt + symAt,
+        dataAt + relaAt,
+        relaSize,
+        24,
+        str.len(),
+        24,
+        0,
+        8,
+        0x08000001,
+        0,
+    ]
+    for (k, t) in tags.enumerate() {
+        data.u64(t)
+        data.u64(values[k])
+    }
+    let dynSize = data.len() - dynAt
+    var out = Buf()
+    out.add([0x7F, 'E', 'L', 'F', 2, 1, 1, 0])
+    out.zeros(8)
+    out.u16(3) // position-independent
+    out.u16(if arm { 183 } else { 62 })
+    out.u32(1)
+    out.u64(textAt + (l.symbols["_start"] ?? 0))
+    out.u64(64)
+    out.u64(0)
+    out.u32(0)
+    out.u16(64)
+    out.u16(56)
+    out.u16(phnum)
+    out.u16(64)
+    out.u16(0)
+    out.u16(0)
+    // the program headers: kind, flags, offset, address (twice), size in the file and in memory, alignment
+    let headers = [
+        Phdr(6, 4, 64, 64, 56 * phnum, 8),
+        Phdr(3, 4, interpAt, interpAt, len(interp) + 1, 1),
+        Phdr(1, 5, 0, 0, textEnd, elfPage),
+        Phdr(1, 6, dataOff, dataAt, data.len(), elfPage),
+        Phdr(2, 6, dataOff + dynAt, dataAt + dynAt, dynSize, 8),
+        Phdr(0x6474E551, 6, 0, 0, 0, 16),
+    ]
+    for h in headers {
+        out.u32(h.kind)
+        out.u32(h.flags)
+        out.u64(h.off)
+        out.u64(h.addr)
+        out.u64(h.addr)
+        out.u64(h.size)
+        out.u64(h.size)
+        out.u64(h.align)
+    }
+    out.cText(interp)
+    out.padTo(textAt)
+    out.add(l.text)
+    out.padTo(dataOff)
+    out.add(data.b)
+    out.add(program)
+    out.b
+}
+
+// ---- Mach-O executables (macOS: x86-64, Apple Silicon) ----
+// dyld calls main(argc, argv): the stub gives the runtime's qkMacMain the program this executable carries in its data
+// (its payload and trailer: their addresses are put in after linking)
+fn macMainX64() -> Stub {
+    let code: Bytes = [0x48, 0x63, 0xFF, 0x48, 0x8D, 0x15, 0, 0, 0, 0, 0x48, 0x8D, 0x0D, 0, 0, 0, 0, 0xE9, 0, 0, 0, 0]
+    // movsxd rdi, edi (argc)
+    // lea rdx, [rip + the payload]
+    // lea rcx, [rip + the trailer]
+    // jmp qkMacMain
+    Stub("main", code, [StubRef(18, "qkMacMain", refRel32)])
+}
+
+fn macMainArm64() -> Stub {
+    let code = bytesOfWords(
+        [0x93407C00, 0x90000002, 0x91000042, 0x90000003, 0x91000063, 0x90000010, 0x91000210, 0xD61F0200],
+    )
+    // sxtw x0, w0 (argc)
+    // adrp x2, the payload
+    // add x2, x2, :lo12:
+    // adrp x3, the trailer
+    // add x3, x3, :lo12:
+    // adrp x16, qkMacMain
+    // add x16, x16, :lo12:
+    // br x16
+    Stub("main", code, [StubRef(20, "qkMacMain", refAdrpAdd)])
+}
+
+fn Buf.uleb(var self, v: Int) {
+    var x = v
+    while x >= 128 {
+        self.u8(x & 127 | 128)
+        x = x >> 7
+    }
+    self.u8(x)
+}
+
+fn Buf.be32(var self, v: Int) {
+    self.add([v >> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255])
+}
+
+fn Buf.be64(var self, v: Int) {
+    self.be32(v >> 32 & 0xFFFFFFFF)
+    self.be32(v & 0xFFFFFFFF)
+}
+
+fn Buf.segment(var self, name: Text, vmaddr: Int, vmsize: Int, fileoff: Int, filesize: Int, prot: Int, sections: Int) {
+    self.u32(0x19) // LC_SEGMENT_64
+    self.u32(72 + 80 * sections)
+    self.name(name, 16)
+    self.u64(vmaddr)
+    self.u64(vmsize)
+    self.u64(fileoff)
+    self.u64(filesize)
+    self.u32(prot)
+    self.u32(prot)
+    self.u32(sections)
+    self.u32(0)
+}
+
+fn Buf.section(var self, name: Text, segment: Text, addr: Int, size: Int, offset: Int, flags: Int) {
+    self.name(name, 16)
+    self.name(segment, 16)
+    self.u64(addr)
+    self.u64(size)
+    self.u32(offset)
+    self.u32(4) // 16-aligned
+    self.u32(0)
+    self.u32(0)
+    self.u32(flags)
+    self.zeros(12)
+}
+
+const machoBase = 0x100000000
+const machoPage = 16384 // Apple Silicon's page (and a multiple of x86-64's)
+const machoCommandsSize = 776
+const codePage = 4096 // what a code signature hashes, page by page
+
+// The executable: the runtime and the stub (__TEXT), the runtime's data, its C functions' cells and the program it
+// carries (__DATA), and what dyld reads (__LINKEDIT): where the data's addresses are (moved by the slide), each cell's
+// function in libSystem (bound when it starts), and an ad-hoc code signature (SHA-256 of each 4 KB page, as a linker
+// signs: Apple Silicon runs nothing unsigned). name: the signature's identifier, the executable's file name.
+pub fn machoImage(mc: MachineCode, o: Layout, program: Bytes, arm: Bool, name: Text) -> Bytes {
+    let stubs = [if arm { macMainArm64() } else { macMainX64() }]
+    let imports = linkImports(mc, o, stubs, .Macos)
+    var cellAt: [Int] = []
+    for i in 0..len(imports) {
+        cellAt.push(8 * i)
+    }
+    let textAt = alignUp(32 + machoCommandsSize, 16)
+    let textEnd = textAt + linkedTextSize(mc, o, stubs)
+    let dataAt = alignUp(textEnd, machoPage)
+    let l0 = link(mc, o, stubs, .Macos, arm, imports, cellAt, 8 * len(imports), textAt, dataAt, machoBase)
+    // the program after the runtime's data: its payload (and a zero after it), then its trailer
+    let payloadBytes = len(program) - 104
+    var data = Buf()
+    data.add(l0.data)
+    data.align(16)
+    let payloadAt = data.len()
+    data.add(program[..payloadBytes])
+    data.u8(0)
+    data.align(16)
+    let trailerAt = data.len()
+    data.add(program[payloadBytes..])
+    data.align(16)
+    // the stub's addresses of them
+    let main = l0.symbols["main"] ?? panic("no main stub")
+    let toPayload = dataAt + payloadAt
+    let toTrailer = dataAt + trailerAt
+    let text = if arm {
+        written(
+            l0.text,
+            adrpPair(l0.text, main + 4, textAt + main + 4, toPayload, false)
+                + adrpPair(l0.text, main + 12, textAt + main + 12, toTrailer, false),
+        )
+    } else {
+        written(
+            l0.text,
+            [Put(main + 6, toPayload - (textAt + main + 10), 4), Put(main + 13, toTrailer - (textAt + main + 17), 4)],
+        )
+    }
+    let dataSize = data.len()
+    let linkAt = alignUp(dataAt + dataSize, machoPage)
+    // __LINKEDIT: the rebases (each address in the data, segment 2), the binds (each cell, from libSystem: ordinal 1)
+    var le = Buf()
+    le.u8(0x11) // REBASE_OPCODE_SET_TYPE_IMM: a pointer
+    for p in l0.pointers.sorted() {
+        le.u8(0x22) // REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: __DATA
+        le.uleb(p)
+        le.u8(0x51) // REBASE_OPCODE_DO_REBASE_IMM_TIMES: once
+    }
+    le.u8(0)
+    le.align(8)
+    let rebaseSize = le.len()
+    let bindAt = le.len()
+    for (i, f) in imports.enumerate() {
+        le.u8(0x11) // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: libSystem
+        le.u8(0x40) // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
+        le.cText(machoName(f))
+        le.u8(0x51) // BIND_OPCODE_SET_TYPE_IMM: a pointer
+        le.u8(0x72) // BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: __DATA
+        le.uleb(l0.importAt + cellAt[i])
+        le.u8(0x90) // BIND_OPCODE_DO_BIND
+    }
+    le.u8(0)
+    le.align(8)
+    let bindSize = le.len() - bindAt
+    let strAt = le.len()
+    le.zeros(8) // the string table: no symbols
+    le.align(16)
+    let sigAt = linkAt + le.len()
+    let pages = (sigAt + codePage - 1) / codePage
+    let ident = name.bytes()
+    let hashOffset = alignUp(88 + len(ident) + 1, 16)
+    let directorySize = hashOffset + 32 * pages
+    let sigSize = alignUp(20 + directorySize, 16)
+    let linkSize = le.len() + sigSize
+    let textSize = dataAt // __TEXT: the headers and the code, to the data's page
+    let dataSegSize = alignUp(dataSize, machoPage)
+    // the headers
+    var out = Buf()
+    out.u32(0xFEEDFACF)
+    out.u32(if arm { 0x0100000C } else { 0x01000007 })
+    out.u32(if arm { 0 } else { 3 })
+    out.u32(2) // MH_EXECUTE
+    out.u32(13)
+    out.u32(machoCommandsSize)
+    out.u32(0x200085) // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    out.u32(0)
+    out.segment("__PAGEZERO", 0, machoBase, 0, 0, 0, 0)
+    out.segment("__TEXT", machoBase, textSize, 0, textSize, 5, 1)
+    out.section("__text", "__TEXT", machoBase + textAt, len(text), textAt, 0x80000400)
+    out.segment("__DATA", machoBase + dataAt, dataSegSize, dataAt, dataSegSize, 3, 1)
+    out.section("__data", "__DATA", machoBase + dataAt, dataSize, dataAt, 0)
+    out.segment("__LINKEDIT", machoBase + linkAt, alignUp(linkSize, machoPage), linkAt, linkSize, 1, 0)
+    out.u32(0x80000022) // LC_DYLD_INFO_ONLY
+    out.u32(48)
+    out.u32(linkAt)
+    out.u32(rebaseSize)
+    out.u32(linkAt + bindAt)
+    out.u32(bindSize)
+    out.zeros(24) // no weak or lazy binds, no exports
+    out.u32(2) // LC_SYMTAB
+    out.u32(24)
+    out.u32(linkAt + strAt)
+    out.u32(0)
+    out.u32(linkAt + strAt)
+    out.u32(8)
+    out.u32(0xB) // LC_DYSYMTAB
+    out.u32(80)
+    out.zeros(72)
+    out.u32(0xE) // LC_LOAD_DYLINKER
+    out.u32(32)
+    out.u32(12)
+    out.name("/usr/lib/dyld", 20)
+    let uuid = sha256Bytes(text + data.b)
+    out.u32(0x1B) // LC_UUID
+    out.u32(24)
+    out.add(uuid[..6])
+    out.u8(uuid[6] & 0x0F | 0x40)
+    out.u8(uuid[7])
+    out.u8(uuid[8] & 0x3F | 0x80)
+    out.add(uuid[9..16])
+    out.u32(0x32) // LC_BUILD_VERSION: macOS 11 and after
+    out.u32(24)
+    out.u32(1)
+    out.u32(0xB0000)
+    out.u32(0xB0000)
+    out.u32(0)
+    out.u32(0x80000028) // LC_MAIN
+    out.u32(24)
+    out.u64(textAt + main)
+    out.u64(0)
+    out.u32(0xC) // LC_LOAD_DYLIB
+    out.u32(56)
+    out.u32(24)
+    out.u32(2)
+    out.u32(0x05470000) // 1351.0.0
+    out.u32(0x00010000) // 1.0.0
+    out.name("/usr/lib/libSystem.B.dylib", 32)
+    out.u32(0x1D) // LC_CODE_SIGNATURE
+    out.u32(16)
+    out.u32(sigAt)
+    out.u32(sigSize)
+    out.padTo(textAt)
+    out.add(text)
+    out.padTo(dataAt)
+    out.add(data.b)
+    out.padTo(linkAt)
+    out.add(le.b)
+    // the signature: a SuperBlob of one CodeDirectory (big-endian), its identifier, each page's hash
+    let signed = out.b
+    var sig = Buf()
+    sig.be32(0xFADE0CC0) // CSMAGIC_EMBEDDED_SIGNATURE
+    sig.be32(20 + directorySize)
+    sig.be32(1)
+    sig.be32(0) // CSSLOT_CODEDIRECTORY
+    sig.be32(20)
+    sig.be32(0xFADE0C02) // CSMAGIC_CODEDIRECTORY
+    sig.be32(directorySize)
+    sig.be32(0x20400) // with the executable segment
+    sig.be32(0x20002) // CS_ADHOC | CS_LINKER_SIGNED
+    sig.be32(hashOffset)
+    sig.be32(88) // the identifier, after the directory's fields
+    sig.be32(0)
+    sig.be32(pages)
+    sig.be32(sigAt) // codeLimit: everything before the signature
+    sig.u8(32) // SHA-256
+    sig.u8(2)
+    sig.u8(0)
+    sig.u8(12) // 4 KB pages
+    sig.be32(0)
+    sig.be32(0)
+    sig.be32(0)
+    sig.be32(0)
+    sig.be64(0)
+    sig.be64(0) // execSegBase: __TEXT
+    sig.be64(textSize)
+    sig.be64(1) // CS_EXECSEG_MAIN_BINARY
+    sig.add(ident)
+    sig.u8(0)
+    sig.padTo(20 + hashOffset)
+    for k in 0..pages {
+        let end = min((k + 1) * codePage, sigAt)
+        sig.add(sha256Bytes(signed[k * codePage..end]))
+    }
+    sig.padTo(sigSize)
+    out.add(sig.b)
+    out.b
+}

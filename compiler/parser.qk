@@ -1,0 +1,2204 @@
+// The parser: tokens to a syntax tree. Comments stay attached to the declarations and statements they sit above
+// (or beside), so the formatter and the node graph keep them.
+use token
+use source
+use lexer
+use ast
+use format
+
+// a parse: the tree, the errors said (as printed), and whether there was none
+pub type Parsed { ast: Ast, errors: [Text], ok: Bool }
+
+// The parser: source the text being read (an interpolation's own, while one is parsed); tokens from base to end
+// (an interpolation's come after the file's, for the while, in the room after them), i the next one; comment the next comment not attached
+// yet; failed an error was said (the parse stops); externNext the fn being parsed is an extern one; aliases use
+// geometry as g (g.area is geometry's area); typeText a type alone (from a graph: any a.Type is a module's); depth
+// expressions and types inside each other (a limit, not a crash); armArrow in an arm's guard, the token index of
+// the arm's => (never a lambda's); ints and texts the lists being made.
+type Parser {
+    source: Source
+    tokens: [Token] = []
+    end: Int = 0
+    comments: [Comment] = []
+    base: Int = 0
+    i: Int = 0
+    comment: Int = 0
+    failed: Bool = false
+    externNext: Bool = false
+    aliases: [Text] = []
+    typeText: Bool = false
+    depth: Int = 0
+    armArrow: Int = -1
+    declStart: Int = 0 // the token the declaration being read starts at
+    errors: Errors = Errors()
+    ast: Ast = Ast()
+    ints: [Int] = []
+    texts: [Text] = []
+}
+
+// a call's values and their names ("" when given by position)
+type Args { values: [Int], names: [Text] }
+
+const maxDepth = 256
+
+// The program in a file's text.
+pub fn parse(src: Source) -> Parsed = parseInto(Ast(), src)
+
+// The program in a file's text, its nodes and declarations added to a tree's (the files a program uses go into
+// the program's own tree).
+pub fn parseInto(tree: Ast, src: Source) -> Parsed {
+    let lexed = lex(src.text)
+    // room after the file's tokens for an interpolation's, written there in place
+    let room = [lexed.tokens[len(lexed.tokens) - 1]] * 256
+    var p = Parser(src, lexed.tokens + room, len(lexed.tokens), lexed.comments, ast: tree)
+    for problem in lexed.problems {
+        p.errors.add(src, problem.line, problem.col, problem.message)
+    }
+    if len(lexed.problems) > 0 {
+        return Parsed(p.ast, p.errors.shown, false)
+    }
+    p.program()
+    Parsed(p.ast, p.errors.shown, not p.failed and p.errors.count == 0)
+}
+
+// A type written as text (the name of a call Pointer<UInt8>(p)), its nodes added to a tree: the tree, and the type's
+// node (-1: it is not one).
+pub fn parseTypeText(tree: Ast, text: Text) -> (Ast, Int) {
+    let lexed = lex(text)
+    if len(lexed.problems) > 0 or len(lexed.tokens) == 0 {
+        return (tree, -1)
+    }
+    var p = Parser(Source("", text), lexed.tokens, len(lexed.tokens), lexed.comments, ast: tree, typeText: true)
+    let te = p.parseType()
+    if p.failed {
+        return (tree, -1)
+    }
+    (p.ast, te)
+}
+
+// The same, onto the end of a tree held by a var: its types moved past the tree's own, so a tree as large as a
+// program's is not copied for a type of a few nodes.
+pub fn Ast.parseTypeOnto(var self, text: Text) -> Int {
+    let (small, te) = parseTypeText(Ast(), text)
+    if te < 0 {
+        return -1
+    }
+    let at = len(self.types)
+    for t in small.types {
+        self.types.push(t with { node: typeMoved(t.node, at) })
+    }
+    te + at
+}
+
+fn typeMoved(node: TypeNode, at: Int) -> TypeNode {
+    let m = (i: Int) => if i >= 0 { i + at } else { i }
+    match node {
+        Named(name, args) => TypeNode.Named(name, args.map(m).toArray())
+        Array(elem) => TypeNode.Array(m(elem))
+        Map(key, value) => TypeNode.Map(m(key), m(value))
+        Fn(params, names, result, isEffect, external) => TypeNode.Fn(
+            params.map(m).toArray(),
+            names,
+            m(result),
+            isEffect,
+            external,
+        )
+        Tuple(items) => TypeNode.Tuple(items.map(m).toArray())
+        Optional(inner) => TypeNode.Optional(m(inner))
+        Result(inner, error) => TypeNode.Result(m(inner), m(error))
+    }
+}
+
+// ---- the cursor ---------------------------------------------------------------------------------------------
+fn Parser.peek(self) -> Token = self.tokens[self.i]
+
+fn Parser.peekAt(self, ahead: Int) -> Token {
+    let k = self.i + ahead
+    self.tokens[if k < self.end { k } else { self.end - 1 }]
+}
+
+fn Parser.at(self, k: Tok) -> Bool = self.tokens[self.i].kind == k
+
+fn Parser.atOp(self, o: Op) -> Bool = self.tokens[self.i].op == o
+
+fn Parser.atName(self, name: Text) -> Bool {
+    let t = self.peek()
+    t.kind == .Name and self.text(t) == name
+}
+
+fn Parser.text(self, t: Token) -> Text = self.source.text[t.at..t.at + t.len]
+
+fn Parser.next(var self) -> Token {
+    let t = self.peek()
+    if t.kind != .Eof {
+        self.i += 1
+    }
+    t
+}
+
+fn Parser.accept(var self, k: Tok) -> Bool {
+    if not self.at(k) {
+        return false
+    }
+    self.next()
+    true
+}
+
+fn Parser.acceptOp(var self, o: Op) -> Bool {
+    if not self.atOp(o) {
+        return false
+    }
+    self.next()
+    true
+}
+
+fn Parser.fail(var self, t: Token, message: Text) {
+    if not self.failed {
+        self.errors.add(self.source, t.line, t.col, message)
+    }
+    self.failed = true
+}
+
+// one level deeper: false (said once) past the limit
+fn Parser.deeper(var self) -> Bool {
+    if self.depth >= maxDepth {
+        self.fail(self.peek(), "nested too deep: give the inner parts names (let) of their own")
+        return false
+    }
+    self.depth += 1
+    true
+}
+
+fn Parser.expected(var self, what: Text, where: Text) -> Token {
+    let t = self.peek()
+    let found = if t.kind is Name | TypeName { self.text(t) } else { t.name() }
+    self.fail(t, cut("expected \"{what}\" {where}, found \"{found}\"", 159))
+    t
+}
+
+fn Parser.expect(var self, k: Tok, where: Text) -> Token {
+    if not self.at(k) {
+        return self.expected(k.name(), where)
+    }
+    self.next()
+}
+
+fn Parser.expectOp(var self, o: Op, where: Text) -> Token {
+    if not self.atOp(o) {
+        return self.expected(o.name(), where)
+    }
+    self.next()
+}
+
+fn Parser.skipNewlines(var self) {
+    while self.at(.Newline) {
+        self.next()
+    }
+}
+
+fn Parser.isAlias(self, name: Text) -> Bool = self.aliases.contains(name)
+
+// Lists are made on two stacks, ints and texts: a list's items go on top (a list inside it goes and comes back
+// above them), and when it is whole they are taken off as an array of its exact size. No small array grows, so the
+// tree's big ones keep their room to grow.
+fn Parser.takeInts(var self, start: Int) -> [Int] {
+    let items = self.ints[start..].toArray()
+    while len(self.ints) > start {
+        self.ints.pop()
+    }
+    items
+}
+
+fn Parser.takeTexts(var self, start: Int) -> [Text] {
+    let items = self.texts[start..].toArray()
+    while len(self.texts) > start {
+        self.texts.pop()
+    }
+    items
+}
+
+// ---- comments -------------------------------------------------------------------------------------------------
+// the comments before a line, one a line (empty ones before the first that says something are dropped)
+fn Parser.joinComments(var self, beforeLine: Int) -> Text {
+    let from = self.comment
+    while self.comment < len(self.comments) and self.comments[self.comment].line < beforeLine {
+        self.comment += 1
+    }
+    var first = from
+    while first < self.comment and self.comments[first].text == "" {
+        first += 1
+    }
+    if first == self.comment {
+        return ""
+    }
+    self.comments[first..self.comment].map(c => c.text).join("\n")
+}
+
+fn Parser.trailingOn(var self, line: Int) -> Text? {
+    if self.comment < len(self.comments) {
+        let c = self.comments[self.comment]
+        if c.line == line and not c.ownLine {
+            self.comment += 1
+            return c.text
+        }
+    }
+    None
+}
+
+fn Parser.lastLine(self) -> Int = if self.i > self.base { self.tokens[self.i - 1].line } else { 1 }
+
+// ---- types ----------------------------------------------------------------------------------------------------
+fn Parser.parseType(var self) -> Int {
+    if not self.deeper() {
+        return self.ast.typeExpr(.Named("Int", []), 0, 0)
+    }
+    let te = self.parseTypeIn()
+    self.depth -= 1
+    te
+}
+
+fn Parser.parseTypeIn(var self) -> Int {
+    let t = self.peek()
+    var te = -1
+    if self.accept(.LBracket) {
+        let first = self.parseType()
+        if self.accept(.Colon) {
+            // [K: V]: a map
+            let value = self.parseType()
+            self.expect(.RBracket, "after a map's value type")
+            te = self.ast.typeExpr(.Map(first, value), t.line, t.col)
+        } else {
+            self.expect(.RBracket, "after an array's element type")
+            te = self.ast.typeExpr(.Array(first), t.line, t.col)
+        }
+    } else if t.kind == .LParen or t.kind is Effect | Extern and self.peekAt(1).kind == .LParen {
+        // (A, B) -> R: a function; effect (A) -> R: one that changes the world; extern (A) -> R: a C function
+        let isEffect = self.accept(.Effect)
+        let external = not isEffect and self.accept(.Extern)
+        self.next()
+        let start = len(self.ints)
+        while not self.at(.RParen) and not self.at(.Eof) and len(self.ints) - start < 16 {
+            let param = self.parseType()
+            self.ints.push(param)
+            if not self.accept(.Comma) {
+                break
+            }
+        }
+        let params = self.takeInts(start)
+        self.expect(.RParen, "after a function type's parameters")
+        if external and not self.at(.Arrow) {
+            self.expect(.Arrow, "in a C function type: extern (A, B) -> Result") // always a function
+        }
+        let plain = not isEffect and not external and not self.at(.Arrow)
+        if plain and len(params) == 0 {
+            // () is a value, not a type
+            self.fail(t, "expected a type, found ()")
+            return self.ast.typeExpr(.Named("Unit", []), t.line, t.col)
+        }
+        if plain and len(params) == 1 {
+            te = params[0] // (Int ! E)?: parentheses group
+        } else if plain {
+            te = self.ast.typeExpr(.Tuple(params), t.line, t.col) // (Int, Text): a tuple
+        } else {
+            self.expect(.Arrow, "in a function type: (A, B) -> Result")
+            let result = self.parseType()
+            return self.ast.typeExpr(.Fn(params, [], result, isEffect, external), t.line, t.col)
+        }
+    } else if t.kind == .Name
+        and self.peekAt(1).kind == .Dot
+        and self.peekAt(2).kind == .TypeName
+        and (self.typeText or self.isAlias(self.text(t))) {
+        // g.Vec2: a type of the module g stands for
+        self.next()
+        self.next()
+        let tn = self.next()
+        te = self.ast.typeExpr(.Named(self.text(t) + "." + self.text(tn), []), t.line, t.col)
+    } else if t.kind != .TypeName {
+        self.fail(t, "expected a type (Int, Float, Bool, Text, a type's name, [Type], [Key: Value], Type? or Type!)")
+        return self.ast.typeExpr(.Named("Int", []), t.line, t.col)
+    } else {
+        self.next()
+        let start = len(self.ints)
+        if self.acceptOp(.Lt) {
+            // Pair<Int, Text>: a generic type, given its types
+            while not self.atOp(.Gt) and not self.at(.Eof) and len(self.ints) - start < 16 {
+                let arg = self.parseType()
+                self.ints.push(arg)
+                if not self.accept(.Comma) {
+                    break
+                }
+            }
+            self.expectOp(.Gt, "after the type's types: Pair<A, B>")
+        }
+        let args = self.takeInts(start)
+        te = self.ast.typeExpr(.Named(self.text(t), args), t.line, t.col)
+    }
+    if not self.at(.Question) and not self.at(.Bang) {
+        return te
+    }
+    // T?: a T, or None; T!: a T, or an error
+    let fallible = self.at(.Bang)
+    let bang = self.next()
+    let inner = self.ast.types[te]
+    if not fallible {
+        let optional = self.ast.typeExpr(.Optional(te), inner.line, inner.col)
+        if not self.at(.Bang) {
+            return optional
+        }
+        // T?!: a result whose value is optional (a next() that may have none, or fail)
+        let bang2 = self.next()
+        let error2 = if self.at(.TypeName) and self.peek().line == bang2.line {
+            self.parseType()
+        } else {
+            -1
+        }
+        return self.ast.typeExpr(.Result(optional, error2), inner.line, inner.col)
+    }
+    let error = if self.at(.TypeName) and self.peek().line == bang.line {
+        self.parseType() // Int ! ParseError
+    } else {
+        -1
+    }
+    self.ast.typeExpr(.Result(te, error), inner.line, inner.col)
+}
+
+// An interface's function: fn speak(loud: Bool) -> Text, effect fn log(line: Text). A field of a function type,
+// its values' names kept for the text.
+fn Parser.parseMember(var self) -> Param {
+    let t = self.peek()
+    let isEffect = self.accept(.Effect)
+    self.expect(.Fn, if isEffect {
+        "after effect (an interface's effect fn)"
+    } else {
+        "for an interface's function"
+    })
+    let name = self.expect(.Name, "after fn (the function's camelCase name)")
+    self.expect(.LParen, "after the function's name")
+    let start = len(self.ints)
+    let named = len(self.texts)
+    while not self.at(.RParen) and not self.at(.Eof) and len(self.ints) - start < 16 {
+        let valueName = self.text(self.expect(.Name, "for a value (a camelCase name)"))
+        self.texts.push(valueName)
+        self.expect(.Colon, "after the value's name")
+        let param = self.parseType()
+        self.ints.push(param)
+        if not self.accept(.Comma) {
+            break
+        }
+    }
+    let params = self.takeInts(start)
+    let names = self.takeTexts(named)
+    self.expect(.RParen, "after the function's values")
+    let result = if self.accept(.Arrow) {
+        self.parseType() // none: it gives nothing
+    } else {
+        -1
+    }
+    let ty = self.ast.typeExpr(.Fn(params, names, result, isEffect, false), t.line, t.col)
+    Param(self.text(name), ty, name.line, name.col)
+}
+
+// ---- expressions ----------------------------------------------------------------------------------------------
+fn Parser.blockExpr(var self) -> Int {
+    let t = self.peek()
+    let b = self.parseBlock()
+    self.ast.expr(.BlockExpr(b, false), t.line, t.col)
+}
+
+fn Parser.lambdaArrow(self, k: Int) -> Bool =
+    self.peekAt(k).kind == .FatArrow and self.i + k != self.armArrow
+
+fn Parser.lambdaAhead(self) -> Bool {
+    if self.at(.Name) and self.lambdaArrow(1) {
+        return true
+    }
+    if not self.at(.LParen) {
+        return false
+    }
+    var k = 1
+    if self.peekAt(k).kind == .RParen {
+        return self.lambdaArrow(k + 1)
+    }
+    while true {
+        if self.peekAt(k).kind != .Name {
+            return false
+        }
+        k += 1
+        if self.peekAt(k).kind == .Colon {
+            // (x: Int) => ...: a type, to the comma or the parenthesis
+            var depth = 0
+            k += 1
+            while true {
+                let t = self.peekAt(k)
+                if t.kind is Eof | Newline {
+                    return false
+                }
+                if t.kind is LParen | LBracket or t.op == Op.Lt {
+                    depth += 1
+                } else if (t.kind is RParen | RBracket or t.op == Op.Gt) and depth > 0 {
+                    depth -= 1
+                } else if t.kind is Comma | RParen and depth == 0 {
+                    break
+                }
+                k += 1
+            }
+        }
+        if self.peekAt(k).kind == .Comma {
+            k += 1
+            continue
+        }
+        return self.peekAt(k).kind == .RParen and self.lambdaArrow(k + 1)
+    }
+    false
+}
+
+fn Parser.parseLambda(var self) -> Int {
+    let t = self.peek()
+    let start = len(self.ints)
+    if self.at(.Name) {
+        let name = self.next()
+        let param = self.ast.param(Param(self.text(name), -1, name.line, name.col))
+        self.ints.push(param)
+    } else {
+        self.expect(.LParen, "")
+        while not self.at(.RParen) and not self.at(.Eof) {
+            let name = self.expect(.Name, "in a lambda's parameters")
+            let ty = if self.accept(.Colon) {
+                self.parseType() // (x: Int) => ...
+            } else {
+                -1
+            }
+            if len(self.ints) - start == 16 {
+                self.fail(name, "a lambda takes at most 16 values: give it a record instead")
+            } else {
+                let param = self.ast.param(Param(self.text(name), ty, name.line, name.col))
+                self.ints.push(param)
+            }
+            if not self.accept(.Comma) {
+                break
+            }
+        }
+        self.expect(.RParen, "after a lambda's parameters")
+    }
+    let params = self.takeInts(start)
+    self.expect(.FatArrow, "in a lambda")
+    let body = self.parseExpr()
+    self.ast.expr(.Lambda(params, body), t.line, t.col)
+}
+
+fn Parser.intValue(var self, t: Token) -> Int {
+    let raw = self.text(t)
+    let b = raw.bytes()
+    if b[0] == '\'' {
+        // 'a': its code point
+        return match charLiteral(raw) {
+            Ok(cp) => cp
+            Err(why) => {
+                self.fail(t, why)
+                0
+            }
+        }
+    }
+    let base = if t.len > 2 and b[0] == '0' {
+        match b[1] {
+            'x' => 16
+            'b' => 2
+            'o' => 8
+            _ => 10
+        }
+    } else {
+        10
+    }
+    var v = 0
+    for c in b[(if base == 10 { 0 } else { 2 })..] {
+        if c == '_' {
+            continue
+        }
+        let d = if c >= 'a' {
+            c - 'a' + 10
+        } else if c >= 'A' {
+            c - 'A' + 10
+        } else {
+            c - '0'
+        }
+        // past 2^63 does not fit (2^63 itself wraps to the minimum, written -9223372036854775808)
+        let room = 9223372036854775807 - d
+        let limit = room / base + (if room % base == base - 1 { 1 } else { 0 })
+        if v < 0 or v > limit {
+            self.fail(t, "this number does not fit in an Int (64 bits)")
+            return 0
+        }
+        v = v *% base +% d // 2^63: the minimum, negated below
+    }
+    v
+}
+
+fn Parser.floatValue(self, t: Token) -> Float = self.text(t).replace("_", "").parseFloat() ?? 0.0
+
+// The escape after a backslash (its letter at b[at]): its code point, and where it ends; or why it is a bad one.
+// quote: the literal's own ('"' a text, '\'' a character), the one it escapes; a text's \x stays below 0x80.
+fn escapeAt(b: Bytes, at: Int, end: Int, quote: Int) -> (Int, Int)! {
+    let k = b[at]
+    let s = at + 1
+    match k {
+        'n' => return (10, s)
+        't' => return (9, s)
+        'r' => return (13, s)
+        '0' => return (0, s)
+        '\\' => return (k, s)
+        '"' | '\'' if k == quote => return (k, s)
+        '{' | '}' if quote == '"' => return (k, s)
+        'x' => {
+            let hi = if s < end { hexDigit(b[s]) } else { -1 }
+            let lo = if s + 1 < end { hexDigit(b[s + 1]) } else { -1 }
+            if hi < 0 or lo < 0 {
+                return Err("\\x takes two hex digits: \\x41")
+            }
+            if quote == '"' and hi > 7 {
+                return Err("\\x80 and above are not UTF-8 in a text: write the character, or \\u\{...\}")
+            }
+            return (hi * 16 + lo, s + 2)
+        }
+        'u' => {
+            var q = s + 1
+            var v = 0
+            var n = 0
+            while q < end and hexDigit(b[q]) >= 0 and n < 7 {
+                v = v * 16 + hexDigit(b[q])
+                q += 1
+                n += 1
+            }
+            if s >= end or b[s] != '{' or n == 0 or n > 6 or q >= end or b[q] != '}' {
+                return Err("\\u takes 1 to 6 hex digits in braces: \\u\{20AC\}")
+            }
+            if v > 0x10ffff or v >= 0xd800 and v <= 0xdfff {
+                return Err("\\u\{...\} is not a Unicode code point (0 to 10FFFF, without D800 to DFFF)")
+            }
+            return (v, q + 1)
+        }
+        _ => {}
+    }
+    if quote == '"' {
+        Err("unknown escape in text (\\n \\t \\r \\0 \\\" \\\\ \\\{ \\\} \\x41 \\u\{20AC\} are known)")
+    } else {
+        Err("unknown escape in a character (\\n \\t \\r \\0 \\' \\\\ \\x41 \\u\{20AC\} are known)")
+    }
+}
+
+fn hexDigit(c: Int) -> Int = match c {
+    '0'..='9' => c - '0'
+    'a'..='f' => c - 'a' + 10
+    'A'..='F' => c - 'A' + 10
+    _ => -1
+}
+
+// past the escape whose backslash is at q (\u{...} whole: its braces are no value's)
+fn escapeEnd(b: Bytes, q: Int, end: Int) -> Int {
+    if q + 2 < end and b[q + 1] == 'u' and b[q + 2] == '{' {
+        if b[q..end].indexOf('}') is Some(close) {
+            return q + close + 1
+        }
+    }
+    if q + 2 < end { q + 2 } else { end }
+}
+
+// The text t[s..end], its escapes decoded (\n \t \r \0 \" \\ \{ \} \x41 to \x7F, \u{20AC}), or why one is bad. Each
+// escape is decoded by a call of its own, not by a loop: a loop that makes something each turn, run inside the
+// parser's loops (which hold the tree), makes their memory's upkeep grow with the tree.
+pub fn decodeEscapes(t: Text, s: Int, end: Int) -> Text! {
+    let b = t.bytes()
+    let at = b[s..end].indexOf('\\') ?? return t[s..end]
+    let q = s + at
+    if q + 1 >= end {
+        return t[s..end] // a backslash at the very end stays one
+    }
+    let (cp, after) = escapeAt(b, q + 1, end, '"')?
+    t[s..q] + char(cp) + decodeEscapes(t, after, end)?
+}
+
+// A character literal's code point ('a', '\n', '\u{20AC}'), or why it is not one.
+pub fn charLiteral(raw: Text) -> Int! {
+    let b = raw.bytes()
+    let n = len(b)
+    var s = 1
+    let end = if n >= 2 and b[n - 1] == '\'' { n - 1 } else { n }
+    if s >= end {
+        return Err("a character goes between the quotes: 'a'")
+    }
+    var cp = 0
+    if b[s] == '\\' and s + 1 < end {
+        let (code, after) = escapeAt(b, s + 1, end, '\'')?
+        cp = code
+        s = after
+    } else {
+        // one character, UTF-8
+        let c = b[s]
+        s += 1
+        var more = if c >= 0xf0 {
+            3
+        } else if c >= 0xe0 {
+            2
+        } else if c >= 0xc0 {
+            1
+        } else {
+            0
+        }
+        cp = match more {
+            3 => c & 7
+            2 => c & 15
+            1 => c & 31
+            _ => c
+        }
+        while more > 0 and s < end and b[s] & 0xc0 == 0x80 {
+            cp = cp << 6 | b[s] & 63
+            s += 1
+            more -= 1
+        }
+        if more > 0 or c >= 0x80 and c < 0xc0 {
+            return Err("this character is not UTF-8")
+        }
+    }
+    if s != end {
+        return Err("a character literal holds one character (a text goes between \"...\")")
+    }
+    cp
+}
+
+// the text between s and end of t, escapes decoded
+fn Parser.decodePiece(var self, tok: Token, t: Text, s: Int, end: Int) -> Text = match decodeEscapes(t, s, end) {
+    Ok(text) => text
+    Err(why) => {
+        self.fail(tok, why)
+        ""
+    }
+}
+
+// """ ... """: the lines between the quotes, each without the closing quotes' indentation, joined by line breaks
+// (none after the last). The opening quotes end their line; the closing ones stand on a line of their own.
+fn Parser.multilineText(var self, t: Token) -> Text? {
+    let src = self.source.text
+    let b = src.bytes()
+    let open = t.at + 3 + (if b[t.at] == 'r' { 1 } else { 0 })
+    let close = t.at + t.len - 3
+    var q = open
+    while q < close and b[q] is ' ' | '\t' | '\r' {
+        q += 1
+    }
+    if q >= close or b[q] != '\n' {
+        self.fail(t, "the text starts on the line after its \"\"\"")
+        return None
+    }
+    let first = q + 1
+    var lastBreak = close
+    while lastBreak > first and b[lastBreak - 1] != '\n' {
+        lastBreak -= 1
+    }
+    for r in lastBreak..close {
+        if b[r] != ' ' and b[r] != '\t' {
+            self.fail(t, "the closing \"\"\" stands on a line of its own")
+            return None
+        }
+    }
+    let indent = close - lastBreak
+    var out = ""
+    var line = first
+    while line < lastBreak {
+        let stop = if b[line..lastBreak].indexOf('\n') is Some(k) {
+            line + k
+        } else {
+            lastBreak
+        }
+        var text = line
+        var strip = 0
+        while strip < indent and text < stop and b[text] is ' ' | '\t' {
+            text += 1
+            strip += 1
+        }
+        var tail = stop
+        while tail > text and b[tail - 1] == '\r' {
+            tail -= 1
+        }
+        if strip < indent and text < tail {
+            self.fail(t, "each line of the text starts at least as far in as the closing \"\"\"")
+            return None
+        }
+        if line != first {
+            out += "\n"
+        }
+        out += src[text..tail]
+        line = stop + 1
+    }
+    out
+}
+
+// A text; with {expressions} inside, an Interp: the pieces around them, and each expression parsed.
+fn Parser.parseText(var self, t: Token) -> Int {
+    let src = self.source.text
+    let b = src.bytes()
+    let last = t.at + t.len - 1
+    if b[t.at] == 'r' {
+        // r"...": the bytes as written, no escapes, no values
+        let multiline = t.len >= 7 and b[t.at + 1..t.at + 4] == "\"\"\"".bytes()
+        if multiline {
+            let lines = self.multilineText(t) ?? ""
+            return self.ast.expr(.TextLit(lines, "r\"\"\"\n" + lines + "\n\"\"\"", true), t.line, t.col)
+        }
+        let end = if t.len > 2 and b[last] == '"' { last } else { last + 1 }
+        return self.ast.expr(.TextLit(src[t.at + 2..end], self.text(t), false), t.line, t.col)
+    }
+    let multiline = t.len >= 6 and b[t.at..t.at + 3] == "\"\"\"".bytes()
+    // the text the pieces are in, and where: the token's own, or a multiline text's lines
+    var w = src
+    var s = t.at + 1
+    var end = if t.len > 1 and b[last] == '"' { last } else { last + 1 }
+    if multiline {
+        let lines = self.multilineText(t) ?? return self.ast.expr(.TextLit("", "\"\"", false), t.line, t.col)
+        w = lines
+        s = 0
+        end = len(lines)
+    }
+    let wb = w.bytes()
+    var open = -1
+    var q = s
+    while q < end {
+        if wb[q] == '\\' {
+            q = escapeEnd(wb, q, end)
+            continue
+        }
+        if wb[q] == '{' {
+            open = q
+            break
+        }
+        q += 1
+    }
+    if open < 0 {
+        let text = self.decodePiece(t, w, s, end)
+        let raw = if multiline {
+            "\"\"\"\n" + w[s..end] + "\n\"\"\""
+        } else {
+            self.text(t)
+        }
+        return self.ast.expr(.TextLit(text, raw, multiline), t.line, t.col)
+    }
+    // on the stacks: the values; and before each one the piece before it, decoded and as written, and its format
+    let start = len(self.ints)
+    let named = len(self.texts)
+    var count = 0
+    var anyFormat = false
+    var piece = s
+    q = s
+    while q < end and count < 63 {
+        if wb[q] == '\\' {
+            q = escapeEnd(wb, q, end)
+            continue
+        }
+        if wb[q] != '{' {
+            q += 1
+            continue
+        }
+        let part = self.decodePiece(t, w, piece, q)
+        self.texts.push(part)
+        self.texts.push(w[piece..q])
+        count += 1
+        // the expression: to the matching brace, texts inside it skipped
+        q += 1
+        let from = q
+        var depth = 1
+        while q < end and depth > 0 {
+            let c = wb[q]
+            if c is '"' | '\'' {
+                // a text or a character inside: its braces are its own
+                q += 1
+                while q < end and wb[q] != c {
+                    if wb[q] == '\\' {
+                        q += 1
+                    }
+                    q += 1
+                }
+            } else if c == '{' {
+                depth += 1
+            } else if c == '}' {
+                depth -= 1
+                if depth == 0 {
+                    break
+                }
+            }
+            q += 1
+        }
+        if q >= end {
+            self.fail(t, "a \{ in a text needs its \} (write \\\{ for the character)")
+            return self.ast.expr(.Interp(self.takeInts(start), self.takeTexts(named), [], [], multiline), t.line, t.col)
+        }
+        // {x:.2} or {n:5}: a format after the last colon outside parentheses, brackets and texts
+        var stop = q
+        var colon = -1
+        var nest = 0
+        var r = from
+        while r < q {
+            let c = wb[r]
+            if c is '"' | '\'' {
+                r += 1
+                while r < q and wb[r] != c {
+                    if wb[r] == '\\' {
+                        r += 1
+                    }
+                    r += 1
+                }
+            } else if c is '(' | '[' | '{' {
+                nest += 1
+            } else if c is ')' | ']' | '}' {
+                nest -= 1
+            } else if c == ':' and nest == 0 {
+                colon = r
+            }
+            r += 1
+        }
+        var format = ""
+        if colon >= 0 and colon + 1 < q and wb[colon + 1..q].all(c => c is '0'..='9' | '.') {
+            format = w[colon + 1..q]
+            anyFormat = true
+            stop = colon
+        }
+        self.texts.push(format)
+        let shift = if multiline { t.col + from - 1 } else { t.col + from - t.at - 1 }
+        let value = self.interpolated(t, w, from, stop, shift)
+        self.ints.push(value)
+        q += 1
+        piece = q
+    }
+    let final = self.decodePiece(t, w, piece, end)
+    self.texts.push(final)
+    self.texts.push(w[piece..end])
+    let values = self.takeInts(start)
+    let pieces = self.takeTexts(named)
+    let parts = (0..len(values) + 1).map(k => pieces[3 * k]).toArray()
+    let raws = (0..len(values) + 1).map(k => pieces[3 * k + 1]).toArray()
+    let formats = if anyFormat {
+        (0..len(values)).map(k => pieces[3 * k + 2]).toArray()
+    } else {
+        []
+    }
+    self.ast.expr(.Interp(values, parts, raws, formats, multiline), t.line, t.col)
+}
+
+// The expression between a text's braces (w[from..stop]): lexed on its own, its errors pointed at the text's line,
+// and parsed with this parser, its tokens after the file's for the while.
+fn Parser.interpolated(var self, t: Token, w: Text, from: Int, stop: Int, shift: Int) -> Int {
+    let sub = Source(self.source.path, w[from..stop])
+    let lexed = lex(sub.text)
+    for problem in lexed.problems {
+        self.errors.add(sub, problem.line, problem.col, problem.message)
+    }
+    let outer = self.source
+    let (base, i, comment, failed, armArrow) = (self.base, self.i, self.comment, self.failed, self.armArrow)
+    let commentBase = len(self.comments)
+    self.base = self.end
+    self.end += len(lexed.tokens)
+    if self.end > len(self.tokens) {
+        self.tokens += lexed.tokens * 2
+    }
+    for (k, tok) in lexed.tokens.enumerate() {
+        self.tokens[self.base + k] = tok with { line: t.line, col: tok.col + shift }
+    }
+    for c in lexed.comments {
+        self.comments.push(c)
+    }
+    self.source = sub
+    self.i = self.base
+    self.comment = commentBase
+    self.failed = false
+    self.armArrow = -1
+    let x = self.parseExpr()
+    let after = self.peek()
+    if after.kind != .Eof and after.kind != .Newline {
+        self.fail(after, "one expression goes between \{ and \}")
+    }
+    let innerFailed = self.failed
+    self.end = self.base
+    while len(self.comments) > commentBase {
+        self.comments.pop()
+    }
+    self.source = outer
+    self.base = base
+    self.i = i
+    self.comment = comment
+    self.failed = failed or innerFailed
+    self.armArrow = armArrow
+    x
+}
+
+fn Parser.parseIf(var self) -> Int {
+    let t = self.next() // if
+    let cond = self.parseExpr()
+    let then = self.parseBlock()
+    var otherwise = -1
+    if self.accept(.Else) {
+        otherwise = if self.at(.If) { self.parseIf() } else { self.blockExpr() }
+    }
+    self.ast.expr(.If(cond, then, otherwise), t.line, t.col)
+}
+
+// 42 or -42, as a pattern
+fn Parser.intLiteral(var self) -> Int {
+    let negative = self.acceptOp(.Minus)
+    let num = self.next()
+    let value = self.intValue(num)
+    let raw = if negative {
+        self.source.text[num.at - 1..num.at + num.len]
+    } else {
+        self.text(num)
+    }
+    self.ast.expr(.IntLit(if negative { 0 -% value } else { value }, raw), num.line, num.col)
+}
+
+// 'a'..='z': the end is kept as written and taken one further, so the range is a..b as any other
+fn Ast.inclusiveEnd(var self, arm: Arm) -> Arm {
+    if self.exprs[arm.intHigh].node is IntLit(value, raw) {
+        self.exprs[arm.intHigh].node = .IntLit(value + 1, raw)
+    }
+    arm with { inclusive: true }
+}
+
+fn Parser.boolPattern(var self) -> Int {
+    let t = self.next()
+    self.ast.expr(.BoolLit(t.kind == .True), t.line, t.col)
+}
+
+// the fields of Circle(...), Point(...) or (...): names, _, or patterns inside
+fn Parser.fieldPatterns(var self, arm: Arm) -> Arm {
+    let start = len(self.ints)
+    let named = len(self.texts)
+    var anySub = false
+    while not self.at(.RParen) and not self.at(.Eof) and len(self.texts) - named < 32 {
+        let b = self.peek()
+        var sub = -1
+        if b.kind == .Name or b.kind == .Underscore and self.peekAt(1).op != Op.Pipe {
+            self.next()
+        } else {
+            // any pattern an arm takes: Some(Circle(r)), Point(x, 0), Some('a'..='z'), Some(' ' | '\n')
+            let inner = self.patternWithAlternatives()
+            sub = self.ast.arm(inner)
+            if self.failed {
+                break
+            }
+        }
+        anySub = anySub or sub >= 0
+        self.ints.push(sub)
+        self.texts.push(if b.kind == .Name { self.text(b) } else { "_" })
+        if not self.accept(.Comma) {
+            break
+        }
+    }
+    let subs = self.takeInts(start)
+    let binds = self.takeTexts(named)
+    self.expect(.RParen, "after the pattern's fields")
+    arm with { binds: binds, subs: if anySub { subs } else { [] } }
+}
+
+// Some(x), Shape.Circle(r, _), Empty, Point(x, 0), (q, r): a case or a record and its fields (a match arm, or a
+// let)
+fn Parser.parseCasePattern(var self) -> Arm {
+    if self.accept(.LParen) {
+        // (q, r): a tuple
+        return self.fieldPatterns(Arm(pattern: "(,)"))
+    }
+    var name = self.next()
+    if self.accept(.Dot) {
+        name = self.expect(.TypeName, "after the enum's name")
+    }
+    let arm = Arm(pattern: self.text(name))
+    if self.accept(.LParen) {
+        return self.fieldPatterns(arm) // Circle(r, _): the case's data
+    }
+    arm
+}
+
+fn Parser.atIntLiteral(self) -> Bool =
+    self.at(.IntLit) or self.atOp(.Minus) and self.peekAt(1).kind == .IntLit
+
+fn Parser.parseMatchPattern(var self) -> Arm {
+    let pt = self.peek()
+    var arm = Arm()
+    if self.accept(.Underscore) {
+        return arm
+    }
+    if self.at(.Name) {
+        // n if n > 2 => ...: the whole value, named
+        return arm with { whole: self.text(self.next()) }
+    }
+    if self.at(.TypeName) or self.at(.LParen) {
+        return self.parseCasePattern()
+    }
+    if self.at(.True) or self.at(.False) {
+        arm.intPattern = self.boolPattern()
+    } else if self.atIntLiteral() or self.at(.DotDot) or self.at(.DotDotEq) {
+        if not self.at(.DotDot) and not self.at(.DotDotEq) {
+            arm.intPattern = self.intLiteral()
+        }
+        let inclusive = self.at(.DotDotEq)
+        if self.accept(.DotDot) or self.accept(.DotDotEq) {
+            arm.isRange = true
+            if self.atIntLiteral() {
+                arm.intHigh = self.intLiteral()
+            }
+            if arm.intPattern < 0 and arm.intHigh < 0 {
+                self.fail(pt, "a range pattern needs a start or an end: 90.., ..60 or 60..90")
+            }
+            if inclusive and arm.intHigh < 0 {
+                self.fail(pt, "..= takes its end: 'a'..='z' (a range with no end is 90..)")
+            }
+            if inclusive and arm.intHigh >= 0 {
+                arm = self.ast.inclusiveEnd(arm)
+            }
+        }
+    } else if self.at(.TextLit) {
+        let tx = self.next()
+        arm.textPattern = self.parseText(tx)
+        if not self.ast.exprs[arm.textPattern].node is TextLit(_, _, _) {
+            self.fail(tx, "a text pattern is a plain text, without \{values\}")
+        }
+    } else {
+        self.fail(pt, "a match arm starts with an enum case, a Bool, an Int, a range, a text, a name, or _")
+    }
+    arm
+}
+
+// a pattern and its alternatives: Red | Green
+fn Parser.patternWithAlternatives(var self) -> Arm {
+    let arm = self.parseMatchPattern()
+    let start = len(self.ints)
+    while not self.failed and self.acceptOp(.Pipe) {
+        let alternative = self.parseMatchPattern()
+        let k = self.ast.arm(alternative)
+        self.ints.push(k)
+    }
+    if len(self.ints) == start {
+        return arm
+    }
+    arm with { alternatives: self.takeInts(start) }
+}
+
+// the index of the => that ends an arm's guard (outside any brackets), or -1
+fn Parser.armArrowAt(self) -> Int {
+    var depth = 0
+    var k = self.i
+    while k < self.end {
+        let kind = self.tokens[k].kind
+        if kind == .Eof or kind == .Newline and depth == 0 {
+            break
+        }
+        if kind is LParen | LBracket | LBrace {
+            depth += 1
+        } else if kind is RParen | RBracket | RBrace and depth > 0 {
+            depth -= 1
+        } else if kind == .FatArrow and depth == 0 {
+            return k
+        }
+        k += 1
+    }
+    -1
+}
+
+fn Parser.parseMatch(var self) -> Int {
+    let t = self.next() // match
+    let subject = self.parseExpr()
+    self.expect(.LBrace, "to start the match's arms")
+    self.skipNewlines()
+    let start = len(self.ints)
+    while not self.at(.RBrace) and not self.at(.Eof) and not self.failed {
+        let comment = self.joinComments(self.peek().line)
+        var arm = self.patternWithAlternatives()
+        arm.comment = comment
+        if self.accept(.If) {
+            // Some(x) if x > 3 => ...
+            let kept = self.armArrow
+            self.armArrow = self.armArrowAt()
+            arm.guard = self.parseExpr()
+            self.armArrow = kept
+        }
+        self.expect(.FatArrow, "after the arm's pattern")
+        arm.body = if self.at(.LBrace) { self.blockExpr() } else { self.parseExpr() }
+        let k = self.ast.arm(arm)
+        self.ints.push(k)
+        if not self.accept(.Comma) and not self.at(.Newline) and not self.at(.RBrace) {
+            self.fail(self.peek(), "match arms are separated by commas or new lines")
+            break
+        }
+        self.skipNewlines()
+    }
+    let arms = self.takeInts(start)
+    self.expect(.RBrace, "to close the match")
+    self.ast.expr(.Match(subject, arms, false), t.line, t.col)
+}
+
+fn Parser.parsePrimary(var self) -> Int {
+    let t = self.peek()
+    if self.lambdaAhead() {
+        return self.parseLambda()
+    }
+    match t.kind {
+        IntLit => {
+            self.next()
+            let value = self.intValue(t)
+            self.ast.expr(.IntLit(value, self.text(t)), t.line, t.col)
+        }
+        FloatLit => {
+            self.next()
+            self.ast.expr(.FloatLit(self.floatValue(t), self.text(t)), t.line, t.col)
+        }
+        TextLit => {
+            self.next()
+            self.parseText(t)
+        }
+        True | False => {
+            self.next()
+            self.ast.expr(.BoolLit(t.kind == .True), t.line, t.col)
+        }
+        Underscore => {
+            // a hole: a value not written yet (a node graph's empty pin)
+            self.next()
+            self.ast.expr(.Hole, t.line, t.col)
+        }
+        Name | TypeName => {
+            if t.kind == .TypeName and self.text(t) == "Pointer" and self.peekAt(1).op == Op.Lt {
+                // Pointer<UInt32>(p): a call named by the type it makes
+                let te = self.parseType()
+                self.expect(.LParen, "after Pointer<T>: Pointer<T>(address) or Pointer<T>(another pointer)")
+                let args = self.parseArgs(-1)
+                return self.ast.expr(
+                    .Call(typeText(self.ast, te), "", args.values, args.names, false, false),
+                    t.line,
+                    t.col,
+                )
+            }
+            self.next()
+            self.ast.expr(.Name(self.text(t)), t.line, t.col)
+        }
+        LParen => {
+            self.next()
+            if self.accept(.RParen) {
+                return self.ast.expr(.Call("(,)", "", [], [], false, false), t.line, t.col)
+            }
+            let e = self.parseExpr()
+            if self.at(.Comma) {
+                // (a, b): a tuple
+                let start = len(self.ints)
+                self.ints.push(e)
+                while self.accept(.Comma) and not self.at(.RParen) {
+                    let item = self.parseExpr()
+                    self.ints.push(item)
+                }
+                let items = self.takeInts(start)
+                self.expect(.RParen, "to close the tuple")
+                return self.ast.expr(.Call("(,)", "", items, [""] * len(items), false, false), t.line, t.col)
+            }
+            self.expect(.RParen, "to close the parenthesis")
+            e
+        }
+        LBracket => {
+            self.next()
+            if self.at(.Colon) and self.peekAt(1).kind == .RBracket {
+                // [:]: an empty map
+                self.next()
+                self.next()
+                return self.ast.expr(.MapLit([]), t.line, t.col)
+            }
+            let start = len(self.ints)
+            var isMap = false
+            while not self.at(.RBracket) and not self.at(.Eof) {
+                let item = self.parseExpr()
+                self.ints.push(item)
+                if len(self.ints) - start == 1 and self.at(.Colon) {
+                    isMap = true // [key: value, ...]
+                }
+                if isMap {
+                    self.expect(.Colon, "between a key and its value")
+                    let value = self.parseExpr()
+                    self.ints.push(value)
+                }
+                if not self.accept(.Comma) {
+                    break
+                }
+            }
+            let items = self.takeInts(start)
+            self.expect(.RBracket, if isMap { "to close the map" } else { "to close the array" })
+            self.ast.expr(if isMap { .MapLit(items) } else { .ArrayLit(items) }, t.line, t.col)
+        }
+        If => self.parseIf()
+        Match => self.parseMatch()
+        LBrace => self.blockExpr()
+        Return | Break | Continue => {
+            // x ?? return 0, _ => break: a block of the one statement
+            self.next()
+            let k = self.peek().kind
+            let node = match t.kind {
+                Return => {
+                    let value = if k is Newline | RBrace | RParen | RBracket | Comma | Eof {
+                        -1
+                    } else {
+                        self.parseExpr()
+                    }
+                    StmtNode.Return(value)
+                }
+                Break => StmtNode.Break
+                _ => StmtNode.Continue
+            }
+            let s = self.ast.stmt(Stmt(node, t.line, t.col))
+            let b = self.ast.block(Block([s]))
+            self.ast.expr(.BlockExpr(b, true), t.line, t.col)
+        }
+        Dot => {
+            // .Case, .Case(...): a case of the enum the value goes into
+            if self.peekAt(1).kind == .TypeName {
+                self.next()
+                let name = self.text(self.next())
+                if self.accept(.LParen) {
+                    let args = self.parseArgs(-1)
+                    return self.ast.expr(.Call(name, "", args.values, args.names, false, true), t.line, t.col)
+                }
+                return self.ast.expr(.Case(name, -1, true), t.line, t.col)
+            }
+            self.fail(t, "a value starts with .Case only (a case of the enum it goes into)")
+            self.next()
+            self.ast.expr(.IntLit(0, ""), t.line, t.col)
+        }
+        _ => {
+            let before: Op? = if self.i > self.base { self.tokens[self.i - 1].op } else { None }
+            let joined = self.i > self.base
+                and self.tokens[self.i - 1].line == t.line
+                and self.tokens[self.i - 1].col + 1 == t.col
+            if joined and before == Op.Amp and t.op == Op.Amp {
+                self.fail(t, "there is no &&: write and")
+            } else if joined and before == Op.Pipe and t.op == Op.Pipe {
+                self.fail(t, "there is no ||: write or")
+            } else if joined and before == Op.Plus and t.op == Op.Plus {
+                self.fail(t, "there is no ++: write x += 1")
+            } else if before == Op.Minus
+                and self.i > self.base + 1
+                and self.tokens[self.i - 2].op == Op.Minus
+                and self.tokens[self.i - 2].col + 1 == self.tokens[self.i - 1].col {
+                self.fail(t, "there is no --: write x -= 1")
+            } else {
+                self.fail(t, "expected a value, found \"{t.name()}\"")
+            }
+            self.next()
+            self.ast.expr(.IntLit(0, ""), t.line, t.col)
+        }
+    }
+}
+
+// a call's values, after its (: the one it is called on first (a method's receiver, or -1), then name: value or
+// value, to the )
+fn Parser.parseArgs(var self, receiver: Int) -> Args {
+    let start = len(self.ints)
+    let named = len(self.texts)
+    if receiver >= 0 {
+        self.ints.push(receiver)
+        self.texts.push("")
+    }
+    while not self.at(.RParen) and not self.at(.Eof) {
+        var name = ""
+        if self.at(.Name) and self.peekAt(1).kind == .Colon {
+            name = self.text(self.next())
+            self.next()
+        }
+        let value = self.parseExpr()
+        self.ints.push(value)
+        self.texts.push(name)
+        if not self.accept(.Comma) {
+            break
+        }
+    }
+    let args = Args(self.takeInts(start), self.takeTexts(named))
+    self.expect(.RParen, "to close the call")
+    args
+}
+
+// a?.rest: the rest of the chain reads into what a holds; when a holds nothing, the whole chain is that nothing
+// (None, or the Err). A match the checker completes: Some(#cN) => #cN.rest, None => None.
+fn Parser.chainOn(var self, subject: Int, q: Token) -> Int {
+    self.ast.holes += 1
+    let hole = self.ast.expr(.Name("#c{self.ast.holes}"), q.line, q.col)
+    let body = self.postfixOn(hole)
+    let arm = self.ast.arm(Arm(body: body))
+    let s = self.ast.exprs[subject]
+    self.ast.expr(.Match(subject, [arm], true), s.line, s.col)
+}
+
+fn startsUpper(t: Text) -> Bool = len(t) > 0 and t.bytes()[0] is 'A'..='Z'
+
+fn Parser.postfixOn(var self, operand: Int) -> Int {
+    var e = operand
+    while true {
+        let t = self.peek()
+        if t.kind == .LParen {
+            self.next()
+            let callee = self.ast.exprs[e]
+            var name = "()"
+            var qualifier = ""
+            var first = e // pick(true)(5): a function a value gives, called; "()" with it as the first value
+            if callee.node is Name(n) {
+                name = n
+                first = -1
+            } else if callee.node is Field(target, field)
+                and startsUpper(field)
+                and self.ast.exprs[target].node is Name(n) {
+                name = field // Shape.Circle(2): a case with data
+                qualifier = n
+                first = -1
+            }
+            let args = self.parseArgs(first)
+            e = self.ast.expr(.Call(name, qualifier, args.values, args.names, false, false), callee.line, callee.col)
+        } else if t.kind == .LBracket {
+            self.next()
+            let index = self.parseExpr()
+            self.expect(.RBracket, "to close the index")
+            e = self.ast.expr(.Index(e, index), t.line, t.col)
+        } else if t.kind == .Dot {
+            self.next()
+            let name = self.peek()
+            if not name.kind is Name | TypeName | IntLit {
+                self.fail(name, "expected a name after \".\"")
+                return e
+            }
+            self.next()
+            let field = self.text(name)
+            let target = self.ast.exprs[e]
+            if target.node is Name(n) and not n.contains(".") and self.isAlias(n) and name.kind != .IntLit {
+                self.ast.exprs[e].node = .Name(n + "." + field) // g.area, g.Vec2, g.pi: a name of the module g stands for
+                continue
+            }
+            if self.at(.LParen) and name.kind == .TypeName and target.node is Name(n) {
+                // Shape.Circle(2): a case with data
+                self.next()
+                let args = self.parseArgs(-1)
+                e = self.ast.expr(.Call(field, n, args.values, args.names, false, false), target.line, target.col)
+            } else if self.at(.LParen) {
+                // a.f(b) is f(a, b)
+                self.next()
+                let args = self.parseArgs(e)
+                e = self.ast.expr(.Call(field, "", args.values, args.names, true, false), name.line, name.col)
+            } else {
+                e = self.ast.expr(.Field(e, field), name.line, name.col)
+            }
+        } else if t.kind == .Question and self.peekAt(1).kind == .Dot {
+            // a?.b: optional chaining
+            self.next()
+            return self.chainOn(e, t)
+        } else if t.kind == .Question {
+            // a?: the value, or leave with the None / Err
+            self.next()
+            e = self.ast.expr(.Try(e), t.line, t.col)
+        } else if t.kind == .With {
+            // ship with { laps: ship.laps + 1 }
+            self.next()
+            self.expect(.LBrace, "after with (the fields that change)")
+            self.skipNewlines()
+            let start = len(self.ints)
+            let named = len(self.texts)
+            while not self.at(.RBrace) and not self.at(.Eof) and not self.failed {
+                let field = self.expect(.Name, "for a field (a camelCase name)")
+                self.expect(.Colon, "after the field's name")
+                let value = self.parseExpr()
+                self.ints.push(value)
+                self.texts.push(self.text(field))
+                if not self.accept(.Comma) and not self.at(.Newline) and not self.at(.RBrace) {
+                    self.fail(self.peek(), "separate the fields with commas or new lines")
+                    break
+                }
+                self.skipNewlines()
+            }
+            let values = self.takeInts(start)
+            let fields = self.takeTexts(named)
+            self.expect(.RBrace, "to close the fields")
+            e = self.ast.expr(.With(e, values, fields), t.line, t.col)
+        } else {
+            return e
+        }
+    }
+    e
+}
+
+fn Parser.parseUnary(var self) -> Int {
+    let t = self.peek()
+    if t.op == Op.Minus and self.peekAt(1).kind is IntLit | FloatLit {
+        // -5.abs(): the literal -5 first
+        self.next()
+        let lit = self.parsePrimary()
+        match self.ast.exprs[lit].node {
+            IntLit(value, raw) if raw != "" => {
+                self.ast.exprs[lit].node = .IntLit(0 -% value, "-" + raw)
+            }
+            FloatLit(value, raw) if raw != "" => {
+                self.ast.exprs[lit].node = .FloatLit(-value, "-" + raw)
+            }
+            _ => {}
+        }
+        self.ast.exprs[lit].line = t.line
+        self.ast.exprs[lit].col = t.col
+        return self.postfixOn(lit)
+    }
+    if t.op == Op.Minus {
+        self.next()
+        let operand = self.parseUnary()
+        match self.ast.exprs[operand].node {
+            IntLit(value, raw) if raw != "" and not raw.startsWith("-") => {
+                // a negative literal
+                self.ast.exprs[operand].node = .IntLit(0 -% value, "-" + raw)
+                self.ast.exprs[operand].line = t.line
+                self.ast.exprs[operand].col = t.col
+                return operand
+            }
+            FloatLit(value, raw) if raw != "" and not raw.startsWith("-") => {
+                self.ast.exprs[operand].node = .FloatLit(-value, "-" + raw)
+                return operand
+            }
+            _ => {}
+        }
+        return self.ast.expr(.Unary(.Minus, operand), t.line, t.col)
+    }
+    if t.op == Op.Tilde {
+        // ~x: every bit of x the other way
+        self.next()
+        let operand = self.parseUnary()
+        return self.ast.expr(.Unary(.Tilde, operand), t.line, t.col)
+    }
+    self.postfixOn(self.parsePrimary())
+}
+
+fn Parser.binary(var self, op: Op, left: Int, right: Int) -> Int {
+    let a = self.ast.exprs[left]
+    self.ast.expr(.Binary(op, left, right), a.line, a.col)
+}
+
+// << and >>: two < or > side by side (the lexer keeps them apart, so Pair<A, Tree<B>> closes)
+fn Parser.shiftAt(self) -> Op? {
+    let t = self.peek()
+    let u = self.peekAt(1)
+    if t.op is Some(o) and o is Lt | Gt and u.op == o and u.at == t.at + 1 {
+        return if o == Op.Lt { Op.Shl } else { Op.Shr }
+    }
+    None
+}
+
+// The binary operators, a level each, loosest first: ??, or, and, not (before a value), the comparisons and is
+// (which do not chain), .. (a range), + - | ^ (| and ^ work like +), and * / % & << >> (one level, as in Go and
+// Swift, so a & b == c is (a & b) == c). A level's operands are the next one's.
+const coalesceLevel = 0
+const orLevel = 1
+const andLevel = 2
+const notLevel = 3
+const compareLevel = 4
+const rangeLevel = 5
+const addLevel = 6
+const mulLevel = 7
+
+// the operator of the level here, or None
+fn Parser.operatorAt(self, level: Int) -> Op? {
+    let t = self.peek()
+    if level == coalesceLevel {
+        return if t.op == Op.Coalesce { Op.Coalesce } else { None }
+    }
+    if level == orLevel {
+        return if t.kind == .Or { Op.Or } else { None }
+    }
+    if level == andLevel {
+        return if t.kind == .And { Op.And } else { None }
+    }
+    if level == addLevel {
+        return if t.op is Some(o) and o is Plus | Minus | Pipe | Caret | PlusWrap | MinusWrap {
+            o
+        } else {
+            None
+        }
+    }
+    self.shiftAt() ?? (if t.op is Some(o) and o is Star | Slash | Percent | Amp | StarWrap {
+        o
+    } else {
+        None
+    })
+}
+
+fn Parser.level(var self, level: Int) -> Int {
+    if level == notLevel {
+        return self.parseNot()
+    }
+    if level == compareLevel {
+        return self.parseCompare()
+    }
+    if level == rangeLevel {
+        return self.parseRange()
+    }
+    if level > mulLevel {
+        return self.parseUnary()
+    }
+    var e = self.level(level + 1)
+    while self.operatorAt(level) is Some(op) {
+        if op is Shl | Shr {
+            self.next() // two tokens
+        }
+        self.next()
+        let right = self.level(level + 1)
+        e = self.binary(op, e, right)
+    }
+    e
+}
+
+// What can follow an open range's .. (xs[2..], 90.. =>): nothing that starts a value.
+fn Parser.rangeEndsHere(self) -> Bool =
+    self.peek().kind is RBracket | RParen | Comma | Newline | FatArrow | LBrace | Eof | RBrace
+
+fn Parser.parseRange(var self) -> Int {
+    if self.at(.DotDot) {
+        // ..b: from the start
+        let t = self.next()
+        let high = self.level(addLevel)
+        return self.ast.expr(.Range(-1, high), t.line, t.col)
+    }
+    let e = self.level(addLevel)
+    if self.at(.DotDotEq) {
+        self.fail(self.peek(), "..= is for patterns ('a'..='z'): a range of values is a..b, b not included (a..b + 1)")
+    }
+    if self.at(.DotDot) {
+        self.next()
+        let high = if self.rangeEndsHere() {
+            -1 // a..: to the end
+        } else {
+            self.level(addLevel)
+        }
+        let a = self.ast.exprs[e]
+        return self.ast.expr(.Range(e, high), a.line, a.col)
+    }
+    e
+}
+
+fn Parser.parseCompare(var self) -> Int {
+    var e = self.level(rangeLevel)
+    let t = self.peek()
+    if t.kind == .Is {
+        // tok is Ident(name): a Bool, the pattern a match arm's
+        self.next()
+        let pattern = self.patternWithAlternatives()
+        let arm = self.ast.arm(pattern)
+        let a = self.ast.exprs[e]
+        e = self.ast.expr(.Is(e, arm), a.line, a.col)
+    } else if t.op is Some(o) and o.compares() {
+        self.next()
+        let right = self.level(rangeLevel)
+        e = self.binary(o, e, right)
+    } else {
+        return e
+    }
+    let after = self.peek()
+    if after.kind == .Is or after.op is Some(o) and o.compares() {
+        self.fail(after, "comparisons do not chain: write a < b and b < c")
+    }
+    e
+}
+
+fn Parser.parseNot(var self) -> Int {
+    if self.at(.Bang) {
+        // !x: Quark says not x (! is for results, T!)
+        self.fail(self.peek(), "write not x: ! is only for results (Int!)")
+        self.next()
+    }
+    if self.at(.Not) {
+        let t = self.next()
+        let operand = self.parseNot()
+        return self.ast.expr(.Unary(.Not, operand), t.line, t.col)
+    }
+    self.level(compareLevel)
+}
+
+fn Parser.parseExpr(var self) -> Int {
+    if not self.deeper() {
+        let t = self.peek()
+        return self.ast.expr(.IntLit(0, ""), t.line, t.col)
+    }
+    let e = self.level(coalesceLevel)
+    self.depth -= 1
+    e
+}
+
+// ---- statements -----------------------------------------------------------------------------------------------
+fn Parser.endStatement(var self, what: Text) {
+    if self.at(.Newline) {
+        self.skipNewlines()
+        return
+    }
+    if self.at(.RBrace) or self.at(.Eof) {
+        return
+    }
+    self.fail(self.peek(), "expected a new line after {what}")
+}
+
+fn Parser.parseStmt(var self) -> Int {
+    let t = self.peek()
+    let leading = self.joinComments(t.line)
+    let node = if (self.at(.Let) or self.at(.Var)) and self.peekAt(1).kind is TypeName | LParen {
+        // let Some(x) = value else { ... }, let Point(x, y) = p, let (q, r) = divmod(7, 2), var (lo, hi) = (0, n)
+        let mutable = self.next().kind == .Var
+        let pattern = self.parseCasePattern()
+        let arm = self.ast.arm(pattern)
+        self.expectOp(.Assign, "after the pattern")
+        let value = self.parseExpr()
+        let otherwise = if self.accept(.Else) {
+            self.parseBlock() // none: the pattern always matches
+        } else {
+            -1
+        }
+        StmtNode.Let(mutable, "", -1, value, arm, otherwise)
+    } else if self.at(.Let) or self.at(.Var) {
+        let mutable = self.next().kind == .Var
+        let name = if not mutable and self.accept(.Underscore) {
+            "_"
+        } else {
+            self.text(self.expect(.Name, "after let / var (a camelCase name)"))
+        }
+        let ty = if self.accept(.Colon) { self.parseType() } else { -1 }
+        self.expectOp(.Assign, "after the name")
+        let value = self.parseExpr()
+        StmtNode.Let(mutable, name, ty, value, -1, -1)
+    } else if self.accept(.For) {
+        var name = ""
+        var pattern = -1
+        if self.at(.LParen) or self.at(.TypeName) {
+            let arm = self.parseCasePattern()
+            pattern = self.ast.arm(arm)
+        } else {
+            name = if self.accept(.Underscore) {
+                "_"
+            } else {
+                self.text(self.expect(.Name, "after for"))
+            }
+        }
+        self.expect(.In, "in a for loop")
+        let iter = self.parseExpr()
+        let body = self.parseBlock()
+        StmtNode.For(name, pattern, iter, body)
+    } else if self.accept(.While) {
+        let cond = self.parseExpr()
+        let body = self.parseBlock()
+        StmtNode.While(cond, body)
+    } else if self.accept(.Defer) {
+        // defer { ... }: runs when the block it is in is left, however it is left
+        StmtNode.Defer(self.parseBlock())
+    } else if self.accept(.Return) {
+        StmtNode.Return(if self.at(.Newline) or self.at(.RBrace) {
+            -1
+        } else {
+            self.parseExpr()
+        })
+    } else if self.accept(.Break) {
+        StmtNode.Break
+    } else if self.accept(.Continue) {
+        StmtNode.Continue
+    } else {
+        let e = self.parseExpr()
+        if self.peek().op is Some(o) and o.assigns() {
+            self.next()
+            let value = self.parseExpr()
+            StmtNode.Assign(e, o, value)
+        } else {
+            StmtNode.ExprStmt(e)
+        }
+    }
+    let trailing = self.trailingOn(self.lastLine())
+    self.endStatement("a statement")
+    self.ast.stmt(Stmt(node, t.line, t.col, leading, trailing, t.blankBefore))
+}
+
+fn Parser.statements(var self) {
+    while not self.at(.RBrace) and not self.at(.Eof) and not self.failed {
+        let from = self.i
+        let t = self.peek()
+        let s = self.parseStmt()
+        if not self.failed or self.typeText {
+            self.ints.push(s)
+            continue
+        }
+        // the statement could not be read (said once): a hole in its place, and on from its end, so every
+        // statement's errors are said at once and the rest of the program is still a tree (a graph)
+        self.skipStatement(from)
+        self.failed = false
+        let hole = self.ast.expr(.Hole, t.line, t.col)
+        self.ints.push(self.ast.stmt(Stmt(.ExprStmt(hole), t.line, t.col)))
+    }
+}
+
+// past a statement that could not be read: back to its start, then to the next line that starts at its column or
+// left of it (a statement after it, or the brace that closes its block, left for the block). The layout is
+// canonical, so this holds where a bracket was left open (inside one, line breaks are not tokens)
+fn Parser.skipStatement(var self, from: Int) {
+    let start = self.tokens[from]
+    self.i = from + 1
+    while self.i < self.end and not self.at(.Eof) {
+        let t = self.peek()
+        let first = self.tokens[self.i - 1].line < t.line
+        if first and t.kind != .Newline and t.col <= start.col {
+            return
+        }
+        self.i += 1
+    }
+}
+
+// past a declaration that could not be read: back to its start, then to the next line that starts one (at the
+// first column)
+fn Parser.skipDeclaration(var self, from: Int) {
+    self.i = from + 1
+    while self.i < self.end and not self.at(.Eof) {
+        let t = self.peek()
+        let first = self.tokens[self.i - 1].line < t.line
+        if first
+            and t.col == 1
+            and (t.kind is Fn | Type | Interface | Enum | Const | Extern | Use | Pub | Effect
+                or t.kind == .Name and self.text(t) == "test") {
+            return
+        }
+        self.i += 1
+    }
+}
+
+fn Parser.parseBlock(var self) -> Int {
+    self.expect(.LBrace, "to start a block")
+    if self.at(.Newline) {
+        self.skipNewlines()
+    }
+    let start = len(self.ints)
+    self.statements()
+    let stmts = self.takeInts(start)
+    let closing = self.joinComments(self.peek().line)
+    self.expect(.RBrace, "to close the block")
+    self.ast.block(Block(stmts, closing))
+}
+
+// ---- declarations ---------------------------------------------------------------------------------------------
+fn Parser.parseFn(var self) -> Decl {
+    let t = self.next() // fn
+    var d = Decl(kind: .Fn, name: "", line: t.line, col: t.col, isExtern: self.externNext)
+    self.externNext = false
+    if self.at(.TypeName) and self.peekAt(1).kind == .Dot {
+        // fn Vec2.plus: a function of the type Vec2
+        let owner = self.next()
+        self.next()
+        let name = self.expect(.Name, "after the type's name and the dot (a camelCase name)")
+        d.name = self.text(owner) + "." + self.text(name)
+    } else {
+        d.name = self.text(self.expect(.Name, "after fn (a camelCase name, or Type.name)"))
+    }
+    if self.acceptOp(.Lt) {
+        // fn first<T>(xs: [T]): type parameters
+        let named = len(self.texts)
+        var anyBound = false
+        while not self.atOp(.Gt) and not self.at(.Eof) and len(self.texts) - named < 32 {
+            let param = self.text(self.expect(.TypeName, "for a type parameter (a PascalCase name, like T)"))
+            self.texts.push(param)
+            var bound = ""
+            if self.accept(.Colon) {
+                // T: Speaker: any type that fits the interface
+                bound = self.text(self.expect(.TypeName, "after the colon (an interface T must fit, like T: Speaker)"))
+                anyBound = true
+            }
+            self.texts.push(bound)
+            if not self.accept(.Comma) {
+                break
+            }
+        }
+        // each one, then its bound
+        let pairs = self.takeTexts(named)
+        d.typeParams = (0..len(pairs) / 2).map(k => pairs[2 * k]).toArray()
+        if anyBound {
+            d.typeBounds = (0..len(pairs) / 2).map(k => pairs[2 * k + 1]).toArray()
+        }
+        self.expectOp(.Gt, "after the type parameters")
+    }
+    self.expect(.LParen, "after the function's name")
+    let typeFn = d.name.contains(".")
+    let start = len(self.ints)
+    while not self.at(.RParen) and not self.at(.Eof) {
+        if self.at(.Ellipsis) {
+            // extern fn printf(format: CText, ...): C's variadic arguments, last
+            let dots = self.next()
+            if not d.isExtern {
+                self.fail(
+                    dots,
+                    "only a C function takes ... (its variadic arguments): extern fn printf(format: CText, ...)",
+                )
+            }
+            d.variadic = true
+            break
+        }
+        let isVar = self.accept(.Var) // fn Parser.next(var self): it changes the value it is called on
+        let pn = self.expect(.Name, "for a parameter (a camelCase name)")
+        let isSelf = len(self.ints) == start and typeFn and self.text(pn) == "self" and not self.at(.Colon)
+        if isVar and not isSelf {
+            let shown = if typeFn { d.name } else { "Type.name" }
+            self.fail(
+                pn,
+                "only self can be var: a function changes the value it is called on (fn {shown}(var self, ...)), never the values it is given",
+            )
+        }
+        if not isSelf {
+            self.expect(.Colon, "after a parameter's name (every parameter has a type)")
+        }
+        let ty = if isSelf {
+            -1 // fn Vec2.length(self): its type
+        } else {
+            self.parseType()
+        }
+        let fallback = if self.acceptOp(.Assign) {
+            self.parseExpr() // a default value
+        } else {
+            -1
+        }
+        let param = self.ast.param(Param(self.text(pn), ty, pn.line, pn.col, fallback, isVar and isSelf))
+        self.ints.push(param)
+        if not self.accept(.Comma) {
+            break
+        }
+    }
+    d.params = self.takeInts(start)
+    self.expect(.RParen, "after the parameters")
+    if self.accept(.Arrow) {
+        d.ret = self.parseType()
+    }
+    if d.isExtern {
+        return d // C's, or Quark's that C calls: parseExtern reads what follows
+    }
+    d.body = if self.acceptOp(.Assign) {
+        self.parseExpr()
+    } else {
+        self.blockExpr()
+    }
+    d
+}
+
+// a plain text after in or as (an extern fn's library, its symbol), or "" with the error said
+fn Parser.externName(var self, where: Text, what: Text) -> Text {
+    self.next()
+    let quoted = self.expect(.TextLit, where)
+    let spelling = if quoted.kind == .TextLit { self.parseText(quoted) } else { -1 }
+    if spelling >= 0
+        and self.ast.exprs[spelling].node is TextLit(text, _, _)
+        and text != ""
+        and not text.bytes().contains(0) {
+        return text
+    }
+    self.fail(quoted, what)
+    ""
+}
+
+// effect fn ... (a function with effects)
+fn Parser.parseEffect(var self, external: Bool) -> Decl {
+    let t = self.next() // effect
+    if not self.at(.Fn) {
+        self.fail(self.peek(), "expected fn after effect")
+        return Decl(kind: .Fn, name: "", line: 0, col: 0)
+    }
+    self.externNext = external
+    let d = self.parseFn()
+    d with { isEffect: true, effectDeclared: not external, line: t.line, col: t.col }
+}
+
+// test "it adds up" { ... }: a check quark test runs (it may print, and assert)
+fn Parser.parseTest(var self) -> Decl {
+    let t = self.next() // test
+    let name = self.next()
+    let title = self.parseText(name)
+    var testName = ""
+    if self.ast.exprs[title].node is TextLit(text, _, _) {
+        testName = text
+    } else {
+        self.fail(name, "a test's name is a plain text")
+    }
+    let body = self.blockExpr()
+    Decl(
+        kind: .Fn,
+        name: "test " + self.text(name),
+        line: t.line,
+        col: t.col,
+        body: body,
+        isTest: true,
+        testName: testName,
+        isEffect: true,
+    )
+}
+
+// use geometry, use shapes.round: the pub declarations of geometry.qk (shapes/round.qk), next to this file
+fn Parser.parseUse(var self) -> Decl {
+    let t = self.next() // use
+    var name = self.text(self.expect(.Name, "after use (a module: the camelCase name of a file, without .qk)"))
+    while self.accept(.Dot) {
+        name += "." + self.text(self.expect(.Name, "after the dot (a folder, then the file: use shapes.round)"))
+    }
+    var d = Decl(kind: .Use, name: name, line: t.line, col: t.col)
+    if self.atName("as") {
+        // use geometry as g
+        self.next()
+        d.alias = self.text(self.expect(.Name, "after as (a camelCase name for the module)"))
+        if len(self.aliases) < 32 {
+            self.aliases.push(d.alias)
+        }
+    }
+    d
+}
+
+// const name = value, at the top: a constant (pure, worked out when the program is compiled)
+fn Parser.parseConst(var self) -> Decl {
+    let t = self.next() // const
+    var d = Decl(kind: .Const, name: "", line: t.line, col: t.col)
+    d.name = self.text(self.expect(.Name, "after const (a camelCase name)"))
+    if self.accept(.Colon) {
+        d.ret = self.parseType()
+    }
+    self.expectOp(.Assign, "after the constant's name")
+    d.body = self.parseExpr()
+    d
+}
+
+// extern fn name(params) -> Result   |   extern effect fn ...   |   extern type Name   |   extern type Name { fields }
+fn Parser.parseExtern(var self) -> Decl {
+    let t = self.next() // extern
+    if self.at(.Effect) or self.at(.Fn) {
+        var d = Decl(kind: .Fn, name: "", line: 0, col: 0)
+        if self.at(.Effect) {
+            d = self.parseEffect(true)
+        } else {
+            self.externNext = true
+            d = self.parseFn()
+        }
+        // in "m": the library; as "symbol": the name C knows it by (each once, in either order)
+        for _ in 0..2 {
+            if self.at(.In) and d.externLib == "" {
+                d.externLib = self.externName(
+                    "for the library's name, in quotes (in \"m\")",
+                    "a library's name must be a nonempty plain text",
+                )
+            }
+            if self.atName("as") and d.externSymbol == "" {
+                d.externSymbol = self.externName(
+                    "for the external symbol, in quotes",
+                    "an external symbol must be a nonempty plain text",
+                )
+            }
+        }
+        if self.atOp(.Assign) or self.at(.LBrace) {
+            // a body: a Quark function C calls
+            if d.externLib != "" {
+                self.fail(
+                    self.peek(),
+                    "a function with a body is Quark's own: in \"lib\" names where C's functions are",
+                )
+            }
+            if d.isEffect {
+                d.effectDeclared = true
+            }
+            d.body = if self.acceptOp(.Assign) {
+                self.parseExpr()
+            } else {
+                self.blockExpr()
+            }
+        }
+        return d with { line: t.line, col: t.col }
+    }
+    self.expect(.Type, "after extern (extern fn or extern type)")
+    var d = Decl(kind: .Type, name: "", line: t.line, col: t.col, isExtern: true)
+    d.name = self.text(self.expect(.TypeName, "after extern type (a PascalCase name)"))
+    if self.accept(.LBrace) {
+        // extern type DivT { quot: Int32, rem: Int32 }: a C struct, its fields in C's layout
+        d.cStruct = true
+        self.skipNewlines()
+        let start = len(self.ints)
+        while not self.at(.RBrace) and not self.at(.Eof) and not self.failed {
+            let fname = self.expect(.Name, "for a field (a camelCase name)")
+            self.expect(.Colon, "after the field's name")
+            let ty = self.parseType()
+            let field = self.ast.param(Param(self.text(fname), ty, fname.line, fname.col))
+            self.ints.push(field)
+            if not self.accept(.Comma) and not self.at(.Newline) and not self.at(.RBrace) {
+                self.fail(self.peek(), "separate them with commas or new lines")
+                break
+            }
+            self.skipNewlines()
+        }
+        d.params = self.takeInts(start)
+        self.expect(.RBrace, "to close the fields")
+        if len(d.params) == 0 {
+            self.fail(t, "a C struct has fields (extern type Name, without braces, is a handle)")
+        }
+    }
+    d
+}
+
+fn Parser.parseTypeDecl(var self) -> Decl {
+    let t = self.next()
+    var d = Decl(
+        kind: if t.kind == .Enum { .Enum } else { .Type },
+        name: "",
+        line: t.line,
+        col: t.col,
+        isInterface: t.kind == .Interface,
+    )
+    d.name = self.text(self.expect(.TypeName, "after type, interface or enum (a PascalCase name)"))
+    if self.acceptOp(.Lt) {
+        // type Pair<A, B>: generic, its types given where it is used
+        while not self.atOp(.Gt) and not self.at(.Eof) and len(d.typeParams) < 16 {
+            d.typeParams.push(self.text(self.expect(.TypeName, "for a type parameter (a PascalCase name, like T)")))
+            if not self.accept(.Comma) {
+                break
+            }
+        }
+        self.expectOp(.Gt, "after the type parameters")
+    }
+    self.expect(.LBrace, "to list its fields or cases")
+    self.members(d, t.kind == .Type)
+}
+
+// a type's fields, an interface's functions or an enum's cases, after the {, to the }
+fn Parser.members(var self, decl: Decl, record: Bool) -> Decl {
+    var d = decl
+    self.skipNewlines()
+    while not self.at(.RBrace) and not self.at(.Eof) and not self.failed {
+        d.memberLeading.push(self.joinComments(self.peek().line))
+        if d.kind == DeclKind.Type {
+            let member = self.at(.Fn) or self.at(.Effect) // interface Speaker { fn speak() -> Text }
+            if member and record {
+                self.fail(self.peek(), "a type lists fields (name: Type)")
+                break
+            }
+            if member != d.isInterface {
+                self.fail(
+                    self.peek(),
+                    "an interface lists functions (fn name(...) -> Type), a record fields (name: Type): not both",
+                )
+                break
+            }
+            if member {
+                let f = self.parseMember()
+                d.params.push(self.ast.param(f))
+            } else {
+                let fname = self.expect(.Name, "for a field (a camelCase name)")
+                self.expect(.Colon, "after the field's name")
+                let ty = self.parseType()
+                let fallback = if self.acceptOp(.Assign) {
+                    self.parseExpr() // a default value: port: Int = 8080
+                } else {
+                    -1
+                }
+                d.params.push(self.ast.param(Param(self.text(fname), ty, fname.line, fname.col, fallback)))
+            }
+        } else {
+            d.cases.push(self.text(self.expect(.TypeName, "for a case (a PascalCase name)")))
+            d.caseFields.push([])
+            if len(d.cases) > 64 {
+                self.fail(self.peek(), "an enum has at most 64 cases")
+                break
+            }
+            if self.accept(.LParen) {
+                // Circle(radius: Float): the case carries data
+                var fields: [Int] = []
+                while not self.at(.RParen) and not self.at(.Eof) and len(fields) < 32 {
+                    let fname = self.expect(.Name, "for the case's data (a camelCase name)")
+                    self.expect(.Colon, "after its name")
+                    let ty = self.parseType()
+                    fields.push(self.ast.param(Param(self.text(fname), ty, fname.line, fname.col)))
+                    if not self.accept(.Comma) {
+                        break
+                    }
+                }
+                self.expect(.RParen, "after the case's data")
+                d.caseFields[len(d.caseFields) - 1] = fields
+            }
+        }
+        if not self.accept(.Comma) and not self.at(.Newline) and not self.at(.RBrace) {
+            self.fail(self.peek(), "separate them with commas or new lines")
+            break
+        }
+        // a comment after it, when the line ends there (on a one-line type's line, the comment is the type's)
+        d.memberTrailing.push(if self.at(.Newline) {
+            self.trailingOn(self.lastLine())
+        } else {
+            None
+        })
+        self.skipNewlines()
+    }
+    self.expect(.RBrace, "to close the list")
+    if d.memberLeading.all(c => c == "") and d.memberTrailing.all(c => c == None) {
+        d.memberLeading = []
+        d.memberTrailing = []
+    }
+    d
+}
+
+fn Parser.program(var self) {
+    self.skipNewlines()
+    while not self.at(.Eof) {
+        if self.failed {
+            // a declaration that could not be read (said once): on from the next one
+            self.skipDeclaration(self.declStart)
+            self.failed = false
+            continue
+        }
+        self.declStart = self.i
+        let t = self.peek()
+        let leading = self.joinComments(t.line)
+        let isPub = self.accept(.Pub)
+        let opaque = isPub and self.atName("opaque") and self.peekAt(1).kind == .Type
+        if opaque {
+            self.next()
+        }
+        if isPub and not self.peek().kind is Fn | Type | Interface | Enum | Effect | Const | Extern {
+            self.fail(self.peek(), "pub goes before fn, type, interface, enum, const or extern")
+            continue
+        }
+        var d = if self.at(.Use) {
+            self.parseUse()
+        } else if self.at(.Fn) {
+            self.parseFn()
+        } else if self.at(.Type) or self.at(.Interface) or self.at(.Enum) {
+            self.parseTypeDecl()
+        } else if self.at(.Extern) {
+            self.parseExtern()
+        } else if isPub and self.at(.Effect) {
+            self.parseEffect(false)
+        } else if self.at(.Effect) {
+            // a function's effects are worked out from its body
+            self.fail(
+                t,
+                "effects are inferred: write fn, without effect (or pub effect fn for a public effect contract)",
+            )
+            continue
+        } else if self.at(.Const) {
+            self.parseConst()
+        } else if self.at(.Let) {
+            // a name for a value inside a function; at the top, a constant
+            self.fail(
+                t,
+                "at the top of a file a constant is written const: const name = value (let names a value inside a function)",
+            )
+            continue
+        } else if self.at(.Name) and self.text(t) == "test" and self.peekAt(1).kind == .TextLit {
+            self.parseTest() // test "name" { ... }
+        } else {
+            self.fail(t, "expected fn, const, type, interface, enum, extern, use, pub or test at the top of the file")
+            continue
+        }
+        d.isPub = isPub
+        d.opaque = opaque
+        if opaque and d.isInterface {
+            self.fail(t, "opaque belongs on a record")
+        }
+        if self.failed {
+            continue // (not kept: its errors are said)
+        }
+        d.leading = leading
+        d.trailing = self.trailingOn(self.lastLine())
+        d.index = len(self.ast.decls)
+        self.ast.decl(d)
+        if not self.at(.Eof) {
+            self.expect(.Newline, "after a declaration")
+        }
+        self.skipNewlines()
+    }
+    self.ast.closingComment = self.joinComments(1 << 30)
+}

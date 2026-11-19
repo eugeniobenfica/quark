@@ -1,0 +1,1264 @@
+// Programs run in memory and built into executables by the compiler, with
+// its own runtime: the runtime written in Quark (compiled from the texts the compiler keeps, compiler/stdlib.qk) is
+// mapped into this process and runs the program (quark run, test, debug, repl), or goes in front of the program in
+// an executable (quark build). The runtime's side of it is compiler/runtime/host.qk.
+use std.machine as machine
+use source
+use types
+use ast
+use module
+use check
+use ir
+use lower
+use release
+use cachedir
+use construn
+use cache
+use x64
+use arm64
+use image
+use imagecli
+use stdlib
+use graph
+
+// what the command line was given (compiler/cli.qk)
+pub type RunOptions {
+    command: Text = ""
+    path: Text = ""
+    outPath: Text? = None
+    symbol: Text? = None
+    target: Text? = None
+    libc: Text = "" // build --target ...-linux: glibc (the default) or musl
+    fuel: Int = 0
+    memory: Int = 0 // bytes (--memory MB)
+    release: Bool = false
+    noAvx: Bool = false
+    sysv: Bool = false // --abi sysv
+    linked: Bool = false
+    allowed: Text? = None
+    prelude: Text = ""
+    timed: Bool = false
+    profile: Bool = false
+    tracePath: Text = ""
+    breaks: [Int] = []
+    programArgs: [Text] = []
+    filter: Text = "" // quark test --filter part: only the tests whose name has it
+}
+
+// a program compiled: its IR, machine code, data and inlined calls; its tests (each function's name and the test's)
+pub type Compiled {
+    prog: IrProgram
+    mc: MachineCode
+    data: Bytes
+    inlines: [InlineCall] = []
+    tests: [(Text, Text)] = []
+    features: Int = 0
+    os: Os = .Windows
+    linked: Bool = false
+}
+
+// ---- compiling ----
+// What a compile is for: this machine (target ""), or the one named (--target: object, code, ir), for objects (each
+// address from a table) or not, the runtime itself (linked: its table filled by the linker), debugging.
+pub type Purpose {
+    target: Text = ""
+    object: Bool = false
+    linked: Bool = false
+    runtime: Bool = false
+    needMain: Bool = false
+    debug: Bool = false
+}
+
+fn targetOs(host: Host, target: Text) -> Os = if target == "" {
+    host.os
+} else if target.endsWith("windows") {
+    Os.Windows
+} else if target.endsWith("linux") {
+    Os.Linux
+} else {
+    Os.Macos
+}
+
+// --target's names (x86_64 or arm64, then windows, linux or macos), as setTarget reads them: the
+// canonical one, or "" when it names none
+pub fn targetName(t: Text) -> Text {
+    let arm = t.startsWith("arm64") or t.startsWith("aarch64")
+    let x64 = t.startsWith("x86_64") or t.startsWith("x64")
+    let dash = t.indexOf("-") ?? -1
+    let os = if dash >= 0 { t[dash + 1..] } else { "" }
+    if not arm and not x64 or not os is "windows" | "linux" | "macos" | "ios" {
+        return ""
+    }
+    (if arm { "arm64-" } else { "x86_64-" }) + (if os == "ios" { "macos" } else { os })
+}
+
+// the program at path (its text given: the REPL's), checked, lowered, optimized and made machine code; its errors
+// said (unless quiet) and None when it has any
+pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, quiet: Bool) -> Compiled? {
+    let t0 = monotonicTime()
+    var preludeSrc: Source? = None
+    if o.prelude != "" and not purpose.runtime {
+        let Ok(text) = readFile(o.prelude) else {
+            printErr("quark: cannot read {o.prelude}")
+            return None
+        }
+        preludeSrc = Source(o.prelude, text)
+    }
+    let loaded = loadProgram(src, preludeSrc)
+    if not loaded.ok {
+        if not quiet {
+            for e in loaded.errors.shown {
+                printErr(e)
+            }
+        }
+        return None
+    }
+    let checked = checkProgram(
+        loaded.program,
+        loaded.errors,
+        purpose.needMain,
+        if purpose.runtime { None } else { o.allowed },
+    )
+    if not quiet {
+        for e in checked.errors.shown {
+            printErr(e)
+        }
+    }
+    if not checked.ok {
+        return None
+    }
+    var checkedProgram = checked.program
+    if not purpose.runtime {
+        let problems = checkedProgram.runConsts(host)
+        if len(problems) > 0 {
+            var errors = Errors()
+            for problem in problems {
+                errors.add(checkedProgram.modules[problem.module].src, problem.line, problem.col, problem.message)
+            }
+            if not quiet {
+                for e in errors.shown {
+                    printErr(e)
+                }
+            }
+            return None
+        }
+    }
+    let t1 = monotonicTime()
+    let cpu = machine.cpu()
+    let target = purpose.target
+    let arm = if target == "" { host.arm } else { target.startsWith("arm64") }
+    let os = targetOs(host, target)
+    let avx = target == "" and not arm and not o.noAvx and cpu & 1 != 0
+    let sysv = if target == "" {
+        os != .Windows or o.sysv and not purpose.runtime
+    } else {
+        os != .Windows
+    }
+    let arch = if arm { Arch.Arm64 } else { Arch.X64 }
+    let runtime = purpose.runtime
+    let release = o.release and not runtime
+    // for the debugger (compiler/debugrun.qk), each line's graph key names its values
+    let debug = purpose.debug and not runtime
+    let keys = if debug { lineKeys(checkedProgram) } else { [:] }
+    var low = Lowered(IrProgram(), [], []) // lowered, optimized and made code in place: the program is never copied
+    low.lowerFrom(
+        checkedProgram,
+        LowerOptions(
+            fuel: o.fuel > 0 and not runtime,
+            runtime: runtime,
+            linked: purpose.linked,
+            arch: arch,
+            sysv: sysv,
+            debug: debug,
+            debugKeys: keys,
+        ),
+    )
+    let lanes = if arm {
+        2
+    } else if avx and cpu & 2 != 0 {
+        4
+    } else {
+        2
+    }
+    low.program.target = Target(
+        arch: arch,
+        sysv: sysv,
+        objectMode: purpose.object,
+        avx: avx,
+        lanes: lanes,
+        sse42: cpu & 4 != 0 and target == "",
+        apple: os == .Macos,
+        checks: false,
+    )
+    let t2 = monotonicTime()
+    // --release: each function's optimized code kept by content, in a pack for this program (QUARK_CACHE=off: none),
+    // when the program is big enough for that to take less than optimizing it does (reading the compiler to know
+    // it, the pack...: some milliseconds)
+    var hits = ""
+    // (QUARK_CACHE=on: whatever its size)
+    let keep = release
+        and (env("QUARK_CACHE") == Some("on") or env("QUARK_CACHE") != Some("off") and low.program.size() >= 5000)
+    let id = if keep { compilerId(host) } else { 0 }
+    if id != 0 {
+        var where = Hash128()
+        where.add("{src.path}|{target}|{purpose.object}|{debug}|{lanes}|{o.fuel > 0}".bytes())
+        let pack = "quark-cache-{where.text()}.bin"
+        let (hit, all) = low.program.optimizeCached(release, low.data, cachePath(pack), hex64(id))
+        cacheUsed(pack, len(readBytes(cachePath(pack)) ?? []))
+        hits = " ({hit} of {all} functions kept from an earlier build)"
+    } else {
+        low.program.optimize(release)
+    }
+    let t3 = monotonicTime()
+    let mc = match low.program.target.arch {
+        X64 => genX64(low.program)
+        Arm64 => genArm64(low.program)
+    }
+    if o.timed and not runtime {
+        let t4 = monotonicTime()
+        printErr(
+            "quark: parsed and checked in {fixed((t1 - t0) * 1000, 2)} ms, compiled in {fixed((t4 - t1) * 1000, 2)} ms ({len(mc.code)} bytes of machine code): lowered in {fixed((t2 - t1) * 1000, 2)}, optimized in {fixed((t3 - t2) * 1000, 2)}{hits}, made machine code in {fixed((t4 - t3) * 1000, 2)}",
+        )
+    }
+    var tests: [(Text, Text)] = []
+    let p = checkedProgram
+    for d in p.decls {
+        let x = p.ast.decls[d]
+        if x.kind == DeclKind.Fn and x.isTest {
+            tests.push((x.name, x.testName))
+        }
+    }
+    let prog = low.program // taken
+    low.program = IrProgram()
+    Compiled(prog, mc, low.data, low.inlines, tests, if avx { 1 } else { 0 }, os, purpose.linked)
+}
+
+// ---- constants worked out by running them (compiler/construn.qk) ----
+// The program compiled for this machine with a function for each constant (what the constants reach of it: the rest
+// a hole), each run with a budget of steps and of memory, its dump read back into the literal nodes lowering puts
+// where the constant is used. What could not be worked out: the problems (a constant that names a host's function, or
+// holds a function; a panic; too many steps). QUARK_CONSTS=off: none worked out (each worked out where it is used).
+const constFuel = 200000000
+const constMemory = 1073741824
+const constTail = "compute it when the program runs (a let in main)"
+
+pub fn Program.runConsts(var self, host: Host) -> [ConstProblem] {
+    if env("QUARK_CONSTS") == Some("off") {
+        return []
+    }
+    var problems: [ConstProblem] = []
+    var which: [Int] = []
+    for d in self.decls {
+        let x = self.ast.decls[d]
+        if x.kind != DeclKind.Const or x.builtin or x.body < 0 or x.retType < 0 {
+            continue
+        }
+        if self.holdsFunction(x.retType, 0) {
+            problems.push(
+                ConstProblem(
+                    x.module,
+                    x.line,
+                    x.col,
+                    "constant {x.name} holds a function: a constant is a value kept in the program's data; make it a fn",
+                ),
+            )
+        } else if self.dumpable(x.retType, 0) {
+            which.push(d)
+        }
+    }
+    if len(which) == 0 {
+        return problems
+    }
+    // a constant that reaches a host's (or C's) function cannot be worked out here
+    var reached = self.reachedFrom(which)
+    var outside = false
+    for d in self.decls {
+        let x = self.ast.decls[d]
+        if reached[d] and x.kind == DeclKind.Fn and x.isExtern and x.body < 0 {
+            outside = true
+        }
+    }
+    if outside {
+        var kept: [Int] = []
+        for c in which {
+            let alone = self.reachedFrom([c])
+            var foreign = -1
+            for d in self.decls {
+                let x = self.ast.decls[d]
+                if foreign < 0 and alone[d] and x.kind == DeclKind.Fn and x.isExtern and x.body < 0 {
+                    foreign = d
+                }
+            }
+            let x = self.ast.decls[c]
+            if foreign >= 0 {
+                problems.push(
+                    ConstProblem(
+                        x.module,
+                        x.line,
+                        x.col,
+                        "constant {x.name} is worked out when the program is compiled, and the host's function is not ({self.ast.decls[foreign].name}): {constTail}",
+                    ),
+                )
+            } else {
+                kept.push(c)
+            }
+        }
+        which = kept
+        if len(which) == 0 {
+            return problems
+        }
+        reached = self.reachedFrom(which)
+    }
+    // the program with every constant as written, what they do not reach a hole, and a function that dumps each
+    var p2 = self
+    for d in p2.decls {
+        let x = p2.ast.decls[d]
+        if x.kind == DeclKind.Const {
+            p2.ast.decls[d].folded = -1
+            p2.ast.decls[d].foldedAgain = false
+            p2.ast.decls[d].dataAt = -1
+        }
+        if not reached[d] and x.kind == DeclKind.Fn and x.body >= 0 and not x.isExtern and not x.isTemplate {
+            p2.ast.exprs.push(Expr(.Hole, x.line, x.col, ty: if x.retType >= 0 { x.retType } else { tyVoid }))
+            p2.ast.decls[d].body = len(p2.ast.exprs) - 1
+            p2.ast.decls[d].inlineOnly = false
+        }
+    }
+    for d in which {
+        let x = p2.ast.decls[d]
+        p2.ast.exprs.push(Expr(.Name(x.name), x.line, x.col, ty: x.retType, decl: d))
+        let value = len(p2.ast.exprs) - 1
+        p2.ast.exprs.push(
+            Expr(.Call("#dump", "", [value], [""], false, false), x.line, x.col, ty: tyVoid, builtin: bDump),
+        )
+        let body = len(p2.ast.exprs) - 1
+        let at = p2.ast.decl(
+            Decl(
+                kind: .Fn,
+                name: "#const{d}",
+                line: x.line,
+                col: x.col,
+                body: body,
+                isEffect: true,
+                module: x.module,
+                retType: tyVoid,
+                state: 2,
+            ),
+        )
+        p2.ast.decls[at].index = len(p2.decls)
+        p2.decls.push(at)
+    }
+    let arch = if host.arm { Arch.Arm64 } else { Arch.X64 }
+    let sysv = host.os != .Windows
+    var low = Lowered(IrProgram(), [], [])
+    low.lowerFrom(p2, LowerOptions(fuel: true, arch: arch, sysv: sysv))
+    low.program.target = Target(
+        arch: arch,
+        sysv: sysv,
+        objectMode: false,
+        avx: false,
+        lanes: 2,
+        sse42: false,
+        apple: host.os == .Macos,
+        checks: false,
+    )
+    low.program.optimize(false)
+    let mc = match arch {
+        X64 => genX64(low.program)
+        Arm64 => genArm64(low.program)
+    }
+    let prog = low.program
+    low.program = IrProgram()
+    let c = Compiled(prog, mc, low.data, low.inlines, [], 0, host.os, false)
+    let Some(m) = loadRuntime(host) else {
+        return problems
+    }
+    m.begin(if len(self.modules) > 0 { self.modules[0].path } else { "program" }, [])
+    let code = loadedCode(host, c)
+    let l = m.load(c, code, 0, constFuel, constMemory, quiet: true) // (a C function not here: worked out where used)
+    if l == 0 {
+        return problems
+    }
+    let sink = m.call("qkHostKeepOutput", 0, 0, 0, 0)
+    var r = ConstReader(self)
+    for d in which {
+        var f = -1
+        for (k, fx) in c.prog.fns.enumerate() {
+            if f < 0 and fx.name == "#const{d}" {
+                f = k
+            }
+        }
+        if f < 0 {
+            continue
+        }
+        let ok = m.call("qkHostCall", l, code.fnAt[f], constFuel, 0) != 0
+        m.flush()
+        let n = peekWord(sink, 1)
+        let none: Bytes = []
+        let bytes = if n > 0 { Bytes(Pointer<UInt8>(peekWord(sink, 0)), n) } else { none }
+        pokeWord(sink, 1, 0)
+        let x = r.p.ast.decls[d]
+        if not ok {
+            let why = m.panicText()
+            let message = if why.contains("ran too long") {
+                "constant {x.name} takes too long to work out when the program is compiled (more than {constFuel / 1000000} million steps): {constTail}"
+            } else if why.contains("too many calls deep") {
+                "constant {x.name} calls functions nested too deep to work out when the program is compiled: {constTail}"
+            } else {
+                "constant {x.name} cannot be worked out when the program is compiled: {why}"
+            }
+            problems.push(ConstProblem(x.module, x.line, x.col, message))
+            continue
+        }
+        r.begin(bytes, x.line, x.col)
+        let node = r.value(x.retType)
+        if not r.ok or r.at != len(r.b) {
+            continue // not folded: worked out where it is used
+        }
+        r.p.ast.decls[d].folded = node
+        r.p.ast.decls[d].foldedAgain = false
+    }
+    self = r.p
+    problems
+}
+
+pub fn compileFile(host: Host, path: Text, o: RunOptions, purpose: Purpose) -> Compiled? {
+    let Ok(text) = readFile(path) else {
+        printErr("quark: cannot read {path}")
+        return None
+    }
+    compileText(host, Source(path, text), o, purpose, false)
+}
+
+// the runtime for this machine (or target's), from the texts the compiler keeps: compiled for objects, linked
+pub fn compileRuntime(host: Host, target: Text) -> Compiled? {
+    let os = targetOs(host, target)
+    let name = match os {
+        Windows => "windows"
+        Linux => "linux"
+        Macos => "macos"
+    }
+    let Some(text) = runtimeText(name) else {
+        printErr("quark: this compiler keeps no runtime for {name}")
+        return None
+    }
+    compileText(
+        host,
+        Source(embeddedRuntime + name + ".qk", text),
+        RunOptions(),
+        Purpose(target: target, object: true, linked: true, runtime: true),
+        false,
+    )
+}
+
+// x with digits after the point, as C's %.Nf writes it
+pub fn fixed(x: Float, digits: Int) -> Text {
+    var scale = 1
+    for _ in 0..digits {
+        scale *= 10
+    }
+    let negative = x < 0.0
+    let n = toInt(round(abs(x) * toFloat(scale)))
+    let whole = n / scale
+    var part = "{n % scale}"
+    while len(part) < digits {
+        part = "0" + part
+    }
+    (if negative and n != 0 { "-" } else { "" }) + "{whole}" + (if digits > 0 { "." + part } else { "" })
+}
+
+// ---- the program as a built executable carries it: the payload, then the trailer ----
+pub fn programBytes(c: Compiled, mc: MachineCode, entry: Int, fuel: Int, memory: Int) -> Bytes {
+    var b = Buf()
+    b.add(mc.code)
+    b.add(c.data)
+    for r in mc.relocs {
+        b.u32(r.at)
+        b.u32(r.kind)
+        b.u64(r.target)
+    }
+    let externsAt = b.len()
+    for x in c.prog.externs {
+        b.cText(x.name)
+        b.cText(x.lib ?? "")
+    }
+    let size = b.len()
+    b.add("QUARKPRG".bytes())
+    b.u64(len(mc.code))
+    b.u64(len(c.data))
+    b.u64(len(mc.relocs))
+    b.u64(entry)
+    b.u64(mc.enter)
+    b.u64(mc.escape)
+    b.u64(fuel)
+    b.u64(memory)
+    b.u64(c.features)
+    b.u64(len(c.prog.externs))
+    b.u64(size - externsAt)
+    b.u64(size)
+    b.b
+}
+
+// --abi sysv on Windows (testing the System V calls): the runtime is called the Quark way, the same in both, so only
+// the way in changes: the trampoline takes its argument in rdi (mov rdi, rcx; jmp enter)
+fn sysvAdapted(mc: MachineCode) -> MachineCode {
+    var code = mc.code
+    while len(code) % 16 != 0 {
+        code.push(0xCC)
+    }
+    let enter = len(code)
+    let rel = mc.enter - (enter + 8)
+    code += [0x48, 0x89, 0xCF, 0xE9, rel & 255, rel >> 8 & 255, rel >> 16 & 255, rel >> 24 & 255]
+    MachineCode(code, mc.relocs, mc.sites, mc.fnAt, enter, mc.escape)
+}
+
+// ---- C's memory ----
+pub fn poke(at: Int, b: Bytes) {
+    let p = Pointer<UInt8>(at)
+    for (i, x) in b.enumerate() {
+        p[i] = x
+    }
+}
+
+pub fn peekWord(at: Int, i: Int) -> Int = Pointer<Int64>(at)[i]
+
+pub fn pokeWord(at: Int, i: Int, v: Int) {
+    Pointer<Int64>(at)[i] = v
+}
+
+// a zero-ended copy of t in C's memory
+pub fn cText(t: Text) -> Int {
+    let b = t.bytes()
+    let p = malloc(len(b) + 1)
+    poke(p, b)
+    Pointer<UInt8>(p)[len(b)] = 0
+    p
+}
+
+extern fn strlen(p: Int64) -> UInt64
+
+// the zero-ended text at p
+pub fn textAtC(p: Int) -> Text = if p == 0 { "" } else { Text(Pointer<UInt8>(p), strlen(p)) }
+
+fn wordsInC(xs: [Int]) -> Int {
+    let p = malloc(8 * len(xs) + 8)
+    for (i, x) in xs.enumerate() {
+        pokeWord(p, i, x)
+    }
+    p
+}
+
+// ---- the runtime, in this process ----
+// names and starts: the runtime's functions (offsets in its text), so a profile says where in it the time goes
+pub type Mapped {
+    base: Int = 0
+    symbols: [Text: Int] = [:]
+    names: [Text] = []
+    starts: [Int] = []
+    textSize: Int = 0
+}
+
+// The runtime linked at address 0 (every pointer in its data then moved by where it is mapped): what a run maps, and
+// what is kept between runs (the runtime is the same until its text is)
+pub type RuntimeImage {
+    linked: Linked = Linked()
+    textSize: Int = 0
+    dataAt: Int = 0
+    size: Int = 0
+    names: [Text] = []
+    starts: [Int] = []
+}
+
+fn linkRuntime(host: Host, rt: Compiled) -> RuntimeImage {
+    let arm = rt.prog.target.arch == .Arm64
+    let info = ImageInfo(rt.os, true, rt.features, rt.data, runtimeNames)
+    let o = layout(rt.mc, rt.prog, info)
+    let stubs = stubsFor(host.os, arm)
+    let imports = linkImports(rt.mc, o, stubs, host.os)
+    var cellAt: [Int] = []
+    for i in 0..len(imports) {
+        cellAt.push(8 * i)
+    }
+    let textSize = linkedTextSize(rt.mc, o, stubs)
+    let dataAt = alignUp(textSize, 65536)
+    let size = dataAt + linkedDataSize(o, 8 * len(imports))
+    var names: [Text] = []
+    for f in rt.prog.fns {
+        names.push(f.name)
+    }
+    RuntimeImage(
+        link(rt.mc, o, stubs, host.os, arm, imports, cellAt, 8 * len(imports), 0, dataAt, 0),
+        textSize,
+        dataAt,
+        size,
+        names,
+        rt.mc.fnAt,
+    )
+}
+
+// the image mapped here, its pointers moved, its C functions found, this thread made ready for it
+fn mapImage(host: Host, img: RuntimeImage) -> Mapped? {
+    let l = img.linked
+    let base = host.mapMemory(img.size)
+    if base == 0 {
+        printErr("quark: no memory for the runtime")
+        return None
+    }
+    poke(base, l.text)
+    let data = base + img.dataAt
+    poke(data, l.data)
+    for p in l.pointers {
+        pokeWord(data + p, 0, peekWord(data + p, 0) + base)
+    }
+    for (i, f) in l.imports.enumerate() {
+        let address = host.cFunction(f)
+        if address == 0 {
+            printErr("quark: cannot find {f} for the runtime")
+            return None
+        }
+        pokeWord(data + l.importAt + l.cellAt[i], 0, address)
+    }
+    if not host.protectCode(base, img.textSize) {
+        printErr("quark: cannot make the runtime's code runnable")
+        return None
+    }
+    let m = Mapped(base, l.symbols, img.names, img.starts, img.textSize)
+    let _ = m.call("qkosHostInit", 0, 0, 0, 0)
+    Some(m)
+}
+
+const imageMagic = "QKRTIMG2"
+
+fn imageBytes(img: RuntimeImage) -> Bytes {
+    let l = img.linked
+    var b = Buf()
+    b.add(imageMagic.bytes())
+    for v in [
+        img.textSize,
+        img.dataAt,
+        img.size,
+        l.importAt,
+        len(l.text),
+        len(l.data),
+        len(l.pointers),
+        len(l.imports),
+        len(l.symbols),
+    ] {
+        b.u64(v)
+    }
+    b.add(l.text)
+    b.add(l.data)
+    for p in l.pointers {
+        b.u64(p)
+    }
+    for (i, f) in l.imports.enumerate() {
+        b.cText(f)
+        b.u64(l.cellAt[i])
+    }
+    for (name, at) in l.symbols {
+        b.cText(name)
+        b.u64(at)
+    }
+    b.u64(len(img.names))
+    for (i, name) in img.names.enumerate() {
+        b.cText(name)
+        b.u64(img.starts[i])
+    }
+    b.add(imageMagic.bytes()) // whole: a file cut short is not read
+    b.b
+}
+
+type Reader { b: Bytes, at: Int = 0 }
+
+fn Reader.u64(var self) -> Int {
+    let v = u64At(self.b, self.at)
+    self.at += 8
+    v
+}
+
+fn Reader.cText(var self) -> Text {
+    var end = self.at
+    while self.b[end] != 0 {
+        end += 1
+    }
+    let t = Text(self.b[self.at..end]) ?? ""
+    self.at = end + 1
+    t
+}
+
+fn Reader.bytes(var self, n: Int) -> Bytes {
+    let out = self.b[self.at..self.at + n]
+    self.at += n
+    out
+}
+
+fn readImage(b: Bytes) -> RuntimeImage? {
+    let n = len(b)
+    if n < 88 or b[..8] != imageMagic.bytes() or b[n - 8..] != imageMagic.bytes() {
+        return None
+    }
+    var r = Reader(b, 8)
+    let textSize = r.u64()
+    let dataAt = r.u64()
+    let size = r.u64()
+    let importAt = r.u64()
+    let textLen = r.u64()
+    let dataLen = r.u64()
+    let pointerCount = r.u64()
+    let importCount = r.u64()
+    let symbolCount = r.u64()
+    if r.at + textLen + dataLen > n {
+        return None
+    }
+    var l = Linked(text: r.bytes(textLen), data: r.bytes(dataLen), importAt: importAt)
+    for _ in 0..pointerCount {
+        l.pointers.push(r.u64())
+    }
+    for _ in 0..importCount {
+        l.imports.push(r.cText())
+        l.cellAt.push(r.u64())
+    }
+    for _ in 0..symbolCount {
+        let name = r.cText()
+        l.symbols[name] = r.u64()
+    }
+    var names: [Text] = []
+    var starts: [Int] = []
+    for _ in 0..r.u64() {
+        names.push(r.cText())
+        starts.push(r.u64())
+    }
+    RuntimeImage(l, textSize, dataAt, size, names, starts)
+}
+
+// what this compiler is: FNV-1a over its own executable, eight bytes at a time (0: unknown, then nothing is kept)
+fn compilerId(host: Host) -> Int {
+    if host.selfPath == "" {
+        return 0
+    }
+    let Ok(b) = readBytes(host.selfPath) else {
+        return 0
+    }
+    var h = -3750763034362895579
+    var i = 0
+    while i + 8 <= len(b) {
+        h = (h ^ u64At(b, i)) *% 1099511628211
+        i += 8
+    }
+    while i < len(b) {
+        h = (h ^ b[i]) *% 1099511628211
+        i += 1
+    }
+    if h == 0 { 1 } else { h }
+}
+
+// FNV-1a over the runtime's texts and the compiler that makes it: the cache's name
+fn runtimeKey(name: Text, id: Int) -> Text {
+    var h = -3750763034362895579 ^ id
+    for file in runtimeFiles {
+        for ch in (runtimeText(file) ?? "").bytes() {
+            h = (h ^ ch) *% 1099511628211
+        }
+    }
+    let digits = "0123456789abcdef"
+    var out = name + "-"
+    for k in 0..16 {
+        let d = h >> (60 - 4 * k) & 15
+        out += digits[d..d + 1]
+    }
+    out
+}
+
+// The runtime for this machine, mapped here: compiled from the texts the compiler keeps, or read from the temporary
+// folder where an earlier run kept it (quark-runtime-NAME-HASH.bin; QUARK_RUNTIME_CACHE=off keeps none)
+pub fn loadRuntime(host: Host) -> Mapped? {
+    let name = (match host.os {
+        Windows => "windows"
+        Linux => "linux"
+        Macos => "macos"
+    }) + (if host.arm { "-arm64" } else { "" })
+    let id = compilerId(host)
+    let keep = env("QUARK_RUNTIME_CACHE") != Some("off") and id != 0
+    let file = "quark-runtime-{runtimeKey(name, id)}.bin"
+    let cache = cachePath(file)
+    if keep and readBytes(cache) is Ok(b) and readImage(b) is Some(img) {
+        cacheUsed(file, len(b))
+        return mapImage(host, img)
+    }
+    let Some(rt) = compileRuntime(host, "") else {
+        return None
+    }
+    let img = linkRuntime(host, rt)
+    if keep {
+        let bytes = imageBytes(img)
+        let _ = writeBytes(cache, bytes)
+        cacheUsed(file, len(bytes))
+    }
+    mapImage(host, img)
+}
+
+// the runtime's function name, called (four integers at most)
+pub fn Mapped.call(self, name: Text, a: Int, b: Int, c: Int, d: Int) -> Int {
+    let at = self.symbols[name] ?? panic("the runtime has no {name}")
+    machine.call(Pointer<UInt8>(self.base + at), a, b, c, d)
+}
+
+// t to the program's output (buffered with what it prints) or, after that, to the errors
+pub fn Mapped.out(self, t: Text) {
+    let p = cText(t)
+    let _ = self.call("qkHostWrite", 1, p, len(t.bytes()), 0)
+}
+
+pub fn Mapped.err(self, t: Text) {
+    let p = cText(t)
+    let _ = self.call("qkHostWrite", 2, p, len(t.bytes()), 0)
+}
+
+pub fn Mapped.flush(self) {
+    let _ = self.call("qkHostFlush", 0, 0, 0, 0)
+}
+
+// the runtime's state for a program: its arguments (args() gives them), the path its panics say
+pub fn Mapped.begin(self, path: Text, programArgs: [Text]) {
+    var argv = [cText("quark")]
+    for a in programArgs {
+        argv.push(cText(a))
+    }
+    argv.push(0)
+    let _ = self.call("qkHostBegin", len(programArgs) + 1, wordsInC(argv), cText(path), 0)
+}
+
+// a program loaded: its Loaded, or 0 with why said ("quark: cannot find f in the C library")
+pub fn Mapped.load(self, c: Compiled, mc: MachineCode, entry: Int, fuel: Int, memory: Int, quiet: Bool = false) -> Int {
+    let program = programBytes(c, mc, entry, fuel, memory)
+    let size = len(program) - trailerBytes
+    let payload = malloc(size + 1)
+    poke(payload, program[..size])
+    let trailer = malloc(trailerBytes)
+    poke(trailer, program[size..])
+    let why = malloc(512)
+    Pointer<UInt8>(why)[0] = 0
+    let l = self.call("qkHostLoad", payload, trailer, why, 0)
+    if l == 0 {
+        self.flush()
+        if not quiet {
+            printErr("quark: {textAtC(why)}")
+        }
+        return 0
+    }
+    // its trace: what a panic says of the calls it went through
+    let t = malloc(8 * 8)
+    var names: [Int] = []
+    for f in c.prog.fns {
+        names.push(cText(f.name))
+    }
+    pokeWord(t, 0, len(c.prog.fns))
+    pokeWord(t, 1, wordsInC(names))
+    pokeWord(t, 2, wordsInC(mc.fnAt))
+    pokeWord(t, 3, len(mc.sites))
+    var sites: [Int] = []
+    for s in mc.sites {
+        sites += [s.ret, s.line, s.caller, s.callee, s.inl]
+    }
+    pokeWord(t, 4, wordsInC(sites))
+    pokeWord(t, 5, len(c.inlines))
+    var inlines: [Int] = []
+    for x in c.inlines {
+        inlines += [x.parent, x.line, cText(x.callee)]
+    }
+    pokeWord(t, 6, wordsInC(inlines))
+    let _ = self.call("qkHostTrace", l, t, 0, 0)
+    l
+}
+
+// the program's machine code as it is loaded: through adapters when it calls the System V way on Windows
+pub fn loadedCode(host: Host, c: Compiled) -> MachineCode = if c.prog.target.sysv
+    and host.os == .Windows
+    and c.prog.target.arch == .X64 {
+    sysvAdapted(c.mc)
+} else {
+    c.mc
+}
+
+pub fn Mapped.panicText(self) -> Text = textAtC(self.call("qkHostPanicText", 0, 0, 0, 0))
+
+// the C functions a program calls, when it calls the System V way on Windows: none can be
+pub fn sysvRefuses(host: Host, c: Compiled) -> Bool {
+    if host.os == .Windows and c.prog.target.sysv and len(c.prog.externs) > 0 {
+        printErr(
+            "quark: --abi sysv tests the System V calls on Windows, and {c.prog.externs[0].name} is a Windows function: run it without --abi",
+        )
+        return true
+    }
+    false
+}
+
+// ---- --profile ----
+// the C functions a profile names (the libraries' others: "(C's libraries)")
+const profiledC = [
+    "memset", "memcpy", "memmove", "memcmp", "malloc", "calloc", "realloc", "free", "strlen", "strtod", "VirtualAlloc",
+    "VirtualFree", "TlsGetValue", "TlsSetValue", "WriteFile", "ReadFile", "pthread_getspecific", "mmap", "munmap",
+]
+
+pub fn profileReport(host: Host, m: Mapped, c: Compiled, l: Int, p: Int) {
+    var cAt: [Int] = []
+    for name in profiledC {
+        cAt.push(host.cFunction(name))
+    }
+    let code = peekWord(l, 0)
+    let codeLen = peekWord(l, 1)
+    let count = len(c.prog.fns)
+    var hits = [0] * (count + 1)
+    var inRuntime = [0] * (len(m.names) + 1)
+    var inC = [0] * (len(profiledC) + 1)
+    var calledFrom = [0] * (count + 1) // the runtime's samples, by the program's function that called it
+    var inclusive = [0] * (count + 1) // each function's samples with what it calls
+    let samples = peekWord(p, 3)
+    for k in 0..peekWord(p, 4) {
+        let pc = peekWord(samples, profileWords * k)
+        // with what it calls: each function in the frames once
+        var seen: [Int] = []
+        for j in 0..profileWords {
+            let a = peekWord(samples, profileWords * k + j)
+            if a >= code and a < code + codeLen {
+                let fi = fnOfCode(c, a - code)
+                if not seen.contains(fi) {
+                    seen.push(fi)
+                    inclusive[fi] += 1
+                }
+            }
+        }
+        if pc < code or pc >= code + codeLen {
+            hits[count] += 1
+            var caller = count
+            for j in 1..profileWords {
+                let ret = peekWord(samples, profileWords * k + j)
+                if caller == count and ret >= code and ret < code + codeLen {
+                    caller = fnOfCode(c, ret - code)
+                }
+            }
+            calledFrom[caller] += 1
+            let r = runtimeFunction(m, pc - m.base)
+            if r < len(m.names) {
+                inRuntime[r] += 1
+            } else {
+                // the C function it is in: the nearest named one below it (within 64 KB), else the libraries'
+                var best = -1
+                for (ci, at) in cAt.enumerate() {
+                    if at != 0 and at <= pc and pc - at < 65536 and (best < 0 or at > cAt[best]) {
+                        best = ci
+                    }
+                }
+                inC[best + 1] += 1
+            }
+            continue
+        }
+        let at = pc - code
+        hits[fnOfCode(c, at)] += 1
+    }
+    let total = hits.sum()
+    if total == 0 {
+        m.err("quark: profile: no samples (the program ran under a millisecond)\n")
+        return
+    }
+    var out = "quark: profile, {total} samples (one a millisecond):\n"
+    var shown = [false] * (count + 1)
+    while true {
+        var best = -1
+        for i in 0..count + 1 {
+            if not shown[i] and hits[i] > 0 and (best < 0 or hits[i] > hits[best]) {
+                best = i
+            }
+        }
+        if best < 0 {
+            break
+        }
+        shown[best] = true
+        var share = fixed(100.0 * toFloat(hits[best]) / toFloat(total), 1)
+        while len(share) < 5 {
+            share = " " + share
+        }
+        out += "  {share}%  {if best < count { c.prog.fns[best].name } else { "(the runtime: printing, text, maps, memory)" }}\n"
+        if best == count {
+            out += runtimeShares(m, inRuntime, total)
+            out += "    the runtime's share, by the program's function that called it:\n"
+            for (fi, n) in calledFrom.enumerate() {
+                if 200 * n >= total {
+                    out += "      {fixed(100.0 * toFloat(n) / toFloat(total), 1)}%  {if fi < count { c.prog.fns[fi].name } else { "(not found)" }}\n"
+                }
+            }
+            for (k, n) in inC.enumerate() {
+                if 1000 * n >= total {
+                    out += "      {fixed(100.0 * toFloat(n) / toFloat(total), 1)}%  C: {if k > 0 { profiledC[k - 1] } else { "the libraries' others" }}\n"
+                }
+            }
+        }
+    }
+    // the copies values make (the "own" functions): who makes them, a frame up
+    var copiers: [Int: Int] = [:]
+    for k in 0..peekWord(p, 4) {
+        var found = -1
+        for j in 0..profileWords {
+            let a = peekWord(samples, profileWords * k + j)
+            if a >= code and a < code + codeLen {
+                let fi = fnOfCode(c, a - code)
+                if found >= 0 and fi != found {
+                    copiers[found * 65536 + fi] = (copiers[found * 65536 + fi] ?? 0) + 1
+                    break
+                }
+                if found < 0 and c.prog.fns[fi].name.startsWith("own ") {
+                    found = fi
+                }
+            }
+        }
+    }
+    for (key, n) in copiers {
+        if 200 * n >= total {
+            out += "  copies: {fixed(100.0 * toFloat(n) / toFloat(total), 1)}%  {c.prog.fns[key / 65536].name} made by {c.prog.fns[key % 65536].name}\n"
+        }
+    }
+    out += "quark: profile with what each function calls (frames the sampler could walk):\n"
+    var shownIn = [false] * (count + 1)
+    for _ in 0..30 {
+        var best = -1
+        for i in 0..count {
+            if not shownIn[i] and inclusive[i] > 0 and (best < 0 or inclusive[i] > inclusive[best]) {
+                best = i
+            }
+        }
+        if best < 0 {
+            break
+        }
+        shownIn[best] = true
+        out += "  {fixed(100.0 * toFloat(inclusive[best]) / toFloat(total), 1)}%  {c.prog.fns[best].name}\n"
+    }
+    m.err(out)
+}
+
+const profileWords = 32 // runtime/host.qk's sampleWords
+
+// the program's function at offset at of its code (len(fns): none)
+fn fnOfCode(c: Compiled, at: Int) -> Int {
+    var f = -1
+    for (i, start) in c.mc.fnAt.enumerate() {
+        if start <= at and (f < 0 or start > c.mc.fnAt[f]) {
+            f = i
+        }
+    }
+    if f >= 0 { f } else { len(c.prog.fns) }
+}
+
+// the runtime's function at offset at of its text (len(m.names): outside it, in C's libraries)
+fn runtimeFunction(m: Mapped, at: Int) -> Int {
+    let outside = len(m.names)
+    if at < 0 or at >= m.textSize {
+        return outside
+    }
+    var f = outside
+    for (i, start) in m.starts.enumerate() {
+        if start <= at and (f == outside or start > m.starts[f]) {
+            f = i
+        }
+    }
+    f
+}
+
+// the runtime's share by function, down to a tenth of a percent of all the samples
+fn runtimeShares(m: Mapped, hits: [Int], total: Int) -> Text {
+    var out = ""
+    var shown = [false] * len(hits)
+    while true {
+        var best = -1
+        for i in 0..len(hits) {
+            if not shown[i] and 1000 * hits[i] >= total and (best < 0 or hits[i] > hits[best]) {
+                best = i
+            }
+        }
+        if best < 0 {
+            break
+        }
+        shown[best] = true
+        var share = fixed(100.0 * toFloat(hits[best]) / toFloat(total), 1)
+        while len(share) < 5 {
+            share = " " + share
+        }
+        out += "      {share}%  {if best < len(m.names) { m.names[best] } else { "(C's libraries)" }}\n"
+    }
+    out
+}
+
+// ---- quark run ----
+// The program run in memory by the runtime mapped here: its exit status (exit(code) ends the process itself).
+pub fn runProgram(host: Host, m: Mapped, c: Compiled, o: RunOptions) -> Int {
+    if c.prog.mainIndex < 0 {
+        printErr("quark: a program starts at fn main() \{ ... \}")
+        return 1
+    }
+    if sysvRefuses(host, c) {
+        return 1
+    }
+    let mc = loadedCode(host, c)
+    let l = m.load(c, mc, mc.fnAt[c.prog.mainIndex], o.fuel, o.memory)
+    if l == 0 {
+        return 1
+    }
+    let t0 = monotonicTime()
+    let p = if o.profile {
+        m.call("qkHostProfileStart", 262144, 0, 0, 0)
+    } else {
+        0
+    }
+    let ok = m.call("qkHostCall", l, mc.fnAt[c.prog.mainIndex], 0, 0) != 0
+    if p != 0 {
+        let _ = m.call("qkHostProfileStop", p, 0, 0, 0)
+        m.flush()
+        profileReport(host, m, c, l, p)
+    }
+    m.flush()
+    if not ok {
+        m.err(m.panicText() + "\n")
+        return 1
+    }
+    if o.timed {
+        m.err("quark: ran in {fixed((monotonicTime() - t0) * 1000, 2)} ms\n")
+    }
+    0
+}
+
+// ---- quark test: each test "name" { ... } on its own, with its own memory; a failed assert or a panic fails only it
+pub fn runTests(host: Host, m: Mapped, c: Compiled, o: RunOptions) -> Int {
+    if sysvRefuses(host, c) {
+        return 1
+    }
+    let mc = loadedCode(host, c)
+    let l = m.load(c, mc, 0, 0, o.memory)
+    if l == 0 {
+        return 1
+    }
+    var passed = 0
+    var failed = 0
+    for (fnName, testName) in c.tests {
+        if o.filter != "" and not testName.contains(o.filter) {
+            continue
+        }
+        var f = -1
+        for (k, x) in c.prog.fns.enumerate() {
+            if f < 0 and x.name == fnName {
+                f = k
+            }
+        }
+        if f < 0 {
+            continue
+        }
+        let fuel = if o.fuel > 0 { o.fuel } else { 9223372036854775807 }
+        let t0 = monotonicTime()
+        let ok = m.call("qkHostCall", l, mc.fnAt[f], fuel, 0) != 0
+        let ms = (monotonicTime() - t0) * 1000
+        if ok {
+            passed += 1
+            m.out("ok    {testName} ({fixed(ms, 1)} ms)\n")
+        } else {
+            failed += 1
+            m.out("FAIL  {testName}\n      {m.panicText()}\n")
+        }
+        m.flush()
+    }
+    m.out("{passed} passed, {failed} failed\n")
+    m.flush()
+    if failed > 0 { 1 } else { 0 }
+}
+
+// ---- quark build ----
+// An executable for target ("": this machine): the runtime (compiled, linked and laid out as the system wants), then
+// the program. The runtime's part is the same for every program, so it is kept made in the temporary folder
+// (quark-exe-NAME-HASH.bin, as quark run keeps its runtime; QUARK_RUNTIME_CACHE=off keeps none). macOS signs the
+// program with the rest: there the runtime is made each time.
+pub fn buildExecutable(host: Host, target: Text, c: Compiled, o: RunOptions) -> Int {
+    if c.prog.mainIndex < 0 {
+        printErr("quark: an executable starts at fn main()")
+        return 1
+    }
+    let program = programBytes(c, c.mc, c.mc.fnAt[c.prog.mainIndex], o.fuel, o.memory)
+    let os = c.os
+    let arm = c.prog.target.arch == .Arm64
+    let out = o.outPath ?? defaultOutput(os, o.path)
+    var libc = Libc.Glibc
+    if host.os == .Linux and (pathExists("/lib/ld-musl-x86_64.so.1") or pathExists("/lib/ld-musl-aarch64.so.1")) {
+        libc = .Musl // the system's own C library, when it is musl
+    }
+    if o.libc == "musl" {
+        libc = .Musl
+    } else if o.libc == "glibc" {
+        libc = .Glibc
+    }
+    let id = compilerId(host)
+    let keep = env("QUARK_RUNTIME_CACHE") != Some("off") and id != 0 and os != .Macos
+    let name = (match os {
+        Windows => "windows"
+        Linux => if libc == .Musl { "linux-musl" } else { "linux" }
+        Macos => "macos"
+    }) + (if arm { "-arm64" } else { "-x64" })
+    let file = "quark-exe-{runtimeKey(name, id)}.bin"
+    let cache = cachePath(file)
+    var image: Bytes = []
+    if keep and readBytes(cache) is Ok(b) and len(b) > 16 and b[len(b) - 8..] == "QKEXEIMG".bytes() {
+        cacheUsed(file, len(b))
+        image = b[..len(b) - 8] + program
+    } else {
+        let Some(rt) = compileRuntime(host, target) else {
+            return 1
+        }
+        let info = ImageInfo(rt.os, true, rt.features, rt.data, runtimeNames)
+        let o2 = layout(rt.mc, rt.prog, info)
+        let none: Bytes = []
+        let front = match os {
+            Windows => peImage(rt.mc, o2, none, arm)
+            Linux => elfImage(rt.mc, o2, none, arm, libc)
+            Macos => none
+        }
+        if keep {
+            let _ = writeBytes(cache, front + "QKEXEIMG".bytes())
+            cacheUsed(file, len(front) + 8)
+        }
+        image = if os == .Macos {
+            machoImage(rt.mc, o2, program, arm, fileNameOf(out))
+        } else {
+            front + program
+        }
+    }
+    if writeBytes(out, image) is Err(_) {
+        printErr("quark: cannot write {out}")
+        return 1
+    }
+    if host.os != .Windows {
+        let _ = runProcess("chmod", ["755", out]) // it runs
+    }
+    printErr("quark: wrote {out} ({len(c.mc.code)} bytes of machine code)")
+    0
+}
+
+// a path's last part: its file's name
+fn fileNameOf(path: Text) -> Text {
+    var from = 0
+    for (i, ch) in path.bytes().enumerate() {
+        if ch is '/' | '\\' {
+            from = i + 1
+        }
+    }
+    path[from..]
+}
+
+// file.qk's executable: file.exe on Windows, file elsewhere
+fn defaultOutput(os: Os, path: Text) -> Text {
+    let b = path.bytes()
+    var dot = -1
+    for (i, ch) in b.enumerate() {
+        if ch == '.' {
+            dot = i
+        } else if ch is '/' | '\\' {
+            dot = -1
+        }
+    }
+    let stem = if dot >= 0 { path[..dot] } else { path }
+    if os == .Windows { stem + ".exe" } else { stem }
+}

@@ -1,0 +1,736 @@
+// The runtime's system calls on macOS (x86-64 and Apple Silicon): libSystem (POSIX, pthreads, dlopen), each behind
+// a symbol of the runtime's own (qkos*, C's calls; linux.qk and windows.qk give the same ones), and the executable's
+// entry: an executable carries its program in its own data (compiler/image.qk's machoImage), so nothing is read back
+// from its file. Code made while running goes into MAP_JIT memory, writable on this thread until it is protected.
+use std.machine as machine
+use base
+use start
+use host
+
+extern effect fn pthreadKeyCreate(key: Int64, destructor: Int64) -> Int32 as "pthread_key_create"
+extern effect fn pthreadGetSpecific(key: UInt64) -> Int64 as "pthread_getspecific"
+extern effect fn pthreadSetSpecific(key: UInt64, v: Int64) -> Int32 as "pthread_setspecific"
+extern effect fn pthreadSelf() -> Int64 as "pthread_self"
+extern effect fn pthreadStackTop(t: Int64) -> Int64 as "pthread_get_stackaddr_np"
+extern effect fn pthreadStackSize(t: Int64) -> UInt64 as "pthread_get_stacksize_np"
+extern effect fn pthreadAttrInit(attr: Int64) -> Int32 as "pthread_attr_init"
+extern effect fn pthreadAttrSetStackSize(attr: Int64, size: UInt64) -> Int32 as "pthread_attr_setstacksize"
+extern effect fn pthreadAttrDestroy(attr: Int64) -> Int32 as "pthread_attr_destroy"
+extern effect fn pthreadCreate(t: Int64, attr: Int64, f: Int64, arg: Int64) -> Int32 as "pthread_create"
+extern effect fn pthreadJoin(t: Int64, result: Int64) -> Int32 as "pthread_join"
+extern effect fn cWrite(fd: Int32, p: Int64, n: UInt64) -> Int64 as "write"
+extern effect fn cRead(fd: Int32, p: Int64, n: UInt64) -> Int64 as "read"
+extern effect fn cClose(fd: Int32) -> Int32 as "close"
+extern effect fn cOpen(path: Int64, flags: Int32, ...) -> Int32 as "open"
+extern effect fn fcntl(fd: Int32, command: Int32, ...) -> Int32
+extern effect fn errnoLocation() -> Int64 as "__error"
+extern effect fn snprintf(buf: Int64, size: UInt64, format: Int64, ...) -> Int32
+extern effect fn clockGettime(clock: Int32, at: Int64) -> Int32 as "clock_gettime"
+extern effect fn usleep(us: UInt32) -> Int32
+extern effect fn fopen(path: Int64, mode: Int64) -> Int64
+extern effect fn getenv(name: Int64) -> Int64
+extern effect fn access(path: Int64, mode: Int32) -> Int32
+extern effect fn opendir(path: Int64) -> Int64
+extern effect fn readdir(d: Int64) -> Int64
+extern effect fn closedir(d: Int64) -> Int32
+extern effect fn mkdir(path: Int64, mode: UInt16) -> Int32
+extern effect fn rmdir(path: Int64) -> Int32
+extern effect fn unlink(path: Int64) -> Int32
+extern effect fn pipe(fds: Int64) -> Int32
+extern effect fn fork() -> Int32
+extern effect fn dup2(a: Int32, b: Int32) -> Int32
+extern effect fn execvp(name: Int64, argv: Int64) -> Int32
+extern effect fn cExitNow(code: Int32) as "_exit"
+extern effect fn poll(fds: Int64, n: UInt32, timeout: Int32) -> Int32
+extern effect fn waitpid(pid: Int32, status: Int64, options: Int32) -> Int32
+extern effect fn mmap(p: Int64, n: UInt64, prot: Int32, flags: Int32, fd: Int32, offset: Int64) -> Int64
+extern effect fn mprotect(p: Int64, n: UInt64, prot: Int32) -> Int32
+extern effect fn munmap(p: Int64, n: UInt64) -> Int32
+extern effect fn dlopen(name: Int64, flags: Int32) -> Int64
+extern effect fn dlsym(h: Int64, name: Int64) -> Int64
+extern effect fn sysconf(name: Int32) -> Int64
+extern fn fnAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+const eintr = 4
+const rtldDefault = -2 // every image the process has loaded
+
+// x86-64's functions start with push rbp (0x55); Apple Silicon's with stp x29, x30
+fn x64() -> Bool = byte(fnAddress(x => x), 0) == 85
+
+// a libSystem function only one processor has, found when it runs (0: none)
+fn optional(name: Text) -> Int = dlsym(rtldDefault, textAt(name))
+
+// ---- the context, the output, numbers ----
+pub extern effect fn osCtxImpl() -> Int64 as "qkosCtx" = pthreadGetSpecific(word(cell(), 1))
+
+pub extern effect fn osSetCtxImpl(c: Int64) as "qkosSetCtx" {
+    let _ = pthreadSetSpecific(word(cell(), 1), c)
+}
+
+pub extern effect fn osWriteImpl(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
+    var at = 0
+    while at < n {
+        let k = cWrite(fd, p + at, n - at)
+        if k < 0 and int32At(errnoLocation(), 0) == eintr {
+            continue
+        }
+        if k <= 0 {
+            break
+        }
+        at += k
+    }
+}
+
+pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = int32At(errnoLocation(), 0)
+
+pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setInt32(errnoLocation(), 0, e)
+
+// printf's way with a Float: snprintf, a variadic call (the compiler passes its values as each processor's C does)
+pub extern effect fn osFloatTextImpl(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText" {
+    let format = if kind == 'f' { textAt("%.*f\0") } else { textAt("%.*g\0") }
+    snprintf(buf, size, format, precision, v)
+}
+
+fn clock(which: Int) -> Float {
+    let t = calloc(2, 8)
+    let _ = clockGettime(which, t)
+    let s = toFloat(word(t, 0)) + toFloat(word(t, 1)) * 0.000000001
+    free(t)
+    s
+}
+
+pub extern effect fn osNowImpl() -> Float64 as "qkosNow" = clock(6) // CLOCK_MONOTONIC
+
+pub extern effect fn osTimeImpl() -> Float64 as "qkosTime" = clock(0) // CLOCK_REALTIME
+
+pub extern effect fn osSleepImpl(ms: Int64) as "qkosSleep" {
+    let _ = usleep(1000 * ms)
+}
+
+// ---- files and folders ----
+pub extern effect fn osOpenImpl(path: Int64, mode: Int64) -> Int64 as "qkosOpen" = fopen(path, mode)
+
+pub extern effect fn osEnvImpl(name: Int64) -> Int64 as "qkosEnv" {
+    let v = getenv(name)
+    if v == 0 {
+        return 0
+    }
+    let n = strlen(v)
+    let s = malloc(n + 1)
+    copyBytes(s, v, n + 1)
+    s
+}
+
+pub extern effect fn osPathKindImpl(path: Int64) -> Int64 as "qkosPathKind" {
+    if access(path, 0) != 0 {
+        return -1
+    }
+    let d = opendir(path)
+    if d == 0 {
+        return 0
+    }
+    let _ = closedir(d)
+    1
+}
+
+pub extern effect fn osMakeDirImpl(path: Int64) -> Int64 as "qkosMakeDir" = mkdir(path, 511)
+
+pub extern effect fn osRemoveImpl(path: Int64, folder: Int64) -> Int64 as "qkosRemove" =
+    if folder == 1 { rmdir(path) } else { unlink(path) }
+
+pub extern effect fn osSeparatorImpl(c: Int64) -> Int64 as "qkosSeparator" =
+    if c == '/' { 1 } else { 0 }
+
+pub extern effect fn osListDirImpl(path: Int64) -> Int64 as "qkosListDir" {
+    let d = opendir(path)
+    if d == 0 {
+        return 0
+    }
+    // d_name: x86-64's readdir has the 32-bit inode's dirent (d_ino, d_reclen, d_type, d_namlen); Apple Silicon's
+    // the 64-bit one (d_ino, d_seekoff, d_reclen, d_namlen, d_type)
+    let nameAt = if x64() { 8 } else { 21 }
+    var cap = 1024
+    var out = malloc(cap)
+    var used = 0
+    while true {
+        let e = readdir(d)
+        if e == 0 {
+            break
+        }
+        let name = e + nameAt
+        let k = strlen(name)
+        let dots = k == 1 and byte(name, 0) == '.' or k == 2 and byte(name, 0) == '.' and byte(name, 1) == '.'
+        if not dots {
+            while used + k + 2 > cap {
+                cap *= 2
+                out = realloc(out, cap)
+            }
+            copyBytes(out + used, name, k + 1)
+            used += k + 1
+        }
+    }
+    let _ = closedir(d)
+    setByte(out, used, 0)
+    out
+}
+
+// ---- the input ----
+pub extern effect fn osReadInImpl(p: Int64, n: Int64) -> Int64 as "qkosReadIn" {
+    while true {
+        let k = cRead(0, p, n)
+        if k < 0 and int32At(errnoLocation(), 0) == eintr {
+            continue
+        }
+        return if k > 0 { k } else { 0 }
+    }
+    0
+}
+
+pub extern effect fn osReadLineImpl(out: Int64) -> Int64 as "qkosReadLine" = -1 + out - out
+
+// ---- other programs ----
+fn cannotRun(out: Int, name: Int, e: Int) -> Int {
+    let m = malloc(700)
+    let _ = bufAt(m, 700).text("cannot run ").zeroText(name).text(": ").zeroText(strerror(e))
+    setWord(out, 1, m)
+    1
+}
+
+fn errno() -> Int = int32At(errnoLocation(), 0)
+
+pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosRunProcess" {
+    let argv = calloc(count + 2, 8)
+    setWord(argv, 0, name)
+    for i in 0..count {
+        let n = word(args, 2 * i + 1)
+        let s = calloc(n + 1, 1)
+        copyBytes(s, word(args, 2 * i), n)
+        setWord(argv, i + 1, s)
+    }
+    let fds = calloc(6, 4) // the output, the errors, and exec's failure (closed when exec works)
+    if pipe(fds) != 0 {
+        return cannotRun(out, name, errno())
+    }
+    if pipe(fds + 8) != 0 {
+        let e = errno()
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 1))
+        return cannotRun(out, name, e)
+    }
+    if pipe(fds + 16) != 0 {
+        let e = errno()
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 1)) + cClose(int32At(fds, 2)) + cClose(int32At(fds, 3))
+        return cannotRun(out, name, e)
+    }
+    let _ = fcntl(int32At(fds, 5), 2, 1) // F_SETFD, FD_CLOEXEC: exec closes it
+    let pid = fork()
+    if pid < 0 {
+        let e = errno()
+        for i in 0..6 {
+            let _ = cClose(int32At(fds, i))
+        }
+        return cannotRun(out, name, e)
+    }
+    if pid == 0 {
+        // the child
+        let devNull = cOpen(textAt("/dev/null\0"), 0)
+        if devNull >= 0 {
+            let _ = dup2(devNull, 0)
+        }
+        let _ = dup2(int32At(fds, 1), 1) + dup2(int32At(fds, 3), 2)
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 2)) + cClose(int32At(fds, 4))
+        let _ = execvp(name, argv)
+        let e = calloc(1, 8)
+        setInt32(e, 0, errno())
+        let _ = cWrite(int32At(fds, 5), e, 4)
+        cExitNow(127)
+    }
+    let _ = cClose(int32At(fds, 1)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5))
+    let execError = calloc(1, 8)
+    var got = cRead(int32At(fds, 4), execError, 4)
+    while got < 0 and errno() == eintr {
+        got = cRead(int32At(fds, 4), execError, 4)
+    }
+    let _ = cClose(int32At(fds, 4))
+    let pfd = calloc(2, 8) // two pollfds: fd, events (POLLIN), revents
+    setInt32(pfd, 0, int32At(fds, 0))
+    setInt32(pfd, 1, 1)
+    setInt32(pfd, 2, int32At(fds, 2))
+    setInt32(pfd, 3, 1)
+    let bufs = calloc(6, 8) // (bytes, length, room) for the output, then the errors
+    for i in 0..2 {
+        setWord(bufs, 3 * i, malloc(4096))
+        setWord(bufs, 3 * i + 2, 4096)
+    }
+    let chunk = malloc(16384)
+    var live = 2
+    while live > 0 {
+        if poll(pfd, 2, -1) < 0 {
+            if errno() == eintr {
+                continue
+            }
+            break
+        }
+        for i in 0..2 {
+            let fd = int32At(pfd, 2 * i)
+            if fd >= 0 and Pointer<Int16>(pfd)[4 * i + 3] != 0 {
+                let n = cRead(fd, chunk, 16384)
+                if n > 0 {
+                    let b = bufs + 24 * i
+                    while word(b, 1) + n > word(b, 2) {
+                        setWord(b, 2, word(b, 2) * 2)
+                        setWord(b, 0, realloc(word(b, 0), word(b, 2)))
+                    }
+                    copyBytes(word(b, 0) + word(b, 1), chunk, n)
+                    setWord(b, 1, word(b, 1) + n)
+                } else if n == 0 or errno() != eintr {
+                    let _ = cClose(fd)
+                    setInt32(pfd, 2 * i, -1)
+                    live -= 1
+                }
+            }
+        }
+    }
+    free(chunk)
+    for i in 0..2 {
+        if int32At(pfd, 2 * i) >= 0 {
+            let _ = cClose(int32At(pfd, 2 * i))
+        }
+    }
+    let ws = calloc(1, 8)
+    while waitpid(pid, ws, 0) < 0 and errno() == eintr {}
+    if got == 4 {
+        free(word(bufs, 0))
+        free(word(bufs, 3))
+        return cannotRun(out, name, int32At(execError, 0))
+    }
+    let s = int32At(ws, 0)
+    let status = if s & 127 == 0 {
+        s >> 8 & 255
+    } else if s & 127 != 127 {
+        128 + s & 127
+    } else {
+        -1
+    }
+    setWord(out, 0, status)
+    setWord(out, 1, word(bufs, 0))
+    setWord(out, 2, word(bufs, 1))
+    setWord(out, 3, word(bufs, 3))
+    setWord(out, 4, word(bufs, 4))
+    0
+}
+
+// ---- code in memory, the stack, C's libraries, threads ----
+// MAP_JIT memory (read, write, run), made writable for this thread (pthread_jit_write_protect_np on Apple Silicon);
+// protected, it runs, and the instruction cache is told (sys_icache_invalidate)
+pub extern effect fn osMapCodeImpl(n: Int64) -> Int64 as "qkosMapCode" {
+    let p = mmap(0, n, 7, 6146, -1, 0) // MAP_PRIVATE | MAP_ANON | MAP_JIT
+    if p == -1 {
+        return 0
+    }
+    let writable = optional("pthread_jit_write_protect_np\0")
+    if writable != 0 {
+        let _ = machine.call(Pointer<UInt8>(writable), 0, 0, 0, 0)
+    }
+    p
+}
+
+pub extern effect fn osProtectCodeImpl(p: Int64, n: Int64) as "qkosProtectCode" {
+    let protect = optional("pthread_jit_write_protect_np\0")
+    if protect != 0 {
+        let _ = machine.call(Pointer<UInt8>(protect), 1, 0, 0, 0)
+    }
+    let invalidate = optional("sys_icache_invalidate\0")
+    if invalidate != 0 {
+        let _ = machine.call(Pointer<UInt8>(invalidate), p, n, 0, 0)
+    }
+}
+
+pub extern effect fn osUnmapCodeImpl(p: Int64, n: Int64) as "qkosUnmapCode" {
+    let _ = munmap(p, n)
+}
+
+// the heap's range (heap.qk): reserved with no access (MAP_PRIVATE | MAP_ANONYMOUS), made readable and writable as
+// it is used
+pub extern effect fn osReserveImpl(n: Int64) -> Int64 as "qkosReserve" {
+    let p = mmap(0, n, 0, 4098, -1, 0)
+    if p == -1 { 0 } else { p }
+}
+
+pub extern effect fn osCommitImpl(p: Int64, n: Int64) -> Int64 as "qkosCommit" =
+    if mprotect(p, n, 3) == 0 { 1 } else { 0 }
+
+pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
+    let _ = munmap(p, n)
+}
+
+pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
+    let t = pthreadSelf()
+    pthreadStackTop(t) - pthreadStackSize(t)
+}
+
+fn isText(s: Int, t: Text) -> Bool = strlen(s) == len(t) and sameBytes(s, textAt(t), len(t))
+
+fn hasPart(s: Int, t: Text) -> Bool {
+    let n = strlen(s)
+    var i = 0
+    while i + len(t) <= n {
+        if sameBytes(s + i, textAt(t), len(t)) {
+            return true
+        }
+        i += 1
+    }
+    false
+}
+
+// "c" and "m" are libSystem, which every process has loaded; another is libNAME.dylib, or a path
+pub extern effect fn osCFunctionImpl(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" {
+    let system = lib == 0 or isText(lib, "c") or isText(lib, "m")
+    var h = rtldDefault
+    if not system {
+        if hasPart(lib, "/") or hasPart(lib, ".dylib") {
+            h = dlopen(lib, 2)
+        } else {
+            let name = calloc(1, 1024)
+            let _ = bufAt(name, 1024).text("lib").zeroText(lib).text(".dylib")
+            h = dlopen(name, 2)
+            free(name)
+        }
+    }
+    if h == 0 {
+        let _ = bufAt(why, 512).text("cannot load the library ").zeroText(lib).text(" (lib").zeroText(lib).text(
+            ".dylib)",
+        )
+        return 0
+    }
+    let f = dlsym(h, symbol)
+    if f == 0 and system {
+        let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(" in the C library")
+    } else if f == 0 {
+        let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(" in the library ").zeroText(lib)
+    }
+    f
+}
+
+pub extern effect fn osProcessorsImpl() -> Int64 as "qkosProcessors" {
+    let n = sysconf(58) // _SC_NPROCESSORS_ONLN
+    if n > 0 { n } else { 1 }
+}
+
+fn threadOf(f: Int, arg: Int, stack: Int) -> Int {
+    let attr = calloc(1, 256)
+    let t = calloc(1, 8)
+    let _ = pthreadAttrInit(attr)
+    let _ = pthreadAttrSetStackSize(attr, stack)
+    let started = pthreadCreate(t, attr, f, arg) == 0
+    let _ = pthreadAttrDestroy(attr)
+    free(attr)
+    let id = word(t, 0)
+    free(t)
+    if started { id } else { 0 }
+}
+
+pub extern effect fn osThreadStartImpl(f: Int64, arg: Int64) -> Int64 as "qkosThreadStart" =
+    threadOf(f, arg, 67108864)
+
+pub extern effect fn osThreadJoinImpl(h: Int64) as "qkosThreadJoin" {
+    let _ = pthreadJoin(h, 0)
+}
+
+// ---- the executable's entry: the program from its own data, on a thread of 256 MB of stack, as elsewhere ----
+// (argc, argv, payload, trailer, status)
+fn run(a: Int) -> Int {
+    setWord(a, 4, qkStartMemory(word(a, 0), word(a, 1), word(a, 2), word(a, 3)))
+    0
+}
+
+fn makeKey() {
+    let _ = pthreadKeyCreate(cell() + 8, 0)
+    setWord(cell(), 1, word(cell() + 8, 0)) // the key (a pthread_key_t is an unsigned long), its own word
+}
+
+// main's stub (compiler/image.qk) gives the program the executable carries: its payload and its trailer
+pub extern effect fn macMain(argc: Int64, argv: Int64, payload: Int64, trailer: Int64) -> Int64 as "qkMacMain" {
+    makeKey()
+    let a = calloc(5, 8)
+    setWord(a, 0, argc)
+    setWord(a, 1, argv)
+    setWord(a, 2, payload)
+    setWord(a, 3, trailer)
+    setWord(a, 4, 1)
+    let t = threadOf(fnAddress(x => run(x)), a, 268435456)
+    if t == 0 {
+        return qkStartMemory(argc, argv, payload, trailer)
+    }
+    let _ = pthreadJoin(t, 0)
+    word(a, 4)
+}
+
+// ---- a program run from memory (quarkimg run): the runtime mapped by the caller, on the caller's thread ----
+pub extern effect fn memoryMain(argc: Int64, argv: Int64, payload: Int64, trailer: Int64) -> Int64 as "qkMemoryMain" {
+    makeKey()
+    qkStartMemory(argc, argv, payload, trailer)
+}
+
+// ---- the command line's own runs (host.qk, compiler/memory.qk): this thread made ready for the runtime ----
+pub extern effect fn hostInit() as "qkosHostInit" = makeKey()
+
+// ---- --profile: a timer signal every millisecond of the process's time, and where the thread it stops is ----
+extern effect fn sigaction(sig: Int32, act: Int64, old: Int64) -> Int32
+extern effect fn setitimer(which: Int32, value: Int64, old: Int64) -> Int32
+extern fn handlerAddress(f: extern (Int64, Int64, Int64) -> Unit) -> Int64 as "qkTextAddress"
+
+// SIGPROF: the stopped code's address, from the signal's ucontext: its uc_mcontext (a pointer, at byte 48), then the
+// thread state after the exception state (16 bytes): x86-64's rip (byte 144), Apple Silicon's pc (byte 272)
+fn sample(context: Int) {
+    let p = word(cell(), 3)
+    if p == 0 or word(p, 4) >= word(p, 5) {
+        return
+    }
+    let mc = word(context, 6)
+    setWord(word(p, 3) + 8 * sampleWords * word(p, 4), 0, word(mc, if x64() { 18 } else { 34 }))
+    setWord(p, 4, word(p, 4) + 1)
+}
+
+fn profileTimer(us: Int) {
+    let t = calloc(4, 8)
+    setWord(t, 1, us) // the interval, then the first one: seconds 0, microseconds us
+    setWord(t, 3, us)
+    let _ = setitimer(2, t, 0) // ITIMER_PROF
+    free(t)
+}
+
+pub extern effect fn osProfileStartImpl(p: Int64) as "qkosProfileStart" {
+    setWord(cell(), 3, p)
+    let sa = calloc(1, 16) // a struct sigaction: the handler, the mask (4 bytes), the flags
+    setWord(sa, 0, handlerAddress((sig, info, context) => sample(context)))
+    setInt32(sa, 3, 66) // SA_SIGINFO | SA_RESTART
+    let _ = sigaction(27, sa, 0) // SIGPROF
+    free(sa)
+    profileTimer(1000)
+}
+
+pub extern effect fn osProfileStopImpl(p: Int64) as "qkosProfileStop" {
+    profileTimer(0)
+    setWord(cell(), 3, 0)
+}
+
+// ---- sockets (BSD sockets), seeking, the local time ----
+extern effect fn pxSocket(family: Int32, kind: Int32, protocol: Int32) -> Int32 as "socket"
+extern effect fn pxBind(s: Int32, addr: Int64, n: UInt32) -> Int32 as "bind"
+extern effect fn pxListen(s: Int32, backlog: Int32) -> Int32 as "listen"
+extern effect fn pxAccept(s: Int32, addr: Int64, n: Int64) -> Int32 as "accept"
+extern effect fn pxConnect(s: Int32, addr: Int64, n: UInt32) -> Int32 as "connect"
+extern effect fn pxRecv(s: Int32, p: Int64, n: UInt64, flags: Int32) -> Int64 as "recv"
+extern effect fn pxSend(s: Int32, p: Int64, n: UInt64, flags: Int32) -> Int64 as "send"
+extern effect fn pxSetOption(s: Int32, level: Int32, name: Int32, value: Int64, n: UInt32) -> Int32 as "setsockopt"
+extern effect fn pxGetAddrInfo(host: Int64, service: Int64, hints: Int64, out: Int64) -> Int32 as "getaddrinfo"
+extern effect fn pxFreeAddrInfo(info: Int64) as "freeaddrinfo"
+extern effect fn pxGaiError(code: Int32) -> Int64 as "gai_strerror"
+extern effect fn fseeko(f: Int64, at: Int64, from: Int32) -> Int32
+extern effect fn ftello(f: Int64) -> Int64
+extern effect fn localtimeR(t: Int64, tm: Int64) -> Int64 as "localtime_r"
+
+const sockLevel = 65535 // SOL_SOCKET
+const reuseAddress = 4 // SO_REUSEADDR
+const nonBlockFlag = 4 // O_NONBLOCK
+const tryAgain = 35 // EAGAIN (EWOULDBLOCK)
+const sendFlags = 0 // MSG_NOSIGNAL where there is one: a closed other end is an error, not a signal
+const addrAt = 4 // ai_addr's place in an addrinfo, in words
+
+fn netWhy(why: Int, text: Int) {
+    let _ = bufAt(why, 256).zeroText(text)
+}
+
+// host:port's first IPv4 address (a sockaddr_in, 16 bytes) into addr; host 0 or "": any (to listen)
+fn resolve(host: Int, port: Int, addr: Int, why: Int) -> Bool {
+    let hints = calloc(48 + 24 + 8, 1) // the hints, the port's digits, the result's address
+    let any = host == 0 or byte(host, 0) == 0
+    setInt32(hints, 0, if any {
+        1 // AI_PASSIVE
+    } else {
+        0
+    })
+    setInt32(hints, 1, 2) // AF_INET
+    setInt32(hints, 2, 1) // SOCK_STREAM
+    let service = bufAt(hints + 48, 24).int(port)
+    let out = hints + 72
+    let r = pxGetAddrInfo(if any { 0 } else { host }, service.p, hints, out)
+    let found = r == 0 and word(out, 0) != 0
+    if found {
+        copyBytes(addr, word(word(out, 0), addrAt), 16)
+        pxFreeAddrInfo(word(out, 0))
+    } else {
+        netWhy(why, if r != 0 { pxGaiError(r) } else { textAt("the host is not known\0") })
+    }
+    free(hints)
+    found
+}
+
+fn nonBlocking(s: Int) {
+    let flags = fcntl(s, 3) // F_GETFL
+    let _ = fcntl(s, 4, flags | nonBlockFlag) // F_SETFL
+}
+
+fn socketOptions(s: Int) {
+    let one = calloc(1, 8)
+    setInt32(one, 0, 1)
+    let _ = pxSetOption(s, sockLevel, reuseAddress, one, 4)
+    let _ = pxSetOption(s, sockLevel, 4130, one, 4) // SO_NOSIGPIPE: a closed other end is an error
+    free(one)
+}
+
+pub extern effect fn osListenImpl(host: Int64, port: Int64, why: Int64) -> Int64 as "qkosListen" {
+    let addr = calloc(2, 8)
+    if not resolve(host, port, addr, why) {
+        free(addr)
+        return -1
+    }
+    let s = pxSocket(2, 1, 0)
+    if s < 0 {
+        netWhy(why, strerror(osErrno()))
+        free(addr)
+        return -1
+    }
+    socketOptions(s)
+    let ok = pxBind(s, addr, 16) == 0 and pxListen(s, 128) == 0
+    free(addr)
+    if not ok {
+        netWhy(why, strerror(osErrno()))
+        let _ = cClose(s)
+        return -1
+    }
+    nonBlocking(s)
+    s
+}
+
+pub extern effect fn osConnectImpl(host: Int64, port: Int64, why: Int64) -> Int64 as "qkosConnect" {
+    let addr = calloc(2, 8)
+    if not resolve(host, port, addr, why) {
+        free(addr)
+        return -1
+    }
+    let s = pxSocket(2, 1, 0)
+    if s < 0 {
+        netWhy(why, strerror(osErrno()))
+        free(addr)
+        return -1
+    }
+    socketOptions(s)
+    var r = pxConnect(s, addr, 16)
+    while r != 0 and osErrno() == 4 {
+        r = pxConnect(s, addr, 16) // EINTR
+    }
+    free(addr)
+    if r != 0 {
+        netWhy(why, strerror(osErrno()))
+        let _ = cClose(s)
+        return -1
+    }
+    nonBlocking(s)
+    s
+}
+
+pub extern effect fn osAcceptImpl(s: Int64, why: Int64) -> Int64 as "qkosAccept" {
+    while true {
+        let c = pxAccept(s, 0, 0)
+        if c >= 0 {
+            socketOptions(c)
+            nonBlocking(c)
+            return c
+        }
+        let e = osErrno()
+        if e == tryAgain {
+            return -1
+        }
+        if e != 4 {
+            netWhy(why, strerror(e))
+            return -2
+        }
+    }
+    -2
+}
+
+pub extern effect fn osRecvImpl(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosRecv" {
+    while true {
+        let k = pxRecv(s, p, n, 0)
+        if k >= 0 {
+            return k
+        }
+        let e = osErrno()
+        if e == tryAgain {
+            return -1
+        }
+        if e != 4 {
+            netWhy(why, strerror(e))
+            return -2
+        }
+    }
+    -2
+}
+
+pub extern effect fn osSendImpl(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosSend" {
+    while true {
+        let k = pxSend(s, p, n, sendFlags)
+        if k >= 0 {
+            return k
+        }
+        let e = osErrno()
+        if e == tryAgain {
+            return -1
+        }
+        if e != 4 {
+            netWhy(why, strerror(e))
+            return -2
+        }
+    }
+    -2
+}
+
+pub extern effect fn osCloseSocketImpl(s: Int64) as "qkosCloseSocket" {
+    let _ = cClose(s)
+}
+
+// items: (socket, write, ready) each; ready 1 for those that are (an error or a hang-up too: the next call says it)
+pub extern effect fn osPollImpl(items: Int64, count: Int64, ms: Int64) -> Int64 as "qkosPoll" {
+    let fds = calloc(if count > 0 {
+        count // pollfd: the fd, then events and revents (shorts)
+    } else {
+        1
+    }, 8)
+    for i in 0..count {
+        setInt32(fds, 2 * i, word(items, 3 * i))
+        setInt32(fds, 2 * i + 1, if word(items, 3 * i + 1) != 0 {
+            4 // POLLOUT, POLLIN
+        } else {
+            1
+        })
+    }
+    var r = poll(fds, count, if ms < 0 { -1 } else { ms })
+    while r < 0 and osErrno() == 4 {
+        r = poll(fds, count, if ms < 0 { -1 } else { ms })
+    }
+    for i in 0..count {
+        let revents = shr(int32At(fds, 2 * i + 1), 16) & 65535
+        setWord(items, 3 * i + 2, if revents != 0 { 1 } else { 0 })
+    }
+    free(fds)
+    r
+}
+
+pub extern effect fn osSeekImpl(f: Int64, at: Int64, from: Int64) -> Int64 as "qkosSeek" {
+    if fseeko(f, at, from) != 0 {
+        return -1
+    }
+    ftello(f)
+}
+
+pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalOffset" {
+    let t = calloc(10, 8) // the moment, then a struct tm (tm_gmtoff: its sixth word)
+    setWord(t, 0, toInt(cFloor(seconds)))
+    var offset = 0
+    if localtimeR(t, t + 8) != 0 {
+        offset = word(t + 8, 5)
+    }
+    free(t)
+    offset
+}

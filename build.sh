@@ -1,52 +1,71 @@
 #!/usr/bin/env bash
-# Builds build/libquark.a (the compiler and runtime, for hosts: include/quark.h), build/quark.exe (the
-# command line) and build/host.exe (the embedding example) with any C11 compiler. Quark itself needs none
-# to run programs.
+# Builds Quark with Quark: build/quark.exe, the compiler (compiler/), and build/libquark.a, the compiler and runtime
+# for C hosts (include/quark.h). A Quark compiler builds it (docs/BOOTSTRAP.md): QUARK=path/to/quark, else quark on
+# the PATH (a release's, or one built before). It builds stage1 (compiler/ in the quick tier), and stage1 builds
+# build/quark.exe (the optimizing tier): what is built is made by today's compiler/, whatever made stage1.
+#   ./build.sh            stage1, then build/quark.exe
+#   ./build.sh --check    then the fixed point: build/quark.exe builds compiler/ once more (build/stage3), and the two
+#                         must be the same bytes
+# With a C compiler (CC, default gcc) it also links the C hosts the tests run: build/host.exe, build/sysv-hosts.exe.
+# macOS: no libquark yet (compiler/libquark.qk writes Windows' and Linux's), so no C hosts either.
 set -e
 cd "$(dirname "$0")"
+B=${QK_OUT:-build}
 CC=${CC:-gcc}
-AR=${AR:-ar}
-FLAGS="-std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-truncation -Iinclude"
-mkdir -p build/obj
-# the standard library (std/*.qk, written in Quark) goes into the compiler as text: use std.json
-{
-    echo "/* Made by build.sh from the files in std: the standard library text. */"
-    echo "#include <stddef.h>"
-    echo "const char* const qkStdNames[] = {"
-    for f in std/*.qk; do echo "    \"$(basename "$f" .qk)\","; done
-    echo "    NULL};"
-    echo "const char* const qkStdTexts[] = {"
-    for f in std/*.qk; do
-        sed 's/\\/\\\\/g; s/"/\\"/g; s/^/    "/; s/$/\\n"/' "$f"
-        echo "    ,"
-    done
-    echo "    NULL};"
-} > build/obj/stdlib.c
-objs=()
-$CC $FLAGS -c build/obj/stdlib.c -o build/obj/stdlib.o
-objs+=(build/obj/stdlib.o)
-# the WebAssembly loader (src/wasm.js) goes in as text too: quark build --target wasm32 writes it beside the module
-{
-    echo "/* Made by build.sh from src/wasm.js: the WebAssembly loader, a string a line. */"
-    echo "#include <stddef.h>"
-    echo "const char* const qkWasmLoaderLines[] = {"
-    tr -d '\r' < src/wasm.js | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/    "/; s/$/",/'
-    echo "    NULL};"
-} > build/obj/wasmjs.c
-$CC $FLAGS -c build/obj/wasmjs.c -o build/obj/wasmjs.o
-objs+=(build/obj/wasmjs.o)
-for f in src/*.c; do
-    name=$(basename "$f" .c)
-    [ "$name" = main ] && continue
-    $CC $FLAGS -c "$f" -o "build/obj/$name.o"
-    objs+=("build/obj/$name.o")
+check=false
+for a in "$@"; do
+    case $a in
+    --check) check=true ;;
+    *) echo "usage: ./build.sh [--check]" >&2; exit 2 ;;
+    esac
 done
-rm -f build/libquark.a
-$AR rcs build/libquark.a "${objs[@]}"
-# a deep stack for the command line (and the executables it builds): recursion as deep as a program needs
-STACK=""
-LIBS="-lm -lpthread"
-case "$($CC -dumpmachine)" in *mingw*|*windows*|*cygwin*) STACK="-Wl,--stack,268435456"; LIBS="-lm -lwinmm" ;; esac
-$CC $FLAGS -o build/quark.exe src/main.c build/libquark.a $LIBS $STACK
-$CC $FLAGS -o build/host.exe examples/host/host.c build/libquark.a $LIBS
-$CC $FLAGS -o build/sysv-hosts.exe tests/sysv/hosts.c build/libquark.a $LIBS
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*) main=compiler/main.qk LIBS="-lm -lwinmm" ;;
+Darwin) main=compiler/mainmacos.qk LIBS="-lm -lpthread -ldl" ;;
+*) main=compiler/mainlinux.qk LIBS="-lm -lpthread -ldl" ;;
+esac
+quark=${QUARK:-$(command -v quark || true)}
+if [ -z "$quark" ]; then
+    echo "build.sh: Quark is built by a Quark compiler, and none was found: install a release's quark (or give one with" >&2
+    echo "QUARK=path/to/quark). One machine's quark makes another's: quark build $main --target T" >&2
+    exit 1
+fi
+mkdir -p "$B"
+# the standard library and the runtime, as texts the compiler keeps: compiler/stdlib.qk
+bash compiler/embed.sh
+
+# stage NAME QUARK OUT [quick]: compiler/ built by QUARK into OUT, with the optimizing tier (unless quick), timed
+stage() {
+    local start=$SECONDS tier=--release
+    [ "$4" = quick ] && tier=
+    mkdir -p "$(dirname "$3")"
+    if ! "$2" build "$main" $tier -o "$3.new" > /dev/null 2> "$B/stage.err"; then
+        cat "$B/stage.err" >&2
+        exit 1
+    fi
+    rm -f "$B/stage.err"
+    mv -f "$3.new" "$3"
+    echo "$1: $3 ($(wc -c < "$3") bytes, $((SECONDS - start)) s)"
+}
+
+stage stage1 "$quark" "$B/stage1/quark.exe" quick
+stage quark "$B/stage1/quark.exe" "$B/quark.exe"
+if $check; then
+    stage stage3 "$B/quark.exe" "$B/stage3/quark.exe"
+    if cmp -s "$B/quark.exe" "$B/stage3/quark.exe"; then
+        echo "fixed point: $B/quark.exe and $B/stage3/quark.exe are the same bytes"
+    else
+        echo "fixed point: $B/quark.exe and $B/stage3/quark.exe differ" >&2
+        exit 1
+    fi
+fi
+[ "$(uname -s)" = Darwin ] && exit 0
+# libquark, written in Quark and compiled by the compiler just made (no C compiler, no ar)
+start=$SECONDS
+QUARK=$B/quark.exe bash tools/libquark.sh "$B/libquark.a"
+echo "libquark: $B/libquark.a ($((SECONDS - start)) s)"
+# the C hosts the tests run: the embedding example and System V calls into a host
+if command -v "$CC" > /dev/null 2>&1; then
+    $CC -Iinclude -o "$B/host.exe" examples/host/host.c "$B/libquark.a" $LIBS
+    $CC -Iinclude -o "$B/sysv-hosts.exe" tests/sysv/hosts.c "$B/libquark.a" $LIBS
+fi

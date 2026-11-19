@@ -1,0 +1,855 @@
+// Packages: code from other people's git repositories.
+//
+// quark.toml, at a project's root, names the project and what it depends on, each by git URL and a pinned tag or
+// commit:
+//
+//     [package]
+//     name = "app"
+//     version = "0.1.0"
+//
+//     [dependencies]
+//     geom = { git = "https://example.org/geom.git", tag = "v1.2.0" }
+//     util = { git = "../util", rev = "3f2a9c1" }
+//
+// `quark get` fetches every package (and the packages they name, in their own quark.toml) with the system git into
+// .quark/pkg/<name>/, one folder per name for the whole project, and writes quark.lock: the exact commit and a
+// SHA-256 of the files of each. Then `use geom.shapes` is .quark/pkg/geom/shapes.qk (and `use geom` is
+// .quark/pkg/geom/geom.qk) with no network: a build checks each package it uses against the lock (Packages, which
+// the module loader keeps while it reads a program). quark.lock wins over a moved tag: once locked, the same code
+// comes back until quark.toml asks for another.
+//
+// The manifest is TOML (the subset below: tables, arrays of tables, strings, inline tables of strings), not Quark:
+// it is data, read before any code is, by quark get and by tools that know nothing of Quark.
+use sha256
+use version
+
+fn isSep(c: Int) -> Bool = c == '/' or c == '\\'
+
+// ---- a package's content hash: its files (not .git), in path order ----------------------------------------------
+fn listFiles(dir: Text, rel: Text) -> [Text] {
+    let Ok(names) = listDir(dir + "/" + rel) else {
+        return []
+    }
+    var out: [Text] = []
+    for name in names {
+        if name is "." | ".." | ".git" {
+            continue
+        }
+        let sub = rel + name
+        if listDir(dir + "/" + sub) is Ok(_) {
+            out += listFiles(dir, sub + "/")
+        } else {
+            out.push(sub)
+        }
+    }
+    out
+}
+
+// "sha256-<hex>" over each file's path, a 0, its length (8 bytes, little end first) and its bytes; None: no files
+pub fn hashDir(dir: Text) -> Text? {
+    let files = listFiles(dir, "").sorted()
+    if len(files) == 0 {
+        return None
+    }
+    var all: Bytes = []
+    for f in files {
+        let content = readBytes(dir + "/" + f) ?? []
+        all += f.bytes()
+        all.push(0)
+        for k in 0..8 {
+            all.push(len(content) >> (8 * k) & 255)
+        }
+        all += content
+    }
+    "sha256-" + sha256(all)
+}
+
+// ---- TOML, the part a manifest and a lock need -------------------------------------------------------------------
+// key = "value" (sub ""), or key = { sub = "value" }, in a table ("" before any; index which [[table]], -1 a [table])
+type Entry { table: Text, index: Int, key: Text, sub: Text, value: Text, line: Int }
+
+type TomlReader {
+    file: Text
+    text: Text
+    b: Bytes
+    p: Int = 0
+    entries: [Entry] = []
+    error: Text = ""
+}
+
+fn TomlReader.at(self) -> Int = if self.p < len(self.b) { self.b[self.p] } else { 0 }
+
+fn TomlReader.after(self, k: Int) -> Int =
+    if self.p + k < len(self.b) { self.b[self.p + k] } else { 0 }
+
+fn TomlReader.space(var self) {
+    while self.at() is ' ' | '\t' {
+        self.p += 1
+    }
+}
+
+fn TomlReader.key(var self) -> Text? {
+    self.space()
+    if self.at() == '"' {
+        self.p += 1
+        let start = self.p
+        while self.at() != 0 and self.at() != '"' and self.at() != '\n' {
+            self.p += 1
+        }
+        if self.at() != '"' {
+            return None
+        }
+        let k = self.text[start..self.p]
+        self.p += 1
+        return k
+    }
+    let start = self.p
+    while self.at() is 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' {
+        self.p += 1
+    }
+    if self.p > start { self.text[start..self.p] } else { None }
+}
+
+fn TomlReader.string(var self) -> Text? {
+    self.space()
+    if self.at() != '"' {
+        return None
+    }
+    self.p += 1
+    var out = ""
+    var from = self.p
+    while self.at() != '"' {
+        let c = self.at()
+        if c == 0 or c == '\n' {
+            return None
+        }
+        if c == '\\' {
+            out += self.text[from..self.p]
+            let e = self.after(1)
+            out += match e {
+                'n' => "\n"
+                't' => "\t"
+                '"' => "\""
+                '\\' => "\\"
+                _ => return None
+            }
+            self.p += 2
+            from = self.p
+        } else {
+            self.p += 1
+        }
+    }
+    out += self.text[from..self.p]
+    self.p += 1
+    out
+}
+
+fn TomlReader.lineEnds(var self) -> Bool {
+    self.space()
+    if self.at() == '#' {
+        while self.at() != 0 and self.at() != '\n' {
+            self.p += 1
+        }
+    }
+    if self.at() == '\r' {
+        self.p += 1
+    }
+    self.at() is '\n' | 0
+}
+
+fn TomlReader.fail(var self, line: Int, message: Text) {
+    if self.error == "" {
+        self.error = "{self.file}:{line}: {message}"
+    }
+}
+
+// the entries of a text; Err: the first mistake, "file:line: message"
+fn parseToml(file: Text, text: Text) -> [Entry]! {
+    var r = TomlReader(file, text, text.bytes())
+    var table = ""
+    var index = -1
+    var line = 1
+    var arrays: [Text] = [] // each [[name]] so far
+    while r.p < len(r.b) {
+        r.space()
+        if r.at() == '[' {
+            let array = r.after(1) == '['
+            r.p += if array { 2 } else { 1 }
+            let name = r.key()
+            if name == None or r.at() != ']' or array and r.after(1) != ']' {
+                r.fail(line, "expected [table] or [[table]]")
+                return Err(r.error)
+            }
+            r.p += if array { 2 } else { 1 }
+            table = name ?? ""
+            index = -1
+            if array {
+                index = arrays.count(a => a == table)
+                arrays.push(table)
+            }
+        } else if not r.at() is '\n' | '\r' | '#' | 0 {
+            let key = r.key()
+            r.space()
+            if key == None or r.at() != '=' {
+                r.fail(line, "expected key = value")
+                return Err(r.error)
+            }
+            r.p += 1
+            r.space()
+            if r.at() == '{' {
+                // key = { a = "x", b = "y" }
+                r.p += 1
+                var any = false
+                while true {
+                    r.space()
+                    if r.at() == '}' and not any {
+                        break
+                    }
+                    let sub = r.key()
+                    r.space()
+                    if sub == None or r.at() != '=' {
+                        r.fail(line, "expected \{ key = \"value\", ... \}")
+                        return Err(r.error)
+                    }
+                    r.p += 1
+                    let Some(value) = r.string() else {
+                        r.fail(line, "expected a string in quotes")
+                        return Err(r.error)
+                    }
+                    r.entries.push(Entry(table, index, key ?? "", sub ?? "", value, line))
+                    any = true
+                    r.space()
+                    if r.at() == ',' {
+                        r.p += 1
+                    } else if r.at() == '}' {
+                        break
+                    } else {
+                        r.fail(line, "expected , or \} in the \{ \}")
+                        return Err(r.error)
+                    }
+                }
+                r.p += 1
+            } else {
+                let Some(value) = r.string() else {
+                    r.fail(line, "expected a string in quotes")
+                    return Err(r.error)
+                }
+                r.entries.push(Entry(table, index, key ?? "", "", value, line))
+            }
+        }
+        if not r.lineEnds() {
+            r.fail(line, "expected the end of the line")
+            return Err(r.error)
+        }
+        if r.p < len(r.b) {
+            r.p += 1
+        }
+        line += 1
+    }
+    r.entries
+}
+
+// ---- the manifest and the lock -----------------------------------------------------------------------------------
+// a package asked for (by quark.toml) or locked (by quark.lock): one of tag and rev; commit the lock's, and what
+// quark get found; by the package that asked for it
+pub type Dep {
+    name: Text
+    git: Text? = None
+    tag: Text? = None
+    rev: Text? = None
+    commit: Text = ""
+    hash: Text = ""
+    by: Text = ""
+}
+
+pub type Manifest { name: Text = "", version: Text? = None, deps: [Dep] = [] }
+
+// a name `use` can say: lowercase letters, digits and _, not std
+fn goodName(s: Text) -> Bool {
+    let b = s.bytes()
+    if len(b) == 0 or not b[0] is 'a'..='z' | '_' {
+        return false
+    }
+    for c in b {
+        if not c is 'a'..='z' | '0'..='9' | '_' {
+            return false
+        }
+    }
+    s != "std"
+}
+
+fn findDep(deps: [Dep], name: Text) -> Int {
+    for (i, d) in deps.enumerate() {
+        if d.name == name {
+            return i
+        }
+    }
+    -1
+}
+
+// what tag or rev a package is pinned to, for messages
+fn pinOf(d: Dep) -> Text = d.tag ?? d.rev ?? ""
+
+fn samePin(a: Dep, b: Dep) -> Bool = a.git == b.git and a.tag == b.tag and a.rev == b.rev
+
+fn hasQuote(t: Text) -> Bool = t.bytes().contains('"')
+
+// Err: what is wrong; path names it in messages
+pub fn parseManifest(path: Text, text: Text) -> Manifest! {
+    let entries = parseToml(path, text)?
+    var error = ""
+    var m = Manifest()
+    var named = false
+    for e in entries {
+        let here = "{path}:{e.line}: "
+        if e.table == "package" and e.index < 0 and e.sub == "" {
+            if e.key == "name" {
+                m.name = e.value
+                named = true
+            } else if e.key == "version" {
+                m.version = e.value
+            } else if e.key == "edition" {
+                // the language edition the package is written in (docs/STABILITY.md): this compiler's, or an error
+                if e.value != "{languageEdition}" and error == "" {
+                    error = here
+                        + "this compiler reads edition {languageEdition} of the language, and the package says edition {e.value}"
+                }
+            } else if error == "" {
+                error = here + "[package] has name, version and edition"
+            }
+        } else if e.table == "dependencies" and e.index < 0 {
+            if e.sub == "" {
+                if error == "" {
+                    error = here + "a dependency is name = \{ git = \"url\", tag = \"v1.0.0\" \} (or rev = \"commit\")"
+                }
+                continue
+            }
+            if not goodName(e.key) {
+                if error == "" {
+                    error = here + "a package's name is lowercase letters, digits and _ (and not std): what use says"
+                }
+                continue
+            }
+            var i = findDep(m.deps, e.key)
+            if i < 0 {
+                m.deps.push(Dep(e.key))
+                i = len(m.deps) - 1
+            }
+            let d = m.deps[i]
+            let slot = match e.sub {
+                "git" => d.git
+                "tag" => d.tag
+                "rev" => d.rev
+                _ => None
+            }
+            if not e.sub is "git" | "tag" | "rev" {
+                if error == "" {
+                    error = here + "a dependency has git, and tag or rev"
+                }
+            } else if slot != None {
+                if error == "" {
+                    error = here + "said twice"
+                }
+            } else if e.sub == "git" {
+                m.deps[i].git = e.value
+            } else if e.sub == "tag" {
+                m.deps[i].tag = e.value
+            } else {
+                m.deps[i].rev = e.value
+            }
+        } else if error == "" {
+            error = here + "quark.toml has [package] (name, version) and [dependencies]"
+        }
+    }
+    if error == "" and not (named and goodName(m.name)) {
+        error = "{path}:1: [package] needs name = \"...\": lowercase letters, digits and _"
+    }
+    if error == "" and m.version == None {
+        error = "{path}:1: [package] needs version = \"...\""
+    }
+    for d in m.deps {
+        if error != "" {
+            break
+        }
+        if d.git == None {
+            error = "{path}: {d.name} needs git = \"url\""
+        } else if (d.tag == None) == (d.rev == None) {
+            error = "{path}: {d.name} needs one of tag = \"...\" and rev = \"commit\""
+        } else {
+            let git = d.git ?? ""
+            let pin = pinOf(d)
+            if hasQuote(git) or hasQuote(pin) or pin.startsWith("-") or git.startsWith("-") {
+                error = "{path}: {d.name}: not a git URL and pin"
+            }
+        }
+    }
+    if error != "" {
+        return Err(error)
+    }
+    m
+}
+
+// None (and no error) if there is no such file
+type ManifestRead { manifest: Manifest?, error: Text }
+
+fn readManifest(path: Text) -> ManifestRead {
+    let Ok(text) = readFile(path) else {
+        return ManifestRead(None, "")
+    }
+    match parseManifest(path, text) {
+        Ok(m) => ManifestRead(m, "")
+        Err(why) => ManifestRead(None, why)
+    }
+}
+
+// the lock: its packages (none, and no error, if there is no lock)
+fn readLock(path: Text) -> [Dep]! {
+    let Ok(text) = readFile(path) else {
+        return []
+    }
+    let entries = parseToml(path, text)?
+    var deps: [Dep] = []
+    var error = ""
+    for e in entries {
+        if e.table != "package" or e.index < 0 or e.sub != "" {
+            return Err("{path}:{e.line}: quark.lock has [[package]] entries (it is written by quark get)")
+        }
+        while len(deps) <= e.index {
+            deps.push(Dep(""))
+        }
+        let i = e.index
+        if e.key == "name" {
+            deps[i].name = e.value
+        } else if e.key == "git" {
+            deps[i].git = e.value
+        } else if e.key == "tag" {
+            deps[i].tag = e.value
+        } else if e.key == "rev" {
+            deps[i].rev = e.value
+        } else if e.key == "commit" {
+            deps[i].commit = e.value
+        } else if e.key == "hash" {
+            deps[i].hash = e.value
+        } else if error == "" {
+            error = "{path}:{e.line}: a locked package has name, git, tag or rev, commit and hash"
+        }
+    }
+    if error != "" {
+        return Err(error)
+    }
+    for d in deps {
+        if d.name == "" or d.git == None or d.commit == "" or d.hash == "" {
+            return Err("{path}:1: a locked package lacks name, git, commit or hash")
+        }
+    }
+    deps
+}
+
+fn quotedLine(key: Text, value: Text) -> Text =
+    "{key} = \"{value.replace("\\", "\\\\").replace("\"", "\\\"")}\"\n"
+
+fn writeLock(path: Text, deps: [Dep]) -> Bool {
+    var out = "# The exact code of every package, written by quark get: commit it with quark.toml.\n"
+    for d in deps.sortedBy(d => d.name) {
+        out += "\n[[package]]\n" + quotedLine("name", d.name) + quotedLine("git", d.git ?? "")
+        out += quotedLine(if d.tag != None { "tag" } else { "rev" }, pinOf(d))
+            + quotedLine("commit", d.commit)
+            + quotedLine("hash", d.hash)
+    }
+    writeFile(path, out) is Ok(_)
+}
+
+// ---- git ---------------------------------------------------------------------------------------------------------
+// git with these arguments: whether it succeeded, and its output without the last line end. git's own errors go to
+// the standard error (they say what went wrong with the network or the repository), unless quiet.
+type GitRun { ok: Bool, out: Text }
+
+fn git(args: [Text], quiet: Bool = false) -> GitRun {
+    let Ok(r) = runProcess("git", ["-c", "advice.detachedHead=false"] + args) else {
+        return GitRun(false, "")
+    }
+    if not quiet and r.err != "" {
+        printErr(if r.err.endsWith("\n") { r.err[..len(r.err) - 1] } else { r.err })
+    }
+    var out = r.out
+    while out.endsWith("\n") or out.endsWith("\r") {
+        out = out[..len(out) - 1]
+    }
+    GitRun(r.status == 0, out)
+}
+
+// ---- quark get ---------------------------------------------------------------------------------------------------
+// a run of quark get: the project ("." or "dir"), quark.lock as it was, what this run found, the packages being
+// visited (a cycle comes back to one)
+type Get { root: Text, lock: [Dep], got: [Dep] = [], stack: [Text] = [] }
+
+fn getError(message: Text) -> Bool {
+    printErr("quark get: " + message)
+    false
+}
+
+// the lock's entry for d, if quark.toml still asks for what it was locked for (-1: none)
+fn Get.lockedFor(self, d: Dep) -> Int {
+    let i = findDep(self.lock, d.name)
+    if i >= 0 and samePin(self.lock[i], d) { i } else { -1 }
+}
+
+// d's commit (the locked one if quark.toml still asks for the same), in the package's own clone, which is made (or
+// fetched into) only when the commit is not there yet. Its files are not touched: see place.
+fn Get.resolve(self, d: Dep) -> Text? {
+    let dir = "{self.root}/.quark/pkg/{d.name}"
+    let locked = self.lockedFor(d)
+    let want = if locked >= 0 {
+        self.lock[locked].commit + "^\{commit\}"
+    } else if d.tag is Some(tag) {
+        "refs/tags/{tag}^\{commit}"
+    } else {
+        pinOf(d) + "^\{commit\}"
+    }
+    let source = d.git ?? ""
+    // line ends exactly as committed: the same files, so the same hash, on every system
+    if not pathExists(dir + "/.git")
+        and not git(
+            [
+                "-C",
+                self.root,
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "-c",
+                "core.autocrlf=false",
+                "-c",
+                "core.eol=lf",
+                "--",
+                source,
+                ".quark/pkg/" + d.name,
+            ],
+        ).ok {
+        getError("{d.name}: cannot clone {source}")
+        return None
+    }
+    let found = git(["-C", dir, "rev-parse", "--verify", "--quiet", want])
+    if found.ok {
+        return found.out
+    }
+    git(["-C", dir, "fetch", "--quiet", "--tags", "origin"]) // not here yet: ask the remote
+    let fetched = git(["-C", dir, "rev-parse", "--verify", "--quiet", want])
+    if fetched.ok {
+        return fetched.out
+    }
+    if locked >= 0 {
+        getError("{d.name}: the locked commit {self.lock[locked].commit} is not in {source}")
+    } else {
+        getError("{d.name}: no {if d.tag != None { "tag" } else { "commit" }} {pinOf(d)} in {source}")
+    }
+    None
+}
+
+// the package's folder holding the files of its commit, their hash the lock's (if it is locked): the hash
+fn Get.place(self, d: Dep) -> Text? {
+    let dir = "{self.root}/.quark/pkg/{d.name}"
+    let locked = self.lockedFor(d)
+    var hash: Text? = None
+    if locked >= 0 {
+        // locked, checked out and unchanged: nothing to do
+        let head = git(["-C", dir, "rev-parse", "--verify", "--quiet", "HEAD"])
+        if head.ok and head.out == d.commit {
+            hash = hashDir(dir)
+            if (hash ?? "") != self.lock[locked].hash {
+                hash = None
+            }
+        }
+    }
+    if hash == None {
+        // otherwise check it out afresh
+        if not git(["-C", dir, "checkout", "--quiet", "--force", "--detach", d.commit]).ok
+            or not git(["-C", dir, "clean", "--quiet", "-ffdx"]).ok {
+            getError("{d.name}: cannot check out {d.commit}")
+            return None
+        }
+        hash = hashDir(dir) ?? "sha256-" // a package of no files
+    }
+    let h = hash ?? ""
+    if locked >= 0 and h != self.lock[locked].hash {
+        getError(
+            "{d.name}: hash mismatch: quark.lock has {self.lock[locked].hash}, but {d.git ?? ""} at {cut12(d.commit)} hashes to {h}",
+        )
+        return None
+    }
+    h
+}
+
+fn cut12(t: Text) -> Text = if len(t) > 12 { t[..12] } else { t }
+
+// the packages m names, and the ones they name, each resolved once; nothing is checked out yet, so a conflict or a
+// cycle found late leaves every package's files as they were
+fn Get.visit(var self, m: Manifest) -> Bool {
+    for dep in m.deps {
+        var want = dep with { by: m.name }
+        for (k, s) in self.stack.enumerate() {
+            if s == want.name {
+                var path = ""
+                for j in k..len(self.stack) {
+                    path += self.stack[j] + " -> "
+                }
+                return getError("a cycle of packages: {path}{want.name}")
+            }
+        }
+        let had = findDep(self.got, want.name)
+        if had >= 0 {
+            let h = self.got[had]
+            if not samePin(h, want) {
+                return getError(
+                    "{want.name} is asked for twice: {h.git ?? ""} {pinOf(h)} by {h.by}, {want.git ?? ""} {pinOf(want)} by {want.by}",
+                )
+            }
+            continue
+        }
+        if len(self.stack) == 64 {
+            return getError("packages nested too deep")
+        }
+        let Some(commit) = self.resolve(want) else {
+            return false
+        }
+        want.commit = commit
+        self.got.push(want)
+        // its own quark.toml, at its commit
+        let shown = git(["-C", "{self.root}/.quark/pkg/{want.name}", "show", "{commit}:quark.toml"], quiet: true)
+        if shown.ok {
+            let sub = match parseManifest("{want.name}/quark.toml", shown.out) {
+                Ok(s) => s
+                Err(why) => return getError(why)
+            }
+            if sub.name != want.name {
+                return getError("{want.name}'s quark.toml calls it {sub.name}: depend on it by its own name")
+            }
+            self.stack.push(want.name)
+            let ok = self.visit(sub)
+            self.stack.pop()
+            if not ok {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn padded(t: Text, n: Int) -> Text {
+    var out = t
+    while len(out) < n {
+        out += " "
+    }
+    out
+}
+
+// quark get [root]: the packages root/quark.toml names, fetched and locked
+pub fn getPackages(root: Text) -> Int {
+    let path = root + "/quark.toml"
+    let read = readManifest(path)
+    let Some(m) = read.manifest else {
+        getError(if read.error != "" {
+            read.error
+        } else {
+            "no quark.toml here: a project names its packages there"
+        })
+        return 1
+    }
+    let lockPath = root + "/quark.lock"
+    let locked = readLock(lockPath)
+    if locked is Err(why) {
+        getError(why)
+        return 1
+    }
+    var g = Get(root, locked ?? [], stack: [m.name])
+    if not g.visit(m) {
+        return 1
+    }
+    var placed: [Dep] = []
+    for d in g.got {
+        let Some(hash) = g.place(d) else {
+            return 1
+        }
+        placed.push(d with { hash: hash })
+    }
+    let ignore = root + "/.quark/.gitignore" // fetched code stays out of the project's own repository
+    if len(placed) > 0 and not pathExists(ignore) {
+        let _ = writeFile(ignore, "*\n")
+    }
+    if not writeLock(lockPath, placed) {
+        getError("cannot write {lockPath}")
+        return 1
+    }
+    for d in placed {
+        print("{padded(d.name, 16)} {padded(pinOf(d), 12)} {cut12(d.commit)}")
+    }
+    let s = if len(placed) == 1 { "" } else { "s" }
+    print("{m.name} {m.version ?? ""}: {len(placed)} package{s} locked")
+    0
+}
+
+// ---- use pkg.module ----------------------------------------------------------------------------------------------
+// The project and package a file belongs to: a file in <root>.quark/pkg/<name>/ is in that package of that project;
+// any other is in the project whose quark.toml is in its folder or the nearest one above. Both end in a separator
+// (or are "" for the current folder) and are kept as the path names them, so the same file is the same text from
+// every file that uses it. dir: the file's folder; manifest None: no packages here.
+type Place {
+    dir: Text
+    root: Text = ""
+    pkg: Text = ""
+    found: Bool = false
+    manifest: Manifest? = None
+    error: Text = ""
+}
+
+// what a use of a package found: the file, or why it cannot be used; neither: not a package's name
+pub type PackageUse { file: Text? = None, error: Text? = None }
+
+// What the loader learns of packages while it reads a program: each folder's place, each package checked against
+// quark.lock (once each).
+pub type Packages { places: [Place] = [], checked: [Text: Text] = [:] }
+
+fn upFolder(at: Text) -> Text? {
+    // "a/b/" -> "a/"; "", "../": on up while there is an up (the folder above is not the same one)
+    let b = at.bytes()
+    let n = len(b)
+    if n == 1 and isSep(b[0]) or n == 3 and b[1] == ':' {
+        return None // "/", "C:/": the top
+    }
+    var k = if n > 0 { n - 1 } else { 0 }
+    while k > 0 and not isSep(b[k - 1]) {
+        k -= 1
+    }
+    if n == 0 or at[k..].startsWith("../") or at[k..].startsWith("..\\") {
+        let here = listDir(if at == "" { "." } else { at }) ?? []
+        let up = listDir(at + "..") ?? []
+        if here == up {
+            return None
+        }
+        return at + "../"
+    }
+    at[..k]
+}
+
+fn placeOf(file: Text) -> Place {
+    let fb = file.bytes()
+    var cut = 0
+    for (i, c) in fb.enumerate() {
+        if isSep(c) {
+            cut = i + 1
+        }
+    }
+    let dir = file[..cut]
+    let pl = Place(dir)
+    let b = dir.bytes()
+    // inside .quark/pkg/<name>/
+    for i in 0..len(b) {
+        if (i == 0 or isSep(b[i - 1]))
+            and dir[i..].startsWith(".quark")
+            and i + 10 < len(b)
+            and isSep(b[i + 6])
+            and dir[i + 7..i + 10] == "pkg"
+            and isSep(b[i + 10]) {
+            var end = i + 11
+            while end < len(b) and not isSep(b[end]) {
+                end += 1
+            }
+            if end >= len(b) {
+                break
+            }
+            let read = readManifest(dir[..end + 1] + "quark.toml")
+            return Place(dir, dir[..i], dir[..end + 1], true, read.manifest, read.error)
+        }
+    }
+    // the nearest quark.toml above: up the path as written, then on with ../
+    var at = dir
+    var steps = 0
+    while steps < 256 {
+        steps += 1
+        let path = at + "quark.toml"
+        if pathExists(path) {
+            let read = readManifest(path)
+            return Place(dir, at, at, true, read.manifest, read.error)
+        }
+        at = upFolder(at) ?? break
+    }
+    pl
+}
+
+fn Packages.place(var self, file: Text) -> Place {
+    let fb = file.bytes()
+    var cut = 0
+    for (i, c) in fb.enumerate() {
+        if isSep(c) {
+            cut = i + 1
+        }
+    }
+    let dir = file[..cut]
+    for pl in self.places {
+        if pl.dir == dir {
+            return pl
+        }
+    }
+    let pl = placeOf(file)
+    self.places.push(pl)
+    pl
+}
+
+// is the package's folder what quark.lock says, and quark.lock what the asking quark.toml says? ("" yes)
+fn checkPackage(pl: Place, name: Text, asked: Dep, dir: Text) -> Text {
+    let lockPath = pl.root + "quark.lock"
+    let lock = match readLock(lockPath) {
+        Ok(l) => l
+        Err(why) => return why
+    }
+    let i = findDep(lock, name)
+    if i < 0 {
+        return "{name} is not in {lockPath}: run quark get"
+    }
+    let d = lock[i]
+    if not samePin(d, asked) {
+        return "{pl.pkg}quark.toml asks for {name} {pinOf(asked)}, quark.lock has {pinOf(d)}: run quark get"
+    }
+    let Some(hash) = hashDir(dir) else {
+        return "the package {name} is not fetched: run quark get"
+    }
+    if hash != d.hash {
+        return "hash mismatch: the files in {dir} are not the ones quark.lock has for {name} (run quark get to restore them)"
+    }
+    ""
+}
+
+// `use name` in the file from: the file of a package, or why it cannot be used, or neither if name is not a
+// package's (a file next to it, then)
+pub fn Packages.fileFor(var self, from: Text, name: Text) -> PackageUse {
+    let pl = self.place(from)
+    if pl.error != "" {
+        return PackageUse(error: pl.error)
+    }
+    let Some(manifest) = pl.manifest else {
+        return PackageUse()
+    }
+    let nb = name.bytes()
+    let dot = nb.indexOf('.') ?? -1
+    let first = if dot >= 0 { name[..dot] } else { name }
+    let i = findDep(manifest.deps, first)
+    if i < 0 {
+        return PackageUse()
+    }
+    let d = manifest.deps[i]
+    let dir = "{pl.root}.quark/pkg/{first}/"
+    let file = dir + (if dot >= 0 { name[dot + 1..] } else { name }).replace(".", "/") + ".qk"
+    // a file of the same name next to it would be hidden: say so
+    let local = pl.dir + name.replace(".", "/") + ".qk"
+    if pathExists(local) {
+        return PackageUse(error: "{name} is both the package {first} and the file {local}: rename the file")
+    }
+    let key = "{dir} {d.git ?? ""} {if d.tag != None { "tag" } else { "rev" }} {pinOf(d)}"
+    if not self.checked.contains(key) {
+        self.checked[key] = checkPackage(pl, first, d, dir)
+    }
+    let error = self.checked[key]
+    if error != "" {
+        return PackageUse(error: error)
+    }
+    PackageUse(file: file)
+}

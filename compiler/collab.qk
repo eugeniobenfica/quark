@@ -1,0 +1,1746 @@
+// Graphs side by side: what changed between two versions of a program, and three-way merges, by node key
+//
+// A graph is read into its declarations, each a head (the declaration without its nodes) and its nodes by key. The
+// numbers that wire nodes together are only a file's own ({"node": 12}), so they are replaced by keys first: every
+// "id", every wire ("node", "elseIf") and every block's "stmts" list then names keys, and two versions compare node
+// by node. Parameters, lambda parameters and a pattern's names keep their keys too (owner#name).
+//
+// Keys of named statements (let, var, for: main/total) stay while their name does; other statements are keyed by
+// their place (main/@3), which an inserted statement shifts. So before comparing, the second version's statements
+// are lined up with the first's, block by block: the same named ones, then the same statements (their content, by
+// names rather than keys: a longest common subsequence), then statements of the same kind left between those. The
+// second version takes the first's keys for them (and their nodes inside), and a new statement whose place-key the
+// first already uses gets a fresh one (main/@0+). A diff then reports nodes added, removed and changed (which inputs
+// or values) and statements moved; a merge takes each node from the side that changed it, merges every block's
+// statement order, and reports a conflict, by key, where both sides changed the same thing differently (the result
+// keeps ours there, so it is always a whole program).
+//
+// Every graph read lives in one Json (the values) and one list of declarations (GDecl), named by their index.
+use source
+use format
+use graph
+use qgn
+
+// ---- JSON as text ---------------------------------------------------------------------------------------------
+// JSON text: with sorted fields, to compare (an editor may write fields in its own order); without the blocks'
+// statement lists, to compare a node apart from what its blocks hold (they merge on their own).
+fn Json.write(self, v: Int, sorted: Bool, noStmts: Bool) -> Text {
+    if v < 0 {
+        return "null"
+    }
+    let n = self.nodes[v]
+    match n.kind {
+        Null => "null"
+        Bool => if n.b { "true" } else { "false" }
+        Num => floatG(n.num, 15)
+        Str => jsonString(n.str)
+        Arr => {
+            var out = "["
+            for (i, item) in n.items.enumerate() {
+                if i > 0 {
+                    out += ", "
+                }
+                out += self.write(item, sorted, noStmts)
+            }
+            out + "]"
+        }
+        Obj => {
+            let order = if sorted {
+                (0..len(n.keys)).sortedBy(i => n.keys[i])
+            } else {
+                (0..len(n.keys)).toArray()
+            }
+            var out = "\{"
+            var first = true
+            for i in order {
+                if noStmts and n.keys[i] == "stmts" {
+                    continue
+                }
+                if not first {
+                    out += ", "
+                }
+                first = false
+                out += jsonString(n.keys[i]) + ": " + self.write(n.items[i], sorted, noStmts)
+            }
+            out + "\}"
+        }
+    }
+}
+
+fn Json.textOf(self, v: Int, sorted: Bool, noStmts: Bool) -> Text? =
+    if v < 0 { None } else { Some(self.write(v, sorted, noStmts)) }
+
+fn same(a: Text?, b: Text?) -> Bool = match a {
+    Some(x) => b is Some(y) and x == y
+    None => b == None
+}
+
+// ---- a graph, by keys -----------------------------------------------------------------------------------------
+// a node: its key (lined up with the other version's), its own graph's key, its object (ids, wires and statement
+// lists hold keys; no line, pos or type: derived), its line
+type GNode { key: Text, own: Text, obj: Int, line: Int }
+
+// a declaration: its head (without its nodes), its nodes; byKey node key -> index; ents a parameter's or a
+// pattern's name: key -> index in entNames; parent key -> the node it is part of (an input, a statement of its
+// block), -2 the head
+type GDecl {
+    name: Text
+    head: Int
+    nodes: [GNode] = []
+    byKey: [Text: Int] = [:]
+    ents: [Text: Int] = [:]
+    entNames: [Text] = []
+    parent: [Text: Int] = [:]
+}
+
+type Graph { decls: [Int] = [], byName: [Text: Int] = [:], closing: Text? = None }
+type Field { name: Text, was: Int, now: Int }
+
+type Change {
+    change: Text
+    key: Text
+    decl: Text
+    now: Text? = None
+    kind: Text? = None
+    summary: Text? = None
+    isDecl: Bool = false
+    quiet: Bool = false
+    line: Int = 0
+    order: Int = 0
+    fields: [Field] = []
+    from: Text? = None
+    to: Text? = None
+}
+
+type Add { anchor: Text?, key: Text }
+
+// everything read: the values, the declarations; while reading a declaration its ids' keys and the keys used;
+// while lining up the blocks to visit (owner, path); the conflicts of a merge
+type Collab {
+    j: Json = Json()
+    decls: [GDecl] = []
+    errors: Errors = Errors()
+    keys: [Text?] = []
+    used: Set<Text> = []
+    queue: [(Text?, Text)] = []
+    conflicts: [(Text, Text)] = []
+    seen: Set<Text> = []
+}
+
+fn Collab.str(self, o: Int, key: Text) -> Text? = self.j.str(o, key)
+
+fn Collab.del(var self, o: Int, key: Text) {
+    let n = self.j.nodes[o]
+    var keys: [Text] = []
+    var items: [Int] = []
+    for (i, k) in n.keys.enumerate() {
+        if k != key {
+            keys.push(k)
+            items.push(n.items[i])
+        }
+    }
+    self.j.nodes[o] = n with { keys: keys, items: items }
+}
+
+fn Collab.copy(var self, v: Int) -> Int {
+    let n = self.j.nodes[v]
+    var items: [Int] = []
+    for item in n.items {
+        let c = self.copy(item)
+        items.push(c)
+    }
+    self.j.add(n with { items: items })
+}
+
+fn Collab.nodeAt(self, d: Int, key: Text) -> Int = self.decls[d].byKey[key] ?? -1
+
+fn Collab.objAt(self, d: Int, owner: Text?) -> Int {
+    let Some(key) = owner else {
+        return self.decls[d].head
+    }
+    let i = self.nodeAt(d, key)
+    if i >= 0 { self.decls[d].nodes[i].obj } else { -1 }
+}
+
+fn Collab.isBinding(self, obj: Int) -> Bool {
+    let kind = self.str(obj, "kind") ?? ""
+    kind == "var" or kind == "for" or kind == "let" and self.str(obj, "name") != None
+}
+
+// the nodes a value wires from: inputs ("node", "elseIf") and, with stmts, its blocks' statements (true)
+fn Collab.refsOf(self, v: Int, withStmts: Bool) -> [(Text, Bool)] {
+    var out: [(Text, Bool)] = []
+    if v < 0 {
+        return out
+    }
+    let n = self.j.nodes[v]
+    let obj = n.kind == JKind.Obj
+    for (i, item) in n.items.enumerate() {
+        let f = if obj { n.keys[i] } else { "" }
+        let it = self.j.nodes[item]
+        if obj and (f == "node" or f == "elseIf") and it.kind == JKind.Str {
+            out.push((it.str, false))
+        } else if obj and f == "stmts" and it.kind == JKind.Arr {
+            if withStmts {
+                for s in it.items {
+                    if self.j.nodes[s].kind == JKind.Str {
+                        out.push((self.j.nodes[s].str, true))
+                    }
+                }
+            }
+        } else if len(it.items) > 0 {
+            out += self.refsOf(item, withStmts)
+        }
+    }
+    out
+}
+
+// the parameters and pattern names inside a node (not the node itself): key -> name
+fn Collab.entsOf(var self, d: Int, v: Int, top: Bool) {
+    let n = self.j.nodes[v]
+    if n.kind == JKind.Obj and not top {
+        if self.str(v, "id") is Some(id) {
+            self.decls[d].ents[id] = len(self.decls[d].entNames)
+            self.decls[d].entNames.push(self.str(v, "name") ?? "_")
+        }
+    }
+    for item in n.items {
+        if self.j.nodes[item].kind is Obj | Arr {
+            self.entsOf(d, item, false)
+        }
+    }
+}
+
+fn Collab.indexDecl(var self, d: Int) {
+    self.decls[d].byKey = [:]
+    self.decls[d].ents = [:]
+    self.decls[d].entNames = []
+    self.decls[d].parent = [:]
+    for i in 0..len(self.decls[d].nodes) {
+        let key = self.str(self.decls[d].nodes[i].obj, "id") ?? "?"
+        self.decls[d].nodes[i].key = key
+        self.decls[d].byKey[key] = i
+    }
+    self.entsOf(d, self.decls[d].head, true)
+    for i in 0..len(self.decls[d].nodes) {
+        self.entsOf(d, self.decls[d].nodes[i].obj, true)
+    }
+    for i in -1..len(self.decls[d].nodes) {
+        let obj = if i < 0 { self.decls[d].head } else { self.decls[d].nodes[i].obj }
+        for (key, stmt) in self.refsOf(obj, true) {
+            let t = self.nodeAt(d, key)
+            if t >= 0 and (stmt or not self.isBinding(self.decls[d].nodes[t].obj)) {
+                self.decls[d].parent[key] = if i < 0 { -2 } else { i }
+            }
+        }
+    }
+}
+
+// the blocks a value holds ("body", "then", "arms.2.block"...): any object with a "stmts" list
+fn Collab.blocksOf(self, v: Int, path: Text) -> [(Text, Int)] {
+    var out: [(Text, Int)] = []
+    if v < 0 {
+        return out
+    }
+    let n = self.j.nodes[v]
+    let obj = n.kind == JKind.Obj
+    for (i, item) in n.items.enumerate() {
+        let it = self.j.nodes[item]
+        if not it.kind is Obj | Arr {
+            continue
+        }
+        let name = if obj { n.keys[i] } else { "{i}" }
+        let sub = if path != "" { path + "." + name } else { name }
+        let stmts = if it.kind == JKind.Obj { self.j.get(item, "stmts") } else { -1 }
+        if stmts >= 0 and self.j.nodes[stmts].kind == JKind.Arr {
+            out.push((sub, item))
+        } else if not obj or name != "inputs" and name != "params" {
+            out += self.blocksOf(item, sub)
+        }
+    }
+    out
+}
+
+fn Collab.blockAt(self, obj: Int, path: Text) -> Int {
+    if obj < 0 {
+        return -1
+    }
+    for (p, b) in self.blocksOf(obj, "") {
+        if p == path {
+            return self.j.get(b, "stmts")
+        }
+    }
+    -1
+}
+
+// a statement list's keys (None: no list)
+fn Collab.listOf(self, stmts: Int) -> [Text]? {
+    if stmts < 0 {
+        return None
+    }
+    var out: [Text] = []
+    for item in self.j.nodes[stmts].items {
+        if self.j.nodes[item].kind == JKind.Str {
+            out.push(self.j.nodes[item].str)
+        }
+    }
+    Some(out)
+}
+
+fn Collab.setList(var self, stmts: Int, keys: [Text]) {
+    var items: [Int] = []
+    for k in keys {
+        let t = self.j.text(k)
+        items.push(t)
+    }
+    self.j.nodes[stmts].items = items
+}
+
+// ---- reading a graph ------------------------------------------------------------------------------------------
+fn Collab.maxIdIn(self, v: Int) -> Int {
+    var m = 0
+    let n = self.j.nodes[v]
+    for (i, item) in n.items.enumerate() {
+        let it = self.j.nodes[item]
+        if n.kind == JKind.Obj and n.keys[i] == "id" and it.kind == JKind.Num and it.num > toFloat(m) {
+            m = truncate(it.num)
+        }
+        if it.kind is Obj | Arr {
+            m = max(m, self.maxIdIn(item))
+        }
+    }
+    m
+}
+
+fn Collab.idKey(self, num: Float) -> Text {
+    let id = truncate(num)
+    if id >= 0 and id < len(self.keys) and self.keys[id] is Some(k) {
+        return k
+    }
+    "?{id}"
+}
+
+// the parameters and names inside a node take keys of their own: owner#name (#name#2 for a second one)
+fn Collab.nameEnts(var self, v: Int, owner: Text, top: Bool) {
+    let n = self.j.nodes[v]
+    if n.kind == JKind.Obj and not top {
+        let id = self.j.get(v, "id")
+        if id >= 0 and self.j.nodes[id].kind == JKind.Num {
+            let at = truncate(self.j.nodes[id].num)
+            if at >= 0 and at < len(self.keys) {
+                let name = self.str(v, "name") ?? "_"
+                var k = owner + "#" + name
+                var c = 2
+                while self.used.contains(k) {
+                    k = "{owner}#{name}#{c}"
+                    c += 1
+                }
+                self.used.add(k)
+                self.keys[at] = k
+            }
+        }
+    }
+    for item in n.items {
+        if self.j.nodes[item].kind is Obj | Arr {
+            self.nameEnts(item, owner, false)
+        }
+    }
+}
+
+fn Collab.keysForIds(var self, v: Int) {
+    let n = self.j.nodes[v]
+    for (i, item) in n.items.enumerate() {
+        let it = self.j.nodes[item]
+        let f = if n.kind == JKind.Obj { n.keys[i] } else { "" }
+        if (f == "id" or f == "node" or f == "elseIf") and it.kind == JKind.Num {
+            let key = self.idKey(it.num)
+            self.j.nodes[item] = JNode(.Str, str: key)
+        } else if f == "stmts" and it.kind == JKind.Arr {
+            for s in it.items {
+                if self.j.nodes[s].kind == JKind.Num {
+                    let key = self.idKey(self.j.nodes[s].num)
+                    self.j.nodes[s] = JNode(.Str, str: key)
+                }
+            }
+        } else if it.kind is Obj | Arr {
+            self.keysForIds(item)
+        }
+    }
+}
+
+fn Collab.validId(self, v: Int, maxId: Int) -> Int {
+    let id = self.j.get(v, "id")
+    if id < 0 or self.j.nodes[id].kind != JKind.Num {
+        return -1
+    }
+    let at = truncate(self.j.nodes[id].num)
+    if at >= 0 and at <= maxId { at } else { -1 }
+}
+
+fn Collab.readDecl(var self, dj: Int, name: Text) -> Int {
+    let nodes = self.j.get(dj, "nodes")
+    self.del(dj, "nodes")
+    var maxId = self.maxIdIn(dj)
+    if nodes >= 0 and self.j.nodes[nodes].kind == JKind.Arr {
+        maxId = max(maxId, self.maxIdIn(nodes))
+    }
+    let none: Text? = None
+    self.keys = [none] * (maxId + 1)
+    self.used = []
+    let params = self.j.get(dj, "params")
+    if params >= 0 and self.j.nodes[params].kind == JKind.Arr {
+        for p in self.j.nodes[params].items {
+            let at = self.validId(p, maxId)
+            if at < 0 {
+                continue
+            }
+            let key = self.str(p, "key") ?? name + "/" + (self.str(p, "name") ?? "_")
+            self.keys[at] = key
+            self.used.add(key)
+            self.del(p, "key") // the key is its id now
+        }
+    }
+    let list = if nodes >= 0 and self.j.nodes[nodes].kind == JKind.Arr {
+        self.j.nodes[nodes].items
+    } else {
+        []
+    }
+    for n in list {
+        let at = self.validId(n, maxId)
+        let Some(given) = self.str(n, "key") else {
+            continue
+        }
+        if at < 0 {
+            continue
+        }
+        var key = given
+        let uid = self.str(n, "uid") ?? ""
+        if uid != "" {
+            key = name + "/#uid/" + uid
+            if self.used.contains(key) {
+                self.errors.add(Source("", ""), 0, 0, "{name}: duplicate node uid {uid}")
+                return -1
+            }
+        }
+        self.keys[at] = key
+        self.used.add(key)
+    }
+    for n in list {
+        let id = self.j.get(n, "id")
+        if id >= 0 and self.j.nodes[id].kind == JKind.Num {
+            let key = self.idKey(self.j.nodes[id].num)
+            self.nameEnts(n, key, true)
+        }
+    }
+    self.keysForIds(dj)
+    var gnodes: [GNode] = []
+    for n in list {
+        if self.j.nodes[n].kind != JKind.Obj {
+            continue
+        }
+        self.keysForIds(n)
+        let line = self.j.get(n, "line")
+        let lineNo = if line >= 0 and self.j.nodes[line].kind == JKind.Num {
+            truncate(self.j.nodes[line].num)
+        } else {
+            0
+        }
+        let own = self.str(n, "id")
+        self.del(n, "key")
+        self.del(n, "line")
+        self.del(n, "pos")
+        self.del(n, "type")
+        self.del(n, "hash") // (worked out from the content compared here)
+        let Some(o) = own else {
+            continue
+        }
+        gnodes.push(GNode("", o, n, lineNo))
+    }
+    self.decls.push(GDecl(name, dj, nodes: gnodes))
+    let d = len(self.decls) - 1
+    self.indexDecl(d)
+    d
+}
+
+fn Collab.readGraph(var self, json: Text, what: Text) -> Graph? {
+    let root = self.j.parse(json)
+    let decls = self.j.get(root, "decls")
+    if decls < 0 or self.j.nodes[decls].kind != JKind.Arr {
+        self.errors.add(Source("", ""), 0, 0, "{what} is not a Quark graph (JSON with \"decls\")")
+        return None
+    }
+    let version = self.j.get(root, "quark")
+    if version >= 0 and (self.j.nodes[version].kind != JKind.Num or self.j.nodes[version].num != 1.0) {
+        self.errors.add(Source("", ""), 0, 0, "{what}: unsupported Quark graph version (expected 1)")
+        return None
+    }
+    var g = Graph()
+    for (i, dj) in self.j.nodes[decls].items.enumerate() {
+        let given = self.str(dj, "name")
+        if self.j.nodes[dj].kind != JKind.Obj or given == None {
+            self.errors.add(Source("", ""), 0, 0, "{what}: declaration {i + 1} has no name")
+            return None
+        }
+        var name = given ?? ""
+        if g.byName.contains(name) {
+            // the same name twice: the second is name#2
+            var n = 2
+            while g.byName.contains("{name}#{n}") {
+                n += 1
+            }
+            name = "{name}#{n}"
+        }
+        let d = self.readDecl(dj, name)
+        if d < 0 {
+            return None
+        }
+        g.byName[name] = len(g.decls)
+        g.decls.push(d)
+    }
+    g.closing = self.str(root, "closing")
+    Some(g)
+}
+
+fn declNamed(g: Graph, name: Text) -> Int = if g.byName[name] is Some(i) { g.decls[i] } else { -1 }
+
+// ---- content without keys: what lines statements up -----------------------------------------------------------
+fn Collab.nameOf(self, d: Int, key: Text) -> Text {
+    let n = self.nodeAt(d, key)
+    if n >= 0 {
+        return self.str(self.decls[d].nodes[n].obj, "name") ?? "?"
+    }
+    if self.decls[d].ents[key] is Some(e) {
+        self.decls[d].entNames[e]
+    } else {
+        "?"
+    }
+}
+
+fn Collab.contentOf(self, d: Int, key: Text, depth: Int) -> Text {
+    let n = self.nodeAt(d, key)
+    if n < 0 or depth > 200 {
+        return "?"
+    }
+    self.content(d, self.decls[d].nodes[n].obj, depth + 1)
+}
+
+fn Collab.content(self, d: Int, v: Int, depth: Int) -> Text {
+    let n = self.j.nodes[v]
+    if n.kind == JKind.Arr {
+        var out = "["
+        for (i, item) in n.items.enumerate() {
+            if i > 0 {
+                out += ","
+            }
+            out += self.content(d, item, depth)
+        }
+        return out + "]"
+    }
+    if n.kind != JKind.Obj {
+        return self.j.write(v, false, false)
+    }
+    var out = "\{"
+    for i in (0..len(n.keys)).sortedBy(i => n.keys[i]) {
+        let f = n.keys[i]
+        let item = self.j.nodes[n.items[i]]
+        if f == "id" {
+            continue
+        }
+        out += f + ":"
+        if (f == "node" or f == "elseIf") and item.kind == JKind.Str {
+            let t = self.nodeAt(d, item.str)
+            if t >= 0 and not self.isBinding(self.decls[d].nodes[t].obj) {
+                out += self.contentOf(d, item.str, depth)
+            } else {
+                out += "@" + self.nameOf(d, item.str) // a use: by the name it uses
+            }
+        } else if f == "stmts" and item.kind == JKind.Arr {
+            out += "["
+            for (s, k) in item.items.enumerate() {
+                if s > 0 {
+                    out += ","
+                }
+                if self.j.nodes[k].kind == JKind.Str {
+                    out += self.contentOf(d, self.j.nodes[k].str, depth)
+                }
+            }
+            out += "]"
+        } else {
+            out += self.content(d, n.items[i], depth)
+        }
+        out += ";"
+    }
+    out + "\}"
+}
+
+// ---- lining up a version's keys with another's ----------------------------------------------------------------
+// The longest common subsequence of a and b: pairs[i] is the b index a[i] pairs with, or -1.
+fn commonOrder(a: [Text], b: [Text]) -> [Int] {
+    let n = len(a)
+    let m = len(b)
+    let w = m + 1
+    var t = [0] * ((n + 1) * w)
+    var i = n - 1
+    while i >= 0 {
+        var j = m - 1
+        while j >= 0 {
+            t[i * w + j] = if a[i] == b[j] {
+                t[(i + 1) * w + j + 1] + 1
+            } else {
+                max(t[(i + 1) * w + j], t[i * w + j + 1])
+            }
+            j -= 1
+        }
+        i -= 1
+    }
+    var pairs = [-1] * n
+    i = 0
+    var j = 0
+    while i < n and j < m {
+        if a[i] == b[j] {
+            pairs[i] = j
+            i += 1
+            j += 1
+        } else if t[(i + 1) * w + j] >= t[i * w + j + 1] {
+            i += 1
+        } else {
+            j += 1
+        }
+    }
+    pairs
+}
+
+// a key under a renamed one (main/@4 -> main/@3: main/@4.0, main/@4/@1, main/@4.0#x)
+fn renamed(r: [(Text, Text)], s: Text) -> Text {
+    var best = -1
+    var bestLen = 0
+    for (i, (from, _)) in r.enumerate() {
+        let n = len(from)
+        if n >= bestLen and s.startsWith(from) and (len(s) == n or s[n..n + 1] is "." | "/" | "#") {
+            best = i
+            bestLen = n
+        }
+    }
+    if best < 0 {
+        return s
+    }
+    let (_, to) = r[best]
+    to + s[bestLen..]
+}
+
+fn Collab.renameIn(var self, v: Int, r: [(Text, Text)]) {
+    let n = self.j.nodes[v]
+    for (i, item) in n.items.enumerate() {
+        let it = self.j.nodes[item]
+        let f = if n.kind == JKind.Obj { n.keys[i] } else { "" }
+        if (f == "id" or f == "node" or f == "elseIf") and it.kind == JKind.Str {
+            self.j.nodes[item].str = renamed(r, it.str)
+        } else if f == "stmts" and it.kind == JKind.Arr {
+            for s in it.items {
+                if self.j.nodes[s].kind == JKind.Str {
+                    let to = renamed(r, self.j.nodes[s].str)
+                    self.j.nodes[s].str = to
+                }
+            }
+        } else if it.kind is Obj | Arr {
+            self.renameIn(item, r)
+        }
+    }
+}
+
+fn Collab.applyRenames(var self, d: Int, r: [(Text, Text)]) {
+    if len(r) == 0 {
+        return
+    }
+    self.renameIn(self.decls[d].head, r)
+    for i in 0..len(self.decls[d].nodes) {
+        self.renameIn(self.decls[d].nodes[i].obj, r)
+    }
+    self.indexDecl(d)
+}
+
+fn Collab.hasKey(self, d: Int, key: Text) -> Bool =
+    self.decls[d].byKey.contains(key) or self.decls[d].ents.contains(key)
+
+// the blocks of a node and of the expressions it is made of (a lambda's block, an if's branches)
+fn Collab.enqueueFrom(var self, a: Int, obj: Int, owner: Text?, depth: Int) {
+    if obj < 0 or depth > 200 {
+        return
+    }
+    for (path, _) in self.blocksOf(obj, "") {
+        self.queue.push((owner, path))
+    }
+    for (key, _) in self.refsOf(obj, false) {
+        let t = self.nodeAt(a, key)
+        if t >= 0 and not self.isBinding(self.decls[a].nodes[t].obj) {
+            let node = self.decls[a].nodes[t]
+            self.enqueueFrom(a, node.obj, Some(node.key), depth + 1)
+        }
+    }
+}
+
+fn Collab.kindOf(self, d: Int, key: Text) -> Text? {
+    let n = self.nodeAt(d, key)
+    if n >= 0 {
+        self.str(self.decls[d].nodes[n].obj, "kind")
+    } else {
+        None
+    }
+}
+
+fn Collab.hasUid(self, obj: Int) -> Bool = self.str(obj, "uid") != None
+
+// where each statement is: key -> the index of its block's "owner:path" in the list
+fn Collab.statementsIn(self, d: Int) -> ([Text: Int], [Text]) {
+    var where: [Text: Int] = [:]
+    var names: [Text] = []
+    for i in -1..len(self.decls[d].nodes) {
+        let obj = if i < 0 { self.decls[d].head } else { self.decls[d].nodes[i].obj }
+        for (path, block) in self.blocksOf(obj, "") {
+            let id = (if i < 0 { self.decls[d].name } else { self.decls[d].nodes[i].key }) + ":" + path
+            for s in self.listOf(self.j.get(block, "stmts")) ?? [] {
+                where[s] = len(names)
+                names.push(id)
+            }
+        }
+    }
+    (where, names)
+}
+
+// b's statements take a's keys where they are the same statements (see the top of the file)
+fn Collab.lineUp(var self, a: Int, b: Int) {
+    self.queue = []
+    self.enqueueFrom(a, self.decls[a].head, None, 0)
+    var at = 0
+    while at < len(self.queue) {
+        let (owner, path) = self.queue[at]
+        at += 1
+        let Some(la) = self.listOf(self.blockAt(self.objAt(a, owner), path)) else {
+            continue
+        }
+        let Some(lb) = self.listOf(self.blockAt(self.objAt(b, owner), path)) else {
+            continue
+        }
+        let n = len(la)
+        let m = len(lb)
+        var pairOfB = [-1] * m
+        var pairedA = [false] * n
+        // 1. named statements keep their keys
+        for j in 0..m {
+            let nb = self.nodeAt(b, lb[j])
+            if nb < 0 {
+                continue
+            }
+            let obj = self.decls[b].nodes[nb].obj
+            if self.str(obj, "name") == None and self.str(obj, "uid") == None {
+                continue
+            }
+            for i in 0..n {
+                if not pairedA[i] and la[i] == lb[j] {
+                    pairOfB[j] = i
+                    pairedA[i] = true
+                }
+            }
+        }
+        // 2. the same statements, in order
+        var ca: [Text] = []
+        var cb: [Text] = []
+        var ia: [Int] = []
+        var ib: [Int] = []
+        for i in 0..n {
+            if not pairedA[i] and not self.hasUid(self.objAt(a, Some(la[i]))) {
+                ia.push(i)
+                ca.push(self.contentOf(a, la[i], 0))
+            }
+        }
+        for j in 0..m {
+            if pairOfB[j] < 0 and not self.hasUid(self.objAt(b, Some(lb[j]))) {
+                ib.push(j)
+                cb.push(self.contentOf(b, lb[j], 0))
+            }
+        }
+        let pairs = commonOrder(ca, cb)
+        for i in 0..len(ca) {
+            if pairs[i] >= 0 {
+                pairOfB[ib[pairs[i]]] = ia[i]
+                pairedA[ia[i]] = true
+            }
+        }
+        // 3. between those, statements of the same kind (and name): the same statement, changed
+        var lastA = -1
+        for j in 0..m {
+            if pairOfB[j] >= 0 {
+                lastA = pairOfB[j]
+                continue
+            }
+            if self.hasUid(self.objAt(b, Some(lb[j]))) {
+                continue
+            }
+            var nextA = n
+            var k = j + 1
+            while k < m {
+                if pairOfB[k] >= 0 {
+                    nextA = pairOfB[k]
+                    break
+                }
+                k += 1
+            }
+            var i = lastA + 1
+            while i < nextA and i < n {
+                if pairedA[i]
+                    or self.hasUid(self.objAt(a, Some(la[i])))
+                    or not same(self.kindOf(a, la[i]), self.kindOf(b, lb[j])) {
+                    i += 1
+                    continue
+                }
+                let na = self.nodeAt(a, la[i])
+                let nb = self.nodeAt(b, lb[j])
+                if na < 0
+                    or nb < 0
+                    or not same(
+                        self.str(self.decls[a].nodes[na].obj, "name"),
+                        self.str(self.decls[b].nodes[nb].obj, "name"),
+                    ) {
+                    i += 1
+                    continue
+                }
+                pairOfB[j] = i
+                pairedA[i] = true
+                lastA = i
+                break
+            }
+        }
+        // b takes a's keys; a new statement whose key a uses for another takes a fresh one
+        var r: [(Text, Text)] = []
+        for j in 0..m {
+            if pairOfB[j] >= 0 {
+                if la[pairOfB[j]] != lb[j] {
+                    r.push((lb[j], la[pairOfB[j]]))
+                }
+            } else if self.hasKey(a, lb[j]) and not self.hasUid(self.objAt(b, Some(lb[j]))) {
+                var k = lb[j] + "+"
+                while self.hasKey(a, k) or self.hasKey(b, k) {
+                    k += "+"
+                }
+                r.push((lb[j], k))
+            }
+        }
+        self.applyRenames(b, r)
+        for i in 0..n {
+            let na = self.nodeAt(a, la[i])
+            if na >= 0 {
+                let node = self.decls[a].nodes[na]
+                self.enqueueFrom(a, node.obj, Some(node.key), 0)
+            }
+        }
+    }
+    // 4. statements moved, in their block or to another: the same statement, not lined up yet
+    let (inA, _) = self.statementsIn(a)
+    let (inB, _) = self.statementsIn(b)
+    var onlyA: [Text?] = []
+    var contentA: [Text] = []
+    for node in self.decls[a].nodes {
+        if inA.contains(node.key) and self.nodeAt(b, node.key) < 0 and not self.hasUid(node.obj) {
+            onlyA.push(Some(node.key))
+            contentA.push(self.contentOf(a, node.key, 0))
+        }
+    }
+    var r: [(Text, Text)] = []
+    if len(onlyA) > 0 {
+        for node in self.decls[b].nodes {
+            let key = node.key
+            if not inB.contains(key) or self.nodeAt(a, key) >= 0 or self.hasUid(node.obj) {
+                continue
+            }
+            let text = self.contentOf(b, key, 0)
+            for i in 0..len(onlyA) {
+                if onlyA[i] is Some(k) and contentA[i] == text {
+                    r.push((key, k))
+                    onlyA[i] = None
+                    break
+                }
+            }
+        }
+    }
+    self.applyRenames(b, r)
+}
+
+// ---- what changed ---------------------------------------------------------------------------------------------
+// a node in a few words: call print, op +, let total
+fn Collab.summaryOf(self, d: Int, obj: Int, depth: Int) -> Text {
+    let Some(kind) = self.str(obj, "kind") else {
+        return "node"
+    }
+    if kind == "do" and depth < 4 {
+        // a statement of an expression: the expression
+        let inp = self.j.get(obj, "inputs")
+        if self.j.kind(inp) == JKind.Arr and self.j.count(inp) > 0 {
+            if self.str(self.j.item(inp, 0), "node") is Some(key) {
+                let n = self.nodeAt(d, key)
+                if n >= 0 {
+                    return self.summaryOf(d, self.decls[d].nodes[n].obj, depth + 1)
+                }
+            }
+        }
+    }
+    for f in ["fn", "op", "name", "field", "pattern"] {
+        if self.str(obj, f) is Some(what) {
+            return kind + " " + what
+        }
+    }
+    kind
+}
+
+// which fields differ: inputs one by one, the rest whole (a block without its statements: they move on their own)
+fn Collab.fieldsChanged(self, a: Int, b: Int) -> [Field] {
+    var names: [Text] = []
+    for o in [a, b] {
+        for k in self.j.nodes[o].keys {
+            if not names.contains(k) {
+                names.push(k)
+            }
+        }
+    }
+    var out: [Field] = []
+    for name in names {
+        let va = self.j.get(a, name)
+        let vb = self.j.get(b, name)
+        if same(self.j.textOf(va, true, true), self.j.textOf(vb, true, true)) {
+            continue
+        }
+        if name == "inputs" and self.j.kind(va) == JKind.Arr and self.j.kind(vb) == JKind.Arr {
+            for i in 0..max(self.j.count(va), self.j.count(vb)) {
+                let ia = if i < self.j.count(va) { self.j.item(va, i) } else { -1 }
+                let ib = if i < self.j.count(vb) { self.j.item(vb, i) } else { -1 }
+                if not same(self.j.textOf(ia, true, false), self.j.textOf(ib, true, false)) {
+                    out.push(Field("inputs.{i}", ia, ib))
+                }
+            }
+            continue
+        }
+        out.push(Field(name, va, vb))
+    }
+    out
+}
+
+fn Collab.declKind(self, d: Int) -> Text = self.str(self.decls[d].head, "kind") ?? "decl"
+
+fn Collab.diffDecl(var self, a: Int, b: Int) -> [Change] {
+    self.lineUp(a, b)
+    var cs: [Change] = []
+    let da = self.decls[a]
+    let db = self.decls[b]
+    if not same(self.j.textOf(da.head, true, true), self.j.textOf(db.head, true, true)) {
+        cs.push(
+            Change(
+                "changed",
+                da.name,
+                da.name,
+                kind: Some(self.declKind(b)),
+                isDecl: true,
+                fields: self.fieldsChanged(da.head, db.head),
+            ),
+        )
+    }
+    for na in da.nodes {
+        let nb = self.nodeAt(b, na.key)
+        if nb < 0 {
+            let p = da.parent[na.key] ?? -1
+            let quiet = p >= 0 and self.nodeAt(b, da.nodes[p].key) < 0
+            cs.push(
+                Change(
+                    "removed",
+                    na.key,
+                    da.name,
+                    kind: self.str(na.obj, "kind"),
+                    summary: Some(self.summaryOf(a, na.obj, 0)),
+                    line: na.line,
+                    quiet: quiet,
+                ),
+            )
+            continue
+        }
+        let obj = db.nodes[nb].obj
+        if same(self.j.textOf(na.obj, true, true), self.j.textOf(obj, true, true)) {
+            continue
+        }
+        cs.push(
+            Change(
+                "changed",
+                na.key,
+                da.name,
+                kind: self.str(obj, "kind"),
+                summary: Some(self.summaryOf(b, obj, 0)),
+                line: na.line,
+                fields: self.fieldsChanged(na.obj, obj),
+            ),
+        )
+    }
+    for nb in db.nodes {
+        if self.nodeAt(a, nb.key) >= 0 {
+            continue
+        }
+        let p = db.parent[nb.key] ?? -1
+        let quiet = p >= 0 and self.nodeAt(a, db.nodes[p].key) < 0
+        cs.push(
+            Change(
+                "added",
+                nb.own,
+                da.name,
+                kind: self.str(nb.obj, "kind"),
+                summary: Some(self.summaryOf(b, nb.obj, 0)),
+                line: nb.line,
+                quiet: quiet,
+            ),
+        )
+    }
+    // statements moved: to another block, or out of their order in the same one
+    let (whereA, blockA) = self.statementsIn(a)
+    let (whereB, blockB) = self.statementsIn(b)
+    for i in -1..len(da.nodes) {
+        let objA = if i < 0 { da.head } else { da.nodes[i].obj }
+        let owner = if i < 0 { None } else { Some(da.nodes[i].key) }
+        let objB = self.objAt(b, owner)
+        for (path, block) in self.blocksOf(objA, "") {
+            let la = self.listOf(self.j.get(block, "stmts")) ?? []
+            let lb = self.listOf(self.blockAt(objB, path)) ?? []
+            // the statements in both, in each one's order
+            var sa: [Text] = []
+            for key in la {
+                let Some(wb) = whereB[key] else {
+                    continue
+                }
+                let wa = whereA[key] ?? 0
+                if blockA[wa] != blockB[wb] {
+                    // to another block
+                    cs.push(self.moved(a, b, key, da.name) with { from: Some(blockA[wa]), to: Some(blockB[wb]) })
+                    continue
+                }
+                sa.push(key)
+            }
+            var sb: [Text] = []
+            for key in lb {
+                for t in sa {
+                    if key == t {
+                        sb.push(key)
+                    }
+                }
+            }
+            let pairs = commonOrder(sa, sb)
+            for (s, key) in sa.enumerate() {
+                if pairs[s] < 0 {
+                    cs.push(self.moved(a, b, key, da.name))
+                }
+            }
+        }
+    }
+    cs
+}
+
+fn Collab.moved(self, a: Int, b: Int, key: Text, decl: Text) -> Change {
+    var c = Change("moved", key, decl)
+    let nb = self.nodeAt(b, key)
+    if nb >= 0 {
+        let node = self.decls[b].nodes[nb]
+        c.kind = self.str(node.obj, "kind")
+        c.summary = Some(self.summaryOf(b, node.obj, 0))
+        if node.own != key {
+            c.now = Some(node.own)
+        }
+    }
+    let na = self.nodeAt(a, key)
+    c.line = if na >= 0 { self.decls[a].nodes[na].line } else { 0 }
+    c
+}
+
+// an input or a value, as text: 12, "hi", main/total, Color.Red
+fn Collab.valueText(self, v: Int) -> Text {
+    if v < 0 {
+        return "nothing"
+    }
+    if self.j.nodes[v].kind == JKind.Obj {
+        for plain in ["value", "node", "case", "fn", "name"] {
+            if self.str(v, plain) is Some(t) and self.j.count(v) <= 2 {
+                return t
+            }
+        }
+    }
+    self.j.write(v, true, true)
+}
+
+fn pad(t: Text, n: Int) -> Text = if len(t) >= n { t } else { t + " " * (n - len(t)) }
+
+fn Collab.changesText(self, cs: [Change]) -> Text {
+    var out = ""
+    for c in cs {
+        if c.quiet {
+            continue
+        }
+        out += pad(c.change, 8) + " "
+        out += if c.isDecl { (c.kind ?? "") + " " + c.key } else { c.key }
+        if c.now is Some(now) {
+            out += " (now {now})"
+        }
+        if c.summary != None or len(c.fields) > 0 or c.from != None {
+            out += ": "
+        }
+        if len(c.fields) > 0 {
+            for (f, field) in c.fields.enumerate() {
+                let sep = if f > 0 { "; " } else { "" }
+                out += if field.name.startsWith("inputs.") {
+                    sep + "input " + field.name[7..] + ": "
+                } else {
+                    sep + field.name + ": "
+                }
+                out += self.valueText(field.was) + " -> " + self.valueText(field.now)
+            }
+        } else if c.summary is Some(s) {
+            out += s
+        }
+        if c.from is Some(from) {
+            out += (if c.summary != None { ", " } else { "" }) + "from " + from + " to " + (c.to ?? "")
+        }
+        out += "\n"
+    }
+    out
+}
+
+fn Collab.changesJson(self, cs: [Change]) -> Text {
+    var out = "\{\"changes\": ["
+    for (i, c) in cs.enumerate() {
+        out += (if i > 0 { ",\n  " } else { "\n  " })
+            + "\{\"change\": "
+            + jsonString(c.change)
+            + ", \"key\": "
+            + jsonString(c.key)
+        if c.kind is Some(k) {
+            out += ", \"kind\": " + jsonString(k)
+        }
+        out += if c.isDecl {
+            ", \"decl\": true"
+        } else {
+            ", \"in\": " + jsonString(c.decl)
+        }
+        if c.line != 0 {
+            out += ", \"line\": {c.line}"
+        }
+        if c.now is Some(now) {
+            out += ", \"now\": " + jsonString(now)
+        }
+        if c.from is Some(from) {
+            out += ", \"from\": " + jsonString(from) + ", \"to\": " + jsonString(c.to ?? "")
+        }
+        if len(c.fields) > 0 {
+            out += ", \"fields\": ["
+            for (f, field) in c.fields.enumerate() {
+                out += (if f > 0 { ", " } else { "" })
+                    + "\{\"field\": "
+                    + jsonString(field.name)
+                    + ", \"was\": "
+                    + self.j.write(field.was, false, true)
+                    + ", \"now\": "
+                    + self.j.write(field.now, false, true)
+                    + "\}"
+            }
+            out += "]"
+        }
+        out += "\}"
+    }
+    out + (if len(cs) > 0 { "\n]\}\n" } else { "]\}\n" })
+}
+
+// the changes from a to b, as text or JSON, and how many (-1: a graph does not read; the errors are in errors)
+fn Collab.diff(var self, a: Text, b: Text, json: Bool) -> (Int, Text) {
+    let Some(ga) = self.readGraph(a, "the first graph") else {
+        return (-1, "")
+    }
+    let Some(gb) = self.readGraph(b, "the second graph") else {
+        return (-1, "")
+    }
+    var cs: [Change] = []
+    for da in ga.decls {
+        let name = self.decls[da].name
+        let db = declNamed(gb, name)
+        var these: [Change] = []
+        if db < 0 {
+            these.push(Change("removed", name, name, kind: Some(self.declKind(da)), isDecl: true))
+        } else {
+            these = self.diffDecl(da, db)
+        }
+        for k in 0..len(these) {
+            these[k].order = len(cs) + k
+        }
+        cs += these.sortedBy(c => (if c.isDecl { 0 } else { 1 }) * 1000000000000000 + c.line * 10000000 + c.order)
+    }
+    for db in gb.decls {
+        let name = self.decls[db].name
+        if declNamed(ga, name) < 0 {
+            cs.push(Change("added", name, name, kind: Some(self.declKind(db)), isDecl: true))
+        }
+    }
+    if not same(ga.closing, gb.closing) {
+        let was = if ga.closing is Some(t) { self.j.text(t) } else { -1 }
+        let now = if gb.closing is Some(t) { self.j.text(t) } else { -1 }
+        cs.push(
+            Change("changed", "closing", "", kind: Some("comment"), isDecl: true, fields: [Field("closing", was, now)]),
+        )
+    }
+    (len(cs), if json { self.changesJson(cs) } else { self.changesText(cs) })
+}
+
+// ---- three-way merges -----------------------------------------------------------------------------------------
+fn Collab.conflict(var self, key: Text, what: Text) {
+    let both = key + "\n" + what
+    if self.seen.contains(both) {
+        return
+    }
+    self.seen.add(both)
+    self.conflicts.push((key, what))
+}
+
+// Which version to take: 0 base, 1 ours, 2 theirs; -1 a conflict (and what says which)
+fn pick(base: Text?, ours: Text?, theirs: Text?) -> (Int, Text) {
+    if same(ours, theirs) {
+        return (1, "")
+    }
+    if same(base, ours) {
+        return (2, "")
+    }
+    if same(base, theirs) {
+        return (1, "")
+    }
+    let what = if base == None {
+        "added on both sides, differently"
+    } else if ours == None or theirs == None {
+        "changed on one side, removed on the other"
+    } else {
+        "changed on both sides"
+    }
+    (-1, what)
+}
+
+// each side's new statements, after the last statement both keep before them (None: at the start)
+fn addsOf(side: [Text], base: [Text], kept: [Text]) -> [Add] {
+    var out: [Add] = []
+    var anchor: Text? = None
+    for key in side {
+        if kept.contains(key) {
+            anchor = Some(key)
+        } else if not base.contains(key) {
+            out.push(Add(anchor, key))
+        }
+    }
+    out
+}
+
+fn addsAt(adds: [Add], anchor: Text?) -> [Text] {
+    var out: [Text] = []
+    for a in adds {
+        if same(a.anchor, anchor) {
+            out.push(a.key)
+        }
+    }
+    out
+}
+
+// A block's statements, merged: what each side removed is gone, each side's new ones come after the statement
+// before them, and a side's new order wins over an unchanged one.
+fn Collab.mergeList(var self, b: [Text], o: [Text], t: [Text], where: Text, statements: Bool) -> [Text] {
+    if o == t or b == t {
+        return o
+    }
+    if b == o {
+        return t
+    }
+    let kept = b.filter(k => o.contains(k) and t.contains(k)).toArray()
+    let ko = o.filter(k => kept.contains(k)).toArray()
+    let kt = t.filter(k => kept.contains(k)).toArray()
+    var order = ko
+    if ko == kept {
+        order = kt
+    } else if kt != kept and ko != kt {
+        self.conflict(where, if statements {
+            "statements reordered on both sides"
+        } else {
+            "declarations reordered on both sides"
+        })
+    }
+    let ao = addsOf(o, b, kept)
+    let at = addsOf(t, b, kept)
+    var out: [Text] = []
+    for i in -1..len(kept) {
+        let anchor = if i < 0 { None } else { Some(order[i]) }
+        if anchor is Some(k) {
+            out.push(k)
+        }
+        let x = addsAt(ao, anchor)
+        let y = addsAt(at, anchor)
+        // both sides add statements at one place: which go first is a choice (declarations' order is not)
+        if statements and len(x) > 0 and len(y) > 0 and x != y {
+            self.conflict(where, if anchor is Some(k) {
+                "statements added after {k} on both sides"
+            } else {
+                "statements added at the start on both sides"
+            })
+        }
+        for key in x + y {
+            if not out.contains(key) {
+                out.push(key)
+            }
+        }
+    }
+    out
+}
+
+// the whole declaration as text (heads and nodes by key), to see whether a side changed it at all
+fn Collab.declText(self, d: Int) -> Text? {
+    if d < 0 {
+        return None
+    }
+    var out = self.j.write(self.decls[d].head, true, false)
+    for node in self.decls[d].nodes.sortedBy(n => n.key) {
+        out += "\n" + self.j.write(node.obj, true, false)
+    }
+    Some(out)
+}
+
+fn Collab.ownKey(self, d: Int, key: Text) -> Text {
+    let n = if d >= 0 { self.nodeAt(d, key) } else { -1 }
+    if n >= 0 { self.decls[d].nodes[n].own } else { key }
+}
+
+// the block a statement is in: its owner (None: the head), its path and list
+fn Collab.blockOfStatement(self, d: Int, key: Text) -> (Text?, Text, [Text])? {
+    for i in -1..len(self.decls[d].nodes) {
+        let obj = if i < 0 { self.decls[d].head } else { self.decls[d].nodes[i].obj }
+        for (path, block) in self.blocksOf(obj, "") {
+            let list = self.listOf(self.j.get(block, "stmts")) ?? []
+            if list.contains(key) {
+                return Some((if i < 0 { None } else { Some(self.decls[d].nodes[i].key) }, path, list))
+            }
+        }
+    }
+    None
+}
+
+fn Collab.textOfNode(self, d: Int, key: Text) -> Text? {
+    let n = self.nodeAt(d, key)
+    if n >= 0 {
+        self.j.textOf(self.decls[d].nodes[n].obj, true, true)
+    } else {
+        None
+    }
+}
+
+fn Collab.mergeDecl(var self, b: Int, o: Int, t: Int) -> Int {
+    self.lineUp(b, o)
+    self.lineUp(b, t)
+    let name = self.decls[b].name
+    let (side, what) = pick(
+        self.j.textOf(self.decls[b].head, true, true),
+        self.j.textOf(self.decls[o].head, true, true),
+        self.j.textOf(self.decls[t].head, true, true),
+    )
+    if side < 0 {
+        self.conflict(name, what)
+    }
+    let sides = [b, o, t]
+    let head = self.copy(self.decls[sides[if side < 0 { 1 } else { side }]].head)
+    // every node: from the side that changed it
+    var seen: Set<Text> = []
+    var nodes: [GNode] = []
+    for s in sides {
+        for node in self.decls[s].nodes {
+            let key = node.key
+            if seen.contains(key) {
+                continue
+            }
+            seen.add(key)
+            var (from, why) = pick(self.textOfNode(b, key), self.textOfNode(o, key), self.textOfNode(t, key))
+            if from < 0 {
+                self.conflict(self.ownKey(o, key), why)
+                from = 1
+            }
+            let n = self.nodeAt(sides[from], key)
+            if n < 0 {
+                continue
+            }
+            let src = self.decls[sides[from]].nodes[n]
+            let obj = self.copy(src.obj)
+            nodes.push(GNode(key, key, obj, src.line))
+        }
+    }
+    self.decls.push(GDecl(name, head, nodes: nodes))
+    let m = len(self.decls) - 1
+    self.indexDecl(m)
+    // every block: its statements merged
+    for i in -1..len(self.decls[m].nodes) {
+        let owner = if i < 0 { None } else { Some(self.decls[m].nodes[i].key) }
+        let obj = if i < 0 { self.decls[m].head } else { self.decls[m].nodes[i].obj }
+        for (path, block) in self.blocksOf(obj, "") {
+            let lb = self.listOf(self.blockAt(self.objAt(b, owner), path)) ?? []
+            let lo = self.listOf(self.blockAt(self.objAt(o, owner), path)) ?? []
+            let lt = self.listOf(self.blockAt(self.objAt(t, owner), path)) ?? []
+            let where = if owner is Some(k) { self.ownKey(o, k) } else { name }
+            let merged = self.mergeList(lb, lo, lt, where, true)
+            self.setList(self.j.get(block, "stmts"), merged)
+        }
+    }
+    self.indexDecl(m)
+    // a node one side removed and the other still uses (or keeps in a block): kept, and a conflict
+    let (inB, _) = self.statementsIn(b)
+    let (inO, _) = self.statementsIn(o)
+    let (inT, _) = self.statementsIn(t)
+    var again = true
+    while again {
+        again = false
+        var i = -1
+        while i < len(self.decls[m].nodes) and not again {
+            let obj = if i < 0 { self.decls[m].head } else { self.decls[m].nodes[i].obj }
+            i += 1
+            for (key, _) in self.refsOf(obj, true) {
+                if self.hasKey(m, key) {
+                    continue
+                }
+                let from = if self.nodeAt(o, key) >= 0 {
+                    o
+                } else if self.nodeAt(t, key) >= 0 {
+                    t
+                } else if self.nodeAt(b, key) >= 0 {
+                    b
+                } else {
+                    -1
+                }
+                self.conflict(self.ownKey(o, key), "removed on one side, still used on the other")
+                if from < 0 {
+                    continue
+                }
+                let src = self.decls[from].nodes[self.nodeAt(from, key)]
+                let copied = self.copy(src.obj)
+                self.decls[m].nodes.push(GNode(key, key, copied, src.line))
+                self.indexDecl(m)
+                again = true
+                break
+            }
+        }
+        // a kept statement goes back in its block, after the statement before it there
+        let (inM, _) = self.statementsIn(m)
+        for node in self.decls[m].nodes {
+            let key = node.key
+            if inM.contains(key) {
+                continue
+            }
+            let from = if inO.contains(key) {
+                o
+            } else if inT.contains(key) {
+                t
+            } else if inB.contains(key) {
+                b
+            } else {
+                -1
+            }
+            if from < 0 {
+                continue
+            }
+            let Some((owner, path, list)) = self.blockOfStatement(from, key) else {
+                continue
+            }
+            let stmts = self.blockAt(self.objAt(m, owner), path)
+            if stmts < 0 {
+                continue
+            }
+            let cur = self.listOf(stmts) ?? []
+            var at = 0
+            for s in list {
+                if s == key {
+                    break
+                }
+                for (c, k) in cur.enumerate() {
+                    if k == s {
+                        at = c + 1
+                    }
+                }
+            }
+            self.setList(stmts, cur[..at] + [key] + cur[at..])
+            again = true
+            break
+        }
+        if again {
+            self.indexDecl(m)
+        }
+    }
+    m
+}
+
+// A declaration as graph JSON again: keys back to numbers.
+fn Collab.numbered(self, v: Int, num: [Text: Int]) -> Text {
+    let n = self.j.nodes[v]
+    match n.kind {
+        Arr => {
+            var out = "["
+            for (i, item) in n.items.enumerate() {
+                if i > 0 {
+                    out += ", "
+                }
+                out += self.numbered(item, num)
+            }
+            out + "]"
+        }
+        Obj => {
+            var out = "\{"
+            for (i, f) in n.keys.enumerate() {
+                let item = self.j.nodes[n.items[i]]
+                if i > 0 {
+                    out += ", "
+                }
+                out += jsonString(f) + ": "
+                if (f == "id" or f == "node" or f == "elseIf") and item.kind == JKind.Str {
+                    out += "{num[item.str] ?? -1}"
+                } else if f == "stmts" and item.kind == JKind.Arr {
+                    out += "["
+                    for (k, s) in item.items.enumerate() {
+                        let sn = self.j.nodes[s]
+                        out += (if k > 0 { ", " } else { "" })
+                            + "{if sn.kind == JKind.Str { num[sn.str] ?? -1 } else { -1 }}"
+                    }
+                    out += "]"
+                } else {
+                    out += self.numbered(n.items[i], num)
+                }
+            }
+            out + "\}"
+        }
+        _ => self.j.write(v, false, false)
+    }
+}
+
+fn Collab.numberIds(self, v: Int, num: [Text: Int]) -> [Text: Int] {
+    var out = num
+    let n = self.j.nodes[v]
+    for (i, item) in n.items.enumerate() {
+        let it = self.j.nodes[item]
+        if n.kind == JKind.Obj and n.keys[i] == "id" and it.kind == JKind.Str and not out.contains(it.str) {
+            out[it.str] = len(out) + 1
+        }
+        if it.kind is Obj | Arr {
+            out = self.numberIds(item, out)
+        }
+    }
+    out
+}
+
+fn Collab.declJson(self, d: Int) -> Text {
+    var num: [Text: Int] = [:]
+    num = self.numberIds(self.decls[d].head, num)
+    for node in self.decls[d].nodes {
+        num = self.numberIds(node.obj, num)
+    }
+    var h = self.numbered(self.decls[d].head, num)
+    if len(self.decls[d].nodes) > 0 {
+        h = h[..len(h) - 1] + ",\n   \"nodes\": [" // its closing brace, then its nodes
+        for (i, node) in self.decls[d].nodes.enumerate() {
+            h += (if i > 0 { ",\n    " } else { "\n    " }) + self.numbered(node.obj, num)
+        }
+        h += "]\}"
+    }
+    h
+}
+
+// base, ours and theirs merged: the merged graph, the conflicts (as text or JSON) and how many (-1: a graph does
+// not read)
+fn Collab.merge(var self, base: Text, ours: Text, theirs: Text, json: Bool) -> (Int, Text, Text) {
+    let Some(gb) = self.readGraph(base, "the base graph") else {
+        return (-1, "", "")
+    }
+    let Some(go) = self.readGraph(ours, "our graph") else {
+        return (-1, "", "")
+    }
+    let Some(gt) = self.readGraph(theirs, "their graph") else {
+        return (-1, "", "")
+    }
+    var names: [[Text]] = []
+    for g in [gb, go, gt] {
+        var list: [Text] = []
+        for d in g.decls {
+            list.push(self.decls[d].name)
+        }
+        names.push(list)
+    }
+    let order = self.mergeList(names[0], names[1], names[2], "the program", false)
+    var out = "\{\"quark\": 1, \"decls\": [\n"
+    var written = 0
+    for name in order {
+        let db = declNamed(gb, name)
+        let dO = declNamed(go, name)
+        let dt = declNamed(gt, name)
+        var take = -1
+        if db >= 0 and dO >= 0 and dt >= 0 {
+            take = self.mergeDecl(db, dO, dt)
+        } else {
+            var (side, what) = pick(self.declText(db), self.declText(dO), self.declText(dt))
+            if side < 0 {
+                self.conflict(name, what)
+                side = 1
+            }
+            take = [db, dO, dt][side]
+            if take < 0 {
+                continue
+            }
+        }
+        out += (if written > 0 { ",\n  " } else { "  " }) + self.declJson(take)
+        written += 1
+    }
+    out += "]"
+    let (side, _) = pick(gb.closing, go.closing, gt.closing)
+    if side < 0 {
+        self.conflict("closing", "the closing comment changed on both sides")
+    }
+    let closing = if side == 0 {
+        gb.closing
+    } else if side == 2 {
+        gt.closing
+    } else {
+        go.closing
+    }
+    if closing is Some(c) {
+        out += ",\n \"closing\": " + jsonString(c)
+    }
+    out += "\}\n"
+    var said = ""
+    if json {
+        said = "["
+        for (i, (key, what)) in self.conflicts.enumerate() {
+            said += (if i > 0 { ",\n \{\"key\": " } else { "\n \{\"key\": " })
+                + jsonString(key)
+                + ", \"what\": "
+                + jsonString(what)
+                + "\}"
+        }
+        said += if len(self.conflicts) > 0 { "\n]\n" } else { "]\n" }
+    } else {
+        for (key, what) in self.conflicts {
+            said += "conflict {key}: {what}\n"
+        }
+    }
+    (len(self.conflicts), out, said)
+}
+
+// ---- quark diff, quark merge ----------------------------------------------------------------------------------
+// A file's graph, as JSON: a .json as it is, a .qgn's (Quark's notation) said in JSON, a program's made from its text
+// (None: it does not read; the errors are said)
+fn graphFile(path: Text, prelude: Text) -> Text? {
+    let Ok(text) = readFile(path) else {
+        printErr("quark: cannot read {path}")
+        return None
+    }
+    if path.endsWith(".json") or path.endsWith(".qgn") {
+        let read = graphJson(text, path) // either notation, whatever the name says
+        if read is Err(why) {
+            printErr(why)
+            return None
+        }
+        return Some(read ?? "")
+    }
+    let read = readProgram(path, text, prelude, false)
+    if not read.ok {
+        return None
+    }
+    Some(graphOf(read.program, ""))
+}
+
+//   quark diff a b [--json]                          exit 0: the same, 1: changes, 2: trouble
+//   quark merge base ours theirs [-o out] [--json]   exit 0: merged, 1: conflicts (ours kept there) or errors
+pub fn collabCommand(given: [Text]) -> Int {
+    let merging = given[0] == "merge"
+    let files = if merging { 3 } else { 2 }
+    let o = options(given, files, merging)
+    if o.bad != "" or o.layout != "" {
+        printErr("quark: unknown option {if o.bad != "" { o.bad } else { "--layout" }}")
+        return 2
+    }
+    if len(o.files) < files {
+        return 2
+    }
+    var graphs: [Text] = []
+    for path in o.files {
+        let Some(g) = graphFile(path, o.prelude) else {
+            return 2
+        }
+        graphs.push(g)
+    }
+    var c = Collab()
+    if not merging {
+        let (changes, out) = c.diff(graphs[0], graphs[1], o.json)
+        for e in c.errors.shown {
+            printErr(e)
+        }
+        if changes < 0 {
+            return 2
+        }
+        emit(out)
+        return if changes > 0 { 1 } else { 0 }
+    }
+    let (count, merged, said) = c.merge(graphs[0], graphs[1], graphs[2], o.json)
+    for e in c.errors.shown {
+        printErr(e)
+    }
+    if count < 0 {
+        return 2
+    }
+    emitErr(said)
+    let imported = graphToAst(merged, "the merged graph")
+    for e in imported.errors {
+        printErr(e)
+    }
+    if not imported.ok {
+        return 2
+    }
+    let text = format(imported.ast)
+    // the merged program, checked as text (a side may use what the other removed): its graph, or the text
+    let name = if o.out != "" { o.out } else { o.files[0] }
+    let read = readProgram(name, text, o.prelude, false)
+    let asGraph = name.endsWith(".json") or name.endsWith(".qgn")
+    var result = text
+    if asGraph {
+        if not read.ok {
+            printErr("quark: the merged program has errors, so it has no graph")
+            return 1
+        }
+        result = if graphHasUids(merged) { merged } else { graphOf(read.program, "") }
+        if name.endsWith(".qgn") {
+            result = qgnOf(result) ?? result
+        }
+    }
+    if o.out != "" {
+        if writeFile(o.out, result) is Err(_) {
+            printErr("quark: cannot write {o.out}")
+            return 2
+        }
+    } else {
+        emit(result)
+    }
+    if not read.ok {
+        printErr("quark: the merged program has errors")
+    }
+    if count > 0 or not read.ok { 1 } else { 0 }
+}
+
+// ---- for hosts: the embedding API's qkDiff and qkMerge (compiler/api.qk) --------------------------------------
+// What changed from graph a to graph b: the count (-1: one does not read; the errors say why) and the lines (or JSON)
+pub type GraphDiff { changes: Int, out: Text, errors: [Text] }
+
+pub fn diffGraphs(a: Text, b: Text, json: Bool) -> GraphDiff {
+    var c = Collab()
+    let (changes, out) = c.diff(a, b, json)
+    GraphDiff(changes, out, c.errors.shown)
+}
+
+// Three graphs merged: the conflicts' count (-1: one does not read), the merged graph, the conflicts said (JSON with
+// json, else lines)
+pub type GraphMerge { count: Int, merged: Text, said: Text, errors: [Text] }
+
+pub fn mergeGraphs(base: Text, ours: Text, theirs: Text, json: Bool) -> GraphMerge {
+    var c = Collab()
+    let (count, merged, said) = c.merge(base, ours, theirs, json)
+    GraphMerge(count, merged, said, c.errors.shown)
+}

@@ -1,0 +1,33 @@
+// quark: the compiler written in Quark, its command line (compiler/cli.qk) on macOS (x86-64, Apple Silicon): memory
+// from mmap, C's functions from the process (dlsym). compiler/main.qk is the same on Windows, compiler/mainlinux.qk on
+// Linux.
+//   quark build compiler/mainmacos.qk --release -o build/quark.exe
+use std.machine as machine
+use cli
+use imagecli
+
+extern effect fn mmap(p: Int64, n: UInt64, prot: Int32, flags: Int32, fd: Int32, offset: Int64) -> Int64
+extern effect fn mprotect(p: Int64, n: UInt64, prot: Int32) -> Int32
+extern effect fn dlsym(h: Int64, name: CText) -> Int64
+
+fn mapMemory(n: Int) -> Int {
+    let p = mmap(0, n, 3, 4098, -1, 0) // read, write; MAP_PRIVATE | MAP_ANON
+    if p == -1 { 0 } else { p }
+}
+
+// read and run; Apple Silicon's instruction cache told of the new code (sys_icache_invalidate)
+fn protectCode(p: Int, n: Int) -> Bool {
+    if mprotect(p, n, 5) != 0 {
+        return false
+    }
+    let invalidate = dlsym(-2, "sys_icache_invalidate")
+    if invalidate != 0 {
+        let _ = machine.call(Pointer<UInt8>(invalidate), p, n, 0, 0)
+    }
+    true
+}
+
+fn cFunction(name: Text) -> Int = dlsym(-2, name) // RTLD_DEFAULT: libSystem, and what the process has loaded
+
+// Apple Silicon: machine.cpu() has no x86-64 features to give
+fn main() -> Int = cliMain(Host(.Macos, mapMemory, protectCode, cFunction, machine.cpu() == 0))

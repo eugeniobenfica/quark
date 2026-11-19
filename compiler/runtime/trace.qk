@@ -1,0 +1,135 @@
+// The calls a panic went through, for code the command line runs (quark run, quark test): "  in pick", then
+// "  called from main at line 20" for each call out to the way in, through inlined calls (which have no frames) and
+// real ones (every Quark function keeps its frame pointer). The command line gives each
+// program it loads its trace (host.qk); a built executable has none, and its panics say only the line.
+use base
+
+// a Loaded's word that holds its trace, 0 for none (loader.qk's words end before it)
+pub const lTrace = 14
+
+// a trace's words: what the command line fills in (compiler/memory.qk)
+pub const trFnCount = 0
+pub const trNames = 1 // each function's name, zero-ended
+pub const trFnAt = 2 // each function's offset in the code
+pub const trSiteCount = 3
+pub const trSites = 4 // each call's 5 words: where it returns to, its line, caller, callee, inlined call
+pub const trInlineCount = 5
+pub const trInlines = 6 // each inlined call's 3 words: the one it is in (0: the function), its line, the callee's name
+
+fn functionAt(t: Int, offset: Int) -> Int {
+    for i in 0..word(t, trFnCount) {
+        if word(word(t, trFnAt), i) == offset {
+            return i
+        }
+    }
+    -1
+}
+
+fn fnName(t: Int, i: Int) -> Int = word(word(t, trNames), i)
+
+fn inlineAt(t: Int, i: Int) -> Int = word(t, trInlines) + 24 * i
+
+fn calledFrom(b: Buf, name: Int, line: Int) -> Buf =
+    b.text("\n  called from ").zeroText(name).text(" at line ").int(line)
+
+// code of the function named fnName, inside the inlined calls inl: each one, outwards
+fn addInlined(b: Buf, t: Int, inl: Int, name: Int) -> Buf {
+    var out = b
+    var i = inl
+    while i > 0 and i < word(t, trInlineCount) {
+        let c = inlineAt(t, i)
+        let parent = word(c, 0)
+        out = calledFrom(out, if parent > 0 { word(inlineAt(t, parent), 2) } else { name }, word(c, 1))
+        i = parent
+    }
+    out
+}
+
+fn sameCall(a: Int, b: Int) -> Bool = word(a, 2) == word(b, 2) and word(a, 1) == word(b, 1)
+
+// the panic text so far, with the calls it went through (inl: the inlined calls the panic is in)
+pub fn appendTrace(inl: Int) {
+    let c = ctx()
+    let l = word(c, ctxRunning)
+    if l == 0 or word(l, lTrace) == 0 or word(c, ctxPanicFrame) == 0 {
+        return
+    }
+    let t = word(l, lTrace)
+    var frame = word(c, ctxPanicFrame)
+    setWord(c, ctxPanicFrame, 0)
+    let code = word(l, 0)
+    let codeLen = word(l, 1)
+    let calls = calloc(16, 8)
+    var depth = 0
+    while frame != 0 and depth < 16 {
+        // the frames, out to the way in from C
+        let ret = word(frame, 1)
+        if ret < code or ret >= code + codeLen {
+            break
+        }
+        var site = 0
+        for i in 0..word(t, trSiteCount) {
+            let s = word(t, trSites) + 40 * i
+            if site == 0 and word(s, 0) == ret - code {
+                site = s
+            }
+        }
+        if site == 0 {
+            break
+        }
+        setWord(calls, depth, site)
+        depth += 1
+        frame = word(frame, 0)
+    }
+    if depth == 0 and inl <= 0 {
+        free(calls)
+        return // it stopped in the function the call began with: nothing to add
+    }
+    var here = 0 // the function it stopped in: its name, 0 for one kept as a value, -1 not known
+    if depth > 0 {
+        let callee = word(word(calls, 0), 3)
+        here = if callee >= 0 { fnName(t, callee) } else { 0 }
+    } else {
+        let entry = functionAt(t, word(c, ctxRunningEntry))
+        here = if entry >= 0 { fnName(t, entry) } else { -1 }
+    }
+    let hereName = if here > 0 {
+        here
+    } else if here == 0 {
+        textAt("a function kept as a value\0")
+    } else {
+        textAt("?\0")
+    }
+    var b = Buf(panicText(), panicTextSize, panicTextLen())
+    b = b.text("\n  in ").zeroText(if inl > 0 and inl < word(t, trInlineCount) {
+        word(inlineAt(t, inl), 2)
+    } else {
+        hereName
+    })
+    b = addInlined(b, t, inl, hereName)
+    var i = 0
+    while i < depth {
+        let s = word(calls, i)
+        let caller = fnName(t, word(s, 2))
+        if i >= 2 and sameCall(s, word(calls, i - 1)) and sameCall(s, word(calls, i - 2)) {
+            // the same call again and again: said once
+            while i + 1 < depth and sameCall(word(calls, i + 1), s) {
+                i += 1
+            }
+            b = b.text("\n  ... called from ").zeroText(caller).text(" at line ").int(word(s, 1)).text(
+                ", again and again",
+            )
+            i += 1
+            continue
+        }
+        let inlined = word(s, 4)
+        b = calledFrom(b, if inlined > 0 and inlined < word(t, trInlineCount) {
+            word(inlineAt(t, inlined), 2)
+        } else {
+            caller
+        }, word(s, 1))
+        b = addInlined(b, t, inlined, caller)
+        i += 1
+    }
+    free(calls)
+}

@@ -1,0 +1,37 @@
+// quark: the compiler written in Quark, its command line (compiler/cli.qk) on Windows: memory from VirtualAlloc, C's
+// functions from their libraries. compiler/mainlinux.qk is the same on Linux.
+//   quark build compiler/main.qk --release -o build/quarkq.exe
+use cli
+use image
+use imagecli
+
+extern effect fn virtualAlloc(p: Int64, n: UInt64, kind: UInt32, protect: UInt32) -> Int64 in "kernel32" as "VirtualAlloc"
+extern effect fn virtualProtect(p: Int64, n: UInt64, protect: UInt32, old: Int64) -> Int32 in "kernel32" as "VirtualProtect"
+extern effect fn flushInstructionCache(process: Int64, p: Int64, n: UInt64) -> Int32 in "kernel32" as "FlushInstructionCache"
+extern effect fn getCurrentProcess() -> Int64 in "kernel32" as "GetCurrentProcess"
+extern effect fn loadLibraryA(name: CText) -> Int64 in "kernel32" as "LoadLibraryA"
+extern effect fn getProcAddress(m: Int64, name: CText) -> Int64 in "kernel32" as "GetProcAddress"
+extern effect fn getModuleFileNameA(m: Int64, out: Pointer<UInt8>, n: UInt32) -> UInt32 in "kernel32" as "GetModuleFileNameA"
+
+// this executable's path
+fn selfPath() -> Text {
+    let room = Pointer<UInt8>(malloc(4096))
+    let n = getModuleFileNameA(0, room, 4096)
+    if n == 0 or n >= 4096 { "" } else { Text(room, n) }
+}
+
+fn mapMemory(n: Int) -> Int = virtualAlloc(0, n, 0x3000, 4) // reserved and committed, read and write
+
+fn protectCode(p: Int, n: Int) -> Bool {
+    let old = malloc(8)
+    let done = virtualProtect(p, n, 0x20, old) != 0 // read and run
+    let _ = flushInstructionCache(getCurrentProcess(), p, n)
+    done
+}
+
+fn cFunction(name: Text) -> Int {
+    let lib = loadLibraryA(dllOf(name))
+    if lib == 0 { 0 } else { getProcAddress(lib, name) }
+}
+
+fn main() -> Int = cliMain(Host(.Windows, mapMemory, protectCode, cFunction, selfPath: selfPath()))

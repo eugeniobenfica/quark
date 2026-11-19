@@ -1,0 +1,571 @@
+// The catalog: every node an editor can offer, the built-ins (their pins and
+// result as shapes), the types, operators and statements, and a program's declarations (the host's too).
+//
+// A pin's shape is its type as data, so an editor checks a wire without reading type text:
+//   {"kind": "int" | "float" | "bool" | "text" | "bytes" | "any" | "never" | "nothing" | "enum" (any enum's case)}
+//   {"kind": "array" | "loop" (an array, a range or a loop) | "range" | "optional" | "result", "element": shape}
+//   {"kind": "map", "key": shape, "element": shape}       {"kind": "tuple", "items": [shape...]}
+//   {"kind": "fn", "params": [shape...], "returns": shape, "effect": true?}
+//   {"kind": "named", "name": "Point", "args": [shape...]?}  a record, an enum, an extern type (Pair<Int, Text>)
+//   {"kind": "param", "name": "T", "oneOf": [shape...]?}   a type parameter: every pin with the same name takes the
+//                                                          same type (Number: one of Int, Float)
+//   {"kind": "oneOf", "options": [shape...]}               any of these (Int | Float | Text)
+use ast
+use source
+use types
+use format
+use module
+use check
+use graph
+
+// name, category, params ("name: Type, ..."; Number: Int or Float; T, U: any; Loop<T>: an array, a range or a
+// loop), returns, doc
+const builtins: [(Text, Text, Text, Text, Text)] = [
+    ("sqrt", "Math", "x: Float", "Float", "square root"),
+    ("sin", "Math", "x: Float", "Float", "sine (radians)"),
+    ("cos", "Math", "x: Float", "Float", "cosine (radians)"),
+    ("tan", "Math", "x: Float", "Float", "tangent (radians)"),
+    ("asin", "Math", "x: Float", "Float", "arc sine"),
+    ("acos", "Math", "x: Float", "Float", "arc cosine"),
+    ("atan", "Math", "x: Float", "Float", "arc tangent"),
+    ("atan2", "Math", "y: Float, x: Float", "Float", "the angle of (x, y)"),
+    ("exp", "Math", "x: Float", "Float", "e to the x"),
+    ("log", "Math", "x: Float", "Float", "natural logarithm"),
+    ("pow", "Math", "x: Float, y: Float", "Float", "x to the y"),
+    ("abs", "Math", "x: Number", "Number", "without its sign"),
+    ("floor", "Math", "x: Float", "Int", "rounded down"),
+    ("ceil", "Math", "x: Float", "Int", "rounded up"),
+    ("round", "Math", "x: Float", "Int", "rounded to the nearest (halves up)"),
+    ("toFloat", "Math", "x: Int", "Float", "an Int as a Float"),
+    ("toInt", "Math", "x: Float", "Int", "a Float without its fraction"),
+    ("min", "Math", "a: Number, b: Number", "Number", "the smaller"),
+    ("max", "Math", "a: Number, b: Number", "Number", "the larger"),
+    ("clamp", "Math", "value: Number, low: Number, high: Number", "Number", "kept between low and high"),
+    ("lerp", "Math", "a: Float, b: Float, t: Float", "Float", "from a to b as t goes 0 to 1"),
+    (
+        "map",
+        "Loops",
+        "source: Loop<T>, f: fn(T) -> U",
+        "Loop<U>",
+        "each value changed (enumerate() first for the index)",
+    ),
+    ("filter", "Loops", "source: Loop<T>, keep: fn(T) -> Bool", "Loop<T>", "only the values kept"),
+    ("fold", "Loops", "source: Loop<T>, start: A, f: fn(A, T) -> A", "A", "all values into one, from start"),
+    ("sum", "Loops", "source: Loop<Number>", "Number", "the total"),
+    ("min", "Loops", "source: Loop<Number>", "Number", "the smallest (stops on an empty list)"),
+    ("max", "Loops", "source: Loop<Number>", "Number", "the largest (stops on an empty list)"),
+    ("any", "Loops", "source: Loop<T>, test: fn(T) -> Bool", "Bool", "true if one passes"),
+    ("all", "Loops", "source: Loop<T>, test: fn(T) -> Bool", "Bool", "true if every one passes"),
+    ("len", "Loops", "source: Loop<T>", "Int", "how many values"),
+    ("toArray", "Loops", "source: Loop<T>", "[T]", "the values, kept in an array"),
+    ("toSet", "Loops", "source: Loop<T>", "Set<T>", "the values, each once, in the order they came"),
+    ("push", "Arrays", "list: [T] (a var), value: T", "", "adds value at the end of a var array"),
+    ("pop", "Arrays", "list: [T] (a var)", "T?", "takes the last value off a var array (None when it is empty)"),
+    (
+        "first",
+        "Loops",
+        "source: Loop<T>, test: fn(T) -> Bool (may be left out)",
+        "T?",
+        "the first value (that passes the test)",
+    ),
+    (
+        "last",
+        "Loops",
+        "source: Loop<T>, test: fn(T) -> Bool (may be left out)",
+        "T?",
+        "the last value (that passes the test)",
+    ),
+    ("count", "Loops", "source: Loop<T>, test: fn(T) -> Bool", "Int", "how many pass the test"),
+    ("contains", "Loops", "source: Loop<T>, value: T", "Bool", "true if value is among them"),
+    ("indexOf", "Loops", "source: Loop<T>, value: T", "Int?", "where value first is"),
+    (
+        "minBy",
+        "Loops",
+        "source: Loop<T>, key: fn(T) -> K",
+        "T",
+        "the value with the smallest key (stops on an empty list)",
+    ),
+    (
+        "maxBy",
+        "Loops",
+        "source: Loop<T>, key: fn(T) -> K",
+        "T",
+        "the value with the largest key (stops on an empty list)",
+    ),
+    (
+        "sorted",
+        "Arrays",
+        "source: Loop<T>, descending: Bool (may be left out)",
+        "[T]",
+        "a copy in order (numbers, texts, cases, or T.compare); stable",
+    ),
+    (
+        "sortedBy",
+        "Arrays",
+        "source: Loop<T>, key: fn(T) -> K, descending: Bool (may be left out)",
+        "[T]",
+        "a copy in the order of the key; stable",
+    ),
+    ("take", "Loops", "source: Loop<T>, count: Int", "Loop<T>", "the first count values (fewer if there are fewer)"),
+    ("enumerate", "Loops", "source: Loop<T>", "Loop<(Int, T)>", "pairs each value with its zero-based index"),
+    ("skip", "Loops", "source: Loop<T>, count: Int", "Loop<T>", "all but the first count values"),
+    ("countBy", "Loops", "source: Loop<T>, key: fn(T) -> K", "[K: Int]", "how many values give each key"),
+    ("mean", "Loops", "source: Loop<Number>", "Float", "the average (stops on an empty list)"),
+    ("get", "Arrays", "list: [T], index: Int", "T?", "the value at index, or None when it is outside"),
+    ("panic", "Tests", "message: Text", "Never", "stops the program (the host's call) with the message"),
+    ("parallelMap", "Loops", "source: Loop<T>, f: fn(T) -> U", "[U]", "f on every value, on the processor's threads"),
+    (
+        "parallelFold",
+        "Loops",
+        "source: Loop<T>, start: A, step: fn(A, T) -> A, combine: fn(A, A) -> A (may be left out)",
+        "A",
+        "the values folded on the processor's threads, the parts combined in order",
+    ),
+    ("random", "Random", "", "Float", "effect: a Float in [0, 1)"),
+    ("randomInt", "Random", "low: Int, high: Int", "Int", "effect: an Int from low to high (high not included)"),
+    ("seedRandom", "Random", "seed: Int", "", "effect: starts the random sequence again from seed"),
+    ("spawn", "Tasks", "f: fn()", "Task", "effect: a task of f, run a step at a time"),
+    ("step", "Tasks", "task: Task", "Bool", "effect: runs the task until it yields; true while it has more"),
+    ("joinTask", "Tasks", "task: Task", "", "effect: drives the task to completion"),
+    ("yield", "Tasks", "", "", "effect: gives the turn back to whoever stepped the task"),
+    ("sleep", "Tasks", "seconds: Float", "", "effect: waits for a duration, yielding if called inside a task"),
+    ("reversed", "Arrays", "source: Loop<T>", "[T]", "a copy, last first"),
+    ("keys", "Maps", "map: [K: V]", "[K]", "the keys, in the order they came"),
+    ("values", "Maps", "map: [K: V]", "[V]", "the values, in the order their keys came"),
+    ("contains", "Maps", "map: [K: V], key: K", "Bool", "true if the key is in it"),
+    ("remove", "Maps", "map: [K: V] (a var), key: K", "", "takes the key out of a var map"),
+    ("add", "Sets", "set: Set<T> (a var), value: T", "", "puts the value in a var set (once)"),
+    ("remove", "Sets", "set: Set<T> (a var), value: T", "", "takes the value out of a var set"),
+    ("len", "Maps", "map: [K: V]", "Int", "how many keys"),
+    ("Some", "Optionals", "value: T", "T?", "a value that is there (None: none)"),
+    ("Ok", "Results", "value: T", "T!", "a value: it worked"),
+    ("Err", "Results", "message: Text", "T!", "it did not work, and why"),
+    ("mapErr", "Results", "result: T ! E, f: fn(E) -> F", "T ! F", "the same Ok value, or Err(f(error))"),
+    ("index", "Enums", "case: an enum", "Int", "the case's place among its enum's cases (from 0)"),
+    ("words", "Text", "text: Text", "[Text]", "the pieces between runs of spaces"),
+    ("lines", "Text", "text: Text", "[Text]", "the lines, without their line breaks"),
+    ("contains", "Text", "text: Text, part: Text", "Bool", "true if part is in the text"),
+    ("indexOf", "Text", "text: Text, part: Text", "Int?", "where part starts (in bytes)"),
+    ("startsWith", "Text", "text: Text, part: Text", "Bool", "true if the text starts with part"),
+    ("endsWith", "Text", "text: Text, part: Text", "Bool", "true if the text ends with part"),
+    ("replace", "Text", "text: Text, old: Text, new: Text", "Text", "every old replaced by new"),
+    ("upper", "Text", "text: Text", "Text", "A to Z for a to z"),
+    ("lower", "Text", "text: Text", "Text", "a to z for A to Z"),
+    ("join", "Text", "texts: Loop<Text>, separator: Text", "Text", "the texts, separated"),
+    (
+        "assert",
+        "Tests",
+        "condition: Bool, message: Text (may be left out)",
+        "",
+        "stops (the test fails) when the condition is false",
+    ),
+    ("toText", "Text", "value: Any", "Text", "the value as text, as print shows it (\"\{x\}\" in a text does it too)"),
+    ("len", "Text", "text: Text", "Int", "how many bytes"),
+    ("split", "Text", "text: Text, separator: Text", "[Text]", "the pieces between separators (\"\": between words)"),
+    ("trim", "Text", "text: Text", "Text", "without spaces and line breaks at either end"),
+    ("parseInt", "Text", "text: Text", "Int!", "the Int the text is, or Err saying it is not one"),
+    ("parseFloat", "Text", "text: Text", "Float!", "the Float the text is, or Err saying it is not one"),
+    ("print", "Out", "values: Any...", "", "effect: shows the values, separated by spaces"),
+    ("monotonicTime", "Out", "", "Float", "effect: monotonic clock in seconds"),
+    ("unixTime", "Out", "", "Float", "effect: seconds since the Unix epoch"),
+    ("readLine", "Out", "", "Text?", "effect: the next line of the input (None at its end)"),
+    ("readFile", "Out", "path: Text", "Text!", "effect: a file's contents (Err says why it cannot be read)"),
+    (
+        "writeFile",
+        "Out",
+        "path: Text, text: Text",
+        "Unit!",
+        "effect: replaces a file's contents (Err says why it cannot be written)",
+    ),
+    ("args", "Out", "", "[Text]", "effect: the command line after the program's name"),
+    ("printErr", "Out", "values: Any...", "", "effect: like print, to the error stream"),
+    ("exit", "Out", "code: Int", "", "effect: ends the program with this status"),
+    ("env", "Out", "name: Text", "Text?", "effect: an environment variable"),
+    ("pathExists", "Out", "path: Text", "Bool", "effect: true if a file or a folder is there"),
+    ("listDir", "Out", "path: Text", "[Text]!", "effect: the names in a folder, sorted"),
+    ("bytes", "Bytes", "text: Text", "Bytes", "the text's bytes (UTF-8), the same memory"),
+    ("Text", "Bytes", "bytes: Bytes", "Text!", "the bytes as a text, when they are UTF-8 (Err says where they are not)"),
+    ("len", "Bytes", "bytes: Bytes", "Int", "how many bytes"),
+    ("push", "Bytes", "bytes: Bytes (a var), value: Int", "", "adds a byte (0 to 255) at the end of var Bytes"),
+    ("char", "Text", "codePoint: Int", "Text", "the text of one code point"),
+    ("codePoints", "Text", "text: Text", "Loop<Int>", "the text's code points, one at a time (nothing is built)"),
+    ("readBytes", "Out", "path: Text", "Bytes!", "effect: a file's bytes, whatever they are"),
+    ("writeBytes", "Out", "path: Text, bytes: Bytes", "Unit!", "effect: replaces a file's contents with the bytes"),
+    (
+        "appendFile",
+        "Out",
+        "path: Text, text: Text",
+        "Unit!",
+        "effect: adds the text at the end of a file (made when missing)",
+    ),
+    ("makeDir", "Out", "path: Text", "Unit!", "effect: makes a folder, and the folders above it that are missing"),
+    ("removePath", "Out", "path: Text", "Unit!", "effect: removes a file, or a folder that is empty"),
+    (
+        "runProcess",
+        "Out",
+        "program: Text, args: [Text]",
+        "Process!",
+        "effect: runs a program to its end: its status, and what it wrote to out and err",
+    ),
+]
+
+// a text in quotes, as the catalog writes it (a tab as \u0009)
+fn jsonText(s: Text) -> Text {
+    var out = "\""
+    var from = 0
+    let b = s.bytes()
+    for (i, c) in b.enumerate() {
+        let escaped = if c == '"' {
+            "\\\""
+        } else if c == '\\' {
+            "\\\\"
+        } else if c == '\n' {
+            "\\n"
+        } else if c < 0x20 {
+            "\\u00" + "0123456789abcdef"[c >> 4..c >> 4 + 1] + "0123456789abcdef"[c & 15..c & 15 + 1]
+        } else {
+            ""
+        }
+        if escaped != "" {
+            out += s[from..i] + escaped
+            from = i + 1
+        }
+    }
+    out + s[from..] + "\""
+}
+
+// ---- pin shapes -------------------------------------------------------------------------------------------------
+// a type's text being read: where, the type parameters' names, and whether it is a built-in's (its type parameters
+// are single capital letters)
+type Shaper { text: Text, b: Bytes, p: Int = 0, params: [Text] = [], builtin: Bool = false }
+
+fn Shaper.at(self, i: Int) -> Int = if i < len(self.b) { self.b[i] } else { 0 }
+
+fn Shaper.spaces(var self) {
+    while self.at(self.p) == ' ' {
+        self.p += 1
+    }
+}
+
+fn Shaper.eat(var self, word: Text) -> Bool {
+    self.spaces()
+    let n = len(word)
+    if self.p + n > len(self.b) or self.text[self.p..self.p + n] != word {
+        return false
+    }
+    self.p += n
+    true
+}
+
+fn isLetter(c: Int) -> Bool = c | 32 >= 'a' and c | 32 <= 'z' or c == '_'
+
+// a name's length (geo.Point: a dot inside a name, not "Any...")
+fn Shaper.word(var self) -> Int {
+    self.spaces()
+    var n = 0
+    while true {
+        let c = self.at(self.p + n)
+        if not isLetter(c)
+            and not (n > 0 and c >= '0' and c <= '9')
+            and not (n > 0 and c == '.' and isLetter(self.at(self.p + n + 1)) and self.at(self.p + n + 1) != '_') {
+            break
+        }
+        n += 1
+    }
+    n
+}
+
+// "(A, B)" after its opening: [shape, shape]
+fn Shaper.list(var self, close: Text) -> Text {
+    var out = "["
+    var i = 0
+    while not self.eat(close) and self.p < len(self.b) {
+        if i > 0 {
+            out += ", "
+        }
+        i += 1
+        let at = self.p
+        let n = self.word()
+        if n > 0 and self.at(self.p + n) == ':' and close == ")" {
+            self.p += n + 1 // (loud: Bool) -> Text: the name is not the type
+        } else {
+            self.p = at
+        }
+        out += self.union()
+        self.eat(",")
+        if self.p == at {
+            break
+        }
+    }
+    out + "]"
+}
+
+// after "(": params, then -> returns
+fn Shaper.fnShape(var self, isEffect: Bool) -> Text {
+    var out = "\{\"kind\": \"fn\", \"params\": " + self.list(")") + ", \"returns\": "
+    out += if self.eat("->") {
+        self.union()
+    } else {
+        "\{\"kind\": \"nothing\"\}"
+    }
+    if isEffect {
+        out += ", \"effect\": true"
+    }
+    out + "\}"
+}
+
+const plainShapes: [Text: Text] = [
+    "Int": "int", "Float": "float", "Bool": "bool", "Text": "text", "Bytes": "bytes", "Any": "any", "Never": "never",
+    "nothing": "nothing", "": "any",
+]
+
+fn Shaper.one(var self) -> Text {
+    var base = ""
+    self.spaces()
+    if self.eat("[") {
+        let first = self.union()
+        if self.eat(":") {
+            base = "\{\"kind\": \"map\", \"key\": " + first + ", \"element\": " + self.union() + "\}"
+        } else {
+            base = "\{\"kind\": \"array\", \"element\": " + first + "\}"
+        }
+        self.eat("]")
+    } else if self.eat("effect (") or self.eat("effect fn(") {
+        base = self.fnShape(true)
+    } else if self.eat("fn(") or self.eat("fn (") {
+        base = self.fnShape(false)
+    } else if self.eat("(") {
+        // (A, B) -> R, or the tuple (A, B)
+        let at = self.p
+        let items = self.list(")")
+        self.spaces()
+        if self.p + 2 <= len(self.b) and self.text[self.p..self.p + 2] == "->" {
+            self.p = at
+            base = self.fnShape(false)
+        } else {
+            base = "\{\"kind\": \"tuple\", \"items\": " + items + "\}"
+        }
+    } else if self.eat("an enum") or self.eat("a case") {
+        base = "\{\"kind\": \"enum\"\}"
+    } else if self.eat("a lambda") {
+        base = "\{\"kind\": \"fn\", \"params\": [], \"returns\": \{\"kind\": \"any\"\}\}"
+    } else if self.eat("a range of ") {
+        base = "\{\"kind\": \"range\", \"element\": " + self.one() + "\}"
+    } else if self.eat("a loop of ") {
+        base = "\{\"kind\": \"loop\", \"element\": " + self.one() + "\}"
+    } else {
+        let n = self.word()
+        let name = self.text[self.p..self.p + n]
+        self.p += n
+        let param = self.builtin and n == 1 and self.b[self.p - 1] >= 'A' and self.b[self.p - 1] <= 'Z'
+            or self.params.contains(name)
+        if plainShapes[name] is Some(kind) {
+            base = "\{\"kind\": \"{kind}\"\}"
+        } else if name == "Number" {
+            base = "\{\"kind\": \"param\", \"name\": \"Number\", \"oneOf\": [\{\"kind\": \"int\"\}, \{\"kind\": \"float\"\}]\}"
+        } else if name == "Loop" and self.eat("<") {
+            base = "\{\"kind\": \"loop\", \"element\": " + self.union()
+            self.eat(">")
+            base += "\}"
+        } else if param {
+            base = "\{\"kind\": \"param\", \"name\": \"{name}\"\}"
+        } else {
+            base = "\{\"kind\": \"named\", \"name\": \"{name}\""
+            if self.eat("<") {
+                base += ", \"args\": " + self.list(">")
+            }
+            base += "\}"
+        }
+    }
+    // T? T! T!ParseError
+    while self.at(self.p) == '?' or self.at(self.p) == '!' {
+        let optional = self.at(self.p) == '?'
+        self.p += 1
+        var wrapped = "\{\"kind\": \"" + (if optional { "optional" } else { "result" }) + "\", \"element\": " + base
+        if not optional and self.word() > 0 {
+            wrapped += ", \"error\": " + self.one()
+        }
+        base = wrapped + "\}"
+    }
+    base
+}
+
+fn Shaper.union(var self) -> Text {
+    let first = self.one()
+    self.spaces()
+    if self.at(self.p) != '|' {
+        return first
+    }
+    var out = "\{\"kind\": \"oneOf\", \"options\": [" + first
+    while self.eat("|") {
+        out += ", " + self.one()
+    }
+    out + "]\}"
+}
+
+// ", \"key\": {shape}" for a type's text
+fn shapeField(key: Text, text: Text, params: [Text], builtin: Bool) -> Text {
+    if text == "" {
+        return ", \"{key}\": \{\"kind\": \"nothing\"\}"
+    }
+    var s = Shaper(text, text.bytes(), params: params, builtin: builtin)
+    ", \"{key}\": " + s.union()
+}
+
+// A built-in's pins from its text ("source: Loop<T>, f: fn(T) -> U"): name, shape, and whether it is a var ("(a
+// var)"), may be left out ("(may be left out)") or takes any number of values ("Any...").
+fn builtinPins(params: Text) -> Text {
+    var out = ", \"pins\": ["
+    var s = Shaper(params, params.bytes(), builtin: true)
+    var i = 0
+    while s.p < len(s.b) {
+        s.spaces()
+        var n = 0
+        while s.p + n < len(s.b) and s.b[s.p + n] != ':' {
+            n += 1
+        }
+        if s.p + n >= len(s.b) {
+            break
+        }
+        out += (if i > 0 { ", \{\"name\": " } else { "\{\"name\": " }) + jsonText(s.text[s.p..s.p + n])
+        i += 1
+        s.p += n + 1
+        out += ", \"shape\": " + s.union()
+        if s.eat("...") {
+            out += ", \"variadic\": true"
+        }
+        if s.eat("(a var)") {
+            out += ", \"mutable\": true"
+        }
+        if s.eat("(may be left out)") {
+            out += ", \"optional\": true"
+        }
+        out += "\}"
+        if not s.eat(",") {
+            break
+        }
+    }
+    out + "]"
+}
+
+fn declEntry(p: Program, d: Decl, checked: Bool) -> Text {
+    let a = p.ast
+    let kind = match d.kind {
+        Enum => "enum"
+        Type => if d.isExtern { "extern type" } else { "type" }
+        Const => "const"
+        _ => if d.isExtern { "extern fn" } else { "fn" }
+    }
+    var out = "\{\"name\": "
+        + jsonText(d.name)
+        + ", \"kind\": "
+        + jsonText(kind)
+        + ", \"host\": "
+        + (if d.fromPrelude { "true" } else { "false" })
+    if d.isEffect {
+        out += ", \"effect\": true" // an action node: on the execution wire
+    }
+    if d.leading != "" {
+        out += ", \"doc\": " + jsonText(d.leading)
+    }
+    if d.kind == DeclKind.Enum {
+        out += ", \"cases\": ["
+        for (k, c) in d.cases.enumerate() {
+            out += (if k > 0 { ", " } else { "" }) + jsonText(c)
+        }
+        return out + "]\}"
+    }
+    if not (d.kind == DeclKind.Type and d.isExtern and not d.cStruct) {
+        out += if d.kind == DeclKind.Type {
+            ", \"fields\": ["
+        } else {
+            ", \"params\": ["
+        }
+        for (k, at) in d.params.enumerate() {
+            let prm = a.params[at]
+            out += (if k > 0 { ", \{\"name\": " } else { "\{\"name\": " }) + jsonText(prm.name)
+            if prm.isVar {
+                out += ", \"var\": true" // fn Parser.next(var self)
+            }
+            let t = if prm.ty >= 0 { typeText(a, prm.ty) } else { "" }
+            out += ", \"type\": " + jsonText(t) + shapeField("shape", t, d.typeParams, false) + "\}"
+        }
+        out += "]"
+    }
+    if d.kind == DeclKind.Fn {
+        // as written (Pair<B, A>), else as the checker found it
+        var r = ""
+        if d.ret >= 0 {
+            r = typeText(a, d.ret)
+        } else if checked and d.retType >= 0 and p.types[d.retType].kind != Kind.Void {
+            r = p.typeName(d.retType)
+        }
+        if checked and d.retType >= 0 or d.ret >= 0 {
+            out += ", \"returns\": " + jsonText(r) + shapeField("result", r, d.typeParams, false)
+        }
+    }
+    out + "\}"
+}
+
+pub fn catalogOf(p: Program, parsed: Bool, checked: Bool) -> Text {
+    var out = "\{\"quark\": 1,\n \"builtins\": ["
+    for (i, (name, category, params, returns, doc)) in builtins.enumerate() {
+        out += (if i > 0 { ",\n    \{\"name\": " } else { "\n    \{\"name\": " })
+            + jsonText(name)
+            + ", \"category\": "
+            + jsonText(category)
+        out += ", \"params\": " + jsonText(params) + ", \"returns\": " + jsonText(returns) + builtinPins(params)
+        out += shapeField("result", returns, [], true) + ", \"doc\": " + jsonText(doc) + "\}"
+    }
+    out += "],\n \"types\": [\"Int\", \"Float\", \"Bool\", \"Text\", \"[T]\", \"[K: V]\", \"T?\", \"T!\"],\n"
+    out += " \"operators\": [\"+\", \"-\", \"*\", \"/\", \"%\", \"==\", \"!=\", \"<\", \"<=\", \">\", \">=\", \"and\", \"or\", \"not\", \"neg\", \"..\", \"??\", \"?\", \"with\"],\n"
+    out += " \"statements\": [\"let\", \"var\", \"set\", \"do\", \"if\", \"match\", \"for\", \"while\", \"return\", \"break\", \"continue\"],\n"
+    out += " \"decls\": ["
+    var first = true
+    if parsed {
+        for at in p.decls {
+            let d = p.ast.decls[at]
+            if d.templateOf >= 0 or d.isTest or d.lifted or d.kind == DeclKind.Use {
+                continue
+            }
+            out += (if first { "\n    " } else { ",\n    " }) + declEntry(p, d, checked)
+            first = false
+        }
+    }
+    out + "]\}\n"
+}
+
+// quark catalog FILE [--prelude P]: FILE a program, or - for the built-ins and the prelude only
+pub fn catalogCommand(given: [Text]) -> Int {
+    let o = options(given, 1, true)
+    if o.bad != "" {
+        printErr("quark: unknown option {o.bad}")
+        return 2
+    }
+    if len(o.files) == 0 {
+        return 2
+    }
+    var host: Source? = None
+    if o.prelude != "" {
+        let Ok(text) = readFile(o.prelude) else {
+            printErr("quark: the prelude {o.prelude} does not read")
+            return 1
+        }
+        let alone = loadProgram(Source("prelude", text), None)
+        if not alone.ok or not checkProgram(alone.program, alone.errors, false, None).ok {
+            printErr("quark: the prelude {o.prelude} does not read")
+            return 1
+        }
+        host = Some(Source("prelude", text))
+    }
+    let text = if o.files[0] == "-" { "" } else { readFile(o.files[0]) ?? "" }
+    let loaded = loadProgram(Source("program", text), host)
+    if not loaded.ok {
+        emit(catalogOf(loaded.program, false, false))
+        return 0
+    }
+    let errors = loaded.errors.count
+    let checked = checkProgram(loaded.program, loaded.errors, false, None)
+    emit(catalogOf(checked.program, true, checked.ok and checked.errors.count == errors))
+    0
+}

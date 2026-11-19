@@ -1,0 +1,1533 @@
+// The ARM64 (AArch64) backend: Linux, Windows, macOS on Apple Silicon, Android, Raspberry Pi. No assembler, no linker:
+// every instruction is one 32-bit word, encoded here.
+//
+// Registers: the most used virtual registers own a machine register while they are alive (linear scan, loops
+// weighing more): x9-x15 and d16-d31 (the platform lets calls change them) for values no call crosses, x19-x28
+// and d8-d15 (kept by calls) for the others; the rest live in the frame. x0-x7 and d0-d7 carry the arguments of
+// calls into C, and with x16, x17, d0-d3 they are this backend's scratch registers.
+//
+// The frame is the one the panic's stack of calls walks: x29 points at the saved x29 and the return address (x30),
+// as rbp does on x86-64. Calls between Quark functions are the same as there: arguments go to [sp + 8i] of the
+// caller (its outgoing area), the callee reads them at [x29 + 16 + 8i] and writes its results there before
+// returning. Calls into C follow AAPCS64: x0-x7 for ints and d0-d7 for floats, each counted on its own, the rest
+// on the stack; a record comes back in x0-x1, in d0-d3 when it is all floats (four at most), or through the
+// address in x8.
+use ir
+
+const x0 = 0
+const x1 = 1
+const x2 = 2
+const x3 = 3
+const x4 = 4
+const x8 = 8
+const x16 = 16
+const x17 = 17
+const x19 = 19
+const fp = 29
+const lr = 30
+const sp = 31
+const xzr = 31
+const d0 = 0
+const d1 = 1
+
+// condition codes
+const eq = 0
+const ne = 1
+const hs = 2
+const lo = 3
+const mi = 4
+const pl = 5
+const vs = 6
+const hi = 8
+const ls = 9
+const ge = 10
+const lt = 11
+const gt = 12
+const le = 13
+const intCond = [eq, ne, lt, le, gt, ge]
+const floatCond = [eq, ne, mi, ls, gt, ge] // false when unordered, but !=
+const floatNotCond = [ne, eq, pl, hi, le, lt] // their negations, NaN included
+const nop = 0xD503201F
+const ret = 0xD65F03C0
+
+// how a fixup's distance goes into its word
+enum FixKind { Branch, BranchCond, Cbz, BranchLink, Adr }
+type Fixup { at: Int, target: Int, kind: FixKind }
+type Cold { at: Int, code: Int, line: Int, a: Int, b: Int, inl: Int }
+
+// a home not given yet (>= 0: a register, x 0-31, d 32-63; < 0: a frame slot, -(n + 1))
+const noHome = -2147483648
+
+type Arm64 {
+    target: Target
+    runtime: [RtSig]
+    externs: [IrExtern]
+    code: Bytes = []
+    patches: [Patch] = []
+    relocs: [Reloc] = []
+    sites: [CallSite] = []
+    callFixups: [Fixup] = []
+    fnIndex: Int = 0
+    inl: Int = 0
+    // the function being made
+    kinds: Bytes = []
+    operands: [Int] = [] // the function's (its calls' arguments and results)
+    isConst: [Bool] = []
+    constValue: [Int] = []
+    home: [Int] = []
+    savedGpr: Int = 0
+    savedFpr: Int = 0
+    out: Int = 0 // bytes of the outgoing area at sp
+    frame: Int = 0 // bytes below x29
+    labelAt: [Int] = []
+    fixups: [Fixup] = []
+    epilogue: Int = 0
+    cold: [Cold] = []
+    uses: [Int] = []
+    sigs: [IrExtern] = [] // the C functions called through an address (HostCall's a): their slots
+}
+
+pub fn genArm64(p: IrProgram) -> MachineCode {
+    var g = Arm64(p.target, p.runtime, p.externs)
+    g.sigs = p.cSigs
+    var fnAt: [Int] = []
+    for (i, f) in p.fns.enumerate() {
+        g.align()
+        fnAt.push(g.here())
+        g.fnIndex = i
+        g.genFn(f)
+    }
+    let (enter, escape) = g.genTrampoline()
+    for fx in g.callFixups {
+        let rel = fnAt[fx.target] - fx.at
+        if fx.kind == .BranchLink {
+            g.patch(fx.at, rel / 4 & 0x3FFFFFF)
+        } else {
+            // adr x0, here, then the distance (any, to 2 GB): movz, movk x17, then add x0, x0, w17, sxtw
+            g.patch(fx.at + 4, rel & 0xFFFF << 5)
+            g.patch(fx.at + 8, rel >> 16 & 0xFFFF << 5)
+        }
+    }
+    MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape)
+}
+
+// ---- encoding ----
+fn Arm64.ins(var self, w: Int) {
+    self.code += le32(w)
+}
+
+fn Arm64.here(self) -> Int = len(self.code)
+
+fn Arm64.align(var self) {
+    while self.here() % 16 != 0 {
+        self.ins(nop)
+    }
+}
+
+// bits ORed into the word at `at`, once the code is done
+fn Arm64.patch(var self, at: Int, bits: Int) {
+    self.patches.push(Patch(at, bits, 4))
+}
+
+fn Arm64.movRR(var self, d: Int, s: Int) {
+    if d == s {
+        return
+    }
+    if d == sp or s == sp {
+        self.ins(0x91000000 | s << 5 | d) // add d, s, #0
+    } else {
+        self.ins(0xAA0003E0 | s << 16 | d) // orr d, xzr, s
+    }
+}
+
+fn Arm64.movImm(var self, d: Int, v: Int) {
+    var zeros = 0
+    var ones = 0
+    for i in 0..4 {
+        let h = v >> (16 * i) & 0xFFFF
+        if h == 0 {
+            zeros += 1
+        }
+        if h == 0xFFFF {
+            ones += 1
+        }
+    }
+    let inverted = ones > zeros // movn, then movk the halves that are not all ones
+    let skip = if inverted { 0xFFFF } else { 0 }
+    var first = true
+    var i = 0
+    while i < 4 {
+        var h = v >> (16 * i) & 0xFFFF
+        if h == skip and not (i == 3 and first) {
+            i += 1
+            continue
+        }
+        if first and i == 3 and h == skip {
+            // 0 or -1: one instruction
+            i = 0
+            h = v & 0xFFFF
+        }
+        if first {
+            if inverted {
+                self.ins(0x92800000 | i << 21 | ~h & 0xFFFF << 5 | d)
+            } else {
+                self.ins(0xD2800000 | i << 21 | h << 5 | d)
+            }
+            first = false
+        } else {
+            self.ins(0xF2800000 | i << 21 | h << 5 | d)
+        }
+        i += 1
+    }
+}
+
+// an address patched at load time: ldr d, =address (the 8 bytes follow, aligned, jumped over)
+fn Arm64.movReloc(var self, d: Int, kind: Int, target: Int) {
+    if self.target.objectMode {
+        // adrp d, entry; ldr d, [d, #lo12]: the address from the table (the object's relocations)
+        self.relocs.push(Reloc(self.here(), kind, target))
+        self.ins(0x90000000 | d)
+        self.ins(0xF9400000 | d << 5 | d)
+        return
+    }
+    if self.here() % 8 != 0 {
+        self.ins(nop) // the literal lands on 8 bytes
+    }
+    self.ins(0x58000000 | 2 << 5 | d) // ldr d, [pc + 8]
+    self.ins(0x14000003) // b +12
+    self.relocs.push(Reloc(self.here(), kind, target))
+    self.ins(0)
+    self.ins(0)
+}
+
+// d = n + k (n, d may be sp)
+fn Arm64.addImm(var self, d: Int, n: Int, k: Int) {
+    if k >= 0 and k < 4096 {
+        self.ins(0x91000000 | k << 10 | n << 5 | d)
+    } else if k < 0 and k > -4096 {
+        self.ins(0xD1000000 | -k << 10 | n << 5 | d)
+    } else {
+        self.movImm(x17, k)
+        self.ins(0x8B206000 | x17 << 16 | n << 5 | d) // add d, n, x17, uxtx
+    }
+}
+
+fn Arm64.add3(var self, d: Int, n: Int, m: Int, shift: Int) {
+    self.ins(0x8B000000 | m << 16 | shift << 10 | n << 5 | d)
+}
+
+fn Arm64.sub3(var self, d: Int, n: Int, m: Int) {
+    self.ins(0xCB000000 | m << 16 | n << 5 | d)
+}
+
+fn Arm64.mul3(var self, d: Int, n: Int, m: Int) {
+    self.ins(0x9B007C00 | m << 16 | n << 5 | d)
+}
+
+fn Arm64.cmpRR(var self, n: Int, m: Int) {
+    self.ins(0xEB00001F | m << 16 | n << 5)
+}
+
+fn Arm64.cset(var self, d: Int, cond: Int) {
+    self.ins(0x9A9F07E0 | (cond ^ 1) << 12 | d)
+}
+
+// ldr / str, 64 bits, of an x or a d register, at base + off
+fn Arm64.access(var self, load: Bool, fp: Bool, r: Int, base: Int, off: Int) {
+    if off >= 0 and off < 32768 and off % 8 == 0 {
+        let op = if fp {
+            if load { 0xFD400000 } else { 0xFD000000 }
+        } else if load {
+            0xF9400000
+        } else {
+            0xF9000000
+        }
+        self.ins(op | off / 8 << 10 | base << 5 | r)
+    } else if off >= -256 and off < 256 {
+        let op = if fp {
+            if load { 0xFC400000 } else { 0xFC000000 }
+        } else if load {
+            0xF8400000
+        } else {
+            0xF8000000
+        }
+        self.ins(op | off & 0x1FF << 12 | base << 5 | r)
+    } else {
+        let op = if fp {
+            if load { 0xFC606800 } else { 0xFC206800 }
+        } else if load {
+            0xF8606800
+        } else {
+            0xF8206800
+        }
+        self.movImm(x17, off)
+        self.ins(op | x17 << 16 | base << 5 | r)
+    }
+}
+
+fn Arm64.fmovToX(var self, x: Int, d: Int) {
+    self.ins(0x9E660000 | d << 5 | x)
+}
+
+fn Arm64.fmovToD(var self, d: Int, x: Int) {
+    self.ins(0x9E670000 | x << 5 | d)
+}
+
+fn Arm64.fmovDD(var self, d: Int, n: Int) {
+    if d != n {
+        self.ins(0x1E604000 | n << 5 | d)
+    }
+}
+
+fn Arm64.fixup(var self, target: Int, kind: FixKind, w: Int) {
+    self.fixups.push(Fixup(self.here(), target, kind))
+    self.ins(w)
+}
+
+fn Arm64.bLabel(var self, target: Int) {
+    self.fixup(target, .Branch, 0x14000000)
+}
+
+fn Arm64.bcondLabel(var self, cond: Int, target: Int) {
+    self.fixup(target, .BranchCond, 0x54000000 | cond)
+}
+
+// ---- where a virtual register lives ----
+fn Arm64.isK(self, v: Int) -> Bool = v >= 0 and self.isConst[v]
+
+fn Arm64.kOf(self, v: Int) -> Int = self.constValue[v]
+
+fn Arm64.inReg(self, v: Int) -> Bool = not self.isK(v) and self.home[v] >= 0
+
+fn Arm64.isFloat(self, v: Int) -> Bool = self.kinds[v] == 'F'
+
+fn Arm64.gprOf(self, v: Int) -> Int = self.home[v]
+
+fn Arm64.fprOf(self, v: Int) -> Int = self.home[v] - 32
+
+// from sp
+fn Arm64.slotOff(self, v: Int) -> Int = self.out + 8 * (-self.home[v] - 1)
+
+fn Arm64.loadBits(var self, x: Int, v: Int) {
+    if self.isK(v) {
+        self.movImm(x, self.kOf(v))
+    } else if self.inReg(v) {
+        if self.isFloat(v) {
+            self.fmovToX(x, self.fprOf(v))
+        } else {
+            self.movRR(x, self.gprOf(v))
+        }
+    } else {
+        self.access(true, false, x, sp, self.slotOff(v))
+    }
+}
+
+fn Arm64.storeBits(var self, v: Int, x: Int) {
+    if self.inReg(v) {
+        if self.isFloat(v) {
+            self.fmovToD(self.fprOf(v), x)
+        } else {
+            self.movRR(self.gprOf(v), x)
+        }
+    } else {
+        self.access(false, false, x, sp, self.slotOff(v))
+    }
+}
+
+fn Arm64.loadF(var self, d: Int, v: Int) {
+    if self.isK(v) {
+        self.movImm(x16, self.kOf(v))
+        self.fmovToD(d, x16)
+    } else if self.inReg(v) {
+        if self.isFloat(v) {
+            self.fmovDD(d, self.fprOf(v))
+        } else {
+            self.fmovToD(d, self.gprOf(v))
+        }
+    } else {
+        self.access(true, true, d, sp, self.slotOff(v))
+    }
+}
+
+fn Arm64.storeF(var self, v: Int, d: Int) {
+    if self.inReg(v) {
+        if self.isFloat(v) {
+            self.fmovDD(self.fprOf(v), d)
+        } else {
+            self.fmovToX(self.gprOf(v), d)
+        }
+    } else {
+        self.access(false, true, d, sp, self.slotOff(v))
+    }
+}
+
+// v in an x register: its own, or `scratch` loaded with it
+fn Arm64.gprIn(var self, v: Int, scratch: Int) -> Int {
+    if self.inReg(v) and not self.isFloat(v) {
+        return self.gprOf(v)
+    }
+    self.loadBits(scratch, v)
+    scratch
+}
+
+fn Arm64.fprIn(var self, v: Int, scratch: Int) -> Int {
+    if self.inReg(v) and self.isFloat(v) {
+        return self.fprOf(v)
+    }
+    self.loadF(scratch, v)
+    scratch
+}
+
+// where v's new value can be made: its own register, or the scratch one (then stored)
+fn Arm64.gprOut(self, v: Int, scratch: Int) -> Int = if self.inReg(v) and not self.isFloat(v) {
+    self.gprOf(v)
+} else {
+    scratch
+}
+
+fn Arm64.fprOut(self, v: Int, scratch: Int) -> Int = if self.inReg(v) and self.isFloat(v) {
+    self.fprOf(v)
+} else {
+    scratch
+}
+
+fn Arm64.doneGpr(var self, v: Int, r: Int) {
+    if not (self.inReg(v) and not self.isFloat(v) and self.gprOf(v) == r) {
+        self.storeBits(v, r)
+    }
+}
+
+fn Arm64.doneFpr(var self, v: Int, r: Int) {
+    if not (self.inReg(v) and self.isFloat(v) and self.fprOf(v) == r) {
+        self.storeF(v, r)
+    }
+}
+
+// ---- calls ----
+fn Arm64.callRuntime(var self, id: Int) {
+    self.movReloc(x16, relocRuntime, id)
+    self.ins(0xD63F0000 | x16 << 5) // blr x16
+}
+
+fn Arm64.markPanicFrame(var self) {
+    self.movReloc(x16, relocPanicFrame, 0)
+    self.access(false, false, fp, x16, 0) // str x29, [x16]
+}
+
+// The arguments of a call into C, from their homes to where AAPCS64 wants them.
+// A call's C slot kinds as AAPCS64 places them: 'I' an x register, 'F' a d register, 'S' the stack. A variadic
+// call's variadic values (from fixed on): Windows passes a Float in an x register, Apple every one on the stack.
+fn Arm64.cKinds(self, x: IrExtern, count: Int) -> Bytes {
+    if x.fixed < 0 {
+        return x.argKinds
+    }
+    var out: Bytes = []
+    for i in 0..count {
+        let k = kindAt(x.argKinds, i)
+        out.push(if i < x.fixed {
+            k
+        } else if self.target.apple {
+            'S'
+        } else if not self.target.sysv {
+            'I'
+        } else {
+            k
+        })
+    }
+    out
+}
+
+fn Arm64.cArguments(var self, args: [Int], kinds: Bytes) {
+    var ints = 0
+    var floats = 0
+    var stack = 0
+    for (i, arg) in args.enumerate() {
+        // past the registers: on the stack, in order
+        if kindAt(kinds, i) == 'S' {} else if kindAt(kinds, i) == 'F' {
+            floats += 1
+            if floats <= 8 {
+                continue
+            }
+        } else {
+            ints += 1
+            if ints <= 8 {
+                continue
+            }
+        }
+        self.loadBits(x16, arg)
+        self.access(false, false, x16, sp, 8 * stack)
+        stack += 1
+    }
+    ints = 0
+    floats = 0
+    for (i, arg) in args.enumerate() {
+        if kindAt(kinds, i) == 'S' {} else if kindAt(kinds, i) == 'F' {
+            if floats < 8 {
+                self.loadF(floats, arg)
+            }
+            floats += 1
+        } else {
+            if ints < 8 {
+                self.loadBits(ints, arg)
+            }
+            ints += 1
+        }
+    }
+}
+
+// how many of a call's arguments go on the stack
+fn stackArgs(kinds: Bytes, count: Int) -> Int {
+    var ints = 0
+    var floats = 0
+    var stack = 0
+    for i in 0..count {
+        if kindAt(kinds, i) == 'S' {
+            stack += 1
+        } else if kindAt(kinds, i) == 'F' {
+            floats += 1
+            if floats > 8 {
+                stack += 1
+            }
+        } else {
+            ints += 1
+            if ints > 8 {
+                stack += 1
+            }
+        }
+    }
+    stack
+}
+
+// b.cond (or cbz with word), patched by emitCold
+fn Arm64.coldJump(var self, cond: Int, code: Int, line: Int, a: Int, b: Int) {
+    self.coldWord(0x54000000 | cond, code, line, a, b)
+}
+
+fn Arm64.coldWord(var self, w: Int, code: Int, line: Int, a: Int, b: Int) {
+    self.cold.push(Cold(self.here(), code, line, a, b, self.inl))
+    self.ins(w)
+}
+
+// x2, x3 hold what it reports: rtPanic(code, line, x2, x3), the Quark way (in the outgoing area, four words at
+// least), never back
+fn Arm64.panicCall(var self, code: Int, line: Int) {
+    self.markPanicFrame()
+    self.access(false, false, x2, sp, 16)
+    self.access(false, false, x3, sp, 24)
+    self.movImm(x16, code)
+    self.access(false, false, x16, sp, 0)
+    self.movImm(x16, line)
+    self.access(false, false, x16, sp, 8)
+    self.callRuntime(rtPanic)
+}
+
+fn Arm64.emitCold(var self) {
+    let cold = self.cold
+    self.cold = []
+    for c in cold {
+        self.patch(c.at, (self.here() - c.at) / 4 & 0x7FFFF << 5)
+        if c.a >= 0 { self.loadBits(x2, c.a) } else { self.movImm(x2, 0) }
+        if c.b >= 0 { self.loadBits(x3, c.b) } else { self.movImm(x3, 0) }
+        self.panicCall(c.code, c.line | c.inl << 32)
+    }
+}
+
+// ---- SIMD (release's vector loops): NEON, two lanes of 64 bits ----
+// release keeps few enough vector registers for each to have a register
+fn Arm64.vecReg(self, v: Int) -> Int {
+    if not self.inReg(v) {
+        panic("quark: internal error: a vector register has no register")
+    }
+    self.fprOf(v)
+}
+
+fn Arm64.neon3(var self, op: Int, d: Int, n: Int, m: Int) {
+    self.ins(op | m << 16 | n << 5 | d)
+}
+
+fn Arm64.genVector(var self, ins: IrIns) {
+    match ins.op {
+        Vload | Vstore => {
+            // ldur / stur q, [a + b * 8 + c]
+            let base = self.gprIn(ins.a, x1)
+            var off = ins.c
+            var addr = base
+            if self.isK(ins.b) {
+                off += self.kOf(ins.b) * ins.imm
+            } else {
+                self.add3(x3, base, self.gprIn(ins.b, x2), 3)
+                addr = x3
+            }
+            if off < -256 or off > 255 {
+                self.addImm(x3, addr, off)
+                addr = x3
+                off = 0
+            }
+            let q = self.vecReg(ins.dst)
+            self.ins((if ins.op == .Vload { 0x3CC00000 } else { 0x3C800000 }) | off & 0x1FF << 12 | addr << 5 | q)
+        }
+        Vsplat => {
+            let d = self.vecReg(ins.dst)
+            if self.isFloat(ins.a) {
+                self.ins(0x4E080400 | self.fprIn(ins.a, d0) << 5 | d) // dup v.2d, v.d[0]
+            } else {
+                self.ins(0x4E080C00 | self.gprIn(ins.a, x0) << 5 | d) // dup v.2d, x
+            }
+        }
+        Vlane => {
+            let n = self.vecReg(ins.a)
+            let l = ins.c & 1
+            if self.isFloat(ins.dst) {
+                // dup d, v.d[l]
+                let d = self.fprOut(ins.dst, d0)
+                self.ins(0x5E080400 | l << 20 | n << 5 | d)
+                self.doneFpr(ins.dst, d)
+            } else {
+                // umov x, v.d[l]
+                let d = self.gprOut(ins.dst, x0)
+                self.ins(0x4E083C00 | l << 20 | n << 5 | d)
+                self.doneGpr(ins.dst, d)
+            }
+        }
+        Vop => self.genVop(ins)
+        _ => {}
+    }
+}
+
+fn Arm64.genVop(var self, ins: IrIns) {
+    let d = self.vecReg(ins.dst)
+    let a = self.vecReg(ins.a)
+    let b = if ins.b >= 0 { self.vecReg(ins.b) } else { 0 }
+    let op = opOf(ins.imm)
+    match op {
+        Fadd => self.neon3(0x4E60D400, d, a, b)
+        Fsub => self.neon3(0x4EE0D400, d, a, b)
+        Fmul => self.neon3(0x6E60DC00, d, a, b)
+        Fdiv => self.neon3(0x6E60FC00, d, a, b)
+        Fmin => self.neon3(0x4EE0F400, d, a, b)
+        Fmax => self.neon3(0x4E60F400, d, a, b)
+        Add => self.neon3(0x4EE08400, d, a, b)
+        Sub => self.neon3(0x6EE08400, d, a, b)
+        And => self.neon3(0x4E201C00, d, a, b)
+        Or => self.neon3(0x4EA01C00, d, a, b)
+        Xor => self.neon3(0x6E201C00, d, a, b)
+        Not => self.neon3(0x4E601C00, d, a, b)
+        // bic: a & ~b
+        Sqrt => self.ins(0x6EE1F800 | a << 5 | d)
+        Shl => self.ins(0x4F405400 | ins.c & 63 << 16 | a << 5 | d)
+        Cmp | Fcmp => {
+            // all ones where it holds; NaN: false, but for !=
+            let fl = op == .Fcmp
+            let eqOp = if fl { 0x4E60E400 } else { 0x6EE08C00 }
+            let gtOp = if fl { 0x6EE0E400 } else { 0x4EE03400 }
+            let geOp = if fl { 0x6E60E400 } else { 0x4EE03C00 }
+            match ins.cond {
+                0 => self.neon3(eqOp, d, a, b)
+                1 => {
+                    self.neon3(eqOp, d, a, b)
+                    self.ins(0x6E205800 | d << 5 | d) // mvn
+                }
+                2 => self.neon3(gtOp, d, b, a)
+                3 => self.neon3(geOp, d, b, a)
+                4 => self.neon3(gtOp, d, a, b)
+                _ => self.neon3(geOp, d, a, b)
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---- one instruction ----
+// The address [a + b * imm + c] as (base register, offset)
+fn Arm64.addressOf(var self, ins: IrIns) -> (Int, Int) {
+    let base = self.gprIn(ins.a, x1)
+    if self.isK(ins.b) {
+        return (base, self.kOf(ins.b) * ins.imm + ins.c)
+    }
+    let idx = self.gprIn(ins.b, x2)
+    if ins.imm == 8 {
+        self.add3(x3, base, idx, 3)
+    } else if ins.imm == 1 {
+        self.add3(x3, base, idx, 0)
+    } else {
+        self.movImm(x17, ins.imm)
+        self.mul3(x3, idx, x17)
+        self.add3(x3, base, x3, 0)
+    }
+    (x3, ins.c)
+}
+
+// x / d and x % d by a positive constant, floored: a shift and a mask for a power of two, else smulh by the magic
+// number, then the remainder's sign fixed (a division takes 7 to 20 cycles on ARM, this 3 or 4).
+fn Arm64.divideByConstant(var self, ins: IrIns) {
+    let d = self.kOf(ins.b)
+    let quotient = ins.op == .Div
+    let n = self.gprIn(ins.a, x0)
+    let out = self.gprOut(ins.dst, x2)
+    if d == 1 {
+        if quotient { self.movRR(out, n) } else { self.movImm(out, 0) }
+        self.doneGpr(ins.dst, out)
+        return
+    }
+    if d & (d - 1) == 0 {
+        if quotient {
+            self.ins(0x9340FC00 | log2(d) << 16 | n << 5 | out) // asr: rounds down
+        } else {
+            // and out, n, d - 1
+            self.movImm(x17, d - 1)
+            self.ins(0x8A000000 | x17 << 16 | n << 5 | out)
+        }
+        self.doneGpr(ins.dst, out)
+        return
+    }
+    let (m, shift) = magic(d)
+    self.movImm(x17, m)
+    self.ins(0x9B407C00 | x17 << 16 | n << 5 | x2) // smulh x2, n, m
+    if m < 0 {
+        self.add3(x2, x2, n, 0)
+    }
+    if shift > 0 {
+        self.ins(0x9340FC00 | shift << 16 | x2 << 5 | x2) // asr x2, x2, shift
+    }
+    if ins.cond & divNonNeg != 0 {
+        // n >= 0: the truncated quotient is the floored one
+        if not quotient {
+            self.movImm(x17, d)
+            self.ins(0x9B008000 | x17 << 16 | n << 10 | x2 << 5 | x3) // x3 = n - x2 * d
+        }
+        self.storeBits(ins.dst, if quotient { x2 } else { x3 })
+        return
+    }
+    self.ins(0x8B400000 | n << 16 | 63 << 10 | x2 << 5 | x2) // add x2, x2, n, lsr #63
+    self.movImm(x17, d)
+    self.ins(0x9B008000 | x17 << 16 | n << 10 | x2 << 5 | x3) // x3 = n - x2 * d
+    self.ins(0xB6F80000 | 3 << 5 | x3) // tbz x3, #63: not below 0
+    self.ins(0xD1000442) // sub x2, x2, #1
+    self.add3(x3, x3, x17, 0) // add x3, x3, d
+    self.storeBits(ins.dst, if quotient { x2 } else { x3 })
+}
+
+fn Arm64.compare(var self, ins: IrIns) {
+    let a = self.gprIn(ins.a, x0)
+    if self.isK(ins.b) and self.kOf(ins.b) >= 0 and self.kOf(ins.b) < 4096 {
+        self.ins(0xF100001F | self.kOf(ins.b) << 10 | a << 5) // cmp a, #k
+    } else if self.isK(ins.b) and self.kOf(ins.b) < 0 and self.kOf(ins.b) > -4096 {
+        self.ins(0xB100001F | -self.kOf(ins.b) << 10 | a << 5) // cmn a, #-k
+    } else {
+        self.cmpRR(a, self.gprIn(ins.b, x1))
+    }
+}
+
+fn Arm64.fcompare(var self, ins: IrIns) {
+    let a = self.fprIn(ins.a, d0)
+    let b = self.fprIn(ins.b, d1)
+    self.ins(0x1E602000 | b << 16 | a << 5) // fcmp a, b
+}
+
+fn Arm64.genIns(var self, ins: IrIns) {
+    self.inl = ins.inl
+    match ins.op {
+        Const => {
+            if self.isK(ins.dst) {
+                return
+            }
+            if ins.c == 1 {
+                self.movReloc(x0, relocData, ins.imm)
+                self.storeBits(ins.dst, x0)
+            } else if ins.c == 2 {
+                // a function kept as a value: its distance from here (code may be past adr's megabyte)
+                self.callFixups.push(Fixup(self.here(), ins.imm, .Adr))
+                self.ins(0x10000000 | x0) // adr x0, here
+                self.ins(0xD2800000 | x17) // movz x17, distance & 0xFFFF
+                self.ins(0xF2A00000 | x17) // movk x17, distance >> 16, lsl 16
+                self.ins(0x8B20C000 | x17 << 16 | x0 << 5 | x0) // add x0, x0, w17, sxtw
+                self.storeBits(ins.dst, x0)
+            } else if self.isFloat(ins.dst) {
+                self.movImm(x0, ins.imm)
+                self.storeBits(ins.dst, x0)
+            } else {
+                let d = self.gprOut(ins.dst, x0)
+                self.movImm(d, ins.imm)
+                self.doneGpr(ins.dst, d)
+            }
+        }
+        Mov => {
+            if self.kinds[ins.dst] == 'V' {
+                // orr v.16b
+                let d = self.vecReg(ins.dst)
+                let a = self.vecReg(ins.a)
+                self.ins(0x4EA01C00 | a << 16 | a << 5 | d)
+            } else if self.isFloat(ins.dst) {
+                let d = self.fprOut(ins.dst, d0)
+                self.loadF(d, ins.a)
+                self.doneFpr(ins.dst, d)
+            } else {
+                let d = self.gprOut(ins.dst, x0)
+                self.loadBits(d, ins.a)
+                self.doneGpr(ins.dst, d)
+            }
+        }
+        Add | Sub | Mul => self.genArith(ins)
+        Div | Mod => self.genDivide(ins)
+        And | Or | Xor | Shl | Sar => {
+            // and, orr, eor, lslv, asrv (the count modulo 64)
+            let op = match ins.op {
+                And => 0x8A000000
+                Or => 0xAA000000
+                Xor => 0xCA000000
+                Shl => 0x9AC02000
+                _ => 0x9AC02800
+            }
+            let a = self.gprIn(ins.a, x0)
+            let b = self.gprIn(ins.b, x1)
+            let d = self.gprOut(ins.dst, x0)
+            self.ins(op | b << 16 | a << 5 | d)
+            self.doneGpr(ins.dst, d)
+        }
+        Neg => {
+            let a = self.gprIn(ins.a, x0)
+            let d = self.gprOut(ins.dst, x0)
+            self.sub3(d, xzr, a)
+            self.doneGpr(ins.dst, d)
+        }
+        Fadd | Fsub | Fmul | Fdiv | Fmin | Fmax => {
+            let op = match ins.op {
+                Fadd => 0x1E602800
+                Fsub => 0x1E603800
+                Fmul => 0x1E600800
+                Fdiv => 0x1E601800
+                Fmin => 0x1E605800
+                _ => 0x1E604800
+            }
+            let a = self.fprIn(ins.a, d0)
+            let b = self.fprIn(ins.b, d1)
+            let d = self.fprOut(ins.dst, d0)
+            self.ins(op | b << 16 | a << 5 | d)
+            self.doneFpr(ins.dst, d)
+        }
+        Fneg | Sqrt => {
+            let a = self.fprIn(ins.a, d0)
+            let d = self.fprOut(ins.dst, d0)
+            self.ins((if ins.op == .Fneg { 0x1E614000 } else { 0x1E61C000 }) | a << 5 | d)
+            self.doneFpr(ins.dst, d)
+        }
+        Cmp => {
+            self.compare(ins)
+            let d = self.gprOut(ins.dst, x0)
+            self.cset(d, intCond[ins.cond])
+            self.doneGpr(ins.dst, d)
+        }
+        Fcmp => {
+            self.fcompare(ins)
+            let d = self.gprOut(ins.dst, x0)
+            self.cset(d, floatCond[ins.cond])
+            self.doneGpr(ins.dst, d)
+        }
+        Not => {
+            let a = self.gprIn(ins.a, x0)
+            self.ins(0xF100001F | a << 5) // cmp a, #0
+            let d = self.gprOut(ins.dst, x0)
+            self.cset(d, eq)
+            self.doneGpr(ins.dst, d)
+        }
+        IntToFloat => {
+            let a = self.gprIn(ins.a, x0)
+            let d = self.fprOut(ins.dst, d0)
+            self.ins(0x9E620000 | a << 5 | d) // scvtf
+            self.doneFpr(ins.dst, d)
+        }
+        FloatToInt => {
+            let a = self.fprIn(ins.a, d0)
+            let d = self.gprOut(ins.dst, x0)
+            self.ins(0x9E780000 | a << 5 | d) // fcvtzs
+            if ins.cond != 0 {
+                // too big: the limits (saturated); NaN: unordered with itself
+                self.ins(0x1E602000 | a << 16 | a << 5) // fcmp a, a
+                self.coldJump(vs, panicTooBig, ins.line, -1, -1)
+                self.ins(0xF100041F | d << 5) // cmp d, #1: overflows on the minimum
+                self.coldJump(vs, panicTooBig, ins.line, -1, -1)
+                self.ins(0xB100041F | d << 5) // cmn d, #1: overflows on the maximum
+                self.coldJump(vs, panicTooBig, ins.line, -1, -1)
+            }
+            self.doneGpr(ins.dst, d)
+        }
+        Round => {
+            // nearest (ties to even), floor, ceil: as SSE4.1's roundsd; 3: fcvt s, d (to C's float), 4: back
+            let op = match ins.imm {
+                1 => 0x1E654000
+                // frintm
+                2 => 0x1E64C000
+                // frintp
+                3 => 0x1E624000
+                4 => 0x1E22C000
+                _ => 0x1E644000
+            }
+            // frintn
+            let a = self.fprIn(ins.a, d0)
+            let d = self.fprOut(ins.dst, d0)
+            self.ins(op | a << 5 | d)
+            self.doneFpr(ins.dst, d)
+        }
+        Load | Store => self.genMemory(ins)
+        Bounds => {
+            // a (index) < b (length), unsigned
+            let a = self.gprIn(ins.a, x0)
+            if self.isK(ins.b) and self.kOf(ins.b) >= 0 and self.kOf(ins.b) < 4096 {
+                self.ins(0xF100001F | self.kOf(ins.b) << 10 | a << 5)
+            } else {
+                self.cmpRR(a, self.gprIn(ins.b, x1))
+            }
+            self.coldJump(hs, ins.imm, ins.line, ins.a, ins.b)
+        }
+        Label => {
+            self.labelAt[ins.imm] = self.here()
+        }
+        Jmp => self.bLabel(ins.imm)
+        Jz | Jnz => {
+            let a = self.gprIn(ins.a, x0)
+            self.fixup(ins.imm, .Cbz, (if ins.op == .Jz { 0xB4000000 } else { 0xB5000000 }) | a)
+        }
+        Call => {
+            for i in 0..ins.argCount {
+                let arg = self.operands[ins.from + i]
+                self.loadBits(x16, arg)
+                self.access(false, false, x16, sp, 8 * i)
+            }
+            if ins.a >= 0 {
+                // blr: a function kept as a value
+                self.loadBits(x16, ins.a)
+                self.ins(0xD63F0000 | x16 << 5)
+            } else {
+                self.callFixups.push(Fixup(self.here(), ins.imm, .BranchLink))
+                self.ins(0x94000000)
+            }
+            self.sites.push(CallSite(self.here(), ins.line, self.fnIndex, int32(ins.imm), ins.inl))
+            for i in 0..ins.retCount {
+                let r = self.operands[ins.from + ins.argCount + i]
+                self.access(true, false, x16, sp, 8 * i)
+                self.storeBits(r, x16)
+            }
+        }
+        RtCall => {
+            // the runtime's Quark function, called the Quark way (the context register goes along)
+            if ins.imm == rtFail or self.target.checks and countingCall(ins.imm) {
+                self.markPanicFrame()
+            }
+            for i in 0..ins.argCount {
+                let arg = self.operands[ins.from + i]
+                self.loadBits(x16, arg)
+                self.access(false, false, x16, sp, 8 * i)
+            }
+            self.callRuntime(ins.imm)
+            for i in 0..ins.retCount {
+                let r = self.operands[ins.from + ins.argCount + i]
+                self.access(true, false, x16, sp, 8 * i)
+                self.storeBits(r, x16)
+            }
+        }
+        Ctx => {
+            if ins.cond == 1 {
+                self.loadBits(28, ins.a)
+            } else {
+                self.storeBits(ins.dst, 28)
+            }
+        }
+        HostCall => self.genHostCall(ins)
+        Ret => {
+            for i in 0..ins.argCount {
+                let arg = self.operands[ins.from + i]
+                self.loadBits(x16, arg)
+                self.access(false, false, x16, fp, 16 + 8 * i)
+            }
+            self.bLabel(self.epilogue)
+        }
+        Fuel => {
+            self.movReloc(x16, relocFuel, 0)
+            self.access(true, false, x17, x16, 0)
+            self.ins(0xF1000400 | x17 << 5 | x17) // subs x17, x17, #1
+            self.access(false, false, x17, x16, 0)
+            self.coldJump(mi, panicFuel, ins.line, -1, -1)
+        }
+        Nop => {}
+        Vload | Vstore | Vsplat | Vop | Vlane | Vend => self.genVector(ins)
+    }
+}
+
+fn Arm64.genArith(var self, ins: IrIns) {
+    let a = self.gprIn(ins.a, x0)
+    let d = self.gprOut(ins.dst, x0)
+    if ins.cond != 0 {
+        // checked: past the limits, a panic
+        let b = self.gprIn(ins.b, x1)
+        if ins.op == .Mul {
+            self.ins(0x9B407C00 | b << 16 | a << 5 | x17) // smulh x17, a, b
+            self.mul3(d, a, b)
+            self.ins(0xEB80001F | d << 16 | 63 << 10 | x17 << 5) // cmp x17, d, asr #63
+            self.coldJump(ne, panicOverflow, ins.line, -1, -1)
+        } else {
+            self.ins((if ins.op == .Add {
+                0xAB000000 // adds / subs
+            } else {
+                0xEB000000
+            }) | b << 16 | a << 5 | d)
+            self.coldJump(vs, panicOverflow, ins.line, -1, -1)
+        }
+        self.doneGpr(ins.dst, d)
+        return
+    }
+    let isK = self.isK(ins.b)
+    let k = if isK { self.kOf(ins.b) } else { 0 }
+    if ins.op != .Mul and isK and k > -4096 and k < 4096 {
+        self.addImm(d, a, if ins.op == .Add { k } else { -k })
+    } else if ins.op == .Mul and isK and k > 0 and k & (k - 1) == 0 {
+        // x * 2^n: lsl
+        let n = log2(k)
+        self.ins(0xD3400000 | (64 - n) & 63 << 16 | (63 - n) << 10 | a << 5 | d)
+    } else if ins.op == .Mul and isK and k is 3 | 5 | 9 {
+        // x + x * 2^n
+        self.add3(d, a, a, if k == 3 {
+            1
+        } else if k == 5 {
+            2
+        } else {
+            3
+        })
+    } else {
+        let b = self.gprIn(ins.b, x1)
+        match ins.op {
+            Add => self.add3(d, a, b, 0)
+            Sub => self.sub3(d, a, b)
+            _ => self.mul3(d, a, b)
+        }
+    }
+    self.doneGpr(ins.dst, d)
+}
+
+// floored: the quotient rounds down, the remainder takes the divisor's sign
+fn Arm64.genDivide(var self, ins: IrIns) {
+    if self.isK(ins.b) and self.kOf(ins.b) >= 1 {
+        // by a constant: a multiplication by its magic number
+        self.divideByConstant(ins)
+        return
+    }
+    self.loadBits(x0, ins.a)
+    self.loadBits(x1, ins.b)
+    let quotient = ins.op == .Div
+    if ins.cond & divNonNeg != 0 {
+        // a >= 0, b >= 1: no zero, no sign to fix
+        self.ins(0x9AC00C00 | x1 << 16 | x0 << 5 | x2) // sdiv
+        if not quotient {
+            self.ins(0x9B008000 | x1 << 16 | x0 << 10 | x2 << 5 | x3)
+        }
+        self.storeBits(ins.dst, if quotient { x2 } else { x3 })
+        return
+    }
+    if not (self.isK(ins.b) and self.kOf(ins.b) != 0) {
+        // cbz x1: division by zero
+        self.coldWord(0xB4000000 | x1, panicDivide, ins.line, -1, -1)
+    }
+    self.ins(0x9AC00C00 | x1 << 16 | x0 << 5 | x2) // sdiv x2, x0, x1
+    self.ins(0x9B008000 | x1 << 16 | x0 << 10 | x2 << 5 | x3) // msub x3 = x0 - x2 * x1
+    self.ins(0xB4000000 | 5 << 5 | x3) // cbz x3, past the adjustment
+    self.ins(0xCA000000 | x1 << 16 | x3 << 5 | x4) // eor x4, x3, x1
+    self.ins(0xB6F80000 | 3 << 5 | x4) // tbz x4, #63, +3 words
+    self.ins(0xD1000400 | x2 << 5 | x2) // sub x2, x2, #1
+    self.add3(x3, x3, x1, 0) // add x3, x3, x1
+    self.storeBits(ins.dst, if quotient { x2 } else { x3 })
+}
+
+fn Arm64.genMemory(var self, ins: IrIns) {
+    let v = ins.dst
+    let load = ins.op == .Load
+    if ins.cond == memF32 or ins.cond == memF32Bits {
+        // a C float: ldr / str s, [address, x17] (fcvt to a double)
+        let (base, off) = self.addressOf(ins)
+        self.movImm(x17, off)
+        if load {
+            let d = self.fprOut(v, d0)
+            self.ins(0xBC606800 | x17 << 16 | base << 5 | d)
+            if ins.cond == memF32 {
+                self.ins(0x1E22C000 | d << 5 | d) // fcvt d, s
+            }
+            self.doneFpr(v, d)
+        } else {
+            var d = self.fprIn(v, d0)
+            if ins.cond == memF32 {
+                self.ins(0x1E624000 | d << 5 | d1) // fcvt s1, d
+                d = d1
+            }
+            self.ins(0xBC206800 | x17 << 16 | base << 5 | d)
+        }
+        return
+    }
+    if ins.cond != 0 {
+        // 1, 2 or 4 bytes: ldrb ldrsb ldrh ldrsh ldr w ldrsw / strb strh str w, [address, x17]
+        let loads = [0, 0x38606800, 0x38A06800, 0x78606800, 0x78A06800, 0xB8606800, 0xB8A06800]
+        let stores = [0, 0x38206800, 0x38206800, 0x78206800, 0x78206800, 0xB8206800, 0xB8206800]
+        let (base, off) = self.addressOf(ins)
+        let r = if self.inReg(v) and not self.isFloat(v) { self.gprOf(v) } else { x0 }
+        if not load and r == x0 {
+            self.loadBits(x0, v)
+        }
+        self.movImm(x17, off)
+        self.ins((if load { loads[ins.cond] } else { stores[ins.cond] }) | x17 << 16 | base << 5 | r)
+        if load and r == x0 {
+            self.storeBits(v, x0)
+        }
+        return
+    }
+    if ins.imm == 8 and ins.c == 0 and not self.isK(ins.b) {
+        // ldr / str v, [a, b, lsl #3]
+        let base = self.gprIn(ins.a, x1)
+        let idx = self.gprIn(ins.b, x2)
+        let inFpr = self.isFloat(v) and self.inReg(v)
+        let r = if self.inReg(v) {
+            if inFpr { self.fprOf(v) } else { self.gprOf(v) }
+        } else {
+            x0
+        }
+        if not load and not self.inReg(v) {
+            self.loadBits(x0, v)
+        }
+        let op = if inFpr {
+            if load { 0xFC607800 } else { 0xFC207800 }
+        } else if load {
+            0xF8607800
+        } else {
+            0xF8207800
+        }
+        self.ins(op | idx << 16 | base << 5 | r)
+        if load and not self.inReg(v) {
+            self.storeBits(v, x0)
+        }
+        return
+    }
+    let (base, off) = self.addressOf(ins)
+    if self.isFloat(v) and self.inReg(v) {
+        self.access(load, true, self.fprOf(v), base, off)
+    } else if not self.isFloat(v) and self.inReg(v) {
+        self.access(load, false, self.gprOf(v), base, off)
+    } else if load {
+        self.access(true, false, x0, base, off)
+        self.storeBits(v, x0)
+    } else {
+        self.loadBits(x0, v)
+        self.access(false, false, x0, base, off)
+    }
+}
+
+fn Arm64.genHostCall(var self, ins: IrIns) {
+    let through = ins.a >= 0 // a C function value: its address in a, its slots in sigs
+    let x = if through { self.sigs[ins.imm] } else { self.externs[ins.imm] }
+    if through {
+        self.loadBits(x17, ins.a) // before the arguments (their stack ones go through x16)
+    }
+    let retCount = ins.retCount
+    let allFloat = retCount > 0 and (0..retCount).all(i => kindAt(x.retKinds, i) == 'F')
+    let hfa = allFloat and retCount <= 4 // d0-d3
+    let inRegs = not x.retHidden and (hfa or retCount <= 2) // x0, x1 (a 16-byte record's bytes)
+    let kinds = self.cKinds(x, ins.argCount)
+    let buffer = 8 * stackArgs(kinds, ins.argCount) // past the stack arguments: room for the record
+    self.cArguments(self.operands[ins.from..ins.from + ins.argCount], kinds)
+    if not inRegs {
+        self.addImm(x8, sp, buffer)
+    }
+    if through {
+        self.ins(0xD63F0000 | x17 << 5) // blr x17
+    } else {
+        self.movReloc(x16, relocHost, ins.imm)
+        self.ins(0xD63F0000 | x16 << 5) // blr x16
+    }
+    if not inRegs {
+        for i in 0..ins.retCount {
+            let r = self.operands[ins.from + ins.argCount + i]
+            self.access(true, false, x16, sp, buffer + 8 * i)
+            self.storeBits(r, x16)
+        }
+    } else if hfa {
+        for i in (0..retCount).map(i => retCount - 1 - i) {
+            self.storeF(self.operands[ins.from + ins.argCount + i], i)
+        }
+    } else if retCount == 1 and kindAt(x.retKinds, 0) == 'F' {
+        self.storeF(self.operands[ins.from + ins.argCount + 0], d0)
+    } else {
+        for i in (0..retCount).map(i => retCount - 1 - i) {
+            // x1 first: x0 is read last
+            self.storeBits(self.operands[ins.from + ins.argCount + i], i)
+        }
+    }
+}
+
+// A comparison whose only reader is the jump right after it: one compare, one conditional branch.
+fn Arm64.fusedBranch(var self, c: IrIns, j: IrIns) -> Bool {
+    if c.op != .Cmp and c.op != .Fcmp or j.op != .Jz and j.op != .Jnz {
+        return false
+    }
+    if j.a != c.dst or self.uses[c.dst] != 1 {
+        return false
+    }
+    let whenTrue = j.op == .Jnz
+    self.inl = c.inl
+    if c.op == .Cmp {
+        self.compare(c)
+        self.bcondLabel(if whenTrue { intCond[c.cond] } else { intCond[c.cond] ^ 1 }, j.imm)
+    } else {
+        self.fcompare(c)
+        self.bcondLabel(if whenTrue { floatCond[c.cond] } else { floatNotCond[c.cond] }, j.imm)
+    }
+    true
+}
+
+// ---- registers ----
+// Linear scan, as on x86-64: a register belongs to a virtual register only while it is alive (stretched over the
+// loops it is alive across); a value no call crosses takes a register calls may change. Gives the slots.
+fn Arm64.allocate(var self, f: IrFn) -> Int {
+    let n = len(f.kinds)
+    let (first, last) = liveRanges(f)
+    var home = [noHome] * n
+    let order = (0..n)
+        .filter(v => last[v] >= 0 and not f.isConst[v] and f.weight[v] > 0)
+        .sortedBy(v => first[v])
+    let pools = [
+        [9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+        [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 8, 9, 10, 11, 12, 13, 14, 15],
+    ]
+    // (x28 holds the machine's context)
+    let volatileCount = [7, 16]
+    let crosses = aliveAt(f, first, last, ins => ins.op is Call | RtCall | HostCall, true)
+    var owner = [[-1] * 17, [-1] * 24]
+    self.savedGpr = 0
+    self.savedFpr = 0
+    for v in order {
+        let c = if f.kinds[v] is 'F' | 'V' { 1 } else { 0 }
+        let pool = pools[c]
+        let from = if crosses[v] { volatileCount[c] } else { 0 }
+        var pick = -1
+        for r in 0..len(pool) {
+            var o = owner[c][r]
+            if o >= 0 and last[o] < first[v] {
+                owner[c][r] = -1
+                o = -1
+            }
+            if o < 0 and pick < 0 and r >= from {
+                pick = r
+            }
+        }
+        if pick < 0 {
+            var lightest = -1
+            for r in from..len(pool) {
+                if lightest < 0 or f.weight[owner[c][r]] < f.weight[owner[c][lightest]] {
+                    lightest = r
+                }
+            }
+            if lightest >= 0 and f.weight[owner[c][lightest]] < f.weight[v] {
+                home[owner[c][lightest]] = noHome
+                pick = lightest
+            }
+        }
+        if pick < 0 {
+            continue
+        }
+        owner[c][pick] = v
+        home[v] = (if c == 1 { 32 } else { 0 }) + pool[pick]
+        if pick >= volatileCount[c] {
+            let saved = pick - volatileCount[c] + 1
+            if c == 1 {
+                self.savedFpr = max(self.savedFpr, saved)
+            } else {
+                self.savedGpr = max(self.savedGpr, saved)
+            }
+        }
+    }
+    var slots = 0
+    for v in 0..n {
+        if home[v] == noHome {
+            slots += 1
+            home[v] = -slots
+        }
+    }
+    self.home = home
+    slots
+}
+
+// ---- functions ----
+// A C entry's start (AAPCS64): C's arguments (x0-x7, d0-d7, then the stack; a record's hidden address in x8) to the
+// outgoing area, a call to the Quark body that follows, its results to x0-x1 or d0-d3. The body keeps x19-x28 and
+// d8-d15, as C expects. Gives where the bl is.
+fn Arm64.cEntryStub(var self, f: IrFn, cArgs: Bytes) -> Int {
+    let n = len(f.params)
+    let slots = max(n, f.resultCount)
+    let area = (8 * max(slots, 1) + 15) & ~15
+    self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+    self.movRR(fp, sp)
+    self.ins(0xF81F0FFC) // str x28, [sp, #-16]!: C's, given back
+    self.ins(0xAA1F03FC) // mov x28, xzr: no context yet (the runtime finds it when it needs it)
+    self.addImm(sp, sp, -area)
+    var ints = 0
+    var floats = 0
+    var stack = 0
+    for k in 0..n {
+        let kind = kindAt(cArgs, k)
+        if k == 0 and f.cHidden {
+            self.access(false, false, x8, sp, 0)
+        } else if kind == 'F' and floats < 8 {
+            self.access(false, true, floats, sp, 8 * k)
+            floats += 1
+        } else if kind == 'I' and ints < 8 {
+            self.access(false, false, ints, sp, 8 * k)
+            ints += 1
+        } else {
+            self.access(true, false, x16, fp, 16 + 8 * stack)
+            stack += 1
+            self.access(false, false, x16, sp, 8 * k)
+        }
+    }
+    let at = self.here()
+    self.ins(0x94000000) // bl the body
+    var ri = 0
+    var rf = 0
+    for k in 0..f.resultCount {
+        if kindAt(f.cRets, k) == 'F' {
+            self.access(true, true, rf, sp, 8 * k)
+            rf += 1
+        } else {
+            self.access(true, false, ri, sp, 8 * k)
+            ri += 1
+        }
+    }
+    self.access(true, false, 28, fp, -16) // C's x28 back
+    self.movRR(sp, fp)
+    self.ins(0xA8C17BFD) // ldp x29, x30, [sp], #16
+    self.ins(ret)
+    at
+}
+
+// std.machine's built-ins, called the Quark way: arguments at [sp], [sp + 8], a result written at [sp].
+// switchStack(save, load): sp, x29, x30, x19-x28, d8-d15 (21 words) into save, the same from load, then ret (to
+// load's x30, on its stack). frame(): x29. cpu(): 0 (its bits are x86-64's). call(f, a, b, c, d): C's call of f
+// with x0-x3; x0 written back.
+fn Arm64.genMachine(var self, kind: Int) {
+    if kind == machineSwitchStack {
+        self.access(true, false, x0, sp, 0)
+        self.access(true, false, x1, sp, 8)
+        self.movRR(x2, sp)
+        self.access(false, false, x2, x0, 0)
+        self.access(false, false, fp, x0, 8)
+        self.access(false, false, lr, x0, 16)
+        for i in 0..10 {
+            self.access(false, false, 19 + i, x0, 24 + 8 * i)
+        }
+        for i in 0..8 {
+            self.access(false, true, 8 + i, x0, 104 + 8 * i)
+        }
+        self.access(true, false, x2, x1, 0)
+        self.movRR(sp, x2)
+        self.access(true, false, fp, x1, 8)
+        self.access(true, false, lr, x1, 16)
+        for i in 0..10 {
+            self.access(true, false, 19 + i, x1, 24 + 8 * i)
+        }
+        for i in 0..8 {
+            self.access(true, true, 8 + i, x1, 104 + 8 * i)
+        }
+    } else if kind == machineCall {
+        self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+        self.movRR(fp, sp)
+        self.access(true, false, x16, fp, 16)
+        for i in 0..4 {
+            self.access(true, false, i, fp, 24 + 8 * i)
+        }
+        self.ins(0xD63F0200) // blr x16
+        self.access(false, false, x0, fp, 16)
+        self.ins(0xA8C17BFD) // ldp x29, x30, [sp], #16
+    } else if kind == machineFrame {
+        self.access(false, false, fp, sp, 0)
+    } else {
+        self.access(false, false, xzr, sp, 0)
+    }
+    self.ins(ret)
+}
+
+fn Arm64.genFn(var self, f: IrFn) {
+    if f.machine != machineNone {
+        self.genMachine(f.machine)
+        return
+    }
+    if f.cArgs is Some(cArgs) {
+        // C's way in first (the function's address), then the body it calls
+        let call = self.cEntryStub(f, cArgs)
+        self.align()
+        self.patch(call, (self.here() - call) / 4 & 0x3FFFFFF)
+    }
+    self.kinds = f.kinds
+    self.operands = f.operands
+    self.isConst = f.isConst
+    self.constValue = f.constValue
+    let slots = self.allocate(f)
+    var outSlots = max(f.maxOut, 4) // (four at least: a panic's call of the runtime)
+    for ins in f.code {
+        // a host call's stack arguments and the record it returns through x8
+        if ins.op != .HostCall {
+            continue // (a runtime call is a Quark call: its slots are in maxOut)
+        }
+        let kinds = self.cKinds(if ins.a >= 0 { self.sigs[ins.imm] } else { self.externs[ins.imm] }, ins.argCount)
+        outSlots = max(outSlots, stackArgs(kinds, ins.argCount) + ins.retCount)
+    }
+    self.out = 8 * outSlots
+    let saved = 8 * (self.savedGpr + self.savedFpr)
+    self.frame = (self.out + 8 * slots + saved + 15) & ~15
+    self.labelAt = [0] * (f.labelCount + 1)
+    self.epilogue = f.labelCount
+    self.fixups = []
+
+    // prologue
+    self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+    self.movRR(fp, sp) // mov x29, sp
+    self.addImm(sp, sp, -self.frame)
+    if not self.target.sysv and self.frame >= 4096 {
+        // Windows: a frame past a page has its pages touched from the top down, as Windows grows a stack a guard
+        // page at a time
+        var at = self.frame - 4096
+        while at > -4096 {
+            self.access(true, false, x16, sp, max(at, 0))
+            at -= 4096
+        }
+    }
+    for i in 0..self.savedGpr {
+        self.access(false, false, 19 + i, fp, -8 * (i + 1))
+    }
+    for i in 0..self.savedFpr {
+        self.access(false, true, 8 + i, fp, -8 * (self.savedGpr + i + 1))
+    }
+    self.inl = 0
+    if f.code.any(ins => ins.op == .Call) {
+        // too many calls deep: a panic, not a crash
+        self.movReloc(x16, relocStackLimit, 0)
+        self.access(true, false, x16, x16, 0)
+        self.movRR(x17, sp)
+        self.cmpRR(x17, x16)
+        self.coldJump(lo, panicStack, f.line, -1, -1)
+    }
+    for (i, v) in f.params.enumerate() {
+        if self.inReg(v) and self.isFloat(v) {
+            self.access(true, true, self.fprOf(v), fp, 16 + 8 * i)
+        } else if self.inReg(v) {
+            self.access(true, false, self.gprOf(v), fp, 16 + 8 * i)
+        } else {
+            self.access(true, false, x16, fp, 16 + 8 * i)
+            self.storeBits(v, x16)
+        }
+    }
+    self.uses = useCounts(f)
+    let count = len(f.code)
+    var k = 0
+    while k < count {
+        if k + 1 < count and self.fusedBranch(f.code[k], f.code[k + 1]) {
+            k += 2
+            continue
+        }
+        self.genIns(f.code[k])
+        k += 1
+    }
+
+    // epilogue
+    self.labelAt[self.epilogue] = self.here()
+    for i in 0..self.savedGpr {
+        self.access(true, false, 19 + i, fp, -8 * (i + 1))
+    }
+    for i in 0..self.savedFpr {
+        self.access(true, true, 8 + i, fp, -8 * (self.savedGpr + i + 1))
+    }
+    self.movRR(sp, fp)
+    self.ins(0xA8C17BFD) // ldp x29, x30, [sp], #16
+    self.ins(ret)
+    self.emitCold()
+    for fx in self.fixups {
+        let rel = (self.labelAt[fx.target] - fx.at) / 4
+        self.patch(fx.at, if fx.kind == .Branch { rel & 0x3FFFFFF } else { rel & 0x7FFFF << 5 })
+    }
+}
+
+// ---- the way in from C, and the way out of a panic ----
+// int64_t enter(QkEnter* e): keeps every callee-saved register (a panic abandons the frames that would restore
+// them), keeps its stack pointer where the escape finds it, copies the argument slots to the outgoing area, calls
+// the function, copies the result slots back, returns 0. void escape(void): from the runtime's panic, back onto that
+// stack: enter returns 1. Frame below x29: x19-x28, d8-d15, the outer call's escape. Gives where each starts.
+fn Arm64.genTrampoline(var self) -> (Int, Int) {
+    self.align()
+    let enter = self.here()
+    self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
+    self.movRR(fp, sp)
+    self.addImm(sp, sp, -160)
+    for i in 0..10 {
+        self.access(false, false, 19 + i, fp, -8 * (i + 1))
+    }
+    for i in 0..8 {
+        self.access(false, true, 8 + i, fp, -8 * (11 + i))
+    }
+    self.movReloc(x16, relocEscape, 0)
+    self.access(true, false, x17, x16, 0)
+    self.access(false, false, x17, fp, -152) // the outer call's escape stack, kept
+    self.movRR(x17, sp)
+    self.access(false, false, x17, x16, 0) // ours
+    self.movRR(x19, x0) // e
+    // the outgoing area: 8 bytes per slot (arguments or results, the larger), 16 aligned
+    self.access(true, false, x1, x19, 16)
+    self.access(true, false, x2, x19, 32)
+    self.cmpRR(x1, x2)
+    self.ins(0x9A800000 | x2 << 16 | ge << 12 | x1 << 5 | x1) // csel x1, x1, x2, ge
+    self.ins(0xD37DF021) // lsl x1, x1, #3
+    self.addImm(x1, x1, 31)
+    self.ins(0xD344FC21) // lsr x1, x1, #4
+    self.ins(0xD37CEC21) // lsl x1, x1, #4
+    self.ins(0xCB2163FF) // sub sp, sp, x1
+    // arguments
+    self.access(true, false, x2, x19, 8)
+    self.access(true, false, x3, x19, 16)
+    self.movImm(x4, 0)
+    self.copyLoop(0xF8647845, 0xF8247BE5) // ldr x5, [x2, x4, lsl #3]; str x5, [sp, x4, lsl #3]
+    self.access(true, false, x16, x19, 0)
+    self.ins(0xD63F0000 | x16 << 5) // blr x16
+    // results
+    self.access(true, false, x2, x19, 24)
+    self.access(true, false, x3, x19, 32)
+    self.movImm(x4, 0)
+    self.copyLoop(0xF8647BE5, 0xF8247845) // ldr x5, [sp, x4, lsl #3]; str x5, [x2, x4, lsl #3]
+    self.movImm(x0, 0)
+    let exit = self.here()
+    self.movReloc(x16, relocEscape, 0) // the outer call's escape stack back
+    self.access(true, false, x17, fp, -152)
+    self.access(false, false, x17, x16, 0)
+    for i in 0..10 {
+        self.access(true, false, 19 + i, fp, -8 * (i + 1))
+    }
+    for i in 0..8 {
+        self.access(true, true, 8 + i, fp, -8 * (11 + i))
+    }
+    self.movRR(sp, fp)
+    self.ins(0xA8C17BFD) // ldp x29, x30, [sp], #16
+    self.ins(ret)
+
+    self.align()
+    let escape = self.here()
+    self.movReloc(x16, relocEscape, 0)
+    self.access(true, false, x17, x16, 0)
+    self.movRR(sp, x17)
+    self.addImm(fp, sp, 160)
+    self.movImm(x0, 1)
+    self.ins(0x14000000 | (exit - self.here()) / 4 & 0x3FFFFFF)
+    (enter, escape)
+}
+
+// while x4 < x3: the load and the store (x5), x4 + 1
+fn Arm64.copyLoop(var self, load: Int, store: Int) {
+    let top = self.here()
+    self.cmpRR(x4, x3)
+    let exit = self.here()
+    self.ins(0x54000000 | ge)
+    self.ins(load)
+    self.ins(store)
+    self.ins(0x91000484) // add x4, x4, #1
+    self.ins(0x14000000 | (top - self.here()) / 4 & 0x3FFFFFF)
+    self.patch(exit, (self.here() - exit) / 4 & 0x7FFFF << 5)
+}

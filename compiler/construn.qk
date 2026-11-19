@@ -1,0 +1,632 @@
+// Constants worked out by running them: a constant's value is what the program's own code makes of it. memory.qk
+// compiles the program (what the constants reach of it) with one more function for each constant, which works the
+// value out and dumps it (lower.qk's dumpVal), runs each with a budget of steps and of memory, and here the dump is
+// read back, by the constant's type, into the literal nodes lowering puts where the constant is used (Decl.folded).
+// So a constant means what the same code means when the program runs: there is no second interpreter of the
+// language. What could not be worked out is a compile-time diagnostic (ConstProblem). A constant whose value the
+// dump does not say whole (an interface) is not folded: lowering works its expression out where it is used.
+//
+// The dump, by type: an Int its digits and ";" (a Bool 0 or 1, a Float its 64 bits as an Int); a Text its length,
+// ":", its bytes; an array its count and its elements; a map its count and each key and value (a set: its keys); a
+// record its fields in order; an enum its case's number and that case's fields (an optional: 0, or 1 and the value;
+// a result: 0 and the error, or 1 and the value).
+use ast
+use types
+
+// what working a constant out found wrong: where (the module's file, line, col) and what
+pub type ConstProblem { module: Int, line: Int, col: Int, message: Text }
+
+// a type that holds a function somewhere (a constant cannot: it is a value kept in the program's data)
+pub fn Program.holdsFunction(self, t: Int, depth: Int) -> Bool {
+    if depth > 12 or t < 0 {
+        return false
+    }
+    let ty = self.types[t]
+    match ty.kind {
+        Fn | CFn => true
+        Array | Map => self.holdsFunction(ty.elem, depth + 1) or ty.key >= 0 and self.holdsFunction(ty.key, depth + 1)
+        Record | Enum => {
+            if ty.decl < 0 {
+                return false
+            }
+            let x = self.ast.decls[ty.decl]
+            if x.isInterface {
+                return false
+            }
+            for prm in x.params {
+                if self.holdsFunction(self.paramType(prm), depth + 1) {
+                    return true
+                }
+            }
+            for fields in x.caseFields {
+                for prm in fields {
+                    if self.holdsFunction(self.paramType(prm), depth + 1) {
+                        return true
+                    }
+                }
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+// a type whose values the dump says whole: no function, no interface, no handle, no type that holds itself
+pub fn Program.dumpable(self, t: Int, depth: Int) -> Bool {
+    if depth > 12 or t < 0 {
+        return false
+    }
+    let ty = self.types[t]
+    match ty.kind {
+        Int | Float | Bool | Text | Bytes => true
+        Array => self.dumpable(ty.elem, depth + 1)
+        Map => self.dumpable(ty.key, depth + 1) and (self.isSet(t) or self.dumpable(ty.elem, depth + 1))
+        Record => {
+            let x = self.ast.decls[ty.decl]
+            not x.isInterface and not x.isExtern and self.fieldsDumpable(x.params, depth)
+        }
+        Enum => {
+            let x = self.ast.decls[ty.decl]
+            if x.resultOf >= 0 {
+                self.dumpable(x.resultOf, depth + 1) and self.dumpable(x.errorOf, depth + 1)
+            } else if x.optionOf >= 0 {
+                self.dumpable(x.optionOf, depth + 1)
+            } else {
+                x.caseFields.all(fields => self.fieldsDumpable(fields, depth))
+            }
+        }
+        _ => false
+    }
+}
+
+fn Program.fieldsDumpable(self, fields: [Int], depth: Int) -> Bool {
+    for prm in fields {
+        if self.ast.params[prm].boxed or not self.dumpable(self.paramType(prm), depth + 1) {
+            return false
+        }
+    }
+    true
+}
+
+// the Float whose 64 bits these are
+fn floatOfBits(bits: Int) -> Float {
+    let e = bits >> 52 & 2047
+    let frac = bits & 4503599627370495
+    var x = 0.0
+    if e == 2047 {
+        let zero = 0.0
+        x = if frac == 0 { 1.0e308 * 10.0 } else { zero / zero }
+    } else {
+        var m = toFloat(if e == 0 { frac } else { frac | 4503599627370496 })
+        var k = (if e == 0 { 1 } else { e }) - 1075
+        while k > 0 {
+            m *= 2.0
+            k -= 1
+        }
+        while k < 0 {
+            m /= 2.0
+            k += 1
+        }
+        x = m
+    }
+    if bits < 0 { -x } else { x }
+}
+
+// a dump being read: the program (its tree gets the nodes), the bytes, where the reading is
+pub type ConstReader {
+    p: Program
+    b: Bytes = []
+    at: Int = 0
+    ok: Bool = true
+    line: Int = 0
+    col: Int = 0
+}
+
+pub fn ConstReader.begin(var self, b: Bytes, line: Int, col: Int) {
+    self.b = b
+    self.at = 0
+    self.ok = true
+    self.line = line
+    self.col = col
+}
+
+// digits (after a - maybe) up to the mark after them
+fn ConstReader.int(var self) -> Int {
+    var n = 0 // kept below 0: the least Int has no positive
+    var negative = false
+    var any = false
+    if self.at < len(self.b) and self.b[self.at] == '-' {
+        negative = true
+        self.at += 1
+    }
+    while self.at < len(self.b) and self.b[self.at] is '0'..='9' {
+        n = n *% 10 -% (self.b[self.at] - '0')
+        self.at += 1
+        any = true
+    }
+    if not any or self.at >= len(self.b) {
+        self.ok = false
+        return 0
+    }
+    self.at += 1 // ; or :
+    if negative { n } else { 0 -% n }
+}
+
+fn ConstReader.node(var self, node: ExprNode, t: Int) -> Int {
+    self.p.ast.exprs.push(Expr(node, self.line, self.col, ty: t))
+    len(self.p.ast.exprs) - 1
+}
+
+fn ConstReader.text(var self, t: Int) -> Int {
+    let n = self.int()
+    if not self.ok or n < 0 or self.at + n > len(self.b) {
+        self.ok = false
+        return -1
+    }
+    let got = Text(self.b[self.at..self.at + n])
+    self.at += n
+    if got is Err(_) {
+        self.ok = false
+        return -1
+    }
+    self.node(.TextLit(got ?? "", "", false), t)
+}
+
+fn ConstReader.bytes(var self, t: Int) -> Int {
+    let n = self.int()
+    if not self.ok or n < 0 or self.at + n > len(self.b) {
+        self.ok = false
+        return -1
+    }
+    var items: [Int] = []
+    for i in 0..n {
+        items.push(self.node(.IntLit(self.b[self.at + i], ""), tyInt))
+    }
+    self.at += n
+    let list = self.node(.ArrayLit(items), t)
+    self.wrapped("#bytes", bToBytes, list, t)
+}
+
+fn ConstReader.many(var self, t: Int) -> Int {
+    let ty = self.p.types[t]
+    let n = self.int()
+    if not self.ok or n < 0 or n > len(self.b) {
+        self.ok = false
+        return -1
+    }
+    var xs: [Int] = []
+    for _ in 0..n {
+        if ty.kind == Kind.Map {
+            let k = self.value(ty.key)
+            xs.push(k)
+            xs.push(if self.p.isSet(t) { k } else { self.value(ty.elem) })
+        } else {
+            xs.push(self.value(ty.elem))
+        }
+        if not self.ok {
+            return -1
+        }
+    }
+    self.node(if ty.kind == Kind.Map {
+        ExprNode.MapLit(xs)
+    } else {
+        ExprNode.ArrayLit(xs)
+    }, t)
+}
+
+fn ConstReader.fields(var self, fields: [Int]) -> [Int] {
+    var xs: [Int] = []
+    for prm in fields {
+        xs.push(self.value(self.p.paramType(prm)))
+    }
+    xs
+}
+
+fn ConstReader.record(var self, t: Int) -> Int {
+    let d = self.p.types[t].decl
+    let xs = self.fields(self.p.ast.decls[d].params)
+    let at = self.node(.Call(self.p.ast.decls[d].name, "", [], [], false, false), t)
+    self.p.ast.exprs[at].decl = d
+    self.p.ast.exprs[at].ordered = xs
+    at
+}
+
+fn ConstReader.wrapped(var self, name: Text, builtin: Int, inner: Int, t: Int) -> Int {
+    let at = self.node(.Call(name, "", [inner], [""], false, false), t)
+    self.p.ast.exprs[at].builtin = builtin
+    at
+}
+
+fn ConstReader.case(var self, t: Int) -> Int {
+    let d = self.p.types[t].decl
+    let x = self.p.ast.decls[d]
+    let k = self.int()
+    if not self.ok {
+        return -1
+    }
+    if x.optionOf >= 0 {
+        if k == 0 {
+            let at = self.node(.Name("None"), t)
+            self.p.ast.exprs[at].decl = d
+            return at
+        }
+        let inner = self.value(x.optionOf)
+        return self.wrapped("Some", bSome, inner, t)
+    }
+    if x.resultOf >= 0 {
+        if k == 0 {
+            let inner = self.value(x.errorOf)
+            return self.wrapped("Err", bErr, inner, t)
+        }
+        let inner = self.value(x.resultOf)
+        return self.wrapped("Ok", bOk, inner, t)
+    }
+    if k < 0 or k >= len(x.cases) {
+        self.ok = false
+        return -1
+    }
+    let fields = x.caseFields.get(k) ?? []
+    if len(fields) == 0 {
+        let at = self.node(.Case(x.cases[k], -1, false), t)
+        self.p.ast.exprs[at].caseIndex = k
+        return at
+    }
+    let xs = self.fields(fields)
+    let at = self.node(.Call(x.cases[k], "", [], [], false, false), t)
+    self.p.ast.exprs[at].decl = d
+    self.p.ast.exprs[at].caseIndex = k
+    self.p.ast.exprs[at].ordered = xs
+    at
+}
+
+// the value of type t the dump says next: its node (-1, and ok false, when the dump is not one of t)
+pub fn ConstReader.value(var self, t: Int) -> Int {
+    if not self.ok {
+        return -1
+    }
+    match self.p.types[t].kind {
+        Int => {
+            let v = self.int()
+            self.node(.IntLit(v, ""), t)
+        }
+        Bool => {
+            let v = self.int()
+            self.node(.BoolLit(v != 0), t)
+        }
+        Float => {
+            let v = self.int()
+            self.node(.FloatLit(floatOfBits(v), ""), t)
+        }
+        Text => self.text(t)
+        Bytes => self.bytes(t)
+        Array | Map => self.many(t)
+        Record => self.record(t)
+        Enum => self.case(t)
+        _ => {
+            self.ok = false
+            -1
+        }
+    }
+}
+
+// ---- comparing with what consteval.qk made ----
+fn sameFloat(a: Float, b: Float) -> Bool = a == b or a != a and b != b
+
+fn Program.sameList(self, xs: [Int], ys: [Int]) -> Bool {
+    if len(xs) != len(ys) {
+        return false
+    }
+    for (i, x) in xs.enumerate() {
+        if not self.sameConst(x, ys[i]) {
+            return false
+        }
+    }
+    true
+}
+
+// what a call's node holds: its ordered values (a record's, a case's), else the values written (Some(x), Ok(x))
+fn held(x: Expr) -> [Int] = if len(x.ordered) > 0 {
+    x.ordered
+} else {
+    match x.node {
+        Call(_, _, args, _, _, _) => args
+        _ => []
+    }
+}
+
+// two literal trees say the same value
+pub fn Program.sameConst(self, a: Int, b: Int) -> Bool {
+    if a < 0 or b < 0 {
+        return false
+    }
+    let x = self.ast.exprs[a]
+    let y = self.ast.exprs[b]
+    match x.node {
+        IntLit(v, _) => match y.node {
+            IntLit(w, _) => v == w
+            _ => false
+        }
+        FloatLit(v, _) => match y.node {
+            FloatLit(w, _) => sameFloat(v, w)
+            _ => false
+        }
+        BoolLit(v) => match y.node {
+            BoolLit(w) => v == w
+            _ => false
+        }
+        TextLit(v, _, _) => match y.node {
+            TextLit(w, _, _) => v == w
+            _ => false
+        }
+        ArrayLit(xs) => match y.node {
+            ArrayLit(ys) => self.sameList(xs, ys)
+            _ => false
+        }
+        MapLit(xs) => match y.node {
+            MapLit(ys) => if self.isSet(x.ty) {
+                len(xs) == len(ys) and (0..len(xs) / 2).all(i => self.sameConst(xs[2 * i], ys[2 * i]))
+            } else {
+                self.sameList(xs, ys)
+            }
+            _ => false
+        }
+        Name(v) => match y.node {
+            Name(w) => v == w
+            _ => false
+        }
+        Case(_, _, _) => x.caseIndex == y.caseIndex and (y.node is Case(_, _, _) or len(held(y)) == 0)
+        Call(_, _, _, _, _, _) => match y.node {
+            Call(_, _, _, _, _, _) => x.builtin == y.builtin
+                and x.caseIndex == y.caseIndex
+                and (x.builtin != 0 or x.decl == y.decl)
+                and self.sameList(held(x), held(y))
+            Case(_, _, _) => x.caseIndex == y.caseIndex and len(held(x)) == 0
+            _ => false
+        }
+        _ => false
+    }
+}
+
+// ---- what the constants reach ----
+// The declarations a constant's code reaches: the functions and constants its expressions name (calls, values,
+// instances, operators), and theirs, on and on; a method of any type an interface value is made of, and a type's
+// compare where a value of it is compared. What it does not reach is not compiled to work the constants out (its body
+// a hole: reached after all, it stops that constant, never gives a wrong value).
+pub fn Program.reachedFrom(self, roots: [Int]) -> [Bool] {
+    var seen = [false] * len(self.ast.decls)
+    var work = roots
+    var interfaces = false
+    var compared: Set<Text> = []
+    while len(work) > 0 {
+        let d = work.pop() ?? -1
+        if d < 0 or seen[d] {
+            continue
+        }
+        seen[d] = true
+        let x = self.ast.decls[d]
+        var exprs = [x.body]
+        for prm in x.params {
+            exprs.push(self.ast.params[prm].fallback)
+        }
+        var blocks: [Int] = []
+        while len(exprs) > 0 or len(blocks) > 0 {
+            if len(blocks) > 0 {
+                let b = blocks.pop() ?? -1
+                if b < 0 {
+                    continue
+                }
+                for s in self.ast.blocks[b].stmts {
+                    let st = self.ast.stmts[s]
+                    exprs.push(st.opValue)
+                    match st.node {
+                        Let(_, _, _, value, pattern, otherwise) => {
+                            exprs.push(value)
+                            blocks.push(otherwise)
+                            exprs += self.armExprs(pattern)
+                        }
+                        Assign(target, _, value) => {
+                            exprs.push(target)
+                            exprs.push(value)
+                        }
+                        ExprStmt(value) => exprs.push(value)
+                        For(_, pattern, iter, body) => {
+                            exprs.push(iter)
+                            blocks.push(body)
+                            exprs += self.armExprs(pattern)
+                        }
+                        While(cond, body) => {
+                            exprs.push(cond)
+                            blocks.push(body)
+                        }
+                        Return(value) => exprs.push(value)
+                        Defer(body) => blocks.push(body)
+                        _ => {}
+                    }
+                }
+                continue
+            }
+            let e = exprs.pop() ?? -1
+            if e < 0 {
+                continue
+            }
+            let ex = self.ast.exprs[e]
+            if ex.decl >= 0 and not seen[ex.decl] {
+                work.push(ex.decl)
+            }
+            exprs.push(ex.callee)
+            exprs += ex.ordered
+            if ex.ty >= 0 and ex.ty < len(self.types) {
+                let ty = self.types[ex.ty]
+                if ty.kind == Kind.Record and ty.decl >= 0 and self.ast.decls[ty.decl].isInterface {
+                    interfaces = true
+                }
+                if ty.kind is Record | Enum and ty.decl >= 0 {
+                    compared.add(self.ast.decls[ty.decl].name)
+                }
+            }
+            match ex.node {
+                Call(_, _, args, _, _, _) => {
+                    exprs += args
+                }
+                Field(target, _) => exprs.push(target)
+                Index(target, index) => {
+                    exprs.push(target)
+                    exprs.push(index)
+                }
+                Unary(_, operand) => exprs.push(operand)
+                Binary(_, left, right) => {
+                    exprs.push(left)
+                    exprs.push(right)
+                }
+                Range(low, high) => {
+                    exprs.push(low)
+                    exprs.push(high)
+                }
+                If(cond, then, otherwise) => {
+                    exprs.push(cond)
+                    blocks.push(then)
+                    exprs.push(otherwise)
+                }
+                Match(subject, arms, _) => {
+                    exprs.push(subject)
+                    for a in arms {
+                        exprs += self.armExprs(a)
+                    }
+                }
+                Lambda(_, body) => exprs.push(body)
+                ArrayLit(items) => {
+                    exprs += items
+                }
+                MapLit(items) => {
+                    exprs += items
+                }
+                BlockExpr(block, _) => blocks.push(block)
+                Case(_, target, _) => exprs.push(target)
+                With(target, values, _) => {
+                    exprs.push(target)
+                    exprs += values
+                }
+                Interp(values, _, _, _, _) => {
+                    exprs += values
+                }
+                Try(value) => exprs.push(value)
+                Is(value, pattern) => {
+                    exprs.push(value)
+                    exprs += self.armExprs(pattern)
+                }
+                _ => {}
+            }
+        }
+        // a type's compare, where a value of it is compared or sorted (lowering finds it by its name)
+        if len(work) == 0 {
+            for (i, y) in self.ast.decls.enumerate() {
+                if seen[i] or y.kind != DeclKind.Fn {
+                    continue
+                }
+                let dot = y.name.indexOf(".") ?? -1
+                let method = dot > 0 and y.name[dot + 1..] is "compare" | "equals" | "hash"
+                if method and compared.contains(y.name[..dot]) or interfaces and dot > 0 {
+                    work.push(i)
+                }
+            }
+        }
+    }
+    seen
+}
+
+// what an arm holds that is code: its guard, its body, its text and its value patterns, the patterns inside it
+fn Program.armExprs(self, a: Int) -> [Int] {
+    if a < 0 {
+        return []
+    }
+    let arm = self.ast.arms[a]
+    var out = [arm.guard, arm.body, arm.textPattern]
+    for s in arm.subs {
+        out += self.armExprs(s)
+    }
+    for alt in arm.alternatives {
+        out += self.armExprs(alt)
+    }
+    out
+}
+
+// ---- quark consts: each constant's value, written ----
+fn hexByte(x: Int) -> Text {
+    let digits = "0123456789abcdef"
+    let hi = x >> 4 & 15
+    let lo = x & 15
+    digits[hi..hi + 1] + digits[lo..lo + 1]
+}
+
+pub fn Program.constsText(self) -> Text {
+    var out = ""
+    for d in self.decls {
+        let x = self.ast.decls[d]
+        if x.kind == DeclKind.Const and x.folded >= 0 {
+            out += "{x.name} = {self.dumpNode(x.folded)}\n"
+        }
+    }
+    out
+}
+
+fn quoted(t: Text) -> Text {
+    var out = "\""
+    let b = t.bytes()
+    var run = 0
+    for (i, c) in b.enumerate() {
+        if c == '"' or c == '\\' or c < 0x20 {
+            out += t[run..i]
+            run = i + 1
+            out += if c == '\n' {
+                "\\n"
+            } else if c < 0x20 {
+                "\\x" + hexByte(c)
+            } else {
+                "\\" + char(c)
+            }
+        }
+    }
+    out + t[run..] + "\""
+}
+
+fn Program.dumpList(self, xs: [Int]) -> Text {
+    var out = ""
+    for (i, x) in xs.enumerate() {
+        if i > 0 {
+            out += ", "
+        }
+        out += self.dumpNode(x)
+    }
+    out
+}
+
+fn Program.dumpNode(self, x: Int) -> Text {
+    let e = self.ast.exprs[x]
+    let ty = if e.ty >= 0 { self.typeName(e.ty) } else { "-" }
+    match e.node {
+        IntLit(v, _) => "{v}"
+        FloatLit(f, _) => "{f.toText()}f"
+        BoolLit(b) => "{b}"
+        TextLit(t, _, _) => quoted(t)
+        Case(_, _, _) => "case{e.caseIndex}:{ty}"
+        Name(n) => "{n}:{ty}"
+        BlockExpr(_, _) => "()"
+        ArrayLit(items) => "[{self.dumpList(items)}]:{ty}"
+        MapLit(items) => "\{{self.dumpList(items)}\}:{ty}"
+        Range(lo, hi) => "{self.dumpNode(lo)}..{self.dumpNode(hi)}"
+        Call(_, _, args, _, _, _) => if e.builtin == bInterface {
+            "#interface({self.dumpNode(args[0])}):{ty}"
+        } else if e.builtin != 0 {
+            "b{e.builtin}({self.dumpList(args)}):{ty}"
+        } else {
+            let d = if e.decl >= 0 { self.ast.decls[e.decl].name } else { "?" }
+            let k = if e.decl >= 0 and self.ast.decls[e.decl].kind == DeclKind.Enum {
+                "#{e.caseIndex}"
+            } else {
+                ""
+            }
+            "{d}{k}({self.dumpList(e.ordered)}):{ty}"
+        }
+        _ => "?"
+    }
+}

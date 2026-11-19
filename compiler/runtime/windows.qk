@@ -1,0 +1,1021 @@
+// The runtime's system calls on Windows: kernel32 and the C runtime (ucrt), each behind a symbol of the runtime's own
+// (qkos*, C's calls; linux.qk gives the same ones), and the executable's entry, wmain. Names are UTF-8 in the runtime
+// and UTF-16 here: Windows' wide functions take any name, its ANSI ones only the code page's.
+use base
+use start
+use host
+
+extern effect fn tlsAlloc() -> UInt32 as "TlsAlloc"
+extern effect fn tlsGetValue(index: UInt32) -> Int64 as "TlsGetValue"
+extern effect fn tlsSetValue(index: UInt32, v: Int64) -> Int32 as "TlsSetValue"
+extern effect fn getStdHandle(which: UInt32) -> Int64 as "GetStdHandle"
+extern effect fn winWriteFile(h: Int64, p: Int64, n: UInt32, done: Int64, overlapped: Int64) -> Int32 as "WriteFile"
+extern effect fn winReadFile(h: Int64, p: Int64, n: UInt32, done: Int64, overlapped: Int64) -> Int32 as "ReadFile"
+extern effect fn getConsoleMode(h: Int64, mode: Int64) -> Int32 as "GetConsoleMode"
+extern effect fn readConsoleW(h: Int64, p: Int64, n: UInt32, done: Int64, control: Int64) -> Int32 as "ReadConsoleW"
+extern effect fn setConsoleOutputCP(page: UInt32) -> Int32 as "SetConsoleOutputCP"
+extern effect fn multiByteToWideChar(page: UInt32, flags: UInt32, s: Int64, n: Int32, w: Int64, wn: Int32) -> Int32 as "MultiByteToWideChar"
+
+extern effect fn wideCharToMultiByte(
+    page: UInt32,
+    flags: UInt32,
+    w: Int64,
+    wn: Int32,
+    s: Int64,
+    n: Int32,
+    d: Int64,
+    u: Int64,
+) -> Int32 as "WideCharToMultiByte"
+
+extern effect fn getModuleFileNameW(m: Int64, w: Int64, n: UInt32) -> UInt32 as "GetModuleFileNameW"
+extern effect fn getFileAttributesW(w: Int64) -> UInt32 as "GetFileAttributesW"
+extern effect fn createDirectoryW(w: Int64, security: Int64) -> Int32 as "CreateDirectoryW"
+extern effect fn removeDirectoryW(w: Int64) -> Int32 as "RemoveDirectoryW"
+extern effect fn deleteFileW(w: Int64) -> Int32 as "DeleteFileW"
+extern effect fn getLastError() -> UInt32 as "GetLastError"
+extern effect fn findFirstFileW(w: Int64, data: Int64) -> Int64 as "FindFirstFileW"
+extern effect fn findNextFileW(h: Int64, data: Int64) -> Int32 as "FindNextFileW"
+extern effect fn findClose(h: Int64) -> Int32 as "FindClose"
+extern effect fn virtualAlloc(p: Int64, n: UInt64, kind: UInt32, protect: UInt32) -> Int64 as "VirtualAlloc"
+extern effect fn virtualProtect(p: Int64, n: UInt64, protect: UInt32, old: Int64) -> Int32 as "VirtualProtect"
+extern effect fn virtualFree(p: Int64, n: UInt64, kind: UInt32) -> Int32 as "VirtualFree"
+extern effect fn flushInstructionCache(process: Int64, p: Int64, n: UInt64) -> Int32 as "FlushInstructionCache"
+extern effect fn getCurrentProcess() -> Int64 as "GetCurrentProcess"
+extern effect fn getCurrentThreadStackLimits(low: Int64, high: Int64) as "GetCurrentThreadStackLimits"
+extern effect fn loadLibraryW(w: Int64) -> Int64 as "LoadLibraryW"
+extern effect fn getProcAddress(m: Int64, name: Int64) -> Int64 as "GetProcAddress"
+extern effect fn getSystemInfo(info: Int64) as "GetSystemInfo"
+extern effect fn createThread(security: Int64, stack: UInt64, f: Int64, arg: Int64, flags: UInt32, id: Int64) -> Int64 as "CreateThread"
+extern effect fn waitForSingleObject(h: Int64, ms: UInt32) -> UInt32 as "WaitForSingleObject"
+extern effect fn closeHandle(h: Int64) -> Int32 as "CloseHandle"
+extern effect fn queryPerformanceCounter(at: Int64) -> Int32 as "QueryPerformanceCounter"
+extern effect fn queryPerformanceFrequency(at: Int64) -> Int32 as "QueryPerformanceFrequency"
+extern effect fn getSystemTimePreciseAsFileTime(at: Int64) as "GetSystemTimePreciseAsFileTime"
+extern effect fn winSleep(ms: UInt32) as "Sleep"
+extern effect fn createPipe(read: Int64, write: Int64, security: Int64, size: UInt32) -> Int32 as "CreatePipe"
+extern effect fn setHandleInformation(h: Int64, mask: UInt32, flags: UInt32) -> Int32 as "SetHandleInformation"
+
+extern effect fn createFileA(
+    name: Int64,
+    access: UInt32,
+    share: UInt32,
+    security: Int64,
+    how: UInt32,
+    flags: UInt32,
+    template: Int64,
+) -> Int64 as "CreateFileA"
+
+extern effect fn createProcessW(
+    app: Int64,
+    line: Int64,
+    ps: Int64,
+    ts: Int64,
+    inherit: Int32,
+    flags: UInt32,
+    env: Int64,
+    dir: Int64,
+    si: Int64,
+    pi: Int64,
+) -> Int32 as "CreateProcessW"
+
+extern effect fn getExitCodeProcess(h: Int64, code: Int64) -> Int32 as "GetExitCodeProcess"
+
+extern effect fn formatMessageA(
+    flags: UInt32,
+    source: Int64,
+    id: UInt32,
+    lang: UInt32,
+    buf: Int64,
+    n: UInt32,
+    args: Int64,
+) -> UInt32 as "FormatMessageA"
+
+extern effect fn getCommandLineW() -> Int64 as "GetCommandLineW"
+extern effect fn commandLineToArgvW(line: Int64, count: Int64) -> Int64 as "CommandLineToArgvW"
+extern effect fn wfopen(name: Int64, mode: Int64) -> Int64 as "_wfopen"
+extern effect fn wgetenv(name: Int64) -> Int64 as "_wgetenv"
+extern effect fn errnoAt() -> Int64 as "_errno"
+extern effect fn snprintfFloat(buf: Int64, size: UInt64, format: Int64, precision: Int32, v: Float64) -> Int32 as "snprintf"
+extern fn fnAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+const utf8 = 65001
+
+// ---- text both ways ----
+// a UTF-8 text (zero-ended) as UTF-16, malloc'd
+fn wide(s: Int) -> Int {
+    let n = multiByteToWideChar(utf8, 0, s, -1, 0, 0)
+    let w = calloc(if n > 0 { n } else { 1 }, 2)
+    if n > 0 {
+        let _ = multiByteToWideChar(utf8, 0, s, -1, w, n)
+    }
+    w
+}
+
+// n bytes of UTF-8 as UTF-16 (zero-ended), malloc'd
+fn wideOf(s: Int, n: Int) -> Int {
+    let k = if n > 0 { multiByteToWideChar(utf8, 0, s, n, 0, 0) } else { 0 }
+    let w = calloc(k + 1, 2)
+    if k > 0 {
+        let _ = multiByteToWideChar(utf8, 0, s, n, w, k)
+    }
+    w
+}
+
+// UTF-16 (zero-ended) as UTF-8, malloc'd
+fn utf8Of(w: Int) -> Int {
+    let n = wideCharToMultiByte(utf8, 0, w, -1, 0, 0, 0, 0)
+    let s = calloc(if n > 0 { n } else { 1 }, 1)
+    if n > 0 {
+        let _ = wideCharToMultiByte(utf8, 0, w, -1, s, n, 0, 0)
+    }
+    s
+}
+
+fn wideLen(w: Int) -> Int {
+    var n = 0
+    while Pointer<UInt16>(w)[n] != 0 {
+        n += 1
+    }
+    n
+}
+
+// ---- the context, the output, numbers ----
+pub extern effect fn osCtxImpl() -> Int64 as "qkosCtx" = tlsGetValue(word(cell(), 1))
+
+pub extern effect fn osSetCtxImpl(c: Int64) as "qkosSetCtx" {
+    let _ = tlsSetValue(word(cell(), 1), c)
+}
+
+fn writeAll(h: Int, p: Int, n: Int) {
+    let done = calloc(1, 8)
+    var at = 0
+    while at < n {
+        if winWriteFile(h, p + at, n - at, done, 0) == 0 or int32At(done, 0) == 0 {
+            break
+        }
+        at += int32At(done, 0)
+    }
+    free(done)
+}
+
+// the output's bytes as they are; the errors' as C's stderr writes them (a text stream: \n made \r\n)
+pub extern effect fn osWriteImpl(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
+    if fd != 2 {
+        writeAll(getStdHandle(-11), p, n)
+        return
+    }
+    let h = getStdHandle(-12)
+    var from = 0
+    for i in 0..n {
+        if byte(p, i) == '\n' {
+            writeAll(h, p + from, i - from)
+            writeAll(h, textAt("\r\n"), 2)
+            from = i + 1
+        }
+    }
+    writeAll(h, p + from, n - from)
+}
+
+pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = int32At(errnoAt(), 0)
+
+pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setInt32(errnoAt(), 0, e)
+
+pub extern effect fn osFloatTextImpl(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText" {
+    let format = if kind == 'f' { textAt("%.*f\0") } else { textAt("%.*g\0") }
+    snprintfFloat(buf, size, format, precision, v) // v fifth: on the stack, where a variadic call reads it
+}
+
+pub extern effect fn osNowImpl() -> Float64 as "qkosNow" {
+    let q = calloc(2, 8)
+    let _ = queryPerformanceFrequency(q)
+    let _ = queryPerformanceCounter(q + 8)
+    let t = toFloat(word(q, 1)) / toFloat(word(q, 0))
+    free(q)
+    t
+}
+
+pub extern effect fn osTimeImpl() -> Float64 as "qkosTime" {
+    let q = calloc(1, 8)
+    getSystemTimePreciseAsFileTime(q)
+    let ticks = word(q, 0) - 116444736000000000 // 100 ns since 1601, made since 1970
+    free(q)
+    toFloat(ticks / 10000000) + toFloat(ticks % 10000000) * 0.0000001
+}
+
+pub extern effect fn osSleepImpl(ms: Int64) as "qkosSleep" = winSleep(ms)
+
+// ---- files and folders ----
+pub extern effect fn osOpenImpl(path: Int64, mode: Int64) -> Int64 as "qkosOpen" {
+    let w = wide(path)
+    let m = wide(mode)
+    let f = wfopen(w, m)
+    free(w)
+    free(m)
+    f
+}
+
+pub extern effect fn osEnvImpl(name: Int64) -> Int64 as "qkosEnv" {
+    let w = wide(name)
+    let v = wgetenv(w)
+    free(w)
+    if v == 0 { 0 } else { utf8Of(v) }
+}
+
+pub extern effect fn osPathKindImpl(path: Int64) -> Int64 as "qkosPathKind" {
+    let w = wide(path)
+    let a = getFileAttributesW(w)
+    free(w)
+    if a == 4294967295 {
+        -1
+    } else if a & 16 != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn setErrno(code: Int) = setInt32(errnoAt(), 0, code)
+
+pub extern effect fn osMakeDirImpl(path: Int64) -> Int64 as "qkosMakeDir" {
+    let w = wide(path)
+    let done = createDirectoryW(w, 0)
+    free(w)
+    if done != 0 {
+        return 0
+    }
+    let e = getLastError() // as errno says it: EEXIST, ENOENT, EACCES, else EIO
+    setErrno(if e == 183 {
+        17
+    } else if e == 3 or e == 2 {
+        2
+    } else if e == 5 {
+        13
+    } else {
+        5
+    })
+    -1
+}
+
+pub extern effect fn osRemoveImpl(path: Int64, folder: Int64) -> Int64 as "qkosRemove" {
+    let w = wide(path)
+    let done = if folder == 1 { removeDirectoryW(w) } else { deleteFileW(w) }
+    free(w)
+    if done != 0 {
+        return 0
+    }
+    let e = getLastError() // ENOTEMPTY, EACCES, else EIO
+    setErrno(if e == 145 {
+        41
+    } else if e == 5 or e == 32 {
+        13
+    } else {
+        5
+    })
+    -1
+}
+
+pub extern effect fn osSeparatorImpl(c: Int64) -> Int64 as "qkosSeparator" =
+    if c == '/' or c == '\\' { 1 } else { 0 }
+
+// the names in a folder: each zero-ended, then a zero (malloc'd); 0 when it cannot be listed
+pub extern effect fn osListDirImpl(path: Int64) -> Int64 as "qkosListDir" {
+    let n = strlen(path)
+    let pattern = calloc(n + 3, 1)
+    copyBytes(pattern, path, n)
+    setByte(pattern, n, '\\')
+    setByte(pattern, n + 1, '*')
+    let w = wide(pattern)
+    free(pattern)
+    let fd = calloc(1, 600)
+    let h = findFirstFileW(w, fd)
+    free(w)
+    if h == -1 {
+        free(fd)
+        setInt32(errnoAt(), 0, 2)
+        return 0
+    }
+    var cap = 1024
+    var out = malloc(cap)
+    var used = 0
+    while true {
+        let name = fd + 44
+        let dot = Pointer<UInt16>(name)
+        let skip = dot[0] == '.' and dot[1] == 0 or dot[0] == '.' and dot[1] == '.' and dot[2] == 0
+        if not skip {
+            let s = utf8Of(name)
+            let k = strlen(s)
+            while used + k + 2 > cap {
+                cap *= 2
+                out = realloc(out, cap)
+            }
+            copyBytes(out + used, s, k + 1)
+            used += k + 1
+            free(s)
+        }
+        if findNextFileW(h, fd) == 0 {
+            break
+        }
+    }
+    let _ = findClose(h)
+    free(fd)
+    setByte(out, used, 0)
+    out
+}
+
+// ---- the input ----
+pub extern effect fn osReadInImpl(p: Int64, n: Int64) -> Int64 as "qkosReadIn" {
+    let got = calloc(1, 8)
+    let ok = winReadFile(getStdHandle(-10), p, n, got, 0)
+    let k = int32At(got, 0)
+    free(got)
+    if ok != 0 { k } else { 0 }
+}
+
+// a line typed at a console: its characters as UTF-16 (the console's code page may not have them)
+pub extern effect fn osReadLineImpl(out: Int64) -> Int64 as "qkosReadLine" {
+    let console = getStdHandle(-10)
+    let mode = calloc(1, 16)
+    if getConsoleMode(console, mode) == 0 {
+        free(mode)
+        return -1
+    }
+    var cap = 256
+    var w = malloc(2 * cap)
+    var n = 0
+    var any = false
+    while readConsoleW(console, mode + 8, 1, mode, 0) != 0 and int32At(mode, 0) != 0 {
+        let ch = Pointer<UInt16>(mode + 8)[0]
+        if ch == 26 and n == 0 {
+            // Ctrl+Z first: the end
+            break
+        }
+        any = true
+        if ch == '\n' {
+            break
+        }
+        if ch != '\r' {
+            if n + 2 > cap {
+                cap *= 2
+                w = realloc(w, 2 * cap)
+            }
+            Pointer<UInt16>(w)[n] = ch
+            n += 1
+        }
+    }
+    free(mode)
+    if not any {
+        free(w)
+        return 0
+    }
+    Pointer<UInt16>(w)[n] = 0
+    let s = utf8Of(w)
+    free(w)
+    setWord(out, 0, s)
+    setWord(out, 1, strlen(s))
+    1
+}
+
+// ---- other programs ----
+type Line { p: Int, n: Int, cap: Int }
+
+fn Line.add(self, c: Int) -> Line {
+    var l = self
+    if l.n + 1 > l.cap {
+        l = Line(realloc(l.p, 2 * l.cap), l.n, 2 * l.cap)
+    }
+    setByte(l.p, l.n, c)
+    Line(l.p, l.n + 1, l.cap)
+}
+
+// one argument on a command line, as the C runtime's parser reads it back
+fn Line.quoted(self, s: Int, n: Int) -> Line {
+    var plain = n > 0
+    for i in 0..n {
+        let c = byte(s, i)
+        if c == ' ' or c == '\t' or c == '"' or c == '\n' or c == 11 {
+            plain = false
+        }
+    }
+    var l = self
+    if plain {
+        for i in 0..n {
+            l = l.add(byte(s, i))
+        }
+        return l
+    }
+    l = l.add('"')
+    var i = 0
+    while true {
+        var slashes = 0
+        while i < n and byte(s, i) == '\\' {
+            i += 1
+            slashes += 1
+        }
+        if i == n {
+            for k in 0..slashes * 2 {
+                l = l.add('\\')
+            }
+            break
+        }
+        let times = if byte(s, i) == '"' { slashes * 2 + 1 } else { slashes }
+        for k in 0..times {
+            l = l.add('\\')
+        }
+        l = l.add(byte(s, i))
+        i += 1
+    }
+    l.add('"')
+}
+
+// what a pipe gives until its end: (handle, bytes, length, room)
+fn drain(r: Int) -> Int {
+    let chunk = malloc(16384)
+    let got = calloc(1, 8)
+    while winReadFile(word(r, 0), chunk, 16384, got, 0) != 0 and int32At(got, 0) != 0 {
+        let k = int32At(got, 0)
+        while word(r, 2) + k > word(r, 3) {
+            setWord(r, 3, word(r, 3) * 2)
+            setWord(r, 1, realloc(word(r, 1), word(r, 3)))
+        }
+        copyBytes(word(r, 1) + word(r, 2), chunk, k)
+        setWord(r, 2, word(r, 2) + k)
+    }
+    free(chunk)
+    free(got)
+    0
+}
+
+fn cannotRun(out: Int, name: Int, e: Int) -> Int {
+    let why = calloc(1, 300)
+    let _ = formatMessageA(4096 | 512, 0, e, 0, why, 300, 0)
+    var k = strlen(why)
+    while k > 0
+        and (byte(why, k - 1) == '\r' or byte(why, k - 1) == '\n' or byte(why, k - 1) == '.' or byte(why, k - 1) == ' ') {
+        k -= 1
+        setByte(why, k, 0)
+    }
+    let m = malloc(700)
+    var b = bufAt(m, 700).text("cannot run ").zeroText(name).text(": ")
+    b = if k == 0 { b.text("error ").int(e) } else { b.zeroText(why) }
+    free(why)
+    setWord(out, 1, m)
+    1
+}
+
+fn pipeRecord(h: Int) -> Int {
+    let r = calloc(4, 8)
+    setWord(r, 0, h)
+    setWord(r, 1, malloc(4096))
+    setWord(r, 3, 4096)
+    r
+}
+
+// runs name with args ((bytes, length) pairs) and an empty input: 0 and (status, out, its length, err, its length)
+// in out; 1 and the message (malloc'd) in out[1] when it cannot be started
+pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosRunProcess" {
+    let n = strlen(name)
+    for i in 0..n {
+        if byte(name, i) == '/' {
+            setByte(name, i, '\\') // CreateProcess finds build\quark.exe, not build/quark.exe
+        }
+    }
+    var line = Line(malloc(256), 0, 256).quoted(name, n)
+    for i in 0..count {
+        line = line.add(' ').quoted(word(args, 2 * i), word(args, 2 * i + 1))
+    }
+    let wline = wideOf(line.p, line.n)
+    free(line.p)
+    let sa = calloc(1, 24) // SECURITY_ATTRIBUTES: its size, no descriptor, inherited
+    setInt32(sa, 0, 24)
+    setInt32(sa, 4, 1)
+    let hs = calloc(4, 8) // outRead, outWrite, errRead, errWrite
+    if createPipe(hs, hs + 8, sa, 0) == 0 {
+        free(wline)
+        return cannotRun(out, name, getLastError())
+    }
+    if createPipe(hs + 16, hs + 24, sa, 0) == 0 {
+        let e = getLastError()
+        let _ = closeHandle(word(hs, 0))
+        let _ = closeHandle(word(hs, 1))
+        free(wline)
+        return cannotRun(out, name, e)
+    }
+    let _ = setHandleInformation(word(hs, 0), 1, 0)
+    let _ = setHandleInformation(word(hs, 2), 1, 0)
+    let input = createFileA(textAt("NUL\0"), 2147483648, 3, sa, 3, 0, 0)
+    let si = calloc(1, 104) // STARTUPINFOW
+    setInt32(si, 0, 104)
+    setInt32(si, 15, 256) // dwFlags (at 60): STARTF_USESTDHANDLES
+    setWord(si, 10, input) // hStdInput at 80
+    setWord(si, 11, word(hs, 1))
+    setWord(si, 12, word(hs, 3))
+    let pi = calloc(1, 24)
+    let started = createProcessW(0, wline, 0, 0, 1, 0, 0, 0, si, pi)
+    let startError = getLastError()
+    free(wline)
+    let _ = closeHandle(word(hs, 1))
+    let _ = closeHandle(word(hs, 3))
+    if input != -1 {
+        let _ = closeHandle(input)
+    }
+    if started == 0 {
+        let _ = closeHandle(word(hs, 0))
+        let _ = closeHandle(word(hs, 2))
+        return cannotRun(out, name, startError)
+    }
+    let errPipe = pipeRecord(word(hs, 2))
+    let outPipe = pipeRecord(word(hs, 0))
+    let t = createThread(0, 0, fnAddress(r => drain(r)), errPipe, 0, 0)
+    let _ = drain(outPipe)
+    if t != 0 {
+        let _ = waitForSingleObject(t, 4294967295)
+        let _ = closeHandle(t)
+    } else {
+        let _ = drain(errPipe) // no thread: the errors after the output
+    }
+    let _ = waitForSingleObject(word(pi, 0), 4294967295)
+    let code = calloc(1, 8)
+    let _ = getExitCodeProcess(word(pi, 0), code)
+    let _ = closeHandle(word(pi, 0))
+    let _ = closeHandle(word(pi, 1))
+    let _ = closeHandle(word(hs, 0))
+    let _ = closeHandle(word(hs, 2))
+    setWord(out, 0, int32At(code, 0))
+    setWord(out, 1, word(outPipe, 1))
+    setWord(out, 2, word(outPipe, 2))
+    setWord(out, 3, word(errPipe, 1))
+    setWord(out, 4, word(errPipe, 2))
+    free(code)
+    free(outPipe)
+    free(errPipe)
+    free(hs)
+    free(sa)
+    free(si)
+    free(pi)
+    0
+}
+
+// ---- code in memory, the stack, C's libraries, threads ----
+pub extern effect fn osMapCodeImpl(n: Int64) -> Int64 as "qkosMapCode" =
+    virtualAlloc(0, n, 12288, 4)
+
+pub extern effect fn osProtectCodeImpl(p: Int64, n: Int64) as "qkosProtectCode" {
+    let old = calloc(1, 8)
+    let _ = virtualProtect(p, n, 32, old)
+    free(old)
+    let _ = flushInstructionCache(getCurrentProcess(), p, n)
+}
+
+pub extern effect fn osUnmapCodeImpl(p: Int64, n: Int64) as "qkosUnmapCode" {
+    let _ = virtualFree(p, 0, 32768) + n - n
+}
+
+// the heap's range (heap.qk): reserved (MEM_RESERVE, no access), committed as it is used (MEM_COMMIT, read and write)
+pub extern effect fn osReserveImpl(n: Int64) -> Int64 as "qkosReserve" = virtualAlloc(0, n, 8192, 1)
+
+pub extern effect fn osCommitImpl(p: Int64, n: Int64) -> Int64 as "qkosCommit" =
+    if virtualAlloc(p, n, 4096, 4) != 0 { 1 } else { 0 }
+
+pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
+    let _ = virtualFree(p, 0, 32768) + n - n
+}
+
+pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
+    let lh = calloc(2, 8)
+    getCurrentThreadStackLimits(lh, lh + 8)
+    let low = word(lh, 0)
+    free(lh)
+    low
+}
+
+fn hasAny(s: Int, a: Int, b: Int, c: Int) -> Bool {
+    let n = strlen(s)
+    for i in 0..n {
+        let x = byte(s, i)
+        if x == a or x == b or x == c {
+            return true
+        }
+    }
+    false
+}
+
+fn isText(s: Int, t: Text) -> Bool = strlen(s) == len(t) and sameBytes(s, textAt(t), len(t))
+
+pub extern effect fn osCFunctionImpl(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" {
+    if lib == 0 or isText(lib, "c") or isText(lib, "m") {
+        // the C runtime: the universal one, else the old one
+        let ucrt = loadLibraryW(wide(textAt("ucrtbase.dll\0")))
+        let f = if ucrt != 0 { getProcAddress(ucrt, symbol) } else { 0 }
+        if f != 0 {
+            return f
+        }
+        let old = loadLibraryW(wide(textAt("msvcrt.dll\0")))
+        let g = if old != 0 { getProcAddress(old, symbol) } else { 0 }
+        if g != 0 {
+            return g
+        }
+        let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(
+            " in the C library (ucrtbase.dll, msvcrt.dll)",
+        )
+        return 0
+    }
+    let path = hasAny(lib, '.', '/', '\\')
+    var h = 0
+    let name = calloc(1, 1024)
+    for attempt in 0..(if path {
+        1 // m.dll, then libm.dll (as MinGW names them)
+    } else {
+        2
+    }) {
+        if h == 0 {
+            let b = bufAt(name, 1024)
+            let _ = if path {
+                b.zeroText(lib)
+            } else if attempt == 1 {
+                b.text("lib").zeroText(lib).text(".dll")
+            } else {
+                b.zeroText(lib).text(".dll")
+            }
+            let w = wide(name)
+            h = loadLibraryW(w)
+            free(w)
+        }
+    }
+    free(name)
+    if h == 0 {
+        let b = bufAt(why, 512).text("cannot load the library ").zeroText(lib).text(" (").zeroText(lib)
+        let _ = if path { b.text(")") } else { b.text(".dll)") }
+        return 0
+    }
+    let f = getProcAddress(h, symbol)
+    if f == 0 {
+        let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(" in the library ").zeroText(lib)
+    }
+    f
+}
+
+pub extern effect fn osProcessorsImpl() -> Int64 as "qkosProcessors" {
+    let info = calloc(1, 64)
+    getSystemInfo(info)
+    let n = int32At(info, 8) // dwNumberOfProcessors, at 32
+    free(info)
+    n
+}
+
+pub extern effect fn osThreadStartImpl(f: Int64, arg: Int64) -> Int64 as "qkosThreadStart" =
+    createThread(0, 67108864, f, arg, 65536, 0) // 64 MB of stack, reserved
+
+pub extern effect fn osThreadJoinImpl(h: Int64) as "qkosThreadJoin" {
+    let _ = waitForSingleObject(h, 4294967295)
+    let _ = closeHandle(h)
+}
+
+// ---- the executable's entry: the arguments as Windows has them (UTF-16), made UTF-8 ----
+pub extern effect fn wmain(argc: Int32, argv: Int64) -> Int32 as "wmain" {
+    setWord(cell(), 1, tlsAlloc())
+    let _ = setConsoleOutputCP(utf8)
+    let args = calloc(argc + 1, 8)
+    for i in 0..argc {
+        setWord(args, i, utf8Of(word(argv, i)))
+    }
+    let w = calloc(32768, 2)
+    let n = getModuleFileNameW(0, w, 32768)
+    let self = if n != 0 and n < 32768 { utf8Of(w) } else { 0 }
+    free(w)
+    qkStart(argc, args, self)
+}
+
+// ---- an executable with no C start (compiler/image.qk writes the PE): its entry point, the command line read here ----
+extern effect fn exitProcess(code: UInt32) as "ExitProcess"
+
+pub extern effect fn winEntry() -> Int32 as "qkWinEntry" {
+    let count = calloc(1, 8)
+    let argv = commandLineToArgvW(getCommandLineW(), count)
+    exitProcess(wmain(int32At(count, 0), argv))
+    0
+}
+
+// ---- a program run from memory (quarkimg run): the runtime mapped by the caller, the arguments UTF-8 already ----
+pub extern effect fn memoryMain(argc: Int64, argv: Int64, payload: Int64, trailer: Int64) -> Int64 as "qkMemoryMain" {
+    setWord(cell(), 1, tlsAlloc())
+    let _ = setConsoleOutputCP(utf8)
+    qkStartMemory(argc, argv, payload, trailer)
+}
+
+// ---- the command line's own runs (host.qk, compiler/memory.qk): this thread made ready for the runtime ----
+pub extern effect fn hostInit() as "qkosHostInit" {
+    setWord(cell(), 1, tlsAlloc())
+    let _ = setConsoleOutputCP(utf8)
+}
+
+// ---- --profile: another thread stops this one every millisecond and reads where it is ----
+extern effect fn getCurrentThread() -> Int64 as "GetCurrentThread"
+
+extern effect fn duplicateHandle(
+    fromProcess: Int64,
+    h: Int64,
+    toProcess: Int64,
+    to: Int64,
+    access: UInt32,
+    inherit: Int32,
+    options: UInt32,
+) -> Int32 as "DuplicateHandle"
+
+extern effect fn suspendThread(h: Int64) -> UInt32 as "SuspendThread"
+extern effect fn resumeThread(h: Int64) -> UInt32 as "ResumeThread"
+extern effect fn getThreadContext(h: Int64, context: Int64) -> Int32 as "GetThreadContext"
+extern effect fn timeBeginPeriod(ms: UInt32) -> UInt32 as "timeBeginPeriod"
+extern effect fn createWaitableTimerExW(security: Int64, name: Int64, flags: UInt32, access: UInt32) -> Int64 as "CreateWaitableTimerExW"
+extern effect fn setWaitableTimer(h: Int64, due: Int64, period: Int32, f: Int64, arg: Int64, resume: Int32) -> Int32 as "SetWaitableTimer"
+extern effect fn timeEndPeriod(ms: UInt32) -> UInt32 as "timeEndPeriod"
+
+// p's words (host.qk): on, the sampled thread, the sampling one, the samples, their count, their room
+fn sampler(p: Int) -> Int {
+    let raw = calloc(1, 1248)
+    let context = (raw + 15) & -16 // a CONTEXT: 16-aligned
+    // x86-64 (its functions start with push rbp): ContextFlags at byte 48, Rip at 248; ARM64: at 0, Pc at 264
+    let x64 = byte(fnAddress(x => sampler(x)), 0) == 85
+    let _ = timeBeginPeriod(1)
+    // a high-resolution timer: Windows 11 lets a process with no window sleep no less than its 15.6 ms tick
+    let timer = createWaitableTimerExW(0, 0, 2, 2031619) // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS
+    let due = calloc(1, 8)
+    setWord(due, 0, -10000) // a millisecond from now, in 100 ns
+    while word(p, 0) != 0 {
+        if timer != 0 and setWaitableTimer(timer, due, 0, 0, 0, 0) != 0 {
+            let _ = waitForSingleObject(timer, 4294967295)
+        } else {
+            winSleep(1)
+        }
+        if suspendThread(word(p, 1)) == 4294967295 {
+            continue
+        }
+        // CONTEXT_CONTROL | CONTEXT_INTEGER of CONTEXT_AMD64 (Rbp is an integer register), or CONTEXT_CONTROL of
+        // CONTEXT_ARM64 (Fp is a control one)
+        setInt32(context, if x64 { 12 } else { 0 }, if x64 { 1048579 } else { 4194305 })
+        if getThreadContext(word(p, 1), context) != 0 and word(p, 4) < word(p, 5) {
+            let s = word(p, 3) + 8 * sampleWords * word(p, 4)
+            setWord(s, 0, word(context, if x64 {
+                31 // Rip, Pc
+            } else {
+                33
+            }))
+            // the frames above: rbp / x29 holds the saved one, then the return address
+            var fp = word(context, if x64 { 20 } else { 30 })
+            for j in 1..sampleWords {
+                if fp < word(p, 6) or fp >= word(p, 7) - 16 or fp & 7 != 0 {
+                    break
+                }
+                setWord(s, j, word(fp, 1))
+                let next = word(fp, 0)
+                fp = if next > fp { next } else { 0 }
+            }
+            setWord(p, 4, word(p, 4) + 1)
+        }
+        let _ = resumeThread(word(p, 1))
+    }
+    let _ = timeEndPeriod(1)
+    if timer != 0 {
+        let _ = closeHandle(timer)
+    }
+    free(due)
+    free(raw)
+    0
+}
+
+pub extern effect fn osProfileStartImpl(p: Int64) as "qkosProfileStart" {
+    getCurrentThreadStackLimits(p + 48, p + 56) // the sampled thread's own: where its frames can be
+    let h = calloc(1, 8)
+    let _ = duplicateHandle(getCurrentProcess(), getCurrentThread(), getCurrentProcess(), h, 0, 0, 2) // the same access
+    setWord(p, 1, word(h, 0))
+    free(h)
+    setWord(p, 2, createThread(0, 0, fnAddress(x => sampler(x)), p, 0, 0))
+}
+
+pub extern effect fn osProfileStopImpl(p: Int64) as "qkosProfileStop" {
+    if word(p, 2) != 0 {
+        let _ = waitForSingleObject(word(p, 2), 4294967295)
+        let _ = closeHandle(word(p, 2))
+    }
+    let _ = closeHandle(word(p, 1))
+}
+
+// ---- sockets (ws2_32: Winsock), seeking, the local time ----
+extern effect fn wsaStartup(version: UInt16, data: Int64) -> Int32 as "WSAStartup"
+extern effect fn wsaGetLastError() -> Int32 as "WSAGetLastError"
+extern effect fn wsaPoll(items: Int64, count: UInt32, ms: Int32) -> Int32 as "WSAPoll"
+extern effect fn wsSocket(family: Int32, kind: Int32, protocol: Int32) -> Int64 as "socket"
+extern effect fn wsBind(s: Int64, addr: Int64, n: Int32) -> Int32 as "bind"
+extern effect fn wsListen(s: Int64, backlog: Int32) -> Int32 as "listen"
+extern effect fn wsAccept(s: Int64, addr: Int64, n: Int64) -> Int64 as "accept"
+extern effect fn wsConnect(s: Int64, addr: Int64, n: Int32) -> Int32 as "connect"
+extern effect fn wsRecv(s: Int64, p: Int64, n: Int32, flags: Int32) -> Int32 as "recv"
+extern effect fn wsSend(s: Int64, p: Int64, n: Int32, flags: Int32) -> Int32 as "send"
+extern effect fn wsClose(s: Int64) -> Int32 as "closesocket"
+extern effect fn wsIoctl(s: Int64, command: Int32, arg: Int64) -> Int32 as "ioctlsocket"
+extern effect fn wsSetOption(s: Int64, level: Int32, name: Int32, value: Int64, n: Int32) -> Int32 as "setsockopt"
+extern effect fn wsGetAddrInfo(host: Int64, service: Int64, hints: Int64, out: Int64) -> Int32 as "getaddrinfo"
+extern effect fn wsFreeAddrInfo(info: Int64) as "freeaddrinfo"
+extern effect fn fseeki64(f: Int64, at: Int64, from: Int32) -> Int32 as "_fseeki64"
+extern effect fn ftelli64(f: Int64) -> Int64 as "_ftelli64"
+extern effect fn localtime64s(tm: Int64, t: Int64) -> Int32 as "_localtime64_s"
+extern effect fn mkgmtime64(tm: Int64) -> Int64 as "_mkgmtime64"
+
+const wouldBlock = 10035 // WSAEWOULDBLOCK
+const fionbio = -2147195266 // FIONBIO: 0x8004667E as an Int32
+
+// what a Winsock error says (the common ones), zero-ended into why
+fn netWhy(why: Int, code: Int) {
+    let b = bufAt(why, 256)
+    let m = match code {
+        10013 => "permission denied"
+        10048 => "the address is in use"
+        10049 => "the address is not this machine's"
+        10050 => "the network is down"
+        10051 => "the network cannot be reached"
+        10053 => "the connection was aborted"
+        10054 => "the connection was reset by the other end"
+        10060 => "it timed out"
+        10061 => "the connection was refused"
+        10065 => "the host cannot be reached"
+        11001 => "the host is not known"
+        11002 => "the host is not known (for now)"
+        _ => ""
+    }
+    if m != "" {
+        let _ = b.text(m)
+    } else {
+        let _ = b.text("Winsock error ").int(code)
+    }
+}
+
+// host:port's first IPv4 address (a sockaddr_in, 16 bytes) into addr; host 0 or "": any (to listen)
+fn resolve(host: Int, port: Int, addr: Int, why: Int) -> Bool {
+    let data = calloc(408, 1)
+    let _ = wsaStartup(514, data) // 2.2 (counted: once is enough, more costs nothing)
+    free(data)
+    let hints = calloc(48 + 24 + 8, 1) // the hints, the port's digits, the result's address
+    setInt32(hints, 0, if host == 0 or byte(host, 0) == 0 {
+        1 // AI_PASSIVE
+    } else {
+        0
+    })
+    setInt32(hints, 1, 2) // AF_INET
+    setInt32(hints, 2, 1) // SOCK_STREAM
+    let service = bufAt(hints + 48, 24).int(port)
+    let out = hints + 72
+    let node = if host == 0 or byte(host, 0) == 0 { 0 } else { host }
+    let r = wsGetAddrInfo(node, service.p, hints, out)
+    let found = r == 0 and word(out, 0) != 0
+    if found {
+        copyBytes(addr, word(word(out, 0), 4), 16) // ai_addr, at 32
+        wsFreeAddrInfo(word(out, 0))
+    } else {
+        netWhy(why, if r != 0 { r } else { 11001 })
+    }
+    free(hints)
+    found
+}
+
+fn nonBlocking(s: Int) {
+    let one = calloc(1, 8)
+    setInt32(one, 0, 1)
+    let _ = wsIoctl(s, fionbio, one)
+    free(one)
+}
+
+pub extern effect fn osListenImpl(host: Int64, port: Int64, why: Int64) -> Int64 as "qkosListen" {
+    let addr = calloc(3, 8) // the address (16 bytes), then an Int32 1
+    if not resolve(host, port, addr, why) {
+        free(addr)
+        return -1
+    }
+    let s = wsSocket(2, 1, 6)
+    if s == -1 {
+        netWhy(why, wsaGetLastError())
+        free(addr)
+        return -1
+    }
+    setInt32(addr, 4, 1)
+    let _ = wsSetOption(s, 65535, 4, addr + 16, 4) // SOL_SOCKET, SO_REUSEADDR
+    let ok = wsBind(s, addr, 16) == 0 and wsListen(s, 128) == 0
+    free(addr)
+    if not ok {
+        netWhy(why, wsaGetLastError())
+        let _ = wsClose(s)
+        return -1
+    }
+    nonBlocking(s)
+    s
+}
+
+pub extern effect fn osConnectImpl(host: Int64, port: Int64, why: Int64) -> Int64 as "qkosConnect" {
+    let addr = calloc(2, 8)
+    if not resolve(host, port, addr, why) {
+        free(addr)
+        return -1
+    }
+    let s = wsSocket(2, 1, 6)
+    if s == -1 {
+        netWhy(why, wsaGetLastError())
+        free(addr)
+        return -1
+    }
+    let ok = wsConnect(s, addr, 16) == 0
+    free(addr)
+    if not ok {
+        netWhy(why, wsaGetLastError())
+        let _ = wsClose(s)
+        return -1
+    }
+    nonBlocking(s)
+    s
+}
+
+pub extern effect fn osAcceptImpl(s: Int64, why: Int64) -> Int64 as "qkosAccept" {
+    let c = wsAccept(s, 0, 0)
+    if c != -1 {
+        nonBlocking(c)
+        return c
+    }
+    let e = wsaGetLastError()
+    if e == wouldBlock {
+        return -1
+    }
+    netWhy(why, e)
+    -2
+}
+
+pub extern effect fn osRecvImpl(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosRecv" {
+    let k = wsRecv(s, p, min(n, 1073741824), 0)
+    if k >= 0 {
+        return k
+    }
+    let e = wsaGetLastError()
+    if e == wouldBlock {
+        return -1
+    }
+    netWhy(why, e)
+    -2
+}
+
+pub extern effect fn osSendImpl(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosSend" {
+    let k = wsSend(s, p, min(n, 1073741824), 0)
+    if k >= 0 {
+        return k
+    }
+    let e = wsaGetLastError()
+    if e == wouldBlock {
+        return -1
+    }
+    netWhy(why, e)
+    -2
+}
+
+pub extern effect fn osCloseSocketImpl(s: Int64) as "qkosCloseSocket" {
+    let _ = wsClose(s)
+}
+
+// items: (socket, write, ready) each; ready set to 1 for those that are (an error or a hang-up is ready too: the
+// next call says it); ms -1: as long as it takes
+pub extern effect fn osPollImpl(items: Int64, count: Int64, ms: Int64) -> Int64 as "qkosPoll" {
+    if count == 0 {
+        if ms > 0 {
+            winSleep(ms)
+        }
+        return 0
+    }
+    let fds = calloc(2 * count, 8) // WSAPOLLFD: the socket, then events and revents (shorts)
+    for i in 0..count {
+        setWord(fds, 2 * i, word(items, 3 * i))
+        setWord(fds, 2 * i + 1, if word(items, 3 * i + 1) != 0 {
+            16 // POLLWRNORM, POLLRDNORM
+        } else {
+            256
+        })
+    }
+    let r = wsaPoll(fds, count, if ms < 0 { -1 } else { ms })
+    for i in 0..count {
+        let revents = shr(word(fds, 2 * i + 1), 16) & 65535
+        setWord(items, 3 * i + 2, if revents != 0 { 1 } else { 0 })
+    }
+    free(fds)
+    r
+}
+
+pub extern effect fn osSeekImpl(f: Int64, at: Int64, from: Int64) -> Int64 as "qkosSeek" {
+    if fseeki64(f, at, from) != 0 {
+        return -1
+    }
+    ftelli64(f)
+}
+
+pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalOffset" {
+    let t = calloc(10, 8) // the moment, then a struct tm
+    setWord(t, 0, toInt(cFloor(seconds)))
+    var offset = 0
+    if localtime64s(t + 8, t) == 0 {
+        offset = mkgmtime64(t + 8) - word(t, 0) // the local wall clock read as UTC, less the moment
+    }
+    free(t)
+    offset
+}

@@ -1,0 +1,792 @@
+// Texts: made in the arena as [length: 8 bytes][bytes], and the code reads both. Optionals and results as the
+// code reads them, and what texts are made of: UTF-8, numbers, cases.
+use base
+use arena
+
+pub fn makeText(p: Int, n: Int) -> Int {
+    let t = allocRaw(n + 8, 1)
+    setWord(arena(), aLastText, t)
+    setWord(t, 0, n)
+    copyBytes(t + 8, p, n)
+    t
+}
+
+pub fn literal(t: Text) -> Int = makeText(textAt(t), len(t))
+
+// an optional: [1 or 0][the value's two slots]
+pub fn optional(has: Bool, a: Int, b: Int) -> Int {
+    let p = alloc(3, 8)
+    if has {
+        setWord(p, 0, 1)
+        setWord(p, 1, a)
+        setWord(p, 2, b)
+    }
+    p
+}
+
+// a result: [1 or 0][the message (bytes, length)][the value's two slots]
+// a result's slots (types.qk's caseLayout): its case, then Err's message or Ok's value from slot 1, a Float's after
+// the message (a slot keeps its kind)
+pub fn okResult(a: Int, b: Int) -> Int {
+    let p = alloc(5, 8)
+    setWord(p, 0, 1)
+    setWord(p, 1, a)
+    setWord(p, 2, b)
+    p
+}
+
+pub fn okFloatResult(bits: Int) -> Int {
+    let p = alloc(5, 8)
+    setWord(p, 0, 1)
+    setWord(p, 3, bits)
+    p
+}
+
+pub fn errResult(m: Buf) -> Int {
+    let p = alloc(5, 8)
+    let bytes = alloc(m.n + 1, 1)
+    copyBytes(bytes, m.p, m.n)
+    setWord(p, 1, bytes)
+    setWord(p, 2, m.n)
+    p
+}
+
+// room for a message, in the arena (what a result keeps is copied out of it)
+pub fn message() -> Buf = bufAt(alloc(1024, 1), 1024)
+
+// a text as a C string (zero-ended), in the arena
+pub fn cString(p: Int, n: Int) -> Int {
+    let s = alloc(n + 1, 1)
+    copyBytes(s, p, n)
+    s
+}
+
+// an array of texts as the code reads it: [count][(bytes, length)...]
+pub fn textArray(count: Int) -> Int {
+    let p = alloc(1 + 2 * count, 8)
+    setWord(p, 0, count)
+    p
+}
+
+// ---- joining ----
+// s + t where s is the last text the arena made and nothing came after it: t goes on its end, in place
+fn appendInPlace(x: Int, xn: Int, y: Int, yn: Int) -> Int {
+    let ar = arena()
+    let cur = word(ar, aCurrent)
+    let p = word(ar, aLastText)
+    if cur == 0 or p == 0 or p + 8 != x or xn <= 0 {
+        return 0
+    }
+    let had = word(p, 0)
+    let oldBytes = align16(had + 8)
+    let newBytes = align16(xn + yn + 8)
+    if had != xn
+        or p + oldBytes != word(cur, bData) + word(cur, bUsed)
+        or word(cur, bUsed) - oldBytes + newBytes > word(cur, bSize) {
+        return 0
+    }
+    setWord(cur, bUsed, word(cur, bUsed) + newBytes - oldBytes)
+    setWord(ar, aAllocated, word(ar, aAllocated) + newBytes - oldBytes)
+    moveBytes(p + 8 + xn, y, yn)
+    setWord(p, 0, xn + yn)
+    p
+}
+
+const textRoomFrom = 128
+
+// the room of the text (bytes, n) when it is the whole of what its room holds, else 0
+pub fn textRoom(a: Int, p: Int, n: Int) -> Int {
+    if n < textRoomFrom {
+        return 0
+    }
+    let room = growingRoom(a, p - 8)
+    if room == 0 {
+        return 0
+    }
+    if word(p - 8, 0) == n { room } else { 0 }
+}
+
+pub fn textJoin(x: Int, xn: Int, y: Int, yn: Int) -> Int {
+    let q = appendInPlace(x, xn, y, yn)
+    if q != 0 {
+        return q
+    }
+    let n = xn + yn
+    let room = textRoom(arena(), x, xn)
+    if n + 8 <= room {
+        // in its room
+        let t = x - 8
+        moveBytes(t + 8 + xn, y, yn)
+        setWord(t, 0, n)
+        return t
+    }
+    let cap = if xn >= textRoomFrom {
+        2 * n + 8 // room to grow: the next join writes in place
+    } else {
+        n + 8
+    }
+    let p = allocRaw(cap, 1)
+    setWord(arena(), aLastText, p)
+    setWord(p, 0, n)
+    copyBytes(p + 8, x, xn)
+    copyBytes(p + 8 + xn, y, yn)
+    if cap > n + 8 {
+        growingAdd(arena(), p, cap)
+    }
+    p
+}
+
+pub extern effect fn rtTextJoin(x: Int64, xn: Int64, y: Int64, yn: Int64) -> Int64 as "qk_textJoin" =
+    textJoin(x, xn, y, yn)
+
+pub fn textCompare(x: Int, xn: Int, y: Int, yn: Int) -> Int {
+    let c = compareBytes(x, y, if xn < yn { xn } else { yn })
+    if c != 0 {
+        return if c < 0 { -1 } else { 1 }
+    }
+    if xn < yn {
+        -1
+    } else if xn > yn {
+        1
+    } else {
+        0
+    }
+}
+
+pub extern effect fn rtTextCompare(x: Int64, xn: Int64, y: Int64, yn: Int64) -> Int64 as "qk_textCompare" =
+    textCompare(x, xn, y, yn)
+
+pub extern effect fn rtTextOfInt(v: Int64) -> Int64 as "qk_textOfInt" {
+    let b = bufAt(ctx() + 8 * ctxScratch, 32).int(v) // (the digits in the context's scratch: nothing made for them)
+    makeText(b.p, b.n)
+}
+
+// x + the digits of v: written from the context's scratch onto x (in place when x has room)
+pub extern effect fn rtJoinInt(x: Int64, xn: Int64, v: Int64) -> Int64 as "qk_joinInt" {
+    let b = bufAt(ctx() + 8 * ctxScratch, 32).int(v)
+    textJoin(x, xn, b.p, b.n)
+}
+
+pub extern effect fn rtTextOfFloat(v: Float64) -> Int64 as "qk_textOfFloat" {
+    let s = ctx() + 8 * ctxScratch
+    makeText(s, floatText(s, v))
+}
+
+// ---- pieces ----
+pub fn isSpace(c: Int) -> Bool = c <= ' ' and (c == ' ' or c == '\t' or c == '\n' or c == '\r')
+
+const spaceBytes = 2387225703656530209 // 0x2121212121212121: a byte below it is ' ' or a control byte
+
+// the first byte at or after i that may be a space (one at most ' '), eight at a time; else where the words end
+fn nextSpaceLike(t: Int, i0: Int, n: Int) -> Int {
+    var i = i0
+    while i + 8 <= n {
+        let x = Pointer<Int64>(t + i)[0]
+        if (x -% spaceBytes) & ~x & highBits != 0 {
+            break
+        }
+        i += 8
+    }
+    i
+}
+
+// the pieces of t between separators (sn 0: words, between spaces), in one pass: each piece's (bytes, length) into
+// a buffer of C's that grows, then the array made once, of the right size
+pub fn splitText(t: Int, n: Int, sep: Int, sn: Int) -> Int {
+    var cap = 256
+    var buf = malloc(cap * 16)
+    var count = 0
+    var i = 0
+    while i <= n {
+        var start = 0
+        var end = 0
+        if sn == 0 {
+            // words
+            while i < n and isSpace(byte(t, i)) {
+                i += 1
+            }
+            if i >= n {
+                break
+            }
+            start = i
+            while i < n {
+                i = nextSpaceLike(t, i, n) // a word's bytes, skipped eight at a time
+                if i >= n or isSpace(byte(t, i)) {
+                    break
+                }
+                i += 1
+            }
+            end = i
+        } else {
+            start = i
+            let k = findBytes(t, i, n, sep, sn)
+            end = if k < 0 { n } else { k }
+            i = end + sn // past the separator; past the end after the last piece
+            if end == n {
+                i = n + 1
+            }
+        }
+        if count == cap {
+            cap *= 2
+            buf = realloc(buf, cap * 16)
+        }
+        setWord(buf, 2 * count, t + start)
+        setWord(buf, 2 * count + 1, end - start)
+        count += 1
+    }
+    let p = textArray(count)
+    copyBytes(p + 8, buf, count * 16)
+    free(buf)
+    p
+}
+
+pub extern effect fn rtSplit(t: Int64, n: Int64, sep: Int64, sn: Int64) -> Int64 as "qk_split" =
+    splitText(t, n, sep, sn)
+
+pub extern effect fn rtWords(t: Int64, n: Int64) -> Int64 as "qk_words" = splitText(t, n, 0, 0)
+
+pub extern effect fn rtLines(t: Int64, n0: Int64) -> Int64 as "qk_lines" {
+    var n = n0
+    if n != 0 and byte(t, n - 1) == '\n' {
+        n -= 1
+    }
+    if n == 0 {
+        return textArray(0)
+    }
+    let p = splitText(t, n, textAt("\n"), 1)
+    for i in 0..word(p, 0) {
+        let s = word(p, 1 + 2 * i)
+        let k = word(p, 2 + 2 * i)
+        if k != 0 and byte(s, k - 1) == '\r' {
+            setWord(p, 2 + 2 * i, k - 1)
+        }
+    }
+    p
+}
+
+pub extern effect fn rtTrim(t: Int64, n: Int64) -> Int64 as "qk_trim" {
+    var a = 0
+    var b = n
+    while a < b and isSpace(byte(t, a)) {
+        a += 1
+    }
+    while b > a and isSpace(byte(t, b - 1)) {
+        b -= 1
+    }
+    makeText(t + a, b - a)
+}
+
+pub extern effect fn rtCodePointCount(t: Int64, n: Int64) -> Int64 as "qk_codePointCount" {
+    var count = 0
+    for i in 0..n {
+        if i == 0 or byte(t, i) & 192 != 128 {
+            count += 1
+        }
+    }
+    count
+}
+
+// t[lo..hi]: 0 when both ends are between characters, else 1 + the byte that cuts one
+pub extern effect fn rtTextCut(t: Int64, n: Int64, lo: Int64, hi: Int64) -> Int64 as "qk_textCut" {
+    if lo > 0 and lo < n and byte(t, lo) & 192 == 128 {
+        return lo + 1
+    }
+    if hi > 0 and hi < n and byte(t, hi) & 192 == 128 {
+        return hi + 1
+    }
+    0
+}
+
+pub extern effect fn rtStartsWith(t: Int64, n: Int64, s: Int64, sn: Int64) -> Int64 as "qk_startsWith" =
+    if sn <= n and sameBytes(t, s, sn) { 1 } else { 0 }
+
+pub extern effect fn rtEndsWith(t: Int64, n: Int64, s: Int64, sn: Int64) -> Int64 as "qk_endsWith" =
+    if sn <= n and sameBytes(t + n - sn, s, sn) { 1 } else { 0 }
+
+pub fn find(t: Int, n: Int, part: Int, pn: Int) -> Int = findBytes(t, 0, n, part, pn)
+
+pub extern effect fn rtFind(t: Int64, n: Int64, part: Int64, pn: Int64) -> Int64 as "qk_find" =
+    find(t, n, part, pn)
+
+pub extern effect fn rtReplace(t: Int64, n: Int64, old: Int64, on: Int64, by: Int64, wn: Int64) -> Int64 as "qk_replace" {
+    if on == 0 {
+        return makeText(t, n)
+    }
+    var total = 0 // first how long, then the bytes
+    var i = 0
+    while i < n {
+        let k = findBytes(t, i, n, old, on)
+        if k < 0 {
+            total += n - i
+            break
+        }
+        total += k - i + wn
+        i = k + on
+    }
+    let p = allocRaw(total + 8, 1)
+    setWord(arena(), aLastText, p)
+    setWord(p, 0, total)
+    var w = p + 8
+    i = 0
+    while i < n {
+        let k = findBytes(t, i, n, old, on)
+        let upTo = if k < 0 { n } else { k }
+        copyBytes(w, t + i, upTo - i)
+        w += upTo - i
+        if k < 0 {
+            break
+        }
+        copyBytes(w, by, wn)
+        w += wn
+        i = k + on
+    }
+    p
+}
+
+pub extern effect fn rtRepeat(t: Int64, n: Int64, times: Int64) -> Int64 as "qk_repeat" {
+    if times <= 0 or n == 0 {
+        return makeText(0, 0)
+    }
+    let p = allocRaw(n * times + 8, 1)
+    setWord(p, 0, n * times)
+    for i in 0..times {
+        copyBytes(p + 8 + i * n, t, n)
+    }
+    p
+}
+
+// join(texts, separator): an array of (bytes, length) pairs
+pub extern effect fn rtJoin(items: Int64, count: Int64, sep: Int64, sn: Int64) -> Int64 as "qk_join" {
+    var total = 0
+    for i in 0..count {
+        total += word(items, 2 * i + 1) + (if i != 0 { sn } else { 0 })
+    }
+    let p = allocRaw(total + 8, 1)
+    setWord(p, 0, total)
+    var w = p + 8
+    for i in 0..count {
+        if i != 0 and sn != 0 {
+            copyBytes(w, sep, sn)
+            w += sn
+        }
+        copyBytes(w, word(items, 2 * i), word(items, 2 * i + 1))
+        w += word(items, 2 * i + 1)
+    }
+    p
+}
+
+// "{x:.2}": a number with so many decimals
+pub extern effect fn rtTextFixed(v: Float64, decimals: Int64) -> Int64 as "qk_textFixed" {
+    let d = if decimals < 0 {
+        0
+    } else if decimals > 40 {
+        40
+    } else {
+        decimals
+    }
+    let s = alloc(400, 1)
+    let n = osFloatText(s, 400, 'f', d, v)
+    makeText(s, if n < 400 { n } else { 399 })
+}
+
+// "{x:8}": at least so wide, with spaces in front
+pub extern effect fn rtPad(t: Int64, n: Int64, width: Int64) -> Int64 as "qk_pad" {
+    var chars = 0
+    for i in 0..n {
+        if byte(t, i) & 192 != 128 {
+            chars += 1
+        }
+    }
+    let pad = if width > chars { width - chars } else { 0 }
+    let p = allocRaw(n + pad + 8, 1)
+    setWord(p, 0, n + pad)
+    let _ = memset(p + 8, ' ', pad)
+    copyBytes(p + 8 + pad, t, n)
+    p
+}
+
+// ---- characters (UTF-8) ----
+// the bytes that are not UTF-8: the first one that is not part of a character, or -1
+pub fn utf8Invalid(s: Int, n: Int) -> Int {
+    var i = 0
+    while i < n {
+        let c = byte(s, i)
+        if c < 128 {
+            i += 1
+            continue
+        }
+        var more = 0
+        var lo = 128
+        var hi = 191 // what the second byte may be
+        if c >= 194 and c <= 223 {
+            more = 1
+        } else if c >= 224 and c <= 239 {
+            more = 2
+            if c == 224 {
+                lo = 160 // overlong
+            } else if c == 237 {
+                hi = 159 // a surrogate
+            }
+        } else if c >= 240 and c <= 244 {
+            more = 3
+            if c == 240 {
+                lo = 144
+            } else if c == 244 {
+                hi = 143 // past 0x10FFFF
+            }
+        } else {
+            return i
+        }
+        if i + more >= n {
+            return i
+        }
+        if byte(s, i + 1) < lo or byte(s, i + 1) > hi {
+            return i
+        }
+        for k in 2..more + 1 {
+            if byte(s, i + k) < 128 or byte(s, i + k) > 191 {
+                return i
+            }
+        }
+        i += 1 + more
+    }
+    -1
+}
+
+pub type Decoded { c: Int, next: Int }
+
+// the character at t[i] (and where the next one starts); a byte that starts no character is itself
+pub fn decodeChar(t: Int, n: Int, i: Int) -> Decoded {
+    let c = byte(t, i)
+    var more = if c >= 240 and c < 248 {
+        3
+    } else if c >= 224 {
+        2
+    } else if c >= 192 {
+        1
+    } else {
+        0
+    }
+    if c >= 248 or c >= 128 and c < 192 or i + more >= n + (if more != 0 { 0 } else { 1 }) {
+        more = 0
+    }
+    var v = if more == 3 {
+        c & 7
+    } else if more == 2 {
+        c & 15
+    } else if more == 1 {
+        c & 31
+    } else {
+        c
+    }
+    for k in 1..more + 1 {
+        if byte(t, i + k) & 192 != 128 {
+            more = 0
+            v = c
+            break
+        }
+        v = v << 6 | byte(t, i + k) & 63
+    }
+    Decoded(v, i + 1 + more)
+}
+
+pub fn charBytes(c: Int) -> Int = if c < 128 {
+    1
+} else if c < 2048 {
+    2
+} else if c < 65536 {
+    3
+} else {
+    4
+}
+
+pub fn encodeChar(c: Int, out: Int) -> Int {
+    if c < 128 {
+        setByte(out, 0, c)
+        return 1
+    }
+    if c < 2048 {
+        setByte(out, 0, 192 | c >> 6)
+        setByte(out, 1, 128 | c & 63)
+        return 2
+    }
+    if c < 65536 {
+        setByte(out, 0, 224 | c >> 12)
+        setByte(out, 1, 128 | c >> 6 & 63)
+        setByte(out, 2, 128 | c & 63)
+        return 3
+    }
+    setByte(out, 0, 240 | c >> 18)
+    setByte(out, 1, 128 | c >> 12 & 63)
+    setByte(out, 2, 128 | c >> 6 & 63)
+    setByte(out, 3, 128 | c & 63)
+    4
+}
+
+fn odd(c: Int) -> Bool = c & 1 == 1
+
+// a letter's other case: Latin (with its accents), Greek, Cyrillic, Armenian, the full-width Latin letters
+fn otherCase(c: Int, upper: Bool) -> Int {
+    if upper {
+        if c >= 'a' and c <= 'z' {
+            return c - 32
+        }
+        if c >= 224 and c <= 254 and c != 247 {
+            return c - 32
+        }
+        if c == 255 {
+            return 376
+        }
+        if (c >= 256 and c <= 311 or c >= 330 and c <= 375) and odd(c) {
+            return c - 1
+        }
+        if (c >= 313 and c <= 328 or c >= 377 and c <= 382) and not odd(c) {
+            return c - 1
+        }
+        if c >= 945 and c <= 969 and c != 962 {
+            return c - 32
+        }
+        if c == 962 {
+            return 931
+        }
+        if c == 940 {
+            return 902
+        }
+        if c >= 941 and c <= 943 {
+            return c - 37
+        }
+        if c == 972 {
+            return 908
+        }
+        if c == 973 or c == 974 {
+            return c - 63
+        }
+        if c >= 1072 and c <= 1103 {
+            return c - 32
+        }
+        if c >= 1104 and c <= 1119 {
+            return c - 80
+        }
+        if (c >= 1120 and c <= 1153 or c >= 1162 and c <= 1215 or c >= 1232 and c <= 1327) and odd(c) {
+            return c - 1
+        }
+        if c >= 1377 and c <= 1414 {
+            return c - 48
+        }
+        if (c >= 7680 and c <= 7829 or c >= 7840 and c <= 7935) and odd(c) {
+            return c - 1
+        }
+        if c >= 65345 and c <= 65370 {
+            return c - 32
+        }
+        return c
+    }
+    if c >= 'A' and c <= 'Z' {
+        return c + 32
+    }
+    if c >= 192 and c <= 222 and c != 215 {
+        return c + 32
+    }
+    if c == 376 {
+        return 255
+    }
+    if (c >= 256 and c <= 311 or c >= 330 and c <= 375) and not odd(c) {
+        return c + 1
+    }
+    if (c >= 313 and c <= 328 or c >= 377 and c <= 382) and odd(c) {
+        return c + 1
+    }
+    if c >= 913 and c <= 937 and c != 930 {
+        return c + 32
+    }
+    if c == 902 {
+        return 940
+    }
+    if c >= 904 and c <= 906 {
+        return c + 37
+    }
+    if c == 908 {
+        return 972
+    }
+    if c == 910 or c == 911 {
+        return c + 63
+    }
+    if c >= 1040 and c <= 1071 {
+        return c + 32
+    }
+    if c >= 1024 and c <= 1039 {
+        return c + 80
+    }
+    if (c >= 1120 and c <= 1153 or c >= 1162 and c <= 1215 or c >= 1232 and c <= 1327) and not odd(c) {
+        return c + 1
+    }
+    if c >= 1329 and c <= 1366 {
+        return c + 48
+    }
+    if (c >= 7680 and c <= 7829 or c >= 7840 and c <= 7935) and not odd(c) {
+        return c + 1
+    }
+    if c >= 65313 and c <= 65338 {
+        return c + 32
+    }
+    c
+}
+
+// upper / lower: into out when not 0; the length either way
+fn caseInto(t: Int, n: Int, upper: Bool, out: Int) -> Int {
+    var w = 0
+    var i = 0
+    while i < n {
+        let at = i
+        let d = decodeChar(t, n, i)
+        i = d.next
+        if d.c >= 128 and i - at == 1 {
+            // a stray byte: as it was
+            if out != 0 {
+                setByte(out, w, d.c)
+            }
+            w += 1
+            continue
+        }
+        let c = otherCase(d.c, upper)
+        if out != 0 {
+            let _ = encodeChar(c, out + w)
+        }
+        w += charBytes(c)
+    }
+    w
+}
+
+fn textCase(t: Int, n: Int, upper: Bool) -> Int {
+    var ascii = true
+    for i in 0..n {
+        if byte(t, i) >= 128 {
+            ascii = false
+        }
+    }
+    if ascii {
+        let p = makeText(t, n)
+        for i in 0..n {
+            let c = byte(p, 8 + i)
+            if upper and c >= 'a' and c <= 'z' {
+                setByte(p, 8 + i, c - 32)
+            }
+            if not upper and c >= 'A' and c <= 'Z' {
+                setByte(p, 8 + i, c + 32)
+            }
+        }
+        return p
+    }
+    let total = caseInto(t, n, upper, 0)
+    let p = allocRaw(total + 8, 1)
+    setWord(arena(), aLastText, p)
+    setWord(p, 0, total)
+    let _ = caseInto(t, n, upper, p + 8)
+    p
+}
+
+pub extern effect fn rtUpper(t: Int64, n: Int64) -> Int64 as "qk_upper" = textCase(t, n, true)
+
+pub extern effect fn rtLower(t: Int64, n: Int64) -> Int64 as "qk_lower" = textCase(t, n, false)
+
+// char(n): the code point's character; a panic for what is not one
+pub extern effect fn rtChar(cp: Int64, line: Int64) -> Int64 as "qk_char" {
+    if cp < 0 or cp > 1114111 or cp >= 55296 and cp <= 57343 {
+        panicNow(panicChar, line, cp, 0)
+    }
+    let p = alloc(16, 1)
+    let n = encodeChar(cp, p + 8)
+    setWord(p, 0, n)
+    setWord(arena(), aLastText, p)
+    p
+}
+
+// ---- bytes ----
+// Text(b) -> Text!: the same bytes when they are UTF-8 (no copy)
+pub extern effect fn rtTextOfBytes(p: Int64, n: Int64) -> Int64 as "qk_textOfBytes" {
+    let bad = utf8Invalid(p, n)
+    if bad < 0 {
+        return okResult(p, n)
+    }
+    errResult(message().text("not UTF-8: byte ").int(bad).text(" is not part of a character"))
+}
+
+// b.push(x): one byte more, as s + t grows a text
+pub extern effect fn rtBytesPush(p: Int64, n: Int64, b: Int64) -> Int64 as "qk_bytesPush" {
+    let one = ctx() + 8 * ctxScratch
+    setByte(one, 0, b)
+    textJoin(p, n, one, 1)
+}
+
+// ---- C: texts across the boundary ----
+// a Text for C: its bytes and a zero, in the arena
+pub extern effect fn rtCText(p: Int64, n: Int64) -> Int64 as "qk_cText" = cString(p, n)
+
+// bytes C gives as a Text (n < 0: up to their zero; 0: an empty text), copied: the address of its two slots
+pub extern effect fn rtTextOfC(p: Int64, n0: Int64) -> Int64 as "qk_textOfC" {
+    let r = alloc(2, 8)
+    let n = if p == 0 {
+        0
+    } else if n0 < 0 {
+        strlen(p)
+    } else {
+        n0
+    }
+    setWord(r, 0, cString(p, n))
+    setWord(r, 1, n)
+    r
+}
+
+// ---- numbers ----
+// Err's message: why, and the text in quotes (its first 40 characters, then "…")
+fn notANumber(why: Text, t: Int, n: Int) -> Int {
+    var cut = 0
+    var chars = 0
+    while cut < n and chars < 40 {
+        cut += 1
+        while cut < n and byte(t, cut) & 192 == 128 {
+            cut += 1
+        }
+        chars += 1
+    }
+    let m = message().text(why).text(": \"").bytes(t, cut)
+    errResult(if cut < n { m.text("…\"") } else { m.text("\"") })
+}
+
+fn numberCopy(t: Int, n: Int) -> Int {
+    let s = alloc(n + 1, 1)
+    copyBytes(s, t, n)
+    s
+}
+
+// the whole text is the number: no space first, no zero inside, the end where it ends
+fn wholeNumber(s: Int, n: Int, end: Int) -> Bool =
+    n != 0 and end == s + n and not isSpace(byte(s, 0)) and strlen(s) == n
+
+pub extern effect fn rtParseInt(t: Int64, n: Int64) -> Int64 as "qk_parseInt" {
+    let s = numberCopy(t, n)
+    let endAt = alloc(1, 8)
+    setWord(endAt, 0, s)
+    osSetErrno(0)
+    let v = if n != 0 { strtoll(s, endAt, 10) } else { 0 }
+    let number = wholeNumber(s, n, word(endAt, 0))
+    if not number {
+        return notANumber("not a number", t, n)
+    }
+    if osErrno() == 34 {
+        // ERANGE
+        return notANumber("too big for an Int", t, n)
+    }
+    okResult(v, 0)
+}
+
+pub extern effect fn rtParseFloat(t: Int64, n: Int64) -> Int64 as "qk_parseFloat" {
+    let s = numberCopy(t, n)
+    let endAt = alloc(1, 8)
+    setWord(endAt, 0, s)
+    let v = if n != 0 { strtod(s, endAt) } else { 0.0 }
+    if not wholeNumber(s, n, word(endAt, 0)) {
+        return notANumber("not a number", t, n)
+    }
+    okFloatResult(bitsOf(v))
+}

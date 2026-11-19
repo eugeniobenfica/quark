@@ -1,0 +1,519 @@
+// The lexer: text to tokens. Names are camelCase (values, functions) or PascalCase (types, enum cases); a name
+// with an underscore is an error, which keeps every program in one style. A line break ends a statement after
+// something that can end one, except inside ( ) and [ ], and before a line that starts with .name (a chained
+// call, lowercase), else, or a binary operator (and, or, is, ??, +, *, ==, <, |...).
+use token
+
+// what is wrong with the text, where
+pub type Problem { line: Int, col: Int, message: Text }
+pub type Lexed { tokens: [Token] = [], comments: [Comment] = [], problems: [Problem] = [] }
+
+// The lexer's place in the text (b its bytes, p the next one, lineStart where its line starts); depth the ( and [
+// open since the innermost {, saved the depth outside each open { (braces of them); tokenOnLine a token was read on
+// this line already; blank an empty line since the last token.
+type Lexer {
+    text: Text
+    b: Bytes
+    p: Int = 0
+    line: Int = 1
+    lineStart: Int = 0
+    depth: Int = 0
+    saved: [Int] = [0] * 256
+    braces: Int = 0
+    tokenOnLine: Bool = false
+    blank: Bool = false
+    out: Lexed = Lexed()
+}
+
+pub fn lex(text: Text) -> Lexed {
+    var lx = Lexer(text, text.bytes())
+    lx.run()
+    lx.out
+}
+
+fn isAlpha(c: Int) -> Bool = c is 'a'..='z' | 'A'..='Z'
+
+fn isDigit(c: Int) -> Bool = c is '0'..='9'
+
+fn isWord(c: Int) -> Bool = isAlpha(c) or isDigit(c) or c == '_'
+
+fn isBaseDigit(c: Int, base: Int) -> Bool = match base {
+    2 => c is '0' | '1'
+    8 => c is '0'..='7'
+    _ => c is '0'..='9' | 'a'..='f' | 'A'..='F'
+}
+
+fn Lexer.add(var self, kind: Tok, at: Int, n: Int, op: Op? = None) {
+    self.out.tokens.push(Token(kind, op, at, n, self.line, at - self.lineStart + 1, self.blank))
+    self.blank = false
+    self.tokenOnLine = true
+}
+
+fn Lexer.fail(var self, line: Int, col: Int, message: Text) {
+    self.out.problems.push(Problem(line, col, message))
+}
+
+// the last token's kind (Eof: none yet)
+fn Lexer.last(self) -> Tok = if len(self.out.tokens) > 0 {
+    self.out.tokens[len(self.out.tokens) - 1].kind
+} else {
+    .Eof
+}
+
+// -> Pointer<UInt8> at the end of a line: a type's closing > ends the statement too
+fn Lexer.typeEnds(self) -> Bool {
+    let n = len(self.out.tokens)
+    if n < 2 or self.out.tokens[n - 1].op != Op.Gt {
+        return false
+    }
+    let before = self.out.tokens[n - 2]
+    before.kind is TypeName | Question or before.op == Op.Gt
+}
+
+// After a line break (q: the next line): does the next line continue this statement?
+fn continues(b: Bytes, from: Int) -> Bool {
+    let end = len(b)
+    var q = from
+    while true {
+        while q < end and b[q] is ' ' | '\t' | '\r' | '\n' {
+            q += 1
+        }
+        if q + 1 < end and b[q] == '/' and b[q + 1] == '/' {
+            while q < end and b[q] != '\n' {
+                q += 1
+            }
+            continue
+        }
+        break
+    }
+    if end - q >= 2 and b[q] == '.' and b[q + 1] is 'a'..='z' {
+        return true // .Case starts a value of its own
+    }
+    for w in ["else", "and", "or", "is"] {
+        let n = len(w)
+        if end - q >= n and b[q..q + n] == w.bytes() and (q + n == end or not isWord(b[q + n])) {
+            return true
+        }
+    }
+    // a binary operator (not -, which may start a value of its own, unless -%; nor .., which starts a match arm's ..60)
+    if q + 1 < end and b[q] == '-' and b[q + 1] == '%' {
+        return true
+    }
+    if q < end and b[q] is '+' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '|' | '&' | '^' | '?' {
+        let c = b[q]
+        let pair = q + 1 < end and b[q + 1] == (if c == '!' { '=' } else { c })
+        return not (c is '=' | '!' | '?' and not pair) // = alone is an assignment's; !x is not Quark
+    }
+    false
+}
+
+fn Lexer.run(var self) {
+    let b = self.b
+    let end = len(b)
+    while self.p < end {
+        let c = b[self.p]
+        if c == '\n' {
+            if self.depth == 0 and (self.last().endsStatement() or self.typeEnds()) and not continues(b, self.p + 1) {
+                self.add(.Newline, self.p, 0)
+            }
+            if not self.tokenOnLine and self.p > 0 {
+                // an empty line (or one with only a comment, handled below)
+                var q = self.lineStart
+                while q < self.p and b[q] is ' ' | '\t' | '\r' {
+                    q += 1
+                }
+                if q == self.p {
+                    self.blank = true
+                }
+            }
+            self.p += 1
+            self.line += 1
+            self.lineStart = self.p
+            self.tokenOnLine = false
+            continue
+        }
+        if c is ' ' | '\t' | '\r' {
+            self.p += 1
+            continue
+        }
+        let start = self.p
+        if c == '/' and self.p + 1 < end and b[self.p + 1] == '/' {
+            self.p += 2
+            if self.p < end and b[self.p] == ' ' {
+                self.p += 1
+            }
+            let from = self.p
+            while self.p < end and b[self.p] != '\n' {
+                self.p += 1
+            }
+            var stop = self.p
+            while stop > from and b[stop - 1] is '\r' | ' ' {
+                stop -= 1
+            }
+            self.out.comments.push(Comment(self.line, not self.tokenOnLine, self.text[from..stop]))
+            continue
+        }
+        if c == 'r' and self.p + 1 < end and b[self.p + 1] == '"' {
+            self.rawText(start)
+            continue
+        }
+        if c == '\'' {
+            // 'a', '\n', '\u{20AC}': a character, an Int (its code point); the parser reads it
+            self.p += 1
+            while self.p < end and b[self.p] != '\'' and b[self.p] != '\n' {
+                self.p += if b[self.p] == '\\' and self.p + 1 < end { 2 } else { 1 }
+            }
+            if self.p >= end or b[self.p] != '\'' {
+                self.fail(self.line, start - self.lineStart + 1, "this character has no closing '")
+            } else {
+                self.p += 1
+            }
+            self.add(.IntLit, start, self.p - start)
+            continue
+        }
+        if isAlpha(c) or c == '_' {
+            self.name(start)
+            continue
+        }
+        if isDigit(c) {
+            self.number(start)
+            continue
+        }
+        if c == '"' and self.p + 2 < end and b[self.p + 1] == '"' and b[self.p + 2] == '"' {
+            self.linesText(start)
+            continue
+        }
+        if c == '"' {
+            self.plainText(start)
+            continue
+        }
+        self.punctuation(start)
+    }
+    if self.last().endsStatement() {
+        self.add(.Newline, end, 0)
+    }
+    self.blank = false
+    self.add(.Eof, end, 0)
+}
+
+// r"...", r"""...""": a raw text, no escapes, no values
+fn Lexer.rawText(var self, start: Int) {
+    let b = self.b
+    let end = len(b)
+    let line = self.line
+    let col = start - self.lineStart + 1
+    let lines = self.p + 3 < end and b[self.p + 2] == '"' and b[self.p + 3] == '"'
+    self.p += if lines { 4 } else { 2 }
+    while self.p < end and (if lines {
+        not (self.p + 2 < end and b[self.p] == '"' and b[self.p + 1] == '"' and b[self.p + 2] == '"')
+    } else {
+        b[self.p] != '"' and b[self.p] != '\n'
+    }) {
+        if b[self.p] == '\n' {
+            self.line += 1
+            self.lineStart = self.p + 1
+        }
+        self.p += 1
+    }
+    if self.p >= end or b[self.p] != '"' {
+        self.fail(line, col, "this text has no closing " + (if lines { "\"\"\"" } else { "\"" }))
+        if lines {
+            self.p = end
+        }
+    } else {
+        self.p += if lines { 3 } else { 1 }
+    }
+    self.add(.TextLit, start, self.p - start)
+    self.out.tokens[len(self.out.tokens) - 1].line = line
+    self.out.tokens[len(self.out.tokens) - 1].col = col
+}
+
+// a name or a keyword; one with an underscore is an error that gives its camelCase spelling
+fn Lexer.name(var self, start: Int) {
+    let b = self.b
+    while self.p < len(b) and isWord(b[self.p]) {
+        self.p += 1
+    }
+    let n = self.p - start
+    if n == 1 and b[start] == '_' {
+        self.add(.Underscore, start, 1)
+        return
+    }
+    if b[start..self.p].contains('_') {
+        var fixed = ""
+        var upper = false
+        var count = 0
+        for ch in b[start..self.p] {
+            if count >= 120 {
+                break
+            }
+            if ch == '_' {
+                upper = count > 0
+                continue
+            }
+            fixed += char(if upper and ch is 'a'..='z' { ch - 32 } else { ch })
+            count += 1
+            upper = false
+        }
+        self.fail(
+            self.line,
+            start - self.lineStart + 1,
+            "names are camelCase or PascalCase, without underscores: write \"{fixed}\"",
+        )
+    }
+    let word = self.text[start..self.p]
+    let kind = keywords[word] ?? (if b[start] is 'A'..='Z' { Tok.TypeName } else { Tok.Name })
+    self.add(kind, start, n)
+}
+
+fn Lexer.number(var self, start: Int) {
+    let b = self.b
+    let end = len(b)
+    if b[start] == '0' and self.p + 1 < end and b[self.p + 1] is 'x' | 'b' | 'o' {
+        let base = match b[self.p + 1] {
+            'b' => 2
+            'o' => 8
+            _ => 16
+        }
+        self.p += 2
+        var valid = self.p < end and isBaseDigit(b[self.p], base)
+        while self.p < end and isWord(b[self.p]) {
+            let k = self.p
+            valid = valid
+                and (isBaseDigit(b[k], base)
+                    or b[k] == '_' and k + 1 < end and isBaseDigit(b[k - 1], base) and isBaseDigit(b[k + 1], base))
+            self.p += 1
+        }
+        if not valid {
+            let what = match base {
+                2 => "binary"
+                8 => "octal"
+                _ => "hexadecimal"
+            }
+            self.fail(self.line, start - self.lineStart + 1, "invalid {what} integer literal")
+        }
+        self.add(.IntLit, start, self.p - start)
+        return
+    }
+    // t.0.1: a field's number after a dot is a whole number, and the dot after it the next field's
+    let field = self.last() == Tok.Dot and start > 0 and b[start - 1] == '.'
+    while self.p < end and (isDigit(b[self.p]) or b[self.p] == '_') {
+        self.p += 1
+    }
+    if field {
+        self.add(.IntLit, start, self.p - start)
+        return
+    }
+    var isFloat = false
+    if self.p + 1 < end and b[self.p] == '.' and isDigit(b[self.p + 1]) {
+        isFloat = true
+        self.p += 1
+        while self.p < end and (isDigit(b[self.p]) or b[self.p] == '_') {
+            self.p += 1
+        }
+    }
+    if self.p < end and b[self.p] is 'e' | 'E' {
+        var q = self.p + 1
+        if q < end and b[q] is '+' | '-' {
+            q += 1
+        }
+        if q < end and isDigit(b[q]) {
+            isFloat = true
+            self.p = q
+            while self.p < end and isDigit(b[self.p]) {
+                self.p += 1
+            }
+        }
+    }
+    if self.p < end and isAlpha(b[self.p]) {
+        self.fail(self.line, self.p - self.lineStart + 1, "a letter right after a number")
+        while self.p < end and isAlpha(b[self.p]) {
+            self.p += 1
+        }
+    }
+    self.add(if isFloat { .FloatLit } else { .IntLit }, start, self.p - start)
+}
+
+// """ a text on lines of its own """
+fn Lexer.linesText(var self, start: Int) {
+    let b = self.b
+    let end = len(b)
+    let line = self.line
+    let col = start - self.lineStart + 1
+    self.p += 3
+    while self.p + 2 < end and not (b[self.p] == '"' and b[self.p + 1] == '"' and b[self.p + 2] == '"') {
+        if b[self.p] == '\\' and self.p + 1 < end {
+            self.p += 1
+        } else if b[self.p] == '\n' {
+            self.line += 1
+            self.lineStart = self.p + 1
+        }
+        self.p += 1
+    }
+    if self.p + 2 >= end {
+        self.fail(line, col, "this text has no closing \"\"\"")
+        self.p = end
+    } else {
+        self.p += 3
+    }
+    self.add(.TextLit, start, self.p - start)
+    self.out.tokens[len(self.out.tokens) - 1].line = line
+    self.out.tokens[len(self.out.tokens) - 1].col = col
+}
+
+// a text, with {expressions} inside (which may hold texts of their own)
+fn Lexer.plainText(var self, start: Int) {
+    let b = self.b
+    let end = len(b)
+    self.p += 1
+    var depth = 0
+    while self.p < end and b[self.p] != '\n' and (depth > 0 or b[self.p] != '"') {
+        let k = b[self.p]
+        if k == '\\' and self.p + 1 < end {
+            self.p += 2
+            continue
+        }
+        if k == '{' {
+            depth += 1
+        } else if k == '}' and depth > 0 {
+            depth -= 1
+        } else if k == '\'' and depth > 0 {
+            // a character inside an expression ('"', '}')
+            self.p += 1
+            while self.p < end and b[self.p] != '\'' and b[self.p] != '\n' {
+                self.p += if b[self.p] == '\\' and self.p + 1 < end { 2 } else { 1 }
+            }
+            if self.p >= end or b[self.p] == '\n' {
+                continue
+            }
+        } else if k == '"' {
+            // a text inside an expression
+            self.p += 1
+            while self.p < end and b[self.p] != '"' and b[self.p] != '\n' {
+                if b[self.p] == '\\' and self.p + 1 < end {
+                    self.p += 1
+                }
+                self.p += 1
+            }
+        }
+        self.p += 1
+    }
+    if self.p >= end or b[self.p] != '"' {
+        self.fail(self.line, start - self.lineStart + 1, "this text has no closing \"")
+    } else {
+        self.p += 1
+    }
+    self.add(.TextLit, start, self.p - start)
+}
+
+type Punct { kind: Tok, op: Op?, n: Int }
+
+// punctuation: the longest first
+fn Lexer.punctuation(var self, start: Int) {
+    let b = self.b
+    let c = b[start]
+    let c1 = if start + 1 < len(b) { b[start + 1] } else { 0 }
+    let c2 = if start + 2 < len(b) { b[start + 2] } else { 0 }
+    let found = match c {
+        '<' if c1 == '<' and c2 == '=' => Punct(Tok.Op, Some(Op.ShlEq), 3)
+        '>' if c1 == '>' and c2 == '=' => Punct(Tok.Op, Some(Op.ShrEq), 3)
+        '+' if c1 == '%' and c2 == '=' => Punct(Tok.Op, Some(Op.PlusWrapEq), 3)
+        '-' if c1 == '%' and c2 == '=' => Punct(Tok.Op, Some(Op.MinusWrapEq), 3)
+        '*' if c1 == '%' and c2 == '=' => Punct(Tok.Op, Some(Op.StarWrapEq), 3)
+        '+' if c1 == '%' => Punct(Tok.Op, Some(Op.PlusWrap), 2)
+        '-' if c1 == '%' => Punct(Tok.Op, Some(Op.MinusWrap), 2)
+        '*' if c1 == '%' => Punct(Tok.Op, Some(Op.StarWrap), 2)
+        '.' if c1 == '.' and c2 == '=' => Punct(Tok.DotDotEq, None, 3)
+        '.' if c1 == '.' and c2 == '.' => Punct(Tok.Ellipsis, None, 3)
+        '.' if c1 == '.' => Punct(Tok.DotDot, None, 2)
+        '.' => Punct(Tok.Dot, None, 1)
+        '%' if c1 == '=' => Punct(Tok.Op, Some(Op.PercentEq), 2)
+        '&' if c1 == '=' => Punct(Tok.Op, Some(Op.AmpEq), 2)
+        '|' if c1 == '=' => Punct(Tok.Op, Some(Op.PipeEq), 2)
+        '^' if c1 == '=' => Punct(Tok.Op, Some(Op.CaretEq), 2)
+        '?' if c1 == '?' => Punct(Tok.Op, Some(Op.Coalesce), 2)
+        '?' => Punct(Tok.Question, None, 1)
+        '-' if c1 == '>' => Punct(Tok.Arrow, None, 2)
+        '=' if c1 == '>' => Punct(Tok.FatArrow, None, 2)
+        '=' if c1 == '=' => Punct(Tok.Op, Some(Op.Eq), 2)
+        '!' if c1 == '=' => Punct(Tok.Op, Some(Op.Ne), 2)
+        '<' if c1 == '=' => Punct(Tok.Op, Some(Op.Le), 2)
+        '>' if c1 == '=' => Punct(Tok.Op, Some(Op.Ge), 2)
+        '+' if c1 == '=' => Punct(Tok.Op, Some(Op.PlusEq), 2)
+        '-' if c1 == '=' => Punct(Tok.Op, Some(Op.MinusEq), 2)
+        '*' if c1 == '=' => Punct(Tok.Op, Some(Op.StarEq), 2)
+        '/' if c1 == '=' => Punct(Tok.Op, Some(Op.SlashEq), 2)
+        '(' => Punct(Tok.LParen, None, 1)
+        ')' => Punct(Tok.RParen, None, 1)
+        '{' => Punct(Tok.LBrace, None, 1)
+        '}' => Punct(Tok.RBrace, None, 1)
+        '[' => Punct(Tok.LBracket, None, 1)
+        ']' => Punct(Tok.RBracket, None, 1)
+        ',' => Punct(Tok.Comma, None, 1)
+        ':' => Punct(Tok.Colon, None, 1)
+        '=' => Punct(Tok.Op, Some(Op.Assign), 1)
+        '+' => Punct(Tok.Op, Some(Op.Plus), 1)
+        '-' => Punct(Tok.Op, Some(Op.Minus), 1)
+        '*' => Punct(Tok.Op, Some(Op.Star), 1)
+        '/' => Punct(Tok.Op, Some(Op.Slash), 1)
+        '%' => Punct(Tok.Op, Some(Op.Percent), 1)
+        '<' => Punct(Tok.Op, Some(Op.Lt), 1)
+        '>' => Punct(Tok.Op, Some(Op.Gt), 1)
+        '!' => Punct(Tok.Bang, None, 1)
+        '&' => Punct(Tok.Op, Some(Op.Amp), 1)
+        '|' => Punct(Tok.Op, Some(Op.Pipe), 1)
+        '^' => Punct(Tok.Op, Some(Op.Caret), 1)
+        '~' => Punct(Tok.Op, Some(Op.Tilde), 1)
+        _ => Punct(Tok.Eof, None, 0)
+    }
+    let (kind, n) = (found.kind, found.n)
+    if n == 0 {
+        self.fail(self.line, start - self.lineStart + 1, "\"{shownByte(self.text, start)}\" is not part of Quark")
+        self.p += 1
+        return
+    }
+    match kind {
+        LParen | LBracket => {
+            self.depth += 1
+        }
+        RParen | RBracket if self.depth > 0 => {
+            self.depth -= 1
+        }
+        LBrace => {
+            // a block inside parentheses (a lambda's) has lines again
+            if self.braces < 256 {
+                self.saved[self.braces] = self.depth
+            }
+            self.braces += 1
+            self.depth = 0
+        }
+        RBrace if self.braces > 0 => {
+            self.braces -= 1
+            if self.braces < 256 {
+                self.depth = self.saved[self.braces]
+            }
+        }
+        _ => {}
+    }
+    self.p += n
+    self.add(kind, start, n, found.op)
+}
+
+// the character a message shows for a byte that is not Quark's: itself (a whole character, when it starts one)
+fn shownByte(text: Text, at: Int) -> Text {
+    let b = text.bytes()
+    let c = b[at]
+    let n = if c >= 0xf0 {
+        4
+    } else if c >= 0xe0 {
+        3
+    } else if c >= 0xc0 {
+        2
+    } else {
+        1
+    }
+    if at + n <= len(b) {
+        return Text(b[at..at + n]) ?? char(c)
+    }
+    char(c)
+}

@@ -1,0 +1,108 @@
+// The compiler's caches, in a folder of their own in the system's temporary folder (quark-cache): the runtime made
+// for this machine (quark-runtime-*.bin), the executables' runtime part (quark-exe-*.bin), each program's optimized
+// functions (quark-cache-*.bin). An index there (index.txt: a line "name bytes time" for each file) says when each
+// was last used; each use writes it again and lets go of the files not used for 30 days, then of the least recently
+// used ones while they take more than 1 GB in all. quark clean empties the folder (and the files older compilers
+// left in the temporary folder itself). A cache file that goes is only made again: nothing else depends on it.
+const cacheDays = 30
+const cacheMostBytes = 1073741824
+
+// the system's temporary folder
+pub fn tempDir() -> Text = env("TEMP") ?? env("TMPDIR") ?? "/tmp"
+
+// the caches' folder, made when missing
+pub fn cacheDir() -> Text {
+    let dir = tempDir() + "/quark-cache"
+    if not pathExists(dir) {
+        let _ = makeDir(dir)
+    }
+    dir
+}
+
+// where the cache file name is kept
+pub fn cachePath(name: Text) -> Text = cacheDir() + "/" + name
+
+type CacheEntry { name: Text, bytes: Int, time: Float }
+
+fn readIndex(dir: Text) -> [CacheEntry] {
+    let Ok(text) = readFile(dir + "/index.txt") else {
+        return []
+    }
+    var out: [CacheEntry] = []
+    for line in text.lines() {
+        let parts = line.split(" ")
+        if len(parts) == 3 and parts[1].parseInt() is Ok(bytes) and parts[2].parseFloat() is Ok(time) {
+            out.push(CacheEntry(parts[0], bytes, time))
+        }
+    }
+    out
+}
+
+fn writeIndex(dir: Text, entries: [CacheEntry]) {
+    var text = ""
+    for e in entries {
+        text += "{e.name} {e.bytes} {e.time}\n"
+    }
+    let _ = writeFile(dir + "/index.txt", text)
+}
+
+// the cache file name used now (bytes: its size): the index says so, and what is too old, or past the budget, goes
+pub fn cacheUsed(name: Text, bytes: Int) {
+    let dir = cacheDir()
+    let now = unixTime()
+    var kept: [CacheEntry] = []
+    for e in readIndex(dir) {
+        if e.name == name {
+            continue
+        }
+        if now - e.time > toFloat(cacheDays * 86400) {
+            let _ = removePath(dir + "/" + e.name)
+        } else {
+            kept.push(e)
+        }
+    }
+    kept.push(CacheEntry(name, bytes, now))
+    // past the budget: the least recently used go first (never the one used now)
+    var total = kept.map(e => e.bytes).sum()
+    if total > cacheMostBytes {
+        let order = kept.sortedBy(e => e.time)
+        var gone: Set<Text> = []
+        for e in order {
+            if total <= cacheMostBytes or e.name == name {
+                continue
+            }
+            let _ = removePath(dir + "/" + e.name)
+            gone.add(e.name)
+            total -= e.bytes
+        }
+        kept = kept.filter(e => not gone.contains(e.name)).toArray()
+    }
+    writeIndex(dir, kept)
+}
+
+fn isCacheFile(name: Text) -> Bool =
+    name.endsWith(".bin")
+        and (name.startsWith("quark-cache-") or name.startsWith("quark-runtime-") or name.startsWith("quark-exe-"))
+
+// quark clean: every cache file gone (those of older compilers, in the temporary folder itself, too)
+pub fn cleanCommand() -> Int {
+    var count = 0
+    var bytes = 0
+    for e in readIndex(cacheDir()) {
+        bytes += e.bytes
+    }
+    for folder in [cacheDir(), tempDir()] {
+        let Ok(names) = listDir(folder) else {
+            continue
+        }
+        for name in names {
+            if isCacheFile(name) and removePath(folder + "/" + name) is Ok(_) {
+                count += 1
+            }
+        }
+    }
+    let _ = removePath(cacheDir() + "/index.txt")
+    let mb = toFloat(bytes) / 1048576.0
+    print("quark: removed {count} cache file{if count == 1 { "" } else { "s" }} ({mb:.1} MB indexed)")
+    0
+}

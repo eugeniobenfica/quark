@@ -1,0 +1,302 @@
+// JSON, as the editor tools speak it: a reader of JSON values (the requests of `quark lsp` and `quark dap`), and
+// the messages they come in, "Content-Length: n\r\n\r\n" and n bytes of JSON, on the standard input and output.
+// What the tools answer is written as text (jsonString in format.qk quotes a text).
+//
+// A JSON value read is a node of a Json: its nodes sit in one array and name their items by index (-1: none), the
+// first one the whole value. Numbers are Floats, as JSON's are.
+pub enum JKind { Null, Bool, Num, Str, Arr, Obj }
+
+// a value: kind; flag a Bool's; num a Num's; text a Str's; items an Arr's or an Obj's (keys: an Obj's, one per item)
+pub type JNode {
+    kind: JKind
+    flag: Bool = false
+    num: Float = 0.0
+    text: Text = ""
+    items: [Int] = []
+    keys: [Text] = []
+}
+
+pub type Json { nodes: [JNode] = [] }
+
+// the value in a text; None when it is not JSON
+pub fn parseJson(text: Text) -> Json? {
+    var r = JReader(text, text.bytes())
+    r.value()
+    if r.failed {
+        return None
+    }
+    Json(r.nodes)
+}
+
+// o's item named key (-1: none, or o is not an object)
+pub fn Json.get(self, o: Int, key: Text) -> Int {
+    if o < 0 or self.nodes[o].kind != JKind.Obj {
+        return -1
+    }
+    let n = self.nodes[o]
+    for (i, k) in n.keys.enumerate() {
+        if k == key {
+            return n.items[i]
+        }
+    }
+    -1
+}
+
+// a Str's text (None: none, or not a text)
+pub fn Json.text(self, v: Int) -> Text? = if v >= 0 and self.nodes[v].kind == JKind.Str {
+    self.nodes[v].text
+} else {
+    None
+}
+
+// a number, as C's (int) makes it (fallback: none)
+pub fn Json.int(self, v: Int, fallback: Int) -> Int =
+    if v >= 0 { toInt(self.nodes[v].num) } else { fallback }
+
+pub fn Json.isBool(self, v: Int, b: Bool) -> Bool =
+    v >= 0 and self.nodes[v].kind == JKind.Bool and self.nodes[v].flag == b
+
+pub fn Json.kind(self, v: Int) -> JKind = if v >= 0 { self.nodes[v].kind } else { JKind.Null }
+
+pub fn Json.items(self, v: Int) -> [Int] = if v >= 0 { self.nodes[v].items } else { [] }
+
+type JReader { text: Text, b: Bytes, p: Int = 0, nodes: [JNode] = [], failed: Bool = false }
+
+fn JReader.space(var self) {
+    while self.p < len(self.b) and self.b[self.p] is ' ' | '\t' | '\n' | '\r' {
+        self.p += 1
+    }
+}
+
+fn JReader.value(var self) -> Int {
+    self.space()
+    let at = len(self.nodes)
+    self.nodes.push(JNode(.Null))
+    if self.p >= len(self.b) {
+        self.failed = true
+        return at
+    }
+    let c = self.b[self.p]
+    if c == '{' or c == '[' {
+        let obj = c == '{'
+        self.p += 1
+        self.space()
+        var items: [Int] = []
+        var keys: [Text] = []
+        if self.p < len(self.b) and self.b[self.p] == (if obj { '}' } else { ']' }) {
+            self.p += 1
+        } else {
+            while not self.failed {
+                if obj {
+                    self.space()
+                    if self.p >= len(self.b) or self.b[self.p] != '"' {
+                        self.failed = true
+                        break
+                    }
+                    let key = self.string()
+                    keys.push(key)
+                    self.space()
+                    if self.p >= len(self.b) or self.b[self.p] != ':' {
+                        self.failed = true
+                        break
+                    }
+                    self.p += 1
+                }
+                let item = self.value()
+                items.push(item)
+                self.space()
+                if self.p < len(self.b) and self.b[self.p] == ',' {
+                    self.p += 1
+                    continue
+                }
+                if self.p < len(self.b) and self.b[self.p] == (if obj { '}' } else { ']' }) {
+                    self.p += 1
+                    break
+                }
+                self.failed = true
+            }
+        }
+        self.nodes[at] = JNode(if obj { .Obj } else { .Arr }, items: items, keys: keys)
+        return at
+    }
+    if c == '"' {
+        let s = self.string()
+        self.nodes[at] = JNode(.Str, text: s)
+        return at
+    }
+    if self.word("true") {
+        self.nodes[at] = JNode(.Bool, flag: true)
+        return at
+    }
+    if self.word("false") {
+        self.nodes[at] = JNode(.Bool)
+        return at
+    }
+    if self.word("null") {
+        return at
+    }
+    let start = self.p
+    while self.p < len(self.b) and self.b[self.p] is '0'..='9' | '-' | '+' | '.' | 'e' | 'E' {
+        self.p += 1
+    }
+    let n = self.text[start..self.p].parseFloat() ?? 0.0
+    if self.p == start {
+        self.failed = true
+    }
+    self.nodes[at] = JNode(.Num, num: n)
+    at
+}
+
+fn JReader.word(var self, w: Text) -> Bool {
+    let n = len(w)
+    if self.p + n <= len(self.b) and self.text[self.p..self.p + n] == w {
+        self.p += n
+        return true
+    }
+    false
+}
+
+fn hexValue(c: Int) -> Int = match c {
+    '0'..='9' => c - '0'
+    'a'..='f' => c - 'a' + 10
+    'A'..='F' => c - 'A' + 10
+    _ => 0
+}
+
+fn JReader.hex4(self, at: Int) -> Int {
+    var v = 0
+    for i in at..at + 4 {
+        v = v * 16 + hexValue(self.b[i])
+    }
+    v
+}
+
+// a "text" decoded (the reader at its opening quote)
+fn JReader.string(var self) -> Text {
+    self.p += 1
+    var out = ""
+    var from = self.p
+    while self.p < len(self.b) and self.b[self.p] != '"' {
+        if self.b[self.p] != '\\' or self.p + 1 >= len(self.b) {
+            self.p += 1
+            continue
+        }
+        out += self.text[from..self.p]
+        let k = self.b[self.p + 1]
+        self.p += 2
+        if k == 'u' and self.p + 4 <= len(self.b) {
+            var u = self.hex4(self.p)
+            self.p += 4
+            if u >= 0xD800
+                and u < 0xDC00
+                and self.p + 6 <= len(self.b)
+                and self.b[self.p] == '\\'
+                and self.b[self.p + 1] == 'u' {
+                let low = self.hex4(self.p + 2)
+                if low >= 0xDC00 and low < 0xE000 {
+                    u = 0x10000 + (u - 0xD800) << 10 + (low - 0xDC00)
+                    self.p += 6
+                }
+            }
+            out += char(u)
+        } else {
+            out += match k {
+                'n' => "\n"
+                't' => "\t"
+                'r' => "\r"
+                'b' => "\x08"
+                'f' => "\x0c"
+                _ => char(k)
+            }
+        }
+        from = self.p
+    }
+    out += self.text[from..min(self.p, len(self.b))]
+    if self.p >= len(self.b) {
+        self.failed = true
+    } else {
+        self.p += 1
+    }
+    out
+}
+
+// ---- messages ----------------------------------------------------------------------------------------------------
+// The standard input read as messages. It is read a line at a time (readLine, which drops each line's end): what
+// is read waits in pending, its lines ended by "\n", taken from at on (pending is let go once all of it is taken).
+pub type Wire { pending: Text = "", at: Int = 0, ended: Bool = false }
+
+fn Wire.more(var self) -> Bool {
+    if self.ended {
+        return false
+    }
+    let Some(line) = readLine() else {
+        self.ended = true
+        return false
+    }
+    if self.at == len(self.pending) {
+        self.pending = line + "\n"
+        self.at = 0
+    } else {
+        self.pending += line + "\n"
+    }
+    true
+}
+
+fn Wire.line(var self) -> Text? {
+    while true {
+        let b = self.pending.bytes()
+        var k = self.at
+        while k < len(b) and b[k] != '\n' {
+            k += 1
+        }
+        if k < len(b) {
+            let line = self.pending[self.at..k]
+            self.at = k + 1
+            return line
+        }
+        if not self.more() {
+            if self.at == len(self.pending) {
+                return None
+            }
+            let rest = self.pending[self.at..]
+            self.at = len(self.pending)
+            return rest
+        }
+    }
+    None
+}
+
+// The next message's body; None at the end of the input. lenient: empty lines before the headers are skipped
+// (the debug adapter's way); otherwise one ends the headers, and with no length, the input.
+pub fn Wire.read(var self, lenient: Bool) -> Text? {
+    var length = -1
+    while true {
+        let line = self.line() ?? return None
+        let l = if line.endsWith("\r") { line[..len(line) - 1] } else { line }
+        if l == "" {
+            if length >= 0 or not lenient {
+                break
+            }
+            continue
+        }
+        if l.startsWith("Content-Length:") {
+            length = l[15..].trim().parseInt() ?? -1
+        }
+    }
+    if length < 0 {
+        return None
+    }
+    while len(self.pending) - self.at < length and self.more() {}
+    if len(self.pending) - self.at < length {
+        return None
+    }
+    let body = self.pending[self.at..self.at + length]
+    self.at += length
+    body
+}
+
+// A message written: its headers, then the JSON. print ends it with a line break, which the length counts (JSON
+// allows white space after a value).
+pub fn send(json: Text) {
+    print("Content-Length: {len(json) + 1}\r\n\r\n{json}")
+}

@@ -1,0 +1,239 @@
+// Sorting plain values in place, random numbers, the math library, the clocks.
+use base
+use text
+
+// ---- sort: Ints (and Bools, cases), Floats or texts, an introsort with no memory of its own ----
+// kind 0: Ints (one word each), 1: Floats, 2: texts (two words each). NaNs go last; -0.0 and 0.0 are equal.
+fn less(kind: Int, v: Int, i: Int, j: Int) -> Bool {
+    if kind == 0 {
+        return word(v, i) < word(v, j)
+    }
+    if kind == 1 {
+        let x = floatAt(v, i)
+        let y = floatAt(v, j)
+        return x < y or y != y and x == x
+    }
+    textCompare(word(v, 2 * i), word(v, 2 * i + 1), word(v, 2 * j), word(v, 2 * j + 1)) < 0
+}
+
+fn swap(kind: Int, v: Int, i: Int, j: Int) {
+    if kind == 2 {
+        let p = word(v, 2 * i)
+        let n = word(v, 2 * i + 1)
+        setWord(v, 2 * i, word(v, 2 * j))
+        setWord(v, 2 * i + 1, word(v, 2 * j + 1))
+        setWord(v, 2 * j, p)
+        setWord(v, 2 * j + 1, n)
+    } else {
+        let t = word(v, i)
+        setWord(v, i, word(v, j))
+        setWord(v, j, t)
+    }
+}
+
+fn each(kind: Int) -> Int = if kind == 2 { 16 } else { 8 }
+
+fn siftDown(kind: Int, v: Int, k0: Int, n: Int) {
+    var k = k0
+    while true {
+        var c = 2 * k + 1
+        if c >= n {
+            return
+        }
+        if c + 1 < n and less(kind, v, c, c + 1) {
+            c += 1
+        }
+        if not less(kind, v, k, c) {
+            return
+        }
+        swap(kind, v, k, c)
+        k = c
+    }
+}
+
+fn introsort(kind: Int, v0: Int, n0: Int, depth0: Int) {
+    var v = v0
+    var n = n0
+    var depth = depth0
+    while n > 24 {
+        if depth == 0 {
+            // heapsort: n log n, whatever the values
+            var i = n / 2 - 1
+            while i >= 0 {
+                siftDown(kind, v, i, n)
+                i -= 1
+            }
+            var e = n - 1
+            while e > 0 {
+                swap(kind, v, 0, e)
+                siftDown(kind, v, 0, e)
+                e -= 1
+            }
+            return
+        }
+        depth -= 1
+        let m = n / 2 // the median of the first, the middle and the last: the pivot
+        if less(kind, v, m, 0) {
+            swap(kind, v, m, 0)
+        }
+        if less(kind, v, n - 1, m) {
+            swap(kind, v, n - 1, m)
+            if less(kind, v, m, 0) {
+                swap(kind, v, m, 0)
+            }
+        }
+        swap(kind, v, 0, m)
+        var i = 0
+        var j = n // the pivot stays at 0 while the others are split around it
+        while true {
+            i += 1
+            while i < n and less(kind, v, i, 0) {
+                i += 1
+            }
+            j -= 1
+            while less(kind, v, 0, j) {
+                j -= 1
+            }
+            if i >= j {
+                break
+            }
+            swap(kind, v, i, j)
+        }
+        swap(kind, v, 0, j)
+        if j < n - 1 - j {
+            // the shorter side by recursion, the longer by the loop
+            introsort(kind, v, j, depth)
+            v += (j + 1) * each(kind)
+            n -= j + 1
+        } else {
+            introsort(kind, v + (j + 1) * each(kind), n - j - 1, depth)
+            n = j
+        }
+    }
+    for i in 1..n {
+        // insertion sort for what is left
+        var j = i
+        while j > 0 and less(kind, v, j, j - 1) {
+            swap(kind, v, j, j - 1)
+            j -= 1
+        }
+    }
+}
+
+pub extern effect fn rtSort(p: Int64, n: Int64, kind: Int64, descending: Int64) as "qk_sort" {
+    var depth = 2
+    var k = n
+    while k > 1 {
+        depth += 2
+        k = k >> 1
+    }
+    introsort(kind, p, n, depth)
+    if descending == 0 {
+        return
+    }
+    var a = 0 // equal values cannot be told apart: the reverse of ascending is descending
+    var b = n - 1
+    while a < b {
+        swap(if kind == 2 { 2 } else { 0 }, p, a, b)
+        a += 1
+        b -= 1
+    }
+}
+
+// ---- random numbers: xoshiro256**, seeded from the clock the first time, or by seedRandom ----
+extern effect fn cTime(t: Int64) -> Int64 as "time"
+
+fn splitmix(state: Int) -> Int {
+    // state: the address of x
+    let z0 = word(state, 0) +% -7046029254386353131
+    setWord(state, 0, z0)
+    var z = (z0 ^ shr(z0, 30)) *% -4658895280553007687
+    z = (z ^ shr(z, 27)) *% -7723592293110705685
+    z ^ shr(z, 31)
+}
+
+pub extern effect fn rtSeedRandom(seed: Int64) as "qk_seedRandom" {
+    let g = globals()
+    let x = ctx() + 8 * ctxScratch
+    setWord(x, 0, seed)
+    for i in 0..4 {
+        setWord(g, gRng + i, splitmix(x))
+    }
+    setWord(g, gRngSeeded, 1)
+}
+
+fn rotl(x: Int, k: Int) -> Int = x << k | shr(x, 64 - k)
+
+fn nextRandom() -> Int {
+    let g = globals()
+    if word(g, gRngSeeded) == 0 {
+        rtSeedRandom(cTime(0) ^ (g + 8 * gRngSeeded))
+    }
+    let s = g + 8 * gRng
+    let r = rotl(word(s, 1) *% 5, 7) *% 9
+    let t = word(s, 1) << 17
+    setWord(s, 2, word(s, 2) ^ word(s, 0))
+    setWord(s, 3, word(s, 3) ^ word(s, 1))
+    setWord(s, 1, word(s, 1) ^ word(s, 2))
+    setWord(s, 0, word(s, 0) ^ word(s, 3))
+    setWord(s, 2, word(s, 2) ^ t)
+    setWord(s, 3, rotl(word(s, 3), 45))
+    r
+}
+
+pub extern effect fn rtRandom() -> Float64 as "qk_random" =
+    toFloat(shr(nextRandom(), 11)) * (1.0 / 9007199254740992.0)
+
+pub extern effect fn rtRandomInt(lo: Int64, hi: Int64, line: Int64) -> Int64 as "qk_randomInt" {
+    if hi <= lo {
+        panicNow(panicEmptyRange, line, lo, hi)
+    }
+    let span = hi -% lo // as an unsigned number
+    let limit = -1 - umod(-1, span)
+    var r = nextRandom()
+    while not below(r, limit) {
+        // no bias toward the low numbers
+        r = nextRandom()
+    }
+    lo +% umod(r, span)
+}
+
+// ---- the math library, and the clocks ----
+extern fn cSin(x: Float64) -> Float64 as "sin"
+extern fn cCos(x: Float64) -> Float64 as "cos"
+extern fn cTan(x: Float64) -> Float64 as "tan"
+extern fn cAsin(x: Float64) -> Float64 as "asin"
+extern fn cAcos(x: Float64) -> Float64 as "acos"
+extern fn cAtan(x: Float64) -> Float64 as "atan"
+extern fn cAtan2(y: Float64, x: Float64) -> Float64 as "atan2"
+extern fn cExp(x: Float64) -> Float64 as "exp"
+extern fn cLog(x: Float64) -> Float64 as "log"
+extern fn cPow(x: Float64, y: Float64) -> Float64 as "pow"
+
+pub extern fn rtSin(x: Float64) -> Float64 as "qk_sin" = cSin(x)
+
+pub extern fn rtCos(x: Float64) -> Float64 as "qk_cos" = cCos(x)
+
+pub extern fn rtTan(x: Float64) -> Float64 as "qk_tan" = cTan(x)
+
+pub extern fn rtAsin(x: Float64) -> Float64 as "qk_asin" = cAsin(x)
+
+pub extern fn rtAcos(x: Float64) -> Float64 as "qk_acos" = cAcos(x)
+
+pub extern fn rtAtan(x: Float64) -> Float64 as "qk_atan" = cAtan(x)
+
+pub extern fn rtAtan2(y: Float64, x: Float64) -> Float64 as "qk_atan2" = cAtan2(y, x)
+
+pub extern fn rtExp(x: Float64) -> Float64 as "qk_exp" = cExp(x)
+
+pub extern fn rtLog(x: Float64) -> Float64 as "qk_log" = cLog(x)
+
+pub extern fn rtPow(x: Float64, y: Float64) -> Float64 as "qk_pow" = cPow(x, y)
+
+pub extern effect fn osNow() -> Float64 as "qkosNow" // seconds, monotonic
+pub extern effect fn osTime() -> Float64 as "qkosTime" // seconds since 1970
+pub extern effect fn osSleep(ms: Int64) as "qkosSleep"
+
+pub extern effect fn rtNow() -> Float64 as "qk_now" = osNow()
+
+pub extern effect fn rtTime() -> Float64 as "qk_time" = osTime()

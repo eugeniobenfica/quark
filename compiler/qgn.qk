@@ -1,0 +1,305 @@
+// Quark Graph Notation: a program's graph written as a Quark value, the type std.graph gives it (a program that uses
+// std.graph can take one as it is: const g: Graph = Graph(quark: 1, decls: [...])). quark graph writes it, every tool
+// that reads a graph reads it, and JSON (quark graph --json) stays as the export.
+//
+// It is the JSON graph's data, said in Quark: an object is a record named by what it is (by the key it is under:
+// "decls" holds Decls, "nodes" Nodes, "inputs" Pins...), its keys the record's named fields, an array a list, null
+// None. A key that is a Quark keyword gets a name (type: typeName, fn: function, else: otherwise, var: mutable,
+// effect: effects, interface: isInterface, pub: isPub); an enum's case without data, a text in JSON, is
+// Case(name: "Red"); a member's comments, [above, after] in JSON, are Note(above: ..., after: ...). Both ways are
+// exact: JSON -> QGN -> JSON gives the same graph.
+use ast
+use token
+use source
+use parser
+use format
+use json
+
+// the record each key's objects are
+fn roleOf(key: Text) -> Text = match key {
+    "" => "Graph"
+    "decls" => "Decl"
+    "nodes" => "Node"
+    "params" => "Param"
+    "fields" => "Field"
+    "cases" => "Case"
+    "arms" => "Arm"
+    "binds" => "Bind"
+    "alternatives" => "Alt"
+    "inputs" | "result" | "default" | "guard" | "value" => "Pin"
+    "body" | "block" | "then" | "else" => "Block"
+    "memberComments" => "Note"
+    _ => key[..1].upper() + key[1..]
+}
+
+// JSON's keys that are Quark keywords, and their names here
+const renamed: [(Text, Text)] = [
+    ("type", "typeName"),
+    ("fn", "function"),
+    ("else", "otherwise"),
+    ("var", "mutable"),
+    ("effect", "effects"),
+    ("interface", "isInterface"),
+    ("pub", "isPub"),
+]
+
+fn fieldOf(key: Text) -> Text = renamed.first(r => r.0 == key)?.1 ?? key
+
+fn keyOf(field: Text) -> Text = renamed.first(r => r.1 == field)?.0 ?? field
+
+// ---- JSON -> QGN ----
+type Writer { j: Json, out: Text = "" }
+
+// a number: an Int as written; a position (pos) a Float, with its point
+fn number(x: Float, key: Text) -> Text {
+    let n = numberText(x)
+    if key == "pos" and not n.contains(".") and not n.contains("e") {
+        n + ".0"
+    } else {
+        n
+    }
+}
+
+// a number as JSON wrote it: an integral one without a point
+fn numberText(x: Float) -> Text = if x == x and x > -1.0e15 and x < 1.0e15 and x == toFloat(toInt(x)) {
+    "{toInt(x)}"
+} else {
+    "{x}"
+}
+
+fn Writer.value(var self, v: Int, key: Text, indent: Int) {
+    let n = self.j.nodes[v]
+    match n.kind {
+        Null => {
+            self.out += "None"
+        }
+        Bool => {
+            self.out += if n.flag { "true" } else { "false" }
+        }
+        Num => {
+            self.out += number(n.num, key)
+        }
+        Str => {
+            self.out += quoteText(n.text)
+        }
+        Arr => self.list(v, key, indent)
+        Obj => self.record(v, roleOf(key), indent)
+    }
+}
+
+// one item a line for a declaration's and a function's nodes; others on the line
+fn Writer.list(var self, v: Int, key: Text, indent: Int) {
+    let items = self.j.nodes[v].items
+    let lines = key is "decls" | "nodes" and len(items) > 0
+    self.out += "["
+    for (i, it) in items.enumerate() {
+        if lines {
+            self.out += "\n" + "    " * (indent + 1)
+        } else if i > 0 {
+            self.out += ", "
+        }
+        let n = self.j.nodes[it]
+        if key == "cases" and n.kind == JKind.Str {
+            self.out += "Case(name: " + quoteText(n.text) + ")" // a case without data
+        } else if key == "memberComments" and n.kind == JKind.Arr {
+            self.note(it)
+        } else {
+            self.value(it, key, indent + 1)
+        }
+        if lines {
+            self.out += ","
+        }
+    }
+    if lines {
+        self.out += "\n" + "    " * indent
+    }
+    self.out += "]"
+}
+
+fn Writer.note(var self, v: Int) {
+    let items = self.j.nodes[v].items
+    self.out += "Note(above: "
+    self.value(items.get(0) ?? -1, "", 0)
+    if len(items) > 1 and self.j.nodes[items[1]].kind != JKind.Null {
+        self.out += ", after: "
+        self.value(items[1], "", 0)
+    }
+    self.out += ")"
+}
+
+fn Writer.record(var self, v: Int, role: Text, indent: Int) {
+    let n = self.j.nodes[v]
+    self.out += role + "("
+    for (i, k) in n.keys.enumerate() {
+        if i > 0 {
+            self.out += ", "
+        }
+        self.out += fieldOf(k) + ": "
+        self.value(n.items[i], k, indent)
+    }
+    self.out += ")"
+}
+
+// a JSON graph's QGN (None: it is not JSON)
+pub fn qgnOf(json: Text) -> Text? {
+    let Some(j) = parseJson(json) else {
+        return None
+    }
+    if j.kind(0) != JKind.Obj {
+        return None
+    }
+    var w = Writer(j)
+    w.value(0, "", 0)
+    Some(w.out + "\n")
+}
+
+// ---- QGN -> JSON ----
+type Reader { a: Ast, out: Text = "", error: Text = "", line: Int = 0 }
+
+fn Reader.fail(var self, e: Int, why: Text) {
+    if self.error == "" {
+        self.error = why
+        self.line = self.a.exprs[e].line
+    }
+}
+
+fn Reader.value(var self, e: Int) {
+    let x = self.a.exprs[e]
+    match x.node {
+        IntLit(v, raw) => {
+            self.out += if raw != "" { raw.replace("_", "") } else { "{v}" }
+        }
+        FloatLit(v, _) => {
+            self.out += numberText(v)
+        }
+        TextLit(text, _, _) => {
+            self.out += jsonString(text)
+        }
+        BoolLit(v) => {
+            self.out += if v { "true" } else { "false" }
+        }
+        Unary(op, operand) if op == Op.Minus and self.a.exprs[operand].node is IntLit(_, _) | FloatLit(_, _) => {
+            self.out += "-"
+            self.value(operand)
+        }
+        Name(n) if n == "None" => {
+            self.out += "null"
+        }
+        ArrayLit(items) => {
+            self.out += "["
+            for (i, it) in items.enumerate() {
+                if i > 0 {
+                    self.out += ", "
+                }
+                self.value(it)
+            }
+            self.out += "]"
+        }
+        Call(name, qualifier, args, names, method, dotted) => {
+            if qualifier != "" or method or dotted {
+                self.fail(e, "a graph's records are written Name(field: value, ...)")
+                return
+            }
+            if name == "None" and len(args) == 0 {
+                self.out += "null"
+                return
+            }
+            if names.any(n => n == "") or len(names) != len(args) {
+                self.fail(e, "a graph's record names each of its values: {name}(field: value, ...)")
+                return
+            }
+            if name == "Note" {
+                // [above, after]
+                self.out += "["
+                let above = names.indexOf("above")
+                let after = names.indexOf("after")
+                if above is Some(k) {
+                    self.value(args[k])
+                } else {
+                    self.out += "\"\""
+                }
+                self.out += ", "
+                if after is Some(k) {
+                    self.value(args[k])
+                } else {
+                    self.out += "null"
+                }
+                self.out += "]"
+                return
+            }
+            if name == "Case" and names == ["name"] {
+                self.value(args[0]) // a case without data: its name
+                return
+            }
+            // laid out as quark graph --json lays it out: each declaration a line, a function's nodes one a line
+            self.out += "\{"
+            for (i, f) in names.enumerate() {
+                let key = keyOf(f)
+                let given = self.a.exprs[args[i]].node
+                if name == "Graph" and key == "decls" and given is ArrayLit(items) {
+                    self.out += (if i > 0 { ", " } else { "" }) + "\"decls\": [\n"
+                    for (k, it) in items.enumerate() {
+                        self.out += if k > 0 { ",\n  " } else { "  " }
+                        self.value(it)
+                    }
+                    self.out += "]"
+                    continue
+                }
+                if name == "Graph" and key == "closing" {
+                    self.out += ",\n \"closing\": "
+                    self.value(args[i])
+                    continue
+                }
+                if name == "Decl" and key == "nodes" and given is ArrayLit(items) {
+                    self.out += ",\n   \"nodes\": [\n"
+                    for (k, it) in items.enumerate() {
+                        self.out += if k > 0 { ",\n    " } else { "    " }
+                        self.value(it)
+                    }
+                    self.out += "]"
+                    continue
+                }
+                if i > 0 {
+                    self.out += ", "
+                }
+                self.out += jsonString(key) + ": "
+                self.value(args[i])
+            }
+            self.out += "\}"
+        }
+        _ => {
+            self.fail(e, "a graph holds records, lists, texts, numbers, true, false and None")
+        }
+    }
+}
+
+// a QGN graph's JSON, or what is wrong with it (path:line: why)
+pub fn jsonOfQgn(text: Text, path: Text) -> Text! {
+    let parsed = parse(Source(path, "const graph = " + text))
+    if not parsed.ok or len(parsed.ast.decls) != 1 or parsed.ast.decls[0].body < 0 {
+        return Err(if len(parsed.errors) > 0 {
+            parsed.errors[0]
+        } else {
+            "{path}: this is not a Quark graph"
+        })
+    }
+    var r = Reader(parsed.ast)
+    r.value(parsed.ast.decls[0].body)
+    if r.error != "" {
+        return Err("{path}:{r.line}: {r.error}")
+    }
+    Ok(r.out + "\n")
+}
+
+// a graph's JSON, from either notation: JSON starts with {
+pub fn graphJson(text: Text, path: Text) -> Text! {
+    let b = text.bytes()
+    var i = 0
+    while i < len(b) and b[i] is ' ' | '\n' | '\r' | '\t' {
+        i += 1
+    }
+    if i < len(b) and b[i] == '{' {
+        return Ok(text)
+    }
+    jsonOfQgn(text, path)
+}

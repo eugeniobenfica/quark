@@ -1,0 +1,138 @@
+// The debugger's hold on a program: what the debug adapter (dap.qk, `quark dap`) asks of a program it runs, and
+// what the in-memory loader and the runtime's debug hooks (image.qk, runtime/) give it. This file is the contract
+// between the two; the adapter is written against it, and the functions below fill it in with the loader (memory.qk).
+//
+// The contract:
+//
+// - startDebuggee(host, p, path, args): the checked program p (its file path; args what args() gives it) compiled for
+//   debugging, as `quark run` compiles it but with every statement saying its line and every name its value (the C
+//   compiler's qkDebug), loaded in memory, ready at the start of main and not running. Err: why it cannot run
+//   ("quark: a program to debug starts at fn main()", a C function not found, the machine code not loaded).
+//
+// - Debuggee.resume(breaks, stepping): runs the program on until the runtime's line hook meets a statement whose
+//   line is in breaks (lines of any file: the adapter decides by file), or any statement when stepping; then it
+//   stops there and gives Stopped(line), with the program's calls as they are at that statement. The adapter looks
+//   at it (depth, frame, vars), and either answers the client or resumes at once (a line of another file, a step
+//   not over yet). When main returns it gives Ended(exitCode) (0; exit(code) ends the run with its code, and does
+//   not end the adapter); a panic gives Panicked(message), the panic's text with its calls, as quark run prints it
+//   (the adapter's exit code is then 1).
+//
+// - While stopped: depth() the calls the program is in (main is 1; 0 before it starts and after it ends);
+//   frame(i) the call at depth i + 1 (0 the outermost, main): its function's name ("" not known) and the line it
+//   is at; vars(i) its names in reach at that line and their values, written as print writes them, in the order
+//   they were made.
+//
+// - output(): what the program wrote to its standard output since the last call (the adapter sends it to the client
+//   as output events at each stop and at the end; the program's own stdout is not the adapter's, which speaks the
+//   protocol there). The program reads no standard input (that is the client's).
+//
+// Everything runs in the adapter's thread: resume returns only when the program stops or ends.
+use types
+use memory
+use imagecli
+
+pub type Frame { name: Text, line: Int }
+pub type Value { name: Text, value: Text }
+pub enum DebugEvent { Stopped(line: Int), Ended(exitCode: Int), Panicked(message: Text) }
+
+// a program loaded under the debugger: the runtime mapped here (compiler/memory.qk), the program running as a task
+// of its debugger's (compiler/runtime/host.qk, debug.qk: d its state's words), its output kept (sink); handle -1: none
+pub type Debuggee { handle: Int = -1, m: Mapped = Mapped(), task: Int = 0, d: Int = 0, sink: Int = 0 }
+
+// The program compiled for the debugger and loaded, ready at the start of main. host: what running in memory needs
+// of the system (the command line's; None: the adapter was started without one).
+pub fn startDebuggee(host: Host?, p: Program, path: Text, args: [Text]) -> Debuggee! {
+    let _ = p // checked already: compiled again here, for the debugger
+    let Some(h) = host else {
+        return Err("quark: this compiler cannot run a program under the debugger here")
+    }
+    var compiled: Compiled? = None
+    var mapped: Mapped? = None
+    for k in 0..2 {
+        // each on its own turn of one loop: what the first made goes back before the second
+        if k == 0 {
+            compiled = compileFile(h, path, RunOptions(), Purpose(needMain: true, debug: true))
+        } else if compiled != None {
+            mapped = loadRuntime(h)
+        }
+    }
+    let Some(c) = compiled else {
+        return Err("quark: {path} does not compile")
+    }
+    let Some(m) = mapped else {
+        return Err("quark: the runtime cannot be loaded")
+    }
+    if c.prog.mainIndex < 0 {
+        return Err("quark: a program to debug starts at fn main()")
+    }
+    m.begin(path, args)
+    let d = m.call("qkHostDebug", 0, 0, 1, 0)
+    let sink = m.call("qkHostKeepOutput", 0, 0, 0, 0)
+    let mc = loadedCode(h, c)
+    let entry = mc.fnAt[c.prog.mainIndex]
+    let l = m.load(c, mc, entry, 0, 0)
+    if l == 0 {
+        return Err("quark: the machine code cannot be loaded")
+    }
+    Ok(Debuggee(1, m, m.call("qkHostDebugTask", l, entry, 0, 0), d, sink))
+}
+
+pub fn Debuggee.resume(var self, breaks: [Int], stepping: Bool) -> DebugEvent {
+    if self.handle < 0 {
+        return DebugEvent.Ended(1)
+    }
+    let _ = self.m.call("qkHostDebugClear", 0, 0, 0, 0)
+    for line in breaks {
+        let _ = self.m.call("qkHostDebugBreak", line, 0, 0, 0)
+    }
+    let r = self.m.call("qkHostDebugStep", self.task, if stepping { 1 } else { 0 }, 0, 0)
+    if r == 1 {
+        return DebugEvent.Stopped(peekWord(self.d, 13)) // debug.qk's dStopLine
+    }
+    self.handle = -1
+    if r == 0 {
+        DebugEvent.Ended(0)
+    } else {
+        DebugEvent.Panicked(self.m.panicText())
+    }
+}
+
+// debug.qk's words: dFrames 5, dFrameCount 6; a frame's: its function's name, its line, its names, their count
+pub fn Debuggee.depth(self) -> Int = if self.d != 0 { peekWord(self.d, 6) } else { 0 }
+
+fn Debuggee.frameAt(self, i: Int) -> Int = peekWord(self.d, 5) + 40 * i
+
+pub fn Debuggee.frame(self, i: Int) -> Frame {
+    if i < 0 or i >= self.depth() {
+        return Frame("", 0)
+    }
+    let f = self.frameAt(i)
+    Frame(textAtC(peekWord(f, 0)), peekWord(f, 1))
+}
+
+pub fn Debuggee.vars(self, i: Int) -> [Value] {
+    if i < 0 or i >= self.depth() {
+        return []
+    }
+    let f = self.frameAt(i)
+    var out: [Value] = []
+    for k in 0..peekWord(f, 3) {
+        let v = peekWord(f, 2) + 32 * k // a name's words: its name, key, value, hits
+        out.push(Value(textAtC(peekWord(v, 0)), textAtC(peekWord(v, 2))))
+    }
+    out
+}
+
+pub fn Debuggee.output(var self) -> Text {
+    if self.sink == 0 {
+        return ""
+    }
+    self.m.flush()
+    let n = peekWord(self.sink, 1)
+    if n == 0 {
+        return ""
+    }
+    let text = Text(Pointer<UInt8>(peekWord(self.sink, 0)), n)
+    pokeWord(self.sink, 1, 0)
+    text
+}

@@ -1,0 +1,155 @@
+// The built-ins written in Quark: declarations every program sees (after its own: a program's name hides one of
+// these), kept in the compiler (compiler/embed.sh). A built-in here is a function like any other: its values have
+// names, defaults and types, its errors are a call's, a.f(b) calls it. What only the runtime can do is one call,
+// runtime(group, name, values...): the runtime's function `name` (compiler/ir.qk's runtimeNames, qk_<name> in
+// compiler/runtime/) with the values' slots in order, giving what the function says it gives. group is the
+// capability a caller needs (quark run --allow, qkVmCapabilities), "" none. runtimeLine gives the runtime the line
+// of the program's call too, last, for its messages.
+// ---- files whole, and folders (runtime/files.qk) ----
+// the file's text; Err says why it could not be read (not UTF-8 too)
+pub effect fn readFile(path: Text) -> Text! = runtime("files", "readFile", path)
+
+// the file made, or written over; Err says why it could not be written
+pub effect fn writeFile(path: Text, text: Text) -> Unit! = runtime("files", "writeFile", path, text)
+
+// the text at the end of the file (made when missing)
+pub effect fn appendFile(path: Text, text: Text) -> Unit! =
+    runtime("files", "appendFile", path, text)
+
+pub effect fn readBytes(path: Text) -> Bytes! = runtime("files", "readBytes", path)
+
+pub effect fn writeBytes(path: Text, bytes: Bytes) -> Unit! =
+    runtime("files", "writeFile", path, bytes)
+
+// a file or a folder is there
+pub effect fn pathExists(path: Text) -> Bool = runtime("files", "pathExists", path)
+
+// the names in a folder
+pub effect fn listDir(path: Text) -> [Text]! = runtime("files", "listDir", path)
+
+// a folder made, and the folders above it that are missing
+pub effect fn makeDir(path: Text) -> Unit! = runtime("files", "makeDir", path)
+
+// a file removed, or a folder that is empty
+pub effect fn removePath(path: Text) -> Unit! = runtime("files", "removePath", path)
+
+// ---- the process and what is around it ----
+// what a program that ran gave: its exit status, what it wrote to its output and to its errors
+pub type Process { status: Int, out: Text, err: Text }
+
+// program run to its end with args; Err says why it could not be started
+pub effect fn runProcess(program: Text, args: [Text]) -> Process! =
+    runtime("process", "runProcess", program, args)
+
+// an environment variable's value
+pub effect fn env(name: Text) -> Text? = runtime("env", "env", name)
+
+// the program's arguments (quark run file.qk -- a b; a built executable's)
+pub effect fn args() -> [Text] = runtime("args", "args")
+
+// the program ends, with this status
+pub effect fn exit(code: Int) -> Never = runtime("exit", "exit", code)
+
+// a line of the input; None at its end
+pub effect fn readLine() -> Text? = runtime("stdin", "readLine")
+
+// ---- files a part at a time (runtime/io.qk) ----
+// an open file: C's stream
+pub type File { handle: Int }
+
+// path opened: "r" read, "w" written from nothing, "a" added to, "r+" read and written, "w+" both from nothing (its
+// bytes as they are)
+pub effect fn openFile(path: Text, mode: Text) -> File! = runtime("files", "openFile", path, mode)
+
+// up to most bytes from where the file is; none at its end
+pub effect fn readChunk(file: File, most: Int) -> Bytes! = runtime("files", "readChunk", file, most)
+
+// every byte, where the file is
+pub effect fn writeChunk(file: File, bytes: Bytes) -> Unit! =
+    runtime("files", "writeChunk", file, bytes)
+
+// the file's place moved to `at` bytes from the start (from: 0), from where it is (1) or from its end (2): the
+// place it is now
+pub effect fn seekFile(file: File, at: Int, from: Int = 0) -> Int! =
+    runtime("files", "seekFile", file, at, from)
+
+// written out and closed
+pub effect fn closeFile(file: File) = runtime("files", "closeFile", file)
+
+// ---- sockets: TCP (runtime/io.qk); a read, write or accept that would wait gives the task's turn back ----
+pub type Socket { handle: Int }
+
+// a socket that listens on host:port ("0.0.0.0": every address of this machine)
+pub effect fn listen(host: Text, port: Int) -> Socket! = runtime("net", "listen", host, port)
+
+// a connection to host:port
+pub effect fn connect(host: Text, port: Int) -> Socket! = runtime("net", "connect", host, port)
+
+// the next connection to a listening socket
+pub effect fn accept(listener: Socket) -> Socket! = runtime("net", "accept", listener)
+
+// what came, up to most bytes; none when the other end closed it
+pub effect fn readSocket(socket: Socket, most: Int) -> Bytes! =
+    runtime("net", "readSocket", socket, most)
+
+// every byte sent
+pub effect fn writeSocket(socket: Socket, bytes: Bytes) -> Unit! =
+    runtime("net", "writeSocket", socket, bytes)
+
+pub effect fn closeSocket(socket: Socket) = runtime("net", "closeSocket", socket)
+
+// ---- tasks: functions run a step at a time (runtime/tasks.qk) ----
+// a task of f: step runs it until it gives its turn back
+pub effect fn spawn(f: effect () -> Unit) -> Task = runtime("tasks", "spawn", f)
+
+// the task run until it yields or sleeps: true while it has more to do
+pub effect fn step(task: Task) -> Bool = runtimeLine("tasks", "step", task)
+
+// the task run to its end
+pub effect fn joinTask(task: Task) = runtimeLine("tasks", "joinTask", task)
+
+// the turn back to whoever runs this task (nothing, outside one)
+pub effect fn yield() = runtime("tasks", "yield")
+
+// the turn back until so many seconds went by (outside a task: a sleep)
+pub effect fn sleep(seconds: Float) = runtime("tasks", "wait", seconds)
+
+// ---- tasks in the background, and channels (runtime/tasks.qk) ----
+// f as a task the background runs (runTasks, or a receive outside a task)
+pub effect fn go(f: effect () -> Unit) = runtime("tasks", "go", f)
+
+// every background task, run until all are done
+pub effect fn runTasks() = runtimeLine("tasks", "runTasks")
+
+// texts from task to task, in the order they were sent
+pub type Channel { id: Int }
+
+pub effect fn channel() -> Channel = runtime("tasks", "channel")
+
+// the text at the end of the channel's queue (it never waits)
+pub effect fn send(channel: Channel, text: Text) = runtimeLine("tasks", "send", channel, text)
+
+// the first text sent and not yet received (it waits for one); None once the channel is closed and empty
+pub effect fn receive(channel: Channel) -> Text? = runtimeLine("tasks", "receive", channel)
+
+// no more texts go in: receive gives those left, then None
+pub effect fn closeChannel(channel: Channel) = runtimeLine("tasks", "closeChannel", channel)
+
+// ---- the clock, and chance ----
+// seconds, for timing: only differences mean something
+pub effect fn monotonicTime() -> Float = runtime("clock", "now")
+
+// seconds since 1970-01-01T00:00:00Z
+pub effect fn unixTime() -> Float = runtime("clock", "time")
+
+// a Float in [0, 1)
+pub effect fn random() -> Float = runtime("random", "random")
+
+// an Int from low up to high, high not included
+pub effect fn randomInt(low: Int, high: Int) -> Int = runtimeLine("random", "randomInt", low, high)
+
+// the same numbers from here on, for the same seed
+pub effect fn seedRandom(seed: Int) = runtime("random", "seedRandom", seed)
+
+// the local time's offset from UTC at that moment (seconds since 1970), in seconds east
+pub effect fn localOffset(seconds: Float) -> Int = runtime("clock", "localOffset", seconds)

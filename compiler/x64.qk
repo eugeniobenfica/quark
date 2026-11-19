@@ -1,0 +1,2320 @@
+// The x86-64 backend: Windows x64, or System V (Linux, macOS) for the calls into C. No assembler, no linker:
+// instructions are encoded here, byte by byte.
+//
+// Registers: the most used virtual registers (loops weigh 8x per level) own a register while they are alive
+// (linear scan): rbx, rsi, rdi, r12-r15 for ints, xmm6-xmm15 for floats (System V: rbx, r12-r15, and xmm8-xmm15,
+// saved around calls into C, which may change every xmm), and r10, r9, r8, xmm1-xmm5 for values no call crosses;
+// the rest live in the frame. rax, rcx, rdx, r11 and xmm0 are scratch.
+//
+// Calls between Quark functions (and of the runtime's, and std.machine's): the first five slots of the arguments go in
+// rcx, rdx, r8, r9, r10 and the rest to [rsp + 8i] of the caller (its outgoing area), where the callee reads them at
+// [rbp + 16 + 8i]; the results come back the same way (the first five in those registers). r8-r10 also hold values
+// no call crosses, so the registers are filled and emptied as one parallel move. Calls to the
+// runtime and the host follow the platform: Windows x64 (rcx, rdx, r8, r9 / xmm0-3 by position, 32 bytes of
+// shadow space), or System V (rdi, rsi, rdx, rcx, r8, r9 for ints and xmm0-7 for floats, each counted on its own).
+use ir
+
+// the general registers' numbers, as the encoding has them (xmm registers are their own numbers, 0 to 15)
+const rax = 0
+const rcx = 1
+const rdx = 2
+const rbx = 3
+const rsp = 4
+const rbp = 5
+const rsi = 6
+const rdi = 7
+const r8 = 8
+const r9 = 9
+const r10 = 10
+const r11 = 11
+const r12 = 12
+const r13 = 13
+const r14 = 14
+const r15 = 15
+
+// condition codes: the low nibble of 0F 8x (jcc) and 0F 9x (setcc)
+const ccO = 0
+const ccB = 2
+const ccAe = 3
+const ccE = 4
+const ccNe = 5
+const ccBe = 6
+const ccA = 7
+const ccS = 8
+const ccNs = 9
+const ccP = 10
+const ccNp = 11
+const ccL = 12
+const ccGe = 13
+const ccLe = 14
+const ccG = 15
+
+// Cmp's cond as a condition code, and its negation
+const intCc = [ccE, ccNe, ccL, ccLe, ccG, ccGe]
+const intNotCc = [ccNe, ccE, ccGe, ccG, ccLe, ccL]
+
+// opcodes of op reg, r/m (two bytes: 0x0F__)
+const opMovLoad = 0x8B
+const opMovStore = 0x89
+const opAdd = 0x03
+const opSub = 0x2B
+const opImul = 0x0FAF
+const opCmp = 0x3B
+const opTest = 0x85
+const opXor = 0x33
+const opAnd = 0x23
+const opOr = 0x0B
+const opLea = 0x8D
+const winGpr = [rcx, rdx, r8, r9]
+
+// a Quark call's first argument and result slots, in order (the rest in the outgoing area)
+pub const quarkRegs = [rcx, rdx, r8, r9, r10]
+const sysvGpr = [rdi, rsi, rdx, rcx, r8, r9]
+
+// a home not given yet (a home >= 0 is a register: GPR 0-15, XMM 16-31; < 0 a frame slot, -(n + 1))
+const noHome = -2147483648
+
+// [base + index * scale + disp], scale 1, 2, 4 or 8 (index < 0: none)
+type Mem { base: Int, index: Int = -1, scale: Int = 1, disp: Int = 0 }
+
+type Fixup {
+    at: Int // a rel32 at `at`: a label's, or a function's
+    target: Int
+}
+
+// a panic's code, placed after the function so loops stay short and fall through
+type Cold { at: Int, code: Int, line: Int, a: Int, b: Int, inl: Int }
+
+type X64 {
+    target: Target
+    runtime: [RtSig]
+    externs: [IrExtern]
+    sysv: Bool
+    xmmFirst: Int // the first callee-saved xmm: 6 (Windows), 8 (System V)
+    code: Bytes = []
+    patches: [Patch] = []
+    relocs: [Reloc] = []
+    sites: [CallSite] = []
+    callFixups: [Fixup] = []
+    rtFixups: [Fixup] = [] // calls of the runtime: each to its stub after the code (target: the runtime function)
+    fnIndex: Int = 0
+    inl: Int = 0 // the instruction's inlined calls
+    // the function being made
+    kinds: Bytes = []
+    operands: [Int] = [] // the function's (its calls' arguments and results)
+    isConst: [Bool] = []
+    constValue: [Int] = []
+    home: [Int] = []
+    pushed: Int = 0 // callee-saved GPRs pushed
+    xmmCount: Int = 0
+    slotBase: Int = 0 // bytes below rbp where slots start
+    xmmBase: Int = 0
+    labelAt: [Int] = []
+    fixups: [Fixup] = []
+    epilogue: Int = 0 // a label
+    cold: [Cold] = []
+    uses: [Int] = [] // how often each virtual register is read
+    loopTop: [Bool] = [] // labels a jump goes back to
+    afterJump: Bool = false // the last instruction was an unconditional jump
+    first: [Int] = [] // each virtual register's first and last mention
+    last: [Int] = []
+    at: Int = 0 // the instruction being made
+    spillBase: Int = 0 // System V: frame slots where live xmm registers wait out a call into C
+    sigs: [IrExtern] = [] // the C functions called through an address (HostCall's a): their slots
+}
+
+// The machine code of a program: each function at a 16-byte boundary, then the trampoline (the way in from C)
+// and the escape (the way out of a panic).
+pub fn genX64(p: IrProgram) -> MachineCode {
+    let sysv = p.target.sysv
+    var g = X64(p.target, p.runtime, p.externs, sysv, if sysv { 8 } else { 6 })
+    g.sigs = p.cSigs
+    var fnAt: [Int] = []
+    for (i, f) in p.fns.enumerate() {
+        g.align(0xCC)
+        fnAt.push(g.here())
+        g.fnIndex = i
+        g.genFn(f)
+    }
+    let (enter, escape) = g.genTrampoline()
+    for fx in g.callFixups {
+        g.patch(fx.at, fnAt[fx.target] - (fx.at + 4), 4)
+    }
+    if len(g.rtFixups) > 0 {
+        // the runtime functions called: a stub each (their address, patched at load time), in order of use
+        var stubAt: [Int: Int] = [:]
+        g.align(0xCC)
+        for fx in g.rtFixups {
+            if not stubAt.contains(fx.target) {
+                stubAt[fx.target] = g.here()
+                g.movReloc(rax, relocRuntime, fx.target)
+                g.byte(0xFF) // jmp rax
+                g.byte(0xE0)
+            }
+            g.patch(fx.at, (stubAt[fx.target] ?? 0) - (fx.at + 4), 4)
+        }
+    }
+    MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape)
+}
+
+// ---- encoding ----
+fn X64.byte(var self, v: Int) {
+    self.code.push(v & 255)
+}
+
+fn X64.i32(var self, v: Int) {
+    self.code += le32(v)
+}
+
+fn X64.i64(var self, v: Int) {
+    self.code += le32(v)
+    self.code += le32(v >> 32)
+}
+
+fn X64.here(self) -> Int = len(self.code)
+
+fn X64.align(var self, fill: Int) {
+    while self.here() % 16 != 0 {
+        self.byte(fill)
+    }
+}
+
+fn X64.patch(var self, at: Int, value: Int, width: Int) {
+    self.patches.push(Patch(at, value, width))
+}
+
+fn X64.rex(var self, w: Bool, reg: Int, index: Int, base: Int, force: Bool = false) {
+    let r = 0x40 | (if w { 8 } else { 0 }) | reg >> 3 & 1 << 2 | index >> 3 & 1 << 1 | base >> 3 & 1
+    if r != 0x40 or force {
+        self.byte(r)
+    }
+}
+
+fn X64.opcode(var self, op: Int) {
+    if op > 255 {
+        self.byte(op >> 8)
+    }
+    self.byte(op & 255)
+}
+
+// op reg, rm (both registers)
+fn X64.rr(var self, w: Bool, op: Int, reg: Int, rm: Int) {
+    self.rex(w, reg, 0, rm)
+    self.opcode(op)
+    self.byte(0xC0 | reg & 7 << 3 | rm & 7)
+}
+
+// ModRM (and SIB) for [base + index * scale + disp], in its shortest form: no displacement when it is 0 (but rbp
+// and r13 always take one), one byte when it fits, else four
+fn X64.address(var self, reg: Int, base: Int, index: Int, scale: Int, disp: Int) {
+    let mode = if disp == 0 and base & 7 != rbp {
+        0x00
+    } else if disp >= -128 and disp <= 127 {
+        0x40
+    } else {
+        0x80
+    }
+    if index < 0 {
+        self.byte(mode | reg & 7 << 3 | base & 7)
+        if base & 7 == rsp {
+            self.byte(0x24)
+        }
+    } else {
+        let ss = match scale {
+            8 => 3
+            4 => 2
+            2 => 1
+            _ => 0
+        }
+        self.byte(mode | 0x04 | reg & 7 << 3)
+        self.byte(ss << 6 | index & 7 << 3 | base & 7)
+    }
+    if mode == 0x40 {
+        self.byte(disp)
+    } else if mode == 0x80 {
+        self.i32(disp)
+    }
+}
+
+// op reg, [base + disp]
+fn X64.rm(var self, w: Bool, op: Int, reg: Int, base: Int, disp: Int) {
+    self.rex(w, reg, 0, base)
+    self.opcode(op)
+    self.address(reg, base, -1, 1, disp)
+}
+
+// SSE: prefix, then REX, then 0F op
+fn X64.sseRR(var self, prefix: Int, w: Bool, op: Int, reg: Int, rmReg: Int) {
+    if prefix != 0 {
+        self.byte(prefix)
+    }
+    self.rex(w, reg, 0, rmReg)
+    self.byte(0x0F)
+    self.byte(op)
+    self.byte(0xC0 | reg & 7 << 3 | rmReg & 7)
+}
+
+fn X64.sseRM(var self, prefix: Int, w: Bool, op: Int, reg: Int, base: Int, disp: Int) {
+    if prefix != 0 {
+        self.byte(prefix)
+    }
+    self.rex(w, reg, 0, base)
+    self.byte(0x0F)
+    self.byte(op)
+    self.address(reg, base, -1, 1, disp)
+}
+
+fn X64.movRR(var self, dst: Int, src: Int) {
+    if dst != src {
+        self.rr(true, opMovLoad, dst, src)
+    }
+}
+
+fn fits32(v: Int) -> Bool = v >= -2147483648 and v <= 2147483647
+
+fn X64.movImm(var self, reg: Int, v: Int) {
+    if v >= 0 and v <= 4294967295 {
+        // mov r32, imm32 (zero extended): the short form
+        self.rex(false, 0, 0, reg)
+        self.byte(0xB8 | reg & 7)
+        self.i32(v)
+        return
+    }
+    self.rex(true, 0, 0, reg)
+    if fits32(v) {
+        // mov r/m64, imm32 (sign extended)
+        self.byte(0xC7)
+        self.byte(0xC0 | reg & 7)
+        self.i32(v)
+    } else {
+        self.byte(0xB8 | reg & 7)
+        self.i64(v)
+    }
+}
+
+// mov reg, imm64 with an address patched at load time
+fn X64.movReloc(var self, reg: Int, kind: Int, target: Int) {
+    if self.target.objectMode {
+        // mov reg, [rip + disp32]: the address from the table (the object file's relocation)
+        self.rex(true, reg, 0, 0)
+        self.byte(0x8B)
+        self.byte(0x05 | reg & 7 << 3)
+        self.relocs.push(Reloc(self.here(), kind, target))
+        self.i32(0)
+        return
+    }
+    self.rex(true, 0, 0, reg)
+    self.byte(0xB8 | reg & 7)
+    self.relocs.push(Reloc(self.here(), kind, target))
+    self.i64(0)
+}
+
+// a jump back to a label already placed (a loop's top) takes two bytes when it is near
+fn X64.shortBack(var self, opcode: Int, target: Int) -> Bool {
+    if self.labelAt[target] < 0 {
+        return false
+    }
+    let rel = self.labelAt[target] - (self.here() + 2)
+    if rel < -128 {
+        return false
+    }
+    self.byte(opcode)
+    self.byte(rel)
+    true
+}
+
+fn X64.jccLabel(var self, cc: Int, target: Int) {
+    if self.shortBack(0x70 | cc, target) {
+        return
+    }
+    self.byte(0x0F)
+    self.byte(0x80 | cc)
+    self.fixups.push(Fixup(self.here(), target))
+    self.i32(0)
+}
+
+fn X64.jmpLabel(var self, target: Int) {
+    if self.shortBack(0xEB, target) {
+        return
+    }
+    self.byte(0xE9)
+    self.fixups.push(Fixup(self.here(), target))
+    self.i32(0)
+}
+
+// a short forward jump, patched by land
+fn X64.jccShort(var self, cc: Int) -> Int {
+    self.byte(0x70 | cc)
+    self.byte(0)
+    self.here()
+}
+
+fn X64.jmpShort(var self) -> Int {
+    self.byte(0xEB)
+    self.byte(0)
+    self.here()
+}
+
+fn X64.land(var self, after: Int) {
+    self.patch(after - 1, self.here() - after, 1)
+}
+
+// setcc r8; reg8 < 4 (al, cl, dl, bl)
+fn X64.setcc(var self, cc: Int, reg8: Int) {
+    self.byte(0x0F)
+    self.byte(0x90 | cc)
+    self.byte(0xC0 | reg8)
+}
+
+fn X64.movzxEaxAl(var self) {
+    self.byte(0x0F)
+    self.byte(0xB6)
+    self.byte(0xC0)
+}
+
+fn X64.bytes(var self, b: Bytes) {
+    self.code += b
+}
+
+// ---- where a virtual register lives ----
+fn X64.isK(self, v: Int) -> Bool = v >= 0 and self.isConst[v]
+
+fn X64.kOf(self, v: Int) -> Int = self.constValue[v]
+
+fn X64.inReg(self, v: Int) -> Bool = not self.isK(v) and self.home[v] >= 0
+
+fn X64.gprOf(self, v: Int) -> Int = self.home[v]
+
+fn X64.xmmOf(self, v: Int) -> Int = self.home[v] - 16
+
+fn X64.slotDisp(self, v: Int) -> Int = -(self.slotBase + 8 * -self.home[v])
+
+fn X64.isFloat(self, v: Int) -> Bool = self.kinds[v] == 'F'
+
+// where a move of a call's way in or out finds or leaves a value: the GPR that is its home, or 100 + v for a value
+// anywhere else (memory, an xmm register, a constant: none of the call's registers)
+fn X64.placeOf(self, v: Int) -> Int = if not self.isK(v) and self.inReg(v) and not self.isFloat(v) {
+    self.gprOf(v)
+} else {
+    100 + v
+}
+
+// moves (to, from) made as if all at once: a move waits while its destination is still another's source, and a
+// cycle of registers goes through rax. A place: a GPR, or 100 + v (placeOf); one side of each move is a GPR.
+fn X64.parallelMove(var self, moves: [(Int, Int)]) {
+    var pending = moves.filter(m => m.0 != m.1).toArray()
+    while len(pending) > 0 {
+        var free = -1
+        for (i, m) in pending.enumerate() {
+            if free < 0 and (m.0 >= 100 or not pending.any(o => o.1 == m.0)) {
+                free = i
+            }
+        }
+        if free < 0 {
+            // every destination is still read: one source to rax, and its moves from there
+            let s = pending[0].1
+            self.movRR(rax, s)
+            pending = pending.map(m => if m.1 == s { (m.0, rax) } else { m }).toArray()
+            continue
+        }
+        let (to, from) = pending[free]
+        if to >= 100 {
+            self.storeBits(to - 100, from)
+        } else if from >= 100 {
+            self.loadBits(to, from - 100)
+        } else {
+            self.movRR(to, from)
+        }
+        pending = pending[..free] + pending[free + 1..]
+    }
+}
+
+// a Quark call's arguments in place: those past the registers to the outgoing area first (they read homes the
+// registers may be), then the registers
+fn X64.quarkArgs(var self, ins: IrIns) {
+    let n = len(quarkRegs)
+    for i in n..ins.argCount {
+        self.loadBits(rax, self.operands[ins.from + i])
+        self.rm(true, opMovStore, rax, rsp, 8 * i)
+    }
+    var moves: [(Int, Int)] = []
+    for i in 0..min(ins.argCount, n) {
+        moves.push((quarkRegs[i], self.placeOf(self.operands[ins.from + i])))
+    }
+    self.parallelMove(moves)
+}
+
+// ... and its results to their homes: the registers first (a home may be one of them), then the outgoing area's
+fn X64.quarkResults(var self, ins: IrIns) {
+    let n = len(quarkRegs)
+    var moves: [(Int, Int)] = []
+    for i in 0..min(ins.retCount, n) {
+        moves.push((self.placeOf(self.operands[ins.from + ins.argCount + i]), quarkRegs[i]))
+    }
+    self.parallelMove(moves)
+    for i in n..ins.retCount {
+        self.rm(true, opMovLoad, rax, rsp, 8 * i)
+        self.storeBits(self.operands[ins.from + ins.argCount + i], rax)
+    }
+}
+
+// the 64 bits of any virtual register into a GPR
+fn X64.loadBits(var self, reg: Int, v: Int) {
+    if self.isK(v) {
+        self.movImm(reg, self.kOf(v))
+    } else if self.inReg(v) {
+        if self.isFloat(v) {
+            self.sseRR(0x66, true, 0x7E, self.xmmOf(v), reg) // movq reg, xmm
+        } else {
+            self.movRR(reg, self.gprOf(v))
+        }
+    } else {
+        self.rm(true, opMovLoad, reg, rbp, self.slotDisp(v))
+    }
+}
+
+fn X64.storeBits(var self, v: Int, reg: Int) {
+    if self.inReg(v) {
+        if self.isFloat(v) {
+            self.sseRR(0x66, true, 0x6E, self.xmmOf(v), reg) // movq xmm, reg
+        } else {
+            self.movRR(self.gprOf(v), reg)
+        }
+    } else {
+        self.rm(true, opMovStore, reg, rbp, self.slotDisp(v))
+    }
+}
+
+fn X64.loadF(var self, xmm: Int, v: Int) {
+    if self.inReg(v) {
+        if self.xmmOf(v) != xmm {
+            self.sseRR(0, false, 0x28, xmm, self.xmmOf(v)) // movaps
+        }
+    } else {
+        self.sseRM(0xF2, false, 0x10, xmm, rbp, self.slotDisp(v)) // movsd xmm, m64
+    }
+}
+
+fn X64.storeF(var self, v: Int, xmm: Int) {
+    if self.inReg(v) {
+        if self.xmmOf(v) != xmm {
+            self.sseRR(0, false, 0x28, self.xmmOf(v), xmm)
+        }
+    } else {
+        self.sseRM(0xF2, false, 0x11, xmm, rbp, self.slotDisp(v)) // movsd m64, xmm
+    }
+}
+
+// op reg, v: v from its register, its slot, or an immediate
+fn X64.aluWith(var self, op: Int, reg: Int, v: Int) {
+    if self.isK(v) {
+        let k = self.kOf(v)
+        let digit = match op {
+            0x03 => 0
+            0x2B => 5
+            0x3B => 7
+            0x33 => 6
+            0x23 => 4
+            0x0B => 1
+            _ => -1
+        }
+        if not fits32(k) or op < 256 and digit < 0 {
+            // through a scratch register
+            self.movImm(r11, k)
+            self.rr(true, op, reg, r11)
+            return
+        }
+        if op > 255 {
+            // imul reg, reg, imm32
+            self.rex(true, reg, 0, reg)
+            self.byte(0x69)
+            self.byte(0xC0 | reg & 7 << 3 | reg & 7)
+            self.i32(k)
+            return
+        }
+        self.rex(true, 0, 0, reg)
+        if k >= -128 and k <= 127 {
+            self.byte(0x83)
+            self.byte(0xC0 | digit << 3 | reg & 7)
+            self.byte(k)
+        } else {
+            self.byte(0x81)
+            self.byte(0xC0 | digit << 3 | reg & 7)
+            self.i32(k)
+        }
+        return
+    }
+    if self.inReg(v) {
+        self.rr(true, op, reg, self.gprOf(v))
+    } else {
+        self.rm(true, op, reg, rbp, self.slotDisp(v))
+    }
+}
+
+fn X64.sseWith(var self, prefix: Int, op: Int, xmm: Int, v: Int) {
+    if self.inReg(v) {
+        self.sseRR(prefix, false, op, xmm, self.xmmOf(v))
+    } else {
+        self.sseRM(prefix, false, op, xmm, rbp, self.slotDisp(v))
+    }
+}
+
+// AVX, scalar double (VEX.F2.0F op): d = a op v, v from its register or its slot. Three-byte VEX.
+fn X64.vexF2(var self, op: Int, d: Int, a: Int, v: Int) {
+    let rmReg = if self.inReg(v) { self.xmmOf(v) } else { rbp }
+    self.byte(0xC4)
+    self.byte((d >> 3 & 1 ^ 1) << 7 | 1 << 6 | (rmReg >> 3 & 1 ^ 1) << 5 | 0x01) // R X B, map 0F
+    self.byte(~a & 15 << 3 | 0x03) // W0, vvvv, L0, pp F2
+    self.byte(op)
+    if self.inReg(v) {
+        self.byte(0xC0 | d & 7 << 3 | rmReg & 7)
+    } else {
+        self.byte(0x80 | d & 7 << 3 | rbp)
+        self.i32(self.slotDisp(v))
+    }
+}
+
+// ---- calls ----
+// call rel32 to the runtime function's stub (made once, after the program's code: mov rax, its address; jmp rax)
+fn X64.callRuntime(var self, id: Int) {
+    self.byte(0xE8)
+    self.rtFixups.push(Fixup(self.here(), id))
+    self.i32(0)
+}
+
+// The panic's frame, for its stack of calls: qkPanicFrame = rbp (through r11, which nothing here holds).
+fn X64.markPanicFrame(var self) {
+    self.movReloc(r11, relocPanicFrame, 0)
+    self.rm(true, opMovStore, rbp, r11, 0)
+}
+
+// System V: C may change every xmm, so the callee-saved ones that hold a value still needed after the call wait in
+// the frame. save: before the call (true), after it (false).
+fn X64.spillAcrossC(var self, save: Bool) {
+    if not self.sysv {
+        return
+    }
+    for v in 0..len(self.home) {
+        if self.home[v] < 16 + self.xmmFirst or self.first[v] >= self.at or self.last[v] <= self.at {
+            continue
+        }
+        let x = self.home[v] - 16
+        let disp = -(self.slotBase + 8 * (self.spillBase + x - self.xmmFirst + 1))
+        self.sseRM(0xF2, false, if save {
+            0x11 // movsd
+        } else {
+            0x10
+        }, x, rbp, disp)
+    }
+}
+
+// The arguments of a call into C, from their homes to where the platform wants them. kinds: 'I' / 'F' per argument
+// ('M': a slot of a record System V passes on the stack). hiddenBuffer >= 0: a pointer to room for the results goes
+// first.
+// fixed: a variadic call's slots before its variadic ones (-1: none): Windows passes such a Float in both registers.
+fn X64.cArguments(var self, args: [Int], kinds: Bytes, hiddenBuffer: Int, fixed: Int) {
+    let count = len(args)
+    if not self.sysv {
+        let hidden = if hiddenBuffer >= 0 { 1 } else { 0 }
+        for i in 0..count {
+            // the stack ones first: they go through rax
+            let pos = i + hidden
+            if pos >= 4 {
+                self.loadBits(rax, args[i])
+                self.rm(true, opMovStore, rax, rsp, 8 * pos)
+            }
+        }
+        for i in 0..count {
+            let pos = i + hidden
+            if pos < 4 {
+                if kindAt(kinds, i) == 'F' {
+                    self.loadF(pos, args[i])
+                    if fixed >= 0 and i >= fixed {
+                        self.loadBits(winGpr[pos], args[i]) // C's va_arg reads it from there
+                    }
+                } else {
+                    self.loadBits(winGpr[pos], args[i])
+                }
+            }
+        }
+        if hidden == 1 {
+            // lea rcx, [rsp + buffer]
+            self.rm(true, opLea, rcx, rsp, hiddenBuffer)
+        }
+        return
+    }
+    var ints = if hiddenBuffer >= 0 { 1 } else { 0 }
+    var floats = 0
+    var stack = 0
+    for i in 0..count {
+        // past the registers, and a record passed in memory ('M'): on the stack, in order
+        let kind = kindAt(kinds, i)
+        if kind != 'M' {
+            if kind == 'F' {
+                floats += 1
+                if floats <= 8 {
+                    continue
+                }
+            } else {
+                ints += 1
+                if ints <= 6 {
+                    continue
+                }
+            }
+        }
+        self.loadBits(rax, args[i])
+        self.rm(true, opMovStore, rax, rsp, 8 * stack)
+        stack += 1
+    }
+    ints = if hiddenBuffer >= 0 { 1 } else { 0 }
+    floats = 0
+    for i in 0..count {
+        let kind = kindAt(kinds, i)
+        if kind == 'M' {
+            continue
+        }
+        if kind == 'F' {
+            if floats < 8 {
+                self.loadF(floats, args[i])
+            }
+            floats += 1
+        } else {
+            if ints < 6 {
+                self.loadBits(sysvGpr[ints], args[i])
+            }
+            ints += 1
+        }
+    }
+    if hiddenBuffer >= 0 {
+        // lea rdi, [rsp + buffer]
+        self.rm(true, opLea, rdi, rsp, hiddenBuffer)
+    }
+}
+
+fn X64.coldJump(var self, cc: Int, code: Int, line: Int, a: Int, b: Int) {
+    self.byte(0x0F)
+    self.byte(0x80 | cc)
+    self.cold.push(Cold(self.here(), code, line, a, b, self.inl))
+    self.i32(0)
+}
+
+// The function's panics: each loads its values (rax, rdx) and calls the panic below, its line (and the inlined calls
+// above its 32 bits) and its code right after the call, where the panic reads them (from its return address).
+fn X64.emitCold(var self) {
+    let cold = self.cold
+    self.cold = []
+    if len(cold) == 0 {
+        return
+    }
+    let thunk = self.here()
+    self.rex(false, 0, 0, r10) // pop r10: the line and the code
+    self.byte(0x58 | r10 & 7)
+    self.markPanicFrame()
+    // rtPanic(code, line, a, b), the Quark way (rcx, rdx, r8, r9), never back
+    self.movRR(r8, rax)
+    self.movRR(r9, rdx)
+    self.rm(false, 0x0FB6, rcx, r10, 8)
+    self.rm(true, opMovLoad, rdx, r10, 0)
+    self.callRuntime(rtPanic)
+    for c in cold {
+        self.patch(c.at, self.here() - (c.at + 4), 4)
+        if c.a >= 0 {
+            self.loadBits(rax, c.a)
+        } else {
+            self.rr(false, opXor, rax, rax)
+        }
+        if c.b >= 0 {
+            self.loadBits(rdx, c.b)
+        } else {
+            self.rr(false, opXor, rdx, rdx)
+        }
+        self.byte(0xE8) // call the panic
+        self.i32(thunk - (self.here() + 4))
+        self.i64(c.line | c.inl << 32)
+        self.byte(c.code)
+    }
+}
+
+// ---- one instruction ----
+fn X64.memOp(var self, prefix: Int, w: Bool, op: Int, reg: Int, m: Mem) {
+    if prefix != 0 {
+        self.byte(prefix)
+    }
+    self.rex(w, reg, if m.index >= 0 { m.index } else { 0 }, m.base)
+    self.opcode(op)
+    self.address(reg, m.base, m.index, m.scale, m.disp)
+}
+
+// [a + b * imm + c] as a memory operand: the index pre-multiplied when the scale is not 1, 2, 4 or 8
+fn X64.memOf(var self, ins: IrIns) -> Mem {
+    let base = if self.inReg(ins.a) { self.gprOf(ins.a) } else { rcx }
+    if base == rcx {
+        self.loadBits(rcx, ins.a)
+    }
+    let scale = ins.imm
+    if self.isK(ins.b) and fits32(self.kOf(ins.b) * scale + ins.c) {
+        return Mem(base, -1, 1, self.kOf(ins.b) * scale + ins.c)
+    }
+    if scale is 1 | 2 | 4 | 8 {
+        let index = if self.inReg(ins.b) { self.gprOf(ins.b) } else { rdx }
+        if index == rdx {
+            self.loadBits(rdx, ins.b)
+        }
+        return Mem(base, index, scale, ins.c)
+    }
+    self.loadBits(rdx, ins.b) // rdx = index * scale
+    self.rex(true, rdx, 0, rdx)
+    self.byte(0x69)
+    self.byte(0xC0 | rdx & 7 << 3 | rdx & 7)
+    self.i32(scale)
+    Mem(base, rdx, 1, ins.c)
+}
+
+// ---- SIMD (release's vector loops): AVX2, four lanes in ymm registers (VEX.256); else two in xmm (VEX.128 with
+// AVX, SSE2 / SSE4.2 without) ----
+// three-byte VEX: L 0 (128) / 1 (256); pp 1: 66, 3: F2; map 1: 0F, 2: 0F38, 3: 0F3A
+fn X64.vexPrefix(var self, l: Int, pp: Int, map: Int, w: Int, reg: Int, vvvv: Int, index: Int, base: Int) {
+    self.byte(0xC4)
+    self.byte((reg >> 3 & 1 ^ 1) << 7 | (index >> 3 & 1 ^ 1) << 6 | (base >> 3 & 1 ^ 1) << 5 | map)
+    self.byte(w << 7 | ~vvvv & 15 << 3 | l << 2 | pp)
+}
+
+fn X64.vexRR(var self, l: Int, pp: Int, map: Int, w: Int, op: Int, reg: Int, vvvv: Int, rmReg: Int) {
+    self.vexPrefix(l, pp, map, w, reg, vvvv, 0, rmReg)
+    self.byte(op)
+    self.byte(0xC0 | reg & 7 << 3 | rmReg & 7)
+}
+
+fn X64.vexMem(var self, l: Int, pp: Int, map: Int, w: Int, op: Int, reg: Int, vvvv: Int, m: Mem) {
+    self.vexPrefix(l, pp, map, w, reg, vvvv, if m.index >= 0 { m.index } else { 0 }, m.base)
+    self.byte(op)
+    self.address(reg, m.base, m.index, m.scale, m.disp)
+}
+
+// legacy SSE, 66 prefix: op reg, rm (map 1: 0F, 2: 0F 38)
+fn X64.sse66(var self, map: Int, op: Int, reg: Int, rmReg: Int) {
+    self.byte(0x66)
+    self.rex(false, reg, 0, rmReg)
+    self.byte(0x0F)
+    if map == 2 {
+        self.byte(0x38)
+    }
+    self.byte(op)
+    self.byte(0xC0 | reg & 7 << 3 | rmReg & 7)
+}
+
+// release keeps few enough vector registers for each to have a register
+fn X64.vecReg(self, v: Int) -> Int {
+    if not self.inReg(v) {
+        panic("quark: internal error: a vector register has no register")
+    }
+    self.xmmOf(v)
+}
+
+fn X64.wide(self) -> Int = if self.target.lanes == 4 { 1 } else { 0 }
+
+// the whole register
+fn X64.vmov(var self, d: Int, s: Int) {
+    if d == s {
+        return
+    }
+    if self.target.avx {
+        self.vexRR(self.wide(), 1, 1, 0, 0x28, d, 0, s) // vmovapd
+    } else {
+        self.sse66(1, 0x28, d, s) // movapd
+    }
+}
+
+// d = a op b, lane by lane (66-prefixed op in map 0F or 0F38)
+fn X64.vbin(var self, map: Int, op: Int, d: Int, a: Int, b: Int, commutes: Bool) {
+    if self.target.avx {
+        self.vexRR(self.wide(), 1, map, 0, op, d, a, b)
+        return
+    }
+    if d == b and d != a {
+        if commutes {
+            self.sse66(map, op, d, a)
+            return
+        }
+        self.vmov(0, a)
+        self.sse66(map, op, 0, b)
+        self.vmov(d, 0)
+        return
+    }
+    self.vmov(d, a)
+    self.sse66(map, op, d, b)
+}
+
+fn X64.genVector(var self, ins: IrIns) {
+    let l = self.wide()
+    let avx = self.target.avx
+    match ins.op {
+        Vload | Vstore => {
+            // movupd
+            let m = self.memOf(ins)
+            let x = self.vecReg(ins.dst)
+            let op = if ins.op == .Vload { 0x10 } else { 0x11 }
+            if avx {
+                self.vexMem(l, 1, 1, 0, op, x, 0, m)
+            } else {
+                self.memOp(0x66, false, 0x0F00 | op, x, m)
+            }
+        }
+        Vsplat => {
+            let d = self.vecReg(ins.dst)
+            var s = d
+            if self.isFloat(ins.a) and self.inReg(ins.a) {
+                s = self.xmmOf(ins.a)
+            } else {
+                // through rax: movq d, rax
+                self.loadBits(rax, ins.a)
+                if avx {
+                    self.vexRR(0, 1, 1, 1, 0x6E, d, 0, rax)
+                } else {
+                    self.sseRR(0x66, true, 0x6E, d, rax)
+                }
+            }
+            if l == 1 {
+                self.vexRR(1, 1, 2, 0, if self.isFloat(ins.a) {
+                    0x19 // vbroadcastsd / vpbroadcastq
+                } else {
+                    0x59
+                }, d, 0, s)
+            } else if avx {
+                self.vexRR(0, 1, 1, 0, 0x14, d, s, s) // vunpcklpd d, s, s
+            } else {
+                self.vmov(d, s)
+                self.sse66(1, 0x14, d, d) // unpcklpd
+            }
+        }
+        Vlane => {
+            var s = self.vecReg(ins.a)
+            var lane = ins.c
+            if l == 1 and lane >= 2 {
+                // vextractf128 xmm0, ymm, 1
+                self.vexRR(1, 1, 3, 0, 0x19, s, 0, 0)
+                self.byte(1)
+                s = 0
+                lane -= 2
+            }
+            let fl = self.isFloat(ins.dst)
+            var t = if fl and self.inReg(ins.dst) { self.xmmOf(ins.dst) } else { 0 }
+            if lane == 0 {
+                if fl and t != s {
+                    if avx {
+                        self.vexRR(0, 1, 1, 0, 0x28, t, 0, s)
+                    } else {
+                        self.sse66(1, 0x28, t, s)
+                    }
+                }
+                if not fl {
+                    t = s
+                }
+            } else if avx {
+                self.vexRR(0, 1, 1, 0, 0x15, t, s, s) // vunpckhpd t, s, s
+            } else {
+                if t != s {
+                    self.sse66(1, 0x28, t, s)
+                }
+                self.sse66(1, 0x15, t, t) // unpckhpd
+            }
+            if fl {
+                if not self.inReg(ins.dst) {
+                    if avx {
+                        // vmovsd [slot], xmm0
+                        self.vexMem(0, 3, 1, 0, 0x11, 0, 0, Mem(rbp, -1, 1, self.slotDisp(ins.dst)))
+                    } else {
+                        self.storeF(ins.dst, 0)
+                    }
+                }
+            } else {
+                if avx {
+                    self.vexRR(0, 1, 1, 1, 0x7E, t, 0, rax) // vmovq rax, xmm
+                } else {
+                    self.sseRR(0x66, true, 0x7E, t, rax)
+                }
+                self.storeBits(ins.dst, rax)
+            }
+        }
+        Vend => {
+            if l == 1 {
+                // vzeroupper: no penalty for the SSE code after
+                self.bytes([0xC5, 0xF8, 0x77])
+            }
+        }
+        Vop => self.genVop(ins, l)
+        _ => {}
+    }
+}
+
+fn X64.genVop(var self, ins: IrIns, l: Int) {
+    let d = self.vecReg(ins.dst)
+    let a = self.vecReg(ins.a)
+    let b = if ins.b >= 0 { self.vecReg(ins.b) } else { 0 }
+    match opOf(ins.imm) {
+        Fadd => self.vbin(1, 0x58, d, a, b, true)
+        Fsub => self.vbin(1, 0x5C, d, a, b, false)
+        Fmul => self.vbin(1, 0x59, d, a, b, true)
+        Fdiv => self.vbin(1, 0x5E, d, a, b, false)
+        Fmin => self.vbin(1, 0x5D, d, a, b, false)
+        // as minsd: b when unordered
+        Fmax => self.vbin(1, 0x5F, d, a, b, false)
+        Add => self.vbin(1, 0xD4, d, a, b, true)
+        // paddq
+        Sub => self.vbin(1, 0xFB, d, a, b, false)
+        // psubq
+        And => self.vbin(1, 0xDB, d, a, b, true)
+        // pand
+        Or => self.vbin(1, 0xEB, d, a, b, true)
+        // por
+        Xor => self.vbin(1, 0xEF, d, a, b, true)
+        // pxor
+        Not => self.vbin(1, 0xDF, d, b, a, false)
+        // pandn: ~b & a
+        Sqrt => {
+            if self.target.avx {
+                self.vexRR(l, 1, 1, 0, 0x51, d, 0, a)
+            } else {
+                self.sse66(1, 0x51, d, a)
+            }
+        }
+        Shl => {
+            // psllq d, imm
+            if self.target.avx {
+                self.vexRR(l, 1, 1, 0, 0x73, 6, d, a)
+            } else {
+                self.vmov(d, a)
+                self.sse66(1, 0x73, 6, d)
+            }
+            self.byte(ins.c & 63)
+        }
+        Fcmp => {
+            // cmppd: eq 0, lt 1, le 2, neq (true when unordered) 4
+            let pred = [0, 4, 1, 2, 1, 2]
+            let swap = ins.cond == condGt or ins.cond == condGe
+            self.vbin(1, 0xC2, d, if swap { b } else { a }, if swap { a } else { b }, false)
+            self.byte(pred[ins.cond])
+        }
+        Cmp => {
+            // pcmpeqq / pcmpgtq, then negated with all ones for != <= >=
+            let c = ins.cond
+            let gt = c != condEq and c != condNe
+            let swap = c == condLt or c == condGe
+            self.vbin(2, if gt { 0x37 } else { 0x29 }, d, if swap { b } else { a }, if swap { a } else { b }, not gt)
+            if c == condNe or c == condLe or c == condGe {
+                self.vbin(1, 0x76, 0, 0, 0, true) // pcmpeqd xmm0, xmm0: all ones
+                self.vbin(1, 0xEF, d, d, 0, true)
+            }
+        }
+        _ => {}
+    }
+}
+
+// shl /4, shr /5, sar /7
+fn X64.shiftImm(var self, reg: Int, digit: Int, n: Int) {
+    self.rex(true, 0, 0, reg)
+    self.byte(0xC1)
+    self.byte(0xC0 | digit << 3 | reg & 7)
+    self.byte(n)
+}
+
+// imul reg, reg, d (through r11 when d does not fit in 32 bits)
+fn X64.imulImm(var self, reg: Int, d: Int) {
+    if fits32(d) {
+        self.rex(true, reg, 0, reg)
+        self.byte(0x69)
+        self.byte(0xC0 | reg & 7 << 3 | reg & 7)
+        self.i32(d)
+    } else {
+        self.movImm(r11, d)
+        self.rr(true, opImul, reg, r11)
+    }
+}
+
+// x / d and x % d by a positive constant, floored like every Int division: a multiplication by d's magic number
+// (or a shift and a mask for a power of two) instead of a division that takes 40 cycles or more.
+fn X64.divideByConstant(var self, ins: IrIns) {
+    let d = self.kOf(ins.b)
+    let quotient = ins.op == .Div
+    self.loadBits(r8, ins.a) // n
+    if d == 1 {
+        if quotient {
+            self.movRR(rdx, r8)
+        } else {
+            self.rr(false, opXor, rdx, rdx)
+        }
+        self.storeBits(ins.dst, rdx)
+        return
+    }
+    if d & (d - 1) == 0 {
+        self.movRR(rdx, r8)
+        if quotient {
+            self.shiftImm(rdx, 7, log2(d)) // sar: rounds down
+        } else if fits32(d - 1) {
+            // and rdx, d - 1
+            self.rex(true, 0, 0, rdx)
+            self.byte(0x81)
+            self.byte(0xE0 | rdx & 7)
+            self.i32(d - 1)
+        } else {
+            self.movImm(r11, d - 1)
+            self.rr(true, opAnd, rdx, r11)
+        }
+        self.storeBits(ins.dst, rdx)
+        return
+    }
+    let (m, shift) = magic(d)
+    self.movImm(rax, m)
+    self.rex(true, 0, 0, r8) // imul r8: rdx:rax = rax * r8
+    self.byte(0xF7)
+    self.byte(0xE8 | r8 & 7)
+    if m < 0 {
+        self.rr(true, opAdd, rdx, r8)
+    }
+    if shift > 0 {
+        self.shiftImm(rdx, 7, shift)
+    }
+    if ins.cond & divNonNeg != 0 {
+        // n >= 0: truncated is floored, nothing to fix
+        if not quotient {
+            self.imulImm(rdx, d)
+            self.movRR(rax, r8)
+            self.rr(true, opSub, rax, rdx)
+            self.storeBits(ins.dst, rax)
+            return
+        }
+        self.storeBits(ins.dst, rdx)
+        return
+    }
+    self.movRR(rax, r8) // + 1 when n < 0: truncated toward zero
+    self.shiftImm(rax, 5, 63)
+    self.rr(true, opAdd, rdx, rax)
+    // r = n - q * d; when r < 0, q - 1 and r + d: rounded down
+    self.movRR(rcx, rdx)
+    self.imulImm(rcx, d)
+    self.movRR(rax, r8)
+    self.rr(true, opSub, rax, rcx)
+    self.movRR(rcx, rax)
+    self.rr(true, opTest, rcx, rcx)
+    let fine = self.jccShort(ccNs)
+    self.rex(true, 0, 0, rdx) // dec rdx
+    self.byte(0xFF)
+    self.byte(0xC8 | rdx & 7)
+    if fits32(d) {
+        // add rcx, d
+        self.rex(true, 0, 0, rcx)
+        self.byte(0x81)
+        self.byte(0xC0 | rcx & 7)
+        self.i32(d)
+    } else {
+        self.movImm(r11, d)
+        self.rr(true, opAdd, rcx, r11)
+    }
+    self.land(fine)
+    self.storeBits(ins.dst, if quotient { rdx } else { rcx })
+}
+
+// x + k, x * 2^n, x * 3, 5, 9 into another register: one lea or shift, no copy first
+fn X64.leaFor(var self, ins: IrIns) -> Bool {
+    if not self.inReg(ins.a) or not self.isK(ins.b) or not self.inReg(ins.dst) {
+        return false
+    }
+    let k = self.kOf(ins.b)
+    let a = self.gprOf(ins.a)
+    let d = self.gprOf(ins.dst)
+    if (ins.op == .Add or ins.op == .Sub) and fits32(k) and fits32(-k) {
+        self.memOp(0, true, opLea, d, Mem(a, -1, 1, if ins.op == .Add { k } else { -k }))
+        return true
+    }
+    if ins.op != .Mul {
+        return false
+    }
+    if k is 3 | 5 | 9 {
+        self.memOp(0, true, opLea, d, Mem(a, a, k - 1, 0))
+        return true
+    }
+    if k > 1 and k < 1 << 31 and k & (k - 1) == 0 {
+        self.movRR(d, a)
+        self.rex(true, 0, 0, d) // shl d, n
+        self.byte(0xC1)
+        self.byte(0xE0 | d & 7)
+        self.byte(log2(k))
+        return true
+    }
+    false
+}
+
+// x = [m]; x = x + k; [m] = x, with x read nowhere else: add qword [m], k
+fn X64.addToMemory(var self, ld: IrIns, add: IrIns, st: IrIns) -> Bool {
+    if ld.op != .Load or add.op != .Add or st.op != .Store or add.cond != 0 or ld.cond != 0 or st.cond != 0 {
+        return false
+    }
+    let v = ld.dst
+    if self.isFloat(v) or add.dst != v or add.a != v or st.dst != v or self.uses[v] != 2 {
+        return false
+    }
+    if not self.isK(add.b) or self.kOf(add.b) < -128 or self.kOf(add.b) > 127 {
+        return false
+    }
+    if st.a != ld.a or st.b != ld.b or st.imm != ld.imm or st.c != ld.c {
+        return false
+    }
+    let m = self.memOf(ld)
+    self.memOp(0, true, 0x83, 0, m) // /0
+    self.byte(self.kOf(add.b))
+    true
+}
+
+// d for a two-operand op: the destination's own register, unless b is in it
+fn X64.twoOperand(self, ins: IrIns) -> Int {
+    if self.inReg(ins.dst) and (not self.inReg(ins.b) or self.gprOf(ins.b) != self.gprOf(ins.dst)) {
+        self.gprOf(ins.dst)
+    } else {
+        rax
+    }
+}
+
+fn X64.genIns(var self, ins: IrIns) {
+    self.inl = ins.inl
+    match ins.op {
+        Const => self.genConst(ins)
+        Mov => {
+            if self.kinds[ins.dst] == 'V' {
+                self.vmov(self.vecReg(ins.dst), self.vecReg(ins.a))
+            } else if self.isFloat(ins.dst) and self.inReg(ins.dst) {
+                self.loadF(self.xmmOf(ins.dst), ins.a)
+            } else if not self.isFloat(ins.dst) and self.inReg(ins.dst) {
+                self.loadBits(self.gprOf(ins.dst), ins.a)
+            } else {
+                self.loadBits(rax, ins.a)
+                self.storeBits(ins.dst, rax)
+            }
+        }
+        Add | Sub | Mul => {
+            if ins.cond == 0 and self.leaFor(ins) {
+                // lea sets no flags: a checked one is a real add
+                return
+            }
+            let op = match ins.op {
+                Add => opAdd
+                Sub => opSub
+                _ => opImul
+            }
+            let d = self.twoOperand(ins)
+            self.loadBits(d, ins.a)
+            self.aluWith(op, d, ins.b)
+            if ins.cond != 0 {
+                // checked: past the limits
+                self.coldJump(ccO, panicOverflow, ins.line, -1, -1)
+            }
+            if d == rax {
+                self.storeBits(ins.dst, rax)
+            }
+        }
+        Div | Mod => self.genDivide(ins)
+        And | Or | Xor => {
+            let op = match ins.op {
+                And => opAnd
+                Or => opOr
+                _ => opXor
+            }
+            let d = self.twoOperand(ins)
+            self.loadBits(d, ins.a)
+            self.aluWith(op, d, ins.b)
+            if d == rax {
+                self.storeBits(ins.dst, rax)
+            }
+        }
+        Shl | Sar => {
+            // shl / sar rax, cl (or an immediate); the count modulo 64, as the processor takes it
+            let digit = if ins.op == .Shl { 4 } else { 7 }
+            self.loadBits(rax, ins.a)
+            if self.isK(ins.b) {
+                self.rex(true, 0, 0, rax)
+                self.byte(0xC1)
+                self.byte(0xC0 | digit << 3 | rax)
+                self.byte(self.kOf(ins.b) & 63)
+            } else {
+                self.loadBits(rcx, ins.b)
+                self.rex(true, 0, 0, rax)
+                self.byte(0xD3)
+                self.byte(0xC0 | digit << 3 | rax)
+            }
+            self.storeBits(ins.dst, rax)
+        }
+        Neg => {
+            self.loadBits(rax, ins.a)
+            self.rex(true, 0, 0, rax)
+            self.byte(0xF7)
+            self.byte(0xD8)
+            self.storeBits(ins.dst, rax)
+        }
+        Fadd | Fsub | Fmul | Fdiv | Fmin | Fmax => {
+            let op = match ins.op {
+                Fadd => 0x58
+                Fsub => 0x5C
+                Fmul => 0x59
+                Fdiv => 0x5E
+                Fmin => 0x5D
+                _ => 0x5F
+            }
+            if self.target.avx {
+                // three operands: no copy of the first one
+                let x = if self.inReg(ins.a) { self.xmmOf(ins.a) } else { 0 }
+                if x == 0 {
+                    self.loadF(0, ins.a)
+                }
+                let d = if self.inReg(ins.dst) { self.xmmOf(ins.dst) } else { 0 }
+                self.vexF2(op, d, x, ins.b)
+                if d == 0 {
+                    self.storeF(ins.dst, 0)
+                }
+                return
+            }
+            let d = if self.inReg(ins.dst) and (not self.inReg(ins.b) or self.xmmOf(ins.b) != self.xmmOf(ins.dst)) {
+                self.xmmOf(ins.dst)
+            } else {
+                0
+            }
+            self.loadF(d, ins.a)
+            self.sseWith(0xF2, op, d, ins.b)
+            if d == 0 {
+                self.storeF(ins.dst, 0)
+            }
+        }
+        Fneg => {
+            self.loadBits(rax, ins.a)
+            self.rex(true, 0, 0, rax) // btc rax, 63
+            self.bytes([0x0F, 0xBA, 0xF8, 63])
+            self.storeBits(ins.dst, rax)
+        }
+        Sqrt => {
+            self.sseWith(0xF2, 0x51, 0, ins.a)
+            self.storeF(ins.dst, 0)
+        }
+        Cmp => {
+            let ra = if self.inReg(ins.a) { self.gprOf(ins.a) } else { rax }
+            if ra == rax {
+                self.loadBits(rax, ins.a)
+            }
+            self.aluWith(opCmp, ra, ins.b)
+            self.setcc(intCc[ins.cond], 0)
+            self.movzxEaxAl()
+            self.storeBits(ins.dst, rax)
+        }
+        Fcmp => {
+            let c = ins.cond
+            let swap = c == condLt or c == condLe // a < b is b > a: false when either is NaN
+            self.loadF(0, if swap { ins.b } else { ins.a })
+            self.sseWith(0x66, 0x2E, 0, if swap {
+                ins.a // ucomisd
+            } else {
+                ins.b
+            })
+            if c == condEq {
+                self.setcc(ccE, 0)
+                self.setcc(ccNp, 1)
+                self.bytes([0x20, 0xC8]) // and al, cl
+            } else if c == condNe {
+                self.setcc(ccNe, 0)
+                self.setcc(ccP, 1)
+                self.bytes([0x08, 0xC8]) // or al, cl
+            } else {
+                self.setcc(if c == condLt or c == condGt { ccA } else { ccAe }, 0)
+            }
+            self.movzxEaxAl()
+            self.storeBits(ins.dst, rax)
+        }
+        Not => {
+            self.loadBits(rax, ins.a)
+            self.rr(true, opTest, rax, rax)
+            self.setcc(ccE, 0)
+            self.movzxEaxAl()
+            self.storeBits(ins.dst, rax)
+        }
+        IntToFloat => {
+            // straight into the destination register when it has one
+            let src = if self.inReg(ins.a) { self.gprOf(ins.a) } else { rax }
+            if src == rax {
+                self.loadBits(rax, ins.a)
+            }
+            let x = if self.inReg(ins.dst) { self.xmmOf(ins.dst) } else { 0 }
+            self.sseRR(0, false, 0x57, x, x) // xorps x, x: cvtsi2sd keeps the upper half, a false dependency
+            self.sseRR(0xF2, true, 0x2A, x, src) // cvtsi2sd x, src
+            if x == 0 {
+                self.storeF(ins.dst, 0)
+            }
+        }
+        FloatToInt => {
+            let x = if self.inReg(ins.a) { self.xmmOf(ins.a) } else { 0 }
+            if x == 0 {
+                self.loadF(0, ins.a)
+            }
+            let d = if self.inReg(ins.dst) { self.gprOf(ins.dst) } else { rax }
+            self.sseRR(0xF2, true, 0x2C, d, x) // cvttsd2si d, x
+            if ins.cond != 0 {
+                // too big or NaN give 0x8000000000000000, the one value d - 1 overflows on
+                self.rex(true, 0, 0, d) // cmp d, 1
+                self.byte(0x83)
+                self.byte(0xF8 | d & 7)
+                self.byte(1)
+                self.coldJump(ccO, panicTooBig, ins.line, -1, -1)
+            }
+            if d == rax {
+                self.storeBits(ins.dst, rax)
+            }
+        }
+        Round => {
+            let x = if self.inReg(ins.a) { self.xmmOf(ins.a) } else { 0 }
+            if x == 0 {
+                self.loadF(0, ins.a)
+            }
+            let d = if self.inReg(ins.dst) { self.xmmOf(ins.dst) } else { 0 }
+            if ins.imm == 3 or ins.imm == 4 {
+                // to C's float (cvtsd2ss), or back (cvtss2sd)
+                self.sseRR(if ins.imm == 3 { 0xF2 } else { 0xF3 }, false, 0x5A, d, x)
+            } else {
+                let mode = match ins.imm {
+                    // floor, ceil, nearest; no precision exception
+                    1 => 9
+                    2 => 10
+                    _ => 8
+                }
+                self.byte(0x66) // roundsd d, x, mode
+                self.rex(false, d, 0, x)
+                self.bytes([0x0F, 0x3A, 0x0B])
+                self.byte(0xC0 | d & 7 << 3 | x & 7)
+                self.byte(mode)
+            }
+            if d == 0 {
+                self.storeF(ins.dst, 0)
+            }
+        }
+        Load | Store => self.genMemory(ins)
+        Bounds => {
+            let ra = if self.inReg(ins.a) { self.gprOf(ins.a) } else { rax }
+            if ra == rax {
+                self.loadBits(rax, ins.a)
+            }
+            self.aluWith(opCmp, ra, ins.b)
+            self.coldJump(ccAe, ins.imm, ins.line, ins.a, ins.b)
+        }
+        Label => {
+            // a loop's top, reached only by jumps: pad it to 16 bytes (the padding is never run)
+            if self.loopTop[ins.imm] and self.afterJump and self.here() % 16 != 0 {
+                let before = self.here()
+                self.align(0xCC)
+                for l in 0..len(self.labelAt) - 1 {
+                    // labels just placed here (L2: L3:) go past the padding too
+                    if self.labelAt[l] == before {
+                        self.labelAt[l] = self.here()
+                    }
+                }
+            }
+            self.labelAt[ins.imm] = self.here()
+        }
+        Jmp => self.jmpLabel(ins.imm)
+        Jz | Jnz => {
+            if self.inReg(ins.a) and not self.isFloat(ins.a) {
+                self.rr(true, opTest, self.gprOf(ins.a), self.gprOf(ins.a))
+            } else {
+                self.loadBits(rax, ins.a)
+                self.rr(true, opTest, rax, rax)
+            }
+            self.jccLabel(if ins.op == .Jz { ccE } else { ccNe }, ins.imm)
+        }
+        Call => {
+            if ins.a >= 0 {
+                self.loadBits(r11, ins.a) // a function kept as a value: before the registers change
+            }
+            self.quarkArgs(ins)
+            if ins.a >= 0 {
+                self.bytes([0x41, 0xFF, 0xD3]) // call r11
+            } else {
+                self.byte(0xE8)
+                self.callFixups.push(Fixup(self.here(), ins.imm))
+                self.i32(0)
+            }
+            self.sites.push(CallSite(self.here(), ins.line, self.fnIndex, int32(ins.imm), ins.inl))
+            self.quarkResults(ins)
+        }
+        RtCall => {
+            // the runtime's Quark function, called the Quark way (the context register goes along)
+            if ins.imm == rtFail or self.target.checks and countingCall(ins.imm) {
+                self.markPanicFrame()
+            }
+            self.quarkArgs(ins)
+            self.callRuntime(ins.imm)
+            self.quarkResults(ins)
+        }
+        HostCall => self.genHostCall(ins)
+        Ret => {
+            // the results past the registers to the caller's outgoing area, then the registers
+            let n = len(quarkRegs)
+            for i in n..ins.argCount {
+                self.loadBits(rax, self.operands[ins.from + i])
+                self.rm(true, opMovStore, rax, rbp, 16 + 8 * i)
+            }
+            var moves: [(Int, Int)] = []
+            for i in 0..min(ins.argCount, n) {
+                moves.push((quarkRegs[i], self.placeOf(self.operands[ins.from + i])))
+            }
+            self.parallelMove(moves)
+            self.jmpLabel(self.epilogue)
+        }
+        Vload | Vstore | Vsplat | Vop | Vlane | Vend => self.genVector(ins)
+        Ctx => {
+            if ins.cond == 1 {
+                self.loadBits(r15, ins.a)
+            } else {
+                self.storeBits(ins.dst, r15)
+            }
+        }
+        Fuel => {
+            self.movReloc(rax, relocFuel, 0)
+            self.rex(true, 0, 0, rax) // dec qword [rax]
+            self.bytes([0xFF, 0x08])
+            self.coldJump(ccS, panicFuel, ins.line, -1, -1)
+        }
+        Nop => {}
+    }
+}
+
+fn X64.genConst(var self, ins: IrIns) {
+    if self.isK(ins.dst) {
+        return
+    }
+    if ins.c == 1 {
+        self.movReloc(rax, relocData, ins.imm)
+    } else if ins.c == 2 {
+        // lea rax, [rip + function]: a function kept as a value
+        self.bytes([0x48, 0x8D, 0x05])
+        self.callFixups.push(Fixup(self.here(), ins.imm))
+        self.i32(0)
+    } else if self.inReg(ins.dst) and not self.isFloat(ins.dst) {
+        self.movImm(self.gprOf(ins.dst), ins.imm)
+        return
+    } else {
+        self.movImm(rax, ins.imm)
+    }
+    self.storeBits(ins.dst, rax)
+}
+
+// floored: the quotient rounds down, the remainder takes the divisor's sign
+fn X64.genDivide(var self, ins: IrIns) {
+    if self.isK(ins.b) and self.kOf(ins.b) >= 1 {
+        self.divideByConstant(ins)
+        return
+    }
+    self.loadBits(rax, ins.a)
+    self.loadBits(rcx, ins.b)
+    let quotient = ins.op == .Div
+    if ins.cond & divNonNeg != 0 {
+        // a >= 0, b >= 1: xor edx, edx; div rcx
+        self.rr(false, opXor, rdx, rdx)
+        self.rex(true, 0, 0, rcx)
+        self.byte(0xF7)
+        self.byte(0xF0 | rcx)
+        self.storeBits(ins.dst, if quotient { rax } else { rdx })
+        return
+    }
+    self.rr(true, opTest, rcx, rcx)
+    self.coldJump(ccE, panicDivide, ins.line, -1, -1)
+    self.rex(true, 0, 0, rcx) // cmp rcx, -1
+    self.bytes([0x83, 0xF8 | rcx, 0xFF])
+    let normal = self.jccShort(ccNe)
+    if quotient {
+        // neg rax: wraps at the minimum
+        self.rex(true, 0, 0, rax)
+        self.bytes([0xF7, 0xD8])
+    } else {
+        self.rr(false, opXor, rax, rax)
+    }
+    let done = self.jmpShort()
+    self.land(normal)
+    self.rex(true, 0, 0, 0) // cqo
+    self.byte(0x99)
+    self.rex(true, 0, 0, rcx) // idiv rcx
+    self.bytes([0xF7, 0xF8 | rcx])
+    // if rdx != 0 and (rdx ^ rcx) < 0: adjust
+    self.rr(true, opTest, rdx, rdx)
+    let exact = self.jccShort(ccE)
+    self.movRR(r8, rdx)
+    self.rr(true, opXor, r8, rcx)
+    let sameSign = self.jccShort(ccNs)
+    if quotient {
+        // dec rax
+        self.rex(true, 0, 0, rax)
+        self.bytes([0xFF, 0xC8])
+    } else {
+        // add rdx, rcx
+        self.rr(true, opAdd, rdx, rcx)
+    }
+    self.land(sameSign)
+    self.land(exact)
+    if not quotient {
+        self.movRR(rax, rdx)
+    }
+    self.land(done)
+    self.storeBits(ins.dst, rax)
+}
+
+fn X64.genMemory(var self, ins: IrIns) {
+    let m = self.memOf(ins)
+    let v = ins.dst
+    let load = ins.op == .Load
+    if ins.cond == memF32 or ins.cond == memF32Bits {
+        // a C float: cvtss2sd / cvtsd2ss, or its bits: movss
+        let inXmm = self.inReg(v) and self.isFloat(v)
+        var x = if inXmm { self.xmmOf(v) } else { 0 }
+        if load {
+            self.memOp(0xF3, false, if ins.cond == memF32 { 0x0F5A } else { 0x0F10 }, x, m)
+            if not inXmm {
+                self.storeF(v, 0)
+            }
+        } else {
+            if not inXmm {
+                self.loadBits(rax, v)
+                self.sseRR(0x66, true, 0x6E, 0, rax) // movq xmm0, rax
+                x = 0
+            }
+            if ins.cond == memF32 {
+                // cvtsd2ss xmm0, x
+                self.sseRR(0xF2, false, 0x5A, 0, x)
+                x = 0
+            }
+            self.memOp(0xF3, false, 0x0F11, x, m)
+        }
+        return
+    }
+    if ins.cond != 0 {
+        // 1, 2 or 4 bytes: movzx / movsx / mov r32 / movsxd, or the low bytes of rax
+        if load {
+            let loads = [0, 0x0FB6, 0x0FBE, 0x0FB7, 0x0FBF, 0x8B, 0x63]
+            let r = if self.inReg(v) and not self.isFloat(v) {
+                self.gprOf(v)
+            } else {
+                rax
+            }
+            self.memOp(0, ins.cond != memU32, loads[ins.cond], r, m)
+            if r == rax {
+                self.storeBits(v, rax)
+            }
+        } else {
+            self.loadBits(rax, v)
+            if ins.cond <= memI8 {
+                self.memOp(0, false, 0x88, rax, m)
+            } else {
+                self.memOp(if ins.cond <= memI16 { 0x66 } else { 0 }, false, 0x89, rax, m)
+            }
+        }
+        return
+    }
+    if self.isFloat(v) and self.inReg(v) {
+        // movsd straight between memory and the register
+        self.memOp(0xF2, false, if load { 0x0F10 } else { 0x0F11 }, self.xmmOf(v), m)
+    } else if not self.isFloat(v) and self.inReg(v) {
+        self.memOp(0, true, if load { opMovLoad } else { opMovStore }, self.gprOf(v), m)
+    } else if load {
+        self.memOp(0, true, opMovLoad, rax, m)
+        self.storeBits(v, rax)
+    } else {
+        self.loadBits(rax, v)
+        self.memOp(0, true, opMovStore, rax, m)
+    }
+}
+
+// Windows x64: one result in rax / xmm0, several through a hidden first argument pointing at room after the
+// arguments. System V: up to two slots in rax, rdx / xmm0, xmm1 (each in the next of its kind), more through the
+// hidden pointer.
+fn X64.genHostCall(var self, ins: IrIns) {
+    let through = ins.a >= 0 // a C function value: its address in a, its slots in sigs
+    let x = if through { self.sigs[ins.imm] } else { self.externs[ins.imm] }
+    if through {
+        self.loadBits(r11, ins.a) // before the arguments: its home may be one of their registers
+    }
+    let retCount = ins.retCount
+    let hidden = retCount > (if self.sysv { 2 } else { 1 }) or x.retHidden
+    let positions = ins.argCount + (if hidden { 1 } else { 0 })
+    let buffer = 8 * max(positions, 4)
+    self.spillAcrossC(true)
+    self.cArguments(
+        self.operands[ins.from..ins.from + ins.argCount],
+        x.argKinds,
+        if hidden { buffer } else { -1 },
+        x.fixed,
+    )
+    if self.sysv and x.fixed >= 0 {
+        // a variadic call: al holds how many xmm registers carry values; the address goes through r11
+        var floats = 0
+        for i in 0..ins.argCount {
+            if kindAt(x.argKinds, i) == 'F' and floats < 8 {
+                floats += 1
+            }
+        }
+        self.byte(0xB8) // mov eax, floats
+        self.i32(floats)
+        self.movReloc(r11, relocHost, ins.imm)
+        self.bytes([0x41, 0xFF, 0xD3]) // call r11
+    } else if through {
+        self.bytes([0x41, 0xFF, 0xD3]) // call r11
+    } else {
+        self.movReloc(rax, relocHost, ins.imm)
+        self.bytes([0xFF, 0xD0]) // call rax
+    }
+    if hidden {
+        for i in 0..ins.retCount {
+            let r = self.operands[ins.from + ins.argCount + i]
+            self.rm(true, opMovLoad, rcx, rsp, buffer + 8 * i)
+            self.storeBits(r, rcx)
+        }
+    } else if self.sysv {
+        var reg: [Int] = []
+        var ints = 0
+        var floats = 0
+        for i in 0..retCount {
+            if kindAt(x.retKinds, i) == 'F' {
+                reg.push(floats)
+                floats += 1
+            } else {
+                reg.push(if ints > 0 { rdx } else { rax })
+                ints += 1
+            }
+        }
+        for i in (0..retCount).map(i => retCount - 1 - i) {
+            // the second first: xmm1 may be the first one's home
+            if kindAt(x.retKinds, i) == 'F' {
+                self.storeF(self.operands[ins.from + ins.argCount + i], reg[i])
+            } else {
+                self.storeBits(self.operands[ins.from + ins.argCount + i], reg[i])
+            }
+        }
+    } else if retCount > 0 {
+        if kindAt(x.retKinds, 0) == 'F' {
+            self.storeF(self.operands[ins.from + ins.argCount + 0], 0)
+        } else {
+            self.storeBits(self.operands[ins.from + ins.argCount + 0], rax)
+        }
+    }
+    self.spillAcrossC(false)
+}
+
+// A comparison whose only reader is the jump right after it: one compare, one conditional jump.
+fn X64.fusedBranch(var self, cmp: IrIns, jump: IrIns) -> Bool {
+    if cmp.op != .Cmp and cmp.op != .Fcmp or jump.op != .Jz and jump.op != .Jnz {
+        return false
+    }
+    if jump.a != cmp.dst or self.uses[cmp.dst] != 1 {
+        return false
+    }
+    let whenTrue = jump.op == .Jnz
+    let target = jump.imm
+    let c = cmp.cond
+    if cmp.op == .Cmp {
+        let ra = if self.inReg(cmp.a) { self.gprOf(cmp.a) } else { rax }
+        if ra == rax {
+            self.loadBits(rax, cmp.a)
+        }
+        self.aluWith(opCmp, ra, cmp.b)
+        self.jccLabel(if whenTrue { intCc[c] } else { intNotCc[c] }, target)
+        return true
+    }
+    let swap = c == condLt or c == condLe
+    let x = if swap { cmp.b } else { cmp.a }
+    let y = if swap { cmp.a } else { cmp.b }
+    let xr = if self.inReg(x) { self.xmmOf(x) } else { 0 }
+    if xr == 0 {
+        self.loadF(0, x)
+    }
+    self.sseWith(0x66, 0x2E, xr, y) // ucomisd
+    if c == condEq or c == condNe {
+        if (c == condEq) == whenTrue {
+            // ordered and equal
+            let skip = self.jccShort(ccP)
+            self.jccLabel(ccE, target)
+            self.land(skip)
+        } else {
+            self.jccLabel(ccP, target)
+            self.jccLabel(ccNe, target)
+        }
+        return true
+    }
+    let strict = c == condLt or c == condGt
+    if whenTrue {
+        self.jccLabel(if strict { ccA } else { ccAe }, target)
+    } else {
+        self.jccLabel(if strict { ccBe } else { ccB }, target)
+    }
+    true
+}
+
+// ---- functions ----
+// Linear scan: a register belongs to a virtual register only while it is alive, so the inner loops of one
+// function do not compete for the same seven registers. When none is free, the lightest (by use, loops weighing
+// more) goes to memory. Gives the slots, and the callee-saved GPRs and XMMs used.
+fn X64.allocate(var self, f: IrFn) -> (Int, Int, Int) {
+    let n = len(f.kinds)
+    let (first, last) = liveRanges(f)
+    var home = [noHome] * n
+    let order = (0..n)
+        .filter(v => last[v] >= 0 and not f.isConst[v] and f.weight[v] > 0)
+        .sortedBy(v => first[v])
+    // a value no call crosses takes a volatile register first (nothing to save), the others a callee-saved one;
+    // System V: rsi and rdi carry C's arguments, and xmm6-7 too, so they hold nothing
+    // (r15 holds the machine's context: no value's)
+    let gprList = if self.sysv {
+        [r10, r9, r8, rbx, r12, r13, r14]
+    } else {
+        [r10, r9, r8, rbx, rsi, rdi, r12, r13, r14]
+    }
+    let xmmList = if self.sysv {
+        [1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
+    } else {
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    }
+    let volatileCount = [3, 5] // r9 is scratch only where a call or a panic is made, r8 where a division is
+    let crosses = aliveAt(f, first, last, ins => ins.op is Call | RtCall | HostCall, true)
+    let divides = aliveAt(f, first, last, ins => ins.op is Div | Mod, false) // not in r8, which divisions use
+    var owner = [[-1] * len(gprList), [-1] * len(xmmList)]
+    var gprUsed = 0
+    var xmmUsed = 0
+    for v in order {
+        let c = if f.kinds[v] is 'F' | 'V' { 1 } else { 0 }
+        let list = if c == 1 { xmmList } else { gprList }
+        let from = if crosses[v] { volatileCount[c] } else { 0 }
+        let noR8 = c == 0 and divides[v]
+        var pick = -1
+        for r in 0..len(list) {
+            var o = owner[c][r]
+            if o >= 0 and last[o] < first[v] {
+                // expired
+                owner[c][r] = -1
+                o = -1
+            }
+            if o < 0 and pick < 0 and r >= from and not (noR8 and list[r] == r8) {
+                pick = r
+            }
+        }
+        if pick < 0 {
+            // all taken: the lightest gives way, if lighter than this one
+            var lightest = -1
+            for r in from..len(list) {
+                if not (noR8 and list[r] == r8)
+                    and (lightest < 0 or f.weight[owner[c][r]] < f.weight[owner[c][lightest]]) {
+                    lightest = r
+                }
+            }
+            if lightest >= 0 and f.weight[owner[c][lightest]] < f.weight[v] {
+                home[owner[c][lightest]] = noHome
+                pick = lightest
+            }
+        }
+        if pick < 0 {
+            continue
+        }
+        owner[c][pick] = v
+        let reg = list[pick]
+        home[v] = if c == 1 { 16 + reg } else { reg }
+        if pick >= volatileCount[c] {
+            if c == 1 {
+                xmmUsed = max(xmmUsed, reg - self.xmmFirst + 1)
+            } else {
+                gprUsed = max(gprUsed, pick - volatileCount[c] + 1)
+            }
+        }
+    }
+    // the frame: a value in memory shares its slot with values never alive at the same time (by first and last
+    // mention, as registers are shared), the lowest free slot first: the frame is as deep as the most values alive at
+    // once, and the nearest slots (one byte from rbp) are the busiest
+    var slots = 0
+    var spilled: [Int] = []
+    for v in 0..n {
+        if home[v] != noHome {
+            continue
+        }
+        if first[v] == 2147483647 {
+            home[v] = -1 // never named: never read or written
+        } else {
+            spilled.push(v)
+        }
+    }
+    var busyUntil: [Int] = [] // each slot's last value's last mention
+    for v in spilled.sortedBy(x => first[x]) {
+        var at = 0
+        while at < slots and busyUntil[at] >= first[v] {
+            at += 1
+        }
+        if at == slots {
+            slots += 1
+            busyUntil.push(0)
+        }
+        busyUntil[at] = last[v]
+        home[v] = -(at + 1)
+    }
+    self.home = home
+    self.spillBase = slots
+    if self.sysv {
+        slots += 8 // xmm8-15 across calls into C
+    }
+    self.first = first
+    self.last = last
+    (slots, gprUsed, xmmUsed)
+}
+
+// A C entry's start: C's arguments, from where the platform's C puts them (cArgs), to the outgoing area; a call to
+// the function's Quark body, which follows; its results to C's registers (cRets). Every register C keeps across
+// calls is kept by the body. Gives where the call's rel32 is.
+fn X64.cEntryStub(var self, f: IrFn, cArgs: Bytes) -> Int {
+    let n = len(f.params)
+    let slots = max(n, f.resultCount)
+    let area = (8 * max(slots, 1) + 15) & ~15
+    self.byte(0x55) // push rbp
+    self.movRR(rbp, rsp)
+    self.bytes([0x41, 0x57]) // push r15: C's, given back
+    self.bytes([0x45, 0x31, 0xFF]) // xor r15d, r15d: no context yet (the runtime finds it when it needs it)
+    self.rex(true, 0, 0, rsp) // sub rsp, area (and the 8 bytes r15 took: 16-aligned at the call)
+    self.bytes([0x81, 0xEC])
+    self.i32(area + 8)
+    var ints = 0
+    var floats = 0
+    var stack = 0
+    for k in 0..n {
+        let kind = kindAt(cArgs, k)
+        var inRegister = false
+        var reg = 0
+        if not self.sysv {
+            // by position: rcx, rdx, r8, r9 / xmm0-3, then the stack past the shadow space
+            inRegister = k < 4
+            reg = if kind == 'F' {
+                k
+            } else if k < 4 {
+                winGpr[k]
+            } else {
+                0
+            }
+        } else {
+            // System V: each kind counted on its own; a record's 'M' slots on the stack
+            inRegister = if kind == 'F' {
+                floats < 8
+            } else if kind == 'I' {
+                ints < 6
+            } else {
+                false
+            }
+            reg = if kind == 'F' {
+                floats
+            } else if kind == 'I' and ints < 6 {
+                sysvGpr[ints]
+            } else {
+                0
+            }
+            if kind == 'F' {
+                floats += 1
+            } else if kind == 'I' {
+                ints += 1
+            }
+        }
+        if inRegister and kind == 'F' {
+            self.sseRM(0xF2, false, 0x11, reg, rsp, 8 * k) // movsd [rsp + 8k], xmm
+        } else if inRegister {
+            self.rm(true, opMovStore, reg, rsp, 8 * k)
+        } else {
+            self.rm(true, opMovLoad, rax, rbp, (if self.sysv { 16 } else { 48 }) + 8 * stack)
+            stack += 1
+            self.rm(true, opMovStore, rax, rsp, 8 * k)
+        }
+    }
+    for k in 0..min(n, len(quarkRegs)) {
+        self.rm(true, opMovLoad, quarkRegs[k], rsp, 8 * k) // the Quark way: the first slots in registers
+    }
+    self.byte(0xE8) // call the body
+    let at = self.here()
+    self.i32(0)
+    var ri = 0
+    var rf = 0
+    for k in 0..f.resultCount {
+        let from = if k < len(quarkRegs) { quarkRegs[k] } else { -1 }
+        if kindAt(f.cRets, k) == 'F' {
+            if from >= 0 {
+                self.sseRR(0x66, true, 0x6E, rf, from) // movq xmm, reg
+            } else {
+                self.sseRM(0xF2, false, 0x10, rf, rsp, 8 * k) // movsd xmm, [rsp + 8k]
+            }
+            rf += 1
+        } else {
+            let to = if ri > 0 { rdx } else { rax }
+            if from >= 0 {
+                self.movRR(to, from)
+            } else {
+                self.rm(true, opMovLoad, to, rsp, 8 * k)
+            }
+            ri += 1
+        }
+    }
+    self.rm(true, opMovLoad, r15, rbp, -8) // C's r15 back
+    self.movRR(rsp, rbp)
+    self.byte(0x5D) // pop rbp
+    self.byte(0xC3)
+    at
+}
+
+// movups [base + disp], xmm (store) or the other way
+fn X64.movups(var self, store: Bool, x: Int, base: Int, disp: Int) {
+    self.rex(false, x, 0, base)
+    self.byte(0x0F)
+    self.byte(if store { 0x11 } else { 0x10 })
+    self.address(x, base, -1, 1, disp)
+}
+
+// movups [rbp + disp32], xmm or the other way, with a four-byte displacement always
+fn X64.movupsFrame(var self, store: Bool, x: Int, disp: Int) {
+    self.rex(false, x, 0, rbp)
+    self.byte(0x0F)
+    self.byte(if store { 0x11 } else { 0x10 })
+    self.byte(0x80 | x & 7 << 3 | rbp)
+    self.i32(disp)
+}
+
+// std.machine's built-ins, called the Quark way: arguments in rcx, rdx, r8..., a result in rcx.
+// switchStack(save, load): rsp, rbp, rbx, rsi, rdi, r12-r15 (9 words), then xmm6-xmm15 (10 x 16 bytes) into save,
+// the same from load, then ret: on load's stack, to the address at its top. frame(): rbp. cpu(): 1 AVX, 2 AVX2,
+// 4 SSE4.2. call(f, a, b, c, d): C's call of f with four integers, its rax written back.
+fn X64.genMachine(var self, kind: Int) {
+    if kind == machineSwitchStack {
+        let gprs = [rsp, rbp, rbx, rsi, rdi, r12, r13, r14, r15]
+        self.movRR(rax, rcx) // save; load is in rdx
+        for (i, r) in gprs.enumerate() {
+            self.rm(true, opMovStore, r, rax, 8 * i)
+        }
+        for i in 0..10 {
+            // movups [rax + 72 + 16i], xmm(6 + i)
+            self.movups(true, 6 + i, rax, 72 + 16 * i)
+        }
+        for (i, r) in gprs.enumerate() {
+            self.rm(true, opMovLoad, r, rdx, 8 * i)
+        }
+        for i in 0..10 {
+            self.movups(false, 6 + i, rdx, 72 + 16 * i)
+        }
+        self.byte(0xC3)
+        return
+    }
+    if kind == machineCall {
+        let args = if self.sysv { [rdi, rsi, rdx, rcx] } else { [rcx, rdx, r8, r9] }
+        self.byte(0x55) // push rbp: rsp 16-aligned
+        self.movRR(rbp, rsp)
+        let room = if self.sysv {
+            128 // the shadow space; System V: xmm8-15, which C does not keep
+        } else {
+            32
+        }
+        self.rex(true, 0, 0, rsp) // sub rsp, room
+        self.bytes([0x81, 0xEC])
+        self.i32(room)
+        if self.sysv {
+            for i in 0..8 {
+                self.movups(true, 8 + i, rsp, 16 * i)
+            }
+        }
+        // f, a, b, c, d come in rcx, rdx, r8, r9, r10: f to rax, a-d to C's (each read before it is written)
+        self.movRR(rax, rcx)
+        let from = [rdx, r8, r9, r10]
+        for (i, r) in args.enumerate() {
+            self.movRR(r, from[i])
+        }
+        self.bytes([0xFF, 0xD0]) // call rax
+        if self.sysv {
+            for i in 0..8 {
+                self.movups(false, 8 + i, rsp, 16 * i)
+            }
+        }
+        self.movRR(rcx, rax)
+        self.movRR(rsp, rbp)
+        self.byte(0x5D) // pop rbp
+        self.byte(0xC3)
+        return
+    }
+    if kind == machineFrame {
+        self.movRR(rcx, rbp)
+        self.byte(0xC3)
+        return
+    }
+    // cpu: cpuid 1 (ecx: 20 SSE4.2, 27 OSXSAVE, 28 AVX), xgetbv 0 (the system saves the AVX registers), cpuid 7 (ebx 5:
+    // AVX2)
+    self.byte(0x53) // push rbx
+    self.byte(0xB8) // mov eax, 1
+    self.i32(1)
+    self.bytes([0x0F, 0xA2]) // cpuid
+    self.bytes([0x45, 0x31, 0xC0]) // xor r8d, r8d
+    self.bytes([0x41, 0x89, 0xC9]) // mov r9d, ecx
+    self.bytes([0x41, 0xF7, 0xC1, 0x00, 0x00, 0x10, 0x00]) // test r9d, 1 << 20
+    let noSse = self.jccShort(ccE)
+    self.bytes([0x41, 0x83, 0xC8, 0x04]) // or r8d, 4
+    self.land(noSse)
+    self.bytes([0x44, 0x89, 0xC8]) // mov eax, r9d
+    self.bytes([0x25, 0x00, 0x00, 0x00, 0x18]) // and eax, 3 << 27
+    self.bytes([0x3D, 0x00, 0x00, 0x00, 0x18]) // cmp eax, 3 << 27
+    let noAvx1 = self.jccShort(ccNe)
+    self.bytes([0x31, 0xC9, 0x0F, 0x01, 0xD0]) // xor ecx, ecx; xgetbv
+    self.bytes([0x83, 0xE0, 0x06, 0x83, 0xF8, 0x06]) // and eax, 6; cmp eax, 6
+    let noAvx2 = self.jccShort(ccNe)
+    self.bytes([0x41, 0x83, 0xC8, 0x01]) // or r8d, 1
+    self.byte(0xB8) // mov eax, 7
+    self.i32(7)
+    self.bytes([0x31, 0xC9]) // xor ecx, ecx
+    self.bytes([0x0F, 0xA2]) // cpuid
+    self.bytes([0xF7, 0xC3, 0x20, 0x00, 0x00, 0x00]) // test ebx, 1 << 5
+    let noAvx3 = self.jccShort(ccE)
+    self.bytes([0x41, 0x83, 0xC8, 0x02]) // or r8d, 2
+    self.land(noAvx1)
+    self.land(noAvx2)
+    self.land(noAvx3)
+    self.byte(0x5B) // pop rbx
+    self.movRR(rcx, r8)
+    self.byte(0xC3)
+}
+
+fn X64.genFn(var self, f: IrFn) {
+    if f.machine != machineNone {
+        self.genMachine(f.machine)
+        return
+    }
+    if f.cArgs is Some(cArgs) {
+        // C's way in first (the function's address), then the body it calls
+        let call = self.cEntryStub(f, cArgs)
+        self.align(0xCC)
+        self.patch(call, self.here() - (call + 4), 4)
+    }
+    self.kinds = f.kinds
+    self.operands = f.operands
+    self.isConst = f.isConst
+    self.constValue = f.constValue
+    let gprs = if self.sysv {
+        [rbx, r12, r13, r14, r15]
+    } else {
+        [rbx, rsi, rdi, r12, r13, r14, r15]
+    }
+    let (slots, gprUsed, xmmUsed) = self.allocate(f)
+    self.pushed = gprUsed
+    self.xmmCount = xmmUsed
+    // frame: pushed GPRs, then slots, then saved XMMs, then the outgoing area at rsp
+    self.slotBase = 8 * self.pushed
+    let xmmArea = 16 * self.xmmCount
+    let out = 8 * max(f.maxOut, 4)
+    var frame = 8 * slots + xmmArea + out + 16
+    while (8 * self.pushed + frame) % 16 != 0 {
+        frame += 8
+    }
+    self.xmmBase = self.slotBase + 8 * slots + 16 // below the slots, 16 aligned enough for movups
+    self.labelAt = [-1] * (f.labelCount + 1) // not placed yet
+    self.epilogue = f.labelCount
+    self.fixups = []
+
+    // prologue
+    self.byte(0x55) // push rbp
+    self.movRR(rbp, rsp)
+    for r in gprs[..self.pushed] {
+        self.rex(false, 0, 0, r)
+        self.byte(0x50 | r & 7) // push
+    }
+    self.rex(true, 0, 0, rsp) // sub rsp, frame
+    self.bytes([0x81, 0xEC])
+    self.i32(frame)
+    if f.code.any(ins => ins.op == .Call) {
+        // too many calls deep (a function that calls itself without end): a panic
+        self.movReloc(r11, relocStackLimit, 0)
+        self.rm(true, opCmp, rsp, r11, 0)
+        self.coldJump(ccB, panicStack, f.line, -1, -1)
+    }
+    // a frame past a page: its pages touched from the top down, as Windows grows a stack a guard page at a time
+    if frame >= 4096 {
+        var at = frame - 4096
+        while at > -4096 {
+            self.rm(true, opTest, rax, rsp, max(at, 0))
+            at -= 4096
+        }
+    }
+    for i in 0..self.xmmCount {
+        // movups [rbp - xmmBase - 16i], xmm(first + i)
+        self.movupsFrame(true, self.xmmFirst + i, -(self.xmmBase + 16 * i))
+    }
+    // parameters to their homes: from the registers first (a home may be one of them), then the caller's outgoing area
+    var moves: [(Int, Int)] = []
+    for (i, p) in f.params.enumerate() {
+        if i < len(quarkRegs) {
+            moves.push((self.placeOf(p), quarkRegs[i]))
+        }
+    }
+    self.parallelMove(moves)
+    for (i, p) in f.params.enumerate() {
+        if i >= len(quarkRegs) {
+            self.rm(true, opMovLoad, rax, rbp, 16 + 8 * i)
+            self.storeBits(p, rax)
+        }
+    }
+    self.uses = useCounts(f)
+    var loopTop = [false] * (f.labelCount + 1)
+    var placed = [false] * (f.labelCount + 1)
+    for ins in f.code {
+        if ins.op == .Label {
+            placed[ins.imm] = true
+        } else if ins.op is Jmp | Jz | Jnz and placed[ins.imm] {
+            loopTop[ins.imm] = true
+        }
+    }
+    self.loopTop = loopTop
+    self.afterJump = false
+    let count = len(f.code)
+    var k = 0
+    while k < count {
+        if k + 1 < count and self.fusedBranch(f.code[k], f.code[k + 1]) {
+            k += 2
+            self.afterJump = false
+            continue
+        }
+        if k + 2 < count and self.addToMemory(f.code[k], f.code[k + 1], f.code[k + 2]) {
+            k += 3
+            self.afterJump = false
+            continue
+        }
+        self.at = k
+        let op = f.code[k].op
+        self.genIns(f.code[k])
+        if op != .Label {
+            self.afterJump = op is Jmp | Ret
+        }
+        k += 1
+    }
+
+    // epilogue
+    self.labelAt[self.epilogue] = self.here()
+    for i in 0..self.xmmCount {
+        self.movupsFrame(false, self.xmmFirst + i, -(self.xmmBase + 16 * i))
+    }
+    self.rex(true, rsp, 0, rbp) // lea rsp, [rbp - 8 * pushed]
+    self.byte(0x8D)
+    self.byte(0x80 | rsp & 7 << 3 | rbp)
+    self.i32(-8 * self.pushed)
+    for i in 0..self.pushed {
+        let r = gprs[self.pushed - 1 - i]
+        self.rex(false, 0, 0, r)
+        self.byte(0x58 | r & 7) // pop
+    }
+    self.byte(0x5D) // pop rbp
+    self.byte(0xC3) // ret
+    self.emitCold()
+    for fx in self.fixups {
+        self.patch(fx.at, self.labelAt[fx.target] - (fx.at + 4), 4)
+    }
+}
+
+// ---- the way in from C, and the way out of a panic ----
+// a short jump to an earlier place; cc < 0: always
+fn X64.jumpBack(var self, cc: Int, target: Int) {
+    let rel = target - (self.here() + 2)
+    self.byte(if cc < 0 { 0xEB } else { 0x70 | cc })
+    self.byte(rel)
+}
+
+// int64_t enter(QkEnter* e). Saves every callee-saved register (a panic abandons the frames that would restore
+// them), keeps its stack pointer where the escape finds it, copies the argument slots to the outgoing area, calls
+// the function, copies the result slots back, returns 0. void escape(void): from the runtime's panic, back onto
+// that stack, enter returns 1. Frame: rbp-8..-56 pushed GPRs, rbp-216..-56 xmm6-15, rbp-224 the escape stack
+// saved by an outer call. Gives where each starts.
+fn X64.genTrampoline(var self) -> (Int, Int) {
+    let saved = [rbx, rsi, rdi, r12, r13, r14, r15]
+    self.align(0xCC)
+    let enter = self.here()
+    self.byte(0x55) // push rbp
+    self.movRR(rbp, rsp)
+    for r in saved {
+        self.rex(false, 0, 0, r)
+        self.byte(0x50 | r & 7)
+    }
+    self.rex(true, 0, 0, rsp) // sub rsp, 168
+    self.bytes([0x81, 0xEC])
+    self.i32(168)
+    for i in 0..10 {
+        // movups [rbp - 216 + 16i], xmm(6 + i)
+        self.movupsFrame(true, 6 + i, -216 + 16 * i)
+    }
+    self.movReloc(r11, relocEscape, 0)
+    self.rm(true, opMovLoad, rax, r11, 0) // the outer call's escape stack, kept
+    self.rm(true, opMovStore, rax, rbp, -224)
+    self.rm(true, opMovStore, rsp, r11, 0) // ours
+    self.movRR(rbx, if self.sysv {
+        rdi // e
+    } else {
+        rcx
+    })
+    // the outgoing area: 8 bytes per slot (arguments or results, the larger), 32 at least, 16 aligned
+    self.rm(true, opMovLoad, rax, rbx, 16)
+    self.rm(true, opMovLoad, rdx, rbx, 32)
+    self.rr(true, opCmp, rax, rdx)
+    self.rr(true, 0x0F4C, rax, rdx) // cmovl
+    self.shiftImm(rax, 4, 3)
+    self.rex(true, 0, 0, rax) // add rax, 47
+    self.bytes([0x83, 0xC0, 47])
+    self.rex(true, 0, 0, rax) // and rax, -16
+    self.bytes([0x83, 0xE0, 0xF0])
+    self.rr(true, opSub, rsp, rax)
+    // arguments
+    self.rm(true, opMovLoad, rsi, rbx, 8)
+    self.rm(true, opMovLoad, rcx, rbx, 16)
+    self.rr(false, opXor, rdx, rdx)
+    let loop1 = self.here()
+    self.rr(true, opCmp, rdx, rcx)
+    let done1 = self.jccShort(ccGe)
+    self.memOp(0, true, opMovLoad, rax, Mem(rsi, rdx, 8, 0))
+    self.memOp(0, true, opMovStore, rax, Mem(rsp, rdx, 8, 0))
+    self.rex(true, 0, 0, rdx) // inc rdx
+    self.bytes([0xFF, 0xC2])
+    self.jumpBack(-1, loop1)
+    self.land(done1)
+    for (i, r) in quarkRegs.enumerate() {
+        self.rm(true, opMovLoad, r, rsp, 8 * i) // the first slots, the Quark way (the area has room for them)
+    }
+    self.bytes([0xFF, 0x13]) // call qword [rbx]
+    for (i, r) in quarkRegs.enumerate() {
+        self.rm(true, opMovStore, r, rsp, 8 * i)
+    }
+    // results
+    self.rm(true, opMovLoad, rdi, rbx, 24)
+    self.rm(true, opMovLoad, rcx, rbx, 32)
+    self.rr(false, opXor, rdx, rdx)
+    let loop2 = self.here()
+    self.rr(true, opCmp, rdx, rcx)
+    let done2 = self.jccShort(ccGe)
+    self.memOp(0, true, opMovLoad, rax, Mem(rsp, rdx, 8, 0))
+    self.memOp(0, true, opMovStore, rax, Mem(rdi, rdx, 8, 0))
+    self.rex(true, 0, 0, rdx)
+    self.bytes([0xFF, 0xC2])
+    self.jumpBack(-1, loop2)
+    self.land(done2)
+    self.rr(false, opXor, rax, rax)
+    let exit = self.here()
+    self.movReloc(r11, relocEscape, 0) // the outer call's escape stack back
+    self.rm(true, opMovLoad, rcx, rbp, -224)
+    self.rm(true, opMovStore, rcx, r11, 0)
+    for i in 0..10 {
+        self.movupsFrame(false, 6 + i, -216 + 16 * i)
+    }
+    self.rm(true, opLea, rsp, rbp, -56)
+    for i in 0..7 {
+        let r = saved[6 - i]
+        self.rex(false, 0, 0, r)
+        self.byte(0x58 | r & 7)
+    }
+    self.byte(0x5D) // pop rbp
+    self.byte(0xC3)
+
+    self.align(0xCC)
+    let escape = self.here()
+    self.movReloc(r11, relocEscape, 0)
+    self.rm(true, opMovLoad, rsp, r11, 0)
+    self.rm(true, opLea, rbp, rsp, 224)
+    self.movImm(rax, 1)
+    self.byte(0xE9)
+    self.i32(exit - (self.here() + 4))
+    (enter, escape)
+}

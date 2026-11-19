@@ -1,0 +1,775 @@
+// Types: what checking works out for every value. A program's types sit in one table (Program.types) and are named
+// by their index there; a type is made once (interned), so "the same type" is a == b on two indices. The table
+// starts with the types every program has (tyError ... the C types, below), then grows as checking meets new ones:
+// [T], T?, T!, T ! E, [K: V], (A, B), (A) -> R, Pointer<T>, a generic type's instance.
+//
+// A record, an enum or a handle names its declaration (decl, an index into ast.decls): the program's own, an
+// instance of a generic one (templateOf its template, typeArgs its types), or one the checker makes and keeps out
+// of the program's list (T?, T!, a tuple, an Entry, Process, Task): those have their fields' bindings filled in
+// and state 2. T? is an enum None | Some(value: T); T! is Err(message: Text) | Ok(value: T), and T ! E holds an E
+// in Err(error: E): the failure first, so case 1 holds the value in both.
+//
+// What lowering needs of a type: slots (how many 64-bit slots a value takes), slotKinds ('I' or 'F' per slot), a
+// record's fields and an enum's cases' data (Decl.params, Decl.caseFields: Param indices, each with its binding's
+// type, and boxed when it holds its own type: one slot, the address of its value), enum layouts (the case, then
+// every case's data side by side), and a C type's width (c: the CT_ number, Int32 is an Int with c 3).
+use ast
+use source
+
+pub enum Kind {
+    Error
+    Void
+    Int
+    Float
+    Bool
+    Text
+    Array
+    Record
+    Enum
+    Range
+    Iter
+    Handle
+    Map
+    Fn
+    Never
+    Bytes
+    Pointer
+    CFn
+}
+
+// A type. elem: an array's, a loop's, a map's value, a function's result (-1: not known yet, [] and a lambda);
+// key: a map's; params: a function's parameters; decl: a record's, an enum's, a handle's declaration; typeVar: a
+// template's type parameter (T) while the template is checked loosely (it behaves as an error type); effect: an
+// effect function; c: the C type it stands for (CT_*).
+pub type Type {
+    kind: Kind
+    elem: Int = -1
+    decl: Int = -1
+    key: Int = -1
+    params: [Int] = []
+    typeVar: Text = ""
+    isEffect: Bool = false
+    c: Int = 0
+}
+
+// the types every program has, at these indices
+pub const tyError = 0
+pub const tyVoid = 1
+pub const tyInt = 2
+pub const tyFloat = 3
+pub const tyBool = 4
+pub const tyText = 5
+pub const tyRange = 6
+pub const tyBytes = 7
+
+// None, [], Err(...) and [:] before they meet the type they go into
+pub const tyNone = 8
+pub const tyEmpty = 9
+pub const tyErr = 10
+pub const tyEmptyMap = 11
+pub const tyNever = 12
+
+// .Case before it meets its enum; a lambda before it meets its function type; a task
+pub const tyDot = 13
+pub const tyLambda = 14
+pub const tyTask = 15
+
+// C's scalar types: tyC + one of the CT_ numbers (Int8 is tyC + 1 ... CText tyC + 11)
+pub const tyC = 16
+pub const ctI8 = 1
+pub const ctI16 = 2
+pub const ctI32 = 3
+pub const ctI64 = 4
+pub const ctU8 = 5
+pub const ctU16 = 6
+pub const ctU32 = 7
+pub const ctU64 = 8
+pub const ctF32 = 9
+pub const ctF64 = 10
+pub const ctText = 11
+
+pub const cTypeNames: [Text] = [
+    "", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float32", "Float64", "CText",
+]
+
+// A name in reach: a let, a var, a parameter, a pattern's name, a field's (fields have bindings too, for their types).
+// uses, iterUses how it is used (as a loop's source: a loop may be fused into its use); readsVar its value reads
+// a var; lazy a loop evaluated where it is used; init its value; depth the loops around it; safeIn a loop's name over
+// 0..len(xs): an index of xs that needs no check; lambda a function parameter in an instance: the caller's lambda;
+// fnParam a parameter that takes a function (put in, never kept); capturedFrom a lifted lambda's copy of a name
+// around it; deep a var changed inside (its arrays and maps its own); paramOf, paramIndex a parameter's function
+// and place; line, col where it is made.
+pub type Binding {
+    name: Text
+    ty: Int
+    mutable: Bool = false
+    isParam: Bool = false
+    uses: Int = 0
+    iterUses: Int = 0
+    readsVar: Bool = false
+    lazy: Bool = false
+    init: Int = -1
+    depth: Int = 0
+    safeIn: Int = -1
+    lambda: Int = -1
+    fnParam: Bool = false
+    capturedFrom: Int = -1
+    deep: Bool = false
+    paramOf: Int = -1
+    paramIndex: Int = 0
+    line: Int = 0
+    col: Int = 0
+}
+
+// A file of the program: the one given (0), then each one a use names. uses: the modules it uses, aliases each
+// one's alias ("" none); useName what the first use of it wrote (use ast, use std.json), for messages.
+pub type Module { path: Text, src: Source, uses: [Int] = [], aliases: [Text] = [], useName: Text = "" }
+
+// A program: its syntax tree (all files, ast.decls in order, plus the declarations checking makes), its files,
+// decls the program's declarations in order (the parsed ones, then instances and lifted lambdas as checking makes
+// them; not T?, tuples...: those are only in ast.decls), the type table, the bindings.
+pub type Program {
+    ast: Ast
+    modules: [Module] = []
+    decls: [Int] = []
+    types: [Type] = []
+    interned: [Text: Int] = [:]
+    arrays: [Int: Int] = [:]
+    iters: [Int: Int] = [:]
+    pointers: [Int: Int] = [:]
+    maps: [Int: Int] = [:]
+    options: [Int: Int] = [:]
+    results: [Int: Int] = [:]
+    bindings: [Binding] = []
+    dotDecl: Int = -1
+    taskDecl: Int = -1
+    executable: Bool = false
+}
+
+// a program of these files, parsed into one tree: the declarations of module 0 first
+pub fn newProgram(tree: Ast, modules: [Module]) -> Program {
+    var p = Program(tree, modules)
+    for i in 0..len(tree.decls) {
+        p.decls.push(i)
+        p.ast.decls[i].index = i
+    }
+    p.dotDecl = p.ast.decl(Decl(kind: .Enum, name: ".Case (of no enum yet)", line: 0, col: 0))
+    p.taskDecl = p.ast.decl(Decl(kind: .Type, name: "Task", line: 0, col: 0, isExtern: true, state: 2))
+    p.types = [
+        Type(.Error),
+        Type(.Void),
+        Type(.Int),
+        Type(.Float),
+        Type(.Bool),
+        Type(.Text),
+        Type(.Range, elem: tyInt),
+        Type(.Bytes, elem: tyInt),
+    ]
+    p.types += [
+        Type(.Enum),
+        Type(.Array),
+        Type(.Enum),
+        Type(.Map),
+        Type(.Never),
+        Type(.Enum, decl: p.dotDecl),
+        Type(.Fn),
+        Type(.Handle, decl: p.taskDecl),
+    ]
+    p.types += [
+        Type(.Error),
+        Type(.Int, c: 1),
+        Type(.Int, c: 2),
+        Type(.Int, c: 3),
+        Type(.Int, c: 4),
+        Type(.Int, c: 5),
+        Type(.Int, c: 6),
+    ]
+    p.types += [Type(.Int, c: 7), Type(.Int, c: 8), Type(.Float, c: 9), Type(.Float, c: 10), Type(.Text, c: 11)]
+    p.ast.decls[p.taskDecl].ty = tyTask
+    p.ast.decls[p.dotDecl].ty = tyDot
+    p
+}
+
+// ---- making types --------------------------------------------------------------------------------------------
+pub fn Program.addType(var self, t: Type) -> Int {
+    self.types.push(t)
+    len(self.types) - 1
+}
+
+fn Program.intern(var self, key: Text, t: Type) -> Int {
+    if self.interned[key] is Some(i) {
+        return i
+    }
+    let i = self.addType(t)
+    self.interned[key] = i
+    i
+}
+
+pub fn Program.arrayType(var self, elem: Int) -> Int {
+    if self.arrays[elem] is Some(t) {
+        return t
+    }
+    let t = self.addType(Type(.Array, elem: elem))
+    self.arrays[elem] = t
+    t
+}
+
+pub fn Program.iterType(var self, elem: Int) -> Int {
+    if self.iters[elem] is Some(t) {
+        return t
+    }
+    let t = self.addType(Type(.Iter, elem: elem))
+    self.iters[elem] = t
+    t
+}
+
+pub fn Program.pointerType(var self, elem: Int) -> Int {
+    if self.pointers[elem] is Some(t) {
+        return t
+    }
+    let t = self.addType(Type(.Pointer, elem: elem))
+    self.pointers[elem] = t
+    t
+}
+
+// [K: V]; a Set<K> is [K: nothing]
+pub fn Program.mapType(var self, key: Int, value: Int) -> Int {
+    let k = key * 4194304 + value
+    if self.maps[k] is Some(t) {
+        return t
+    }
+    let t = self.addType(Type(.Map, elem: value, key: key))
+    self.maps[k] = t
+    t
+}
+
+fn listKey(ts: [Int]) -> Text = ts.map(t => t.toText()).join(",")
+
+// (A, B) -> R
+pub fn Program.fnType(var self, params: [Int], ret: Int, isEffect: Bool) -> Int =
+    self.intern("f{isEffect}{ret}:{listKey(params)}", Type(.Fn, elem: ret, params: params, isEffect: isEffect))
+
+// extern (A, B) -> R: a C function value, its types C's
+pub fn Program.cFnType(var self, params: [Int], ret: Int) -> Int =
+    self.intern("c{ret}:{listKey(params)}", Type(.CFn, elem: ret, params: params, isEffect: true))
+
+// a field (or a case's data) the checker makes: its param, and its binding of this type
+fn Program.field(var self, name: Text, ty: Int) -> Int {
+    self.bindings.push(Binding(name, ty))
+    self.ast.param(Param(name, -1, 0, 0, binding: len(self.bindings) - 1))
+}
+
+// a declaration the checker makes for a type (T?, T!, a tuple...): in the tree, not among the program's
+fn Program.typeDecl(var self, d: Decl, kind: Kind, elem: Int) -> Int {
+    let at = self.ast.decl(d)
+    let t = self.addType(Type(kind, elem: elem, decl: at))
+    self.ast.decls[at].ty = t
+    t
+}
+
+// T?: None, Some(value: T)
+pub fn Program.optionType(var self, elem: Int) -> Int {
+    if self.options[elem] is Some(i) {
+        return i
+    }
+    let value = self.field("value", elem)
+    let inner = self.typeName(elem)
+    let d = Decl(kind: .Enum, name: if self.types[elem].kind == Kind.CFn {
+        "(" + inner + ")?" // (extern (A) -> R)?
+    } else {
+        inner + "?"
+    }, line: 0, col: 0, cases: ["None", "Some"], caseFields: [[], [value]], state: 2, optionOf: elem)
+    let t = self.typeDecl(d, .Enum, elem)
+    self.options[elem] = t
+    t
+}
+
+// T!: Err(message: Text), Ok(value: T)
+pub fn Program.resultType(var self, elem: Int) -> Int {
+    if self.results[elem] is Some(i) {
+        return i
+    }
+    let message = self.field("message", tyText)
+    let value = self.field("value", elem)
+    let d = Decl(
+        kind: .Enum,
+        name: self.typeName(elem) + "!",
+        line: 0,
+        col: 0,
+        cases: ["Err", "Ok"],
+        caseFields: [[message], [value]],
+        state: 2,
+        resultOf: elem,
+        errorOf: tyText,
+    )
+    let t = self.typeDecl(d, .Enum, elem)
+    self.results[elem] = t
+    t
+}
+
+// T ! E: Err(error: E), Ok(value: T) (a Text error: T!)
+pub fn Program.resultOfType(var self, elem: Int, error: Int) -> Int {
+    if error < 0 or error == tyText {
+        return self.resultType(elem)
+    }
+    let key = "r{elem},{error}"
+    if self.interned[key] is Some(i) {
+        return i
+    }
+    let plain = self.resultType(elem)
+    var d = self.ast.decls[self.types[plain].decl]
+    d.name = self.typeName(elem) + " ! " + self.typeName(error)
+    d.caseFields = [[self.field("error", error)], [self.field("value", elem)]]
+    d.errorOf = error
+    let t = self.typeDecl(d, .Enum, elem)
+    self.interned[key] = t
+    t
+}
+
+// (Int, Text): a record of its own, its fields 0, 1...; () is Unit
+pub fn Program.tupleType(var self, elems: [Int]) -> Int {
+    let key = "t{listKey(elems)}"
+    if self.interned[key] is Some(i) {
+        return i
+    }
+    var name = if len(elems) == 0 { "Unit" } else { "(" }
+    var fields: [Int] = []
+    for (k, e) in elems.enumerate() {
+        fields.push(self.field(k.toText(), e))
+        if k > 0 {
+            name += ", "
+        }
+        name += self.typeName(e)
+    }
+    if len(elems) > 0 {
+        name += ")"
+    }
+    let t = self.typeDecl(
+        Decl(kind: .Type, name: name, line: 0, col: 0, params: fields, state: 2, isTuple: true),
+        .Record,
+        -1,
+    )
+    self.interned[key] = t
+    t
+}
+
+// Entry<K, V> { key: K, value: V }: a map's entry, as a loop goes over a map
+pub fn Program.entryType(var self, key: Int, value: Int) -> Int {
+    let k = "e{key},{value}"
+    if self.interned[k] is Some(i) {
+        return i
+    }
+    let fields = [self.field("key", key), self.field("value", value)]
+    let name = "Entry<{self.typeName(key)}, {self.typeName(value)}>"
+    let t = self.typeDecl(
+        Decl(kind: .Type, name: name, line: 0, col: 0, params: fields, state: 2, isEntry: true),
+        .Record,
+        -1,
+    )
+    self.interned[k] = t
+    t
+}
+
+// ---- what a type is ------------------------------------------------------------------------------------------
+pub fn Program.kind(self, t: Int) -> Kind = self.types[t].kind
+
+pub fn Program.isError(self, t: Int) -> Bool = self.types[t].kind == Kind.Error
+
+pub fn Program.isOption(self, t: Int) -> Bool =
+    self.types[t].kind == Kind.Enum and self.types[t].decl >= 0 and self.ast.decls[self.types[t].decl].optionOf >= 0
+
+pub fn Program.isResult(self, t: Int) -> Bool =
+    self.types[t].kind == Kind.Enum and self.types[t].decl >= 0 and self.ast.decls[self.types[t].decl].resultOf >= 0
+
+// the T of a T? or a T!, else -1
+pub fn Program.fallibleValue(self, t: Int) -> Int {
+    let d = self.types[t].decl
+    if self.types[t].kind != Kind.Enum or d < 0 {
+        return -1
+    }
+    if self.ast.decls[d].optionOf >= 0 {
+        return self.ast.decls[d].optionOf
+    }
+    self.ast.decls[d].resultOf
+}
+
+// what a T! (or T ! E) holds in its Err
+pub fn Program.errorOf(self, t: Int) -> Int = self.ast.decls[self.types[t].decl].errorOf
+
+// a Set<K>: a map whose values are nothing
+pub fn Program.isSet(self, t: Int) -> Bool =
+    self.types[t].kind == Kind.Map
+        and self.types[t].key >= 0
+        and self.types[t].elem >= 0
+        and self.types[self.types[t].elem].kind == Kind.Void
+
+pub fn Program.isIterable(self, t: Int) -> Bool = self.types[t].kind is Array | Range | Iter | Bytes
+
+pub fn Program.elemType(self, t: Int) -> Int =
+    if self.types[t].elem >= 0 { self.types[t].elem } else { tyError }
+
+pub fn Program.isNumeric(self, t: Int) -> Bool = self.types[t].kind is Int | Float
+
+// an enum with a case that carries data
+pub fn Program.hasData(self, t: Int) -> Bool {
+    let ty = self.types[t]
+    if ty.kind != Kind.Enum or ty.decl < 0 {
+        return false
+    }
+    for fields in self.ast.decls[ty.decl].caseFields {
+        if len(fields) > 0 {
+            return true
+        }
+    }
+    false
+}
+
+// a field's type (a record's field, or a case's data): its binding's
+pub fn Program.paramType(self, prm: Int) -> Int {
+    let b = self.ast.params[prm].binding
+    if b < 0 { tyError } else { self.bindings[b].ty }
+}
+
+// Int32 -> Int, CText? -> Text?: what a C type is in Quark
+pub fn Program.plainType(var self, t: Int) -> Int {
+    if t < 0 {
+        return t
+    }
+    let ty = self.types[t]
+    if ty.c != 0 {
+        return match ty.kind {
+            Int => tyInt
+            Float => tyFloat
+            _ => tyText
+        }
+    }
+    if ty.kind == Kind.Array and self.types[ty.elem].c != 0 {
+        // [Float32]: C's array, of Floats in Quark
+        let plain = self.plainType(ty.elem)
+        return self.arrayType(plain)
+    }
+    let inner = self.fallibleValue(t)
+    if inner >= 0 and self.types[inner].c != 0 and self.ast.decls[ty.decl].optionOf >= 0 {
+        let plain = self.plainType(inner)
+        return self.optionType(plain)
+    }
+    t
+}
+
+// the name a message gives a type
+pub fn Program.typeName(self, t: Int) -> Text {
+    let ty = self.types[t]
+    match ty.kind {
+        Error => if ty.typeVar != "" { ty.typeVar } else { "?" }
+        Void => "nothing"
+        Int | Float | Text => if ty.c != 0 {
+            cTypeNames[ty.c]
+        } else {
+            match ty.kind {
+                Int => "Int"
+                Float => "Float"
+                _ => "Text"
+            }
+        }
+        Bool => "Bool"
+        Pointer => "Pointer<{self.typeName(ty.elem)}>"
+        CFn => "extern ({self.namesOf(ty.params)}) -> {self.typeName(ty.elem)}"
+        Bytes => "Bytes"
+        Array => if ty.elem < 0 {
+            "[] (of no type yet)"
+        } else {
+            "[{self.typeName(ty.elem)}]"
+        }
+        Record | Enum | Handle => if t == tyNone {
+            "None (of no type yet)"
+        } else if t == tyErr {
+            "Err (of no type yet)"
+        } else {
+            self.ast.decls[ty.decl].name
+        }
+        Never => "Never"
+        Range => "a range of Int"
+        Iter => "a loop of {self.typeName(ty.elem)}"
+        Map => if ty.key < 0 {
+            "[:] (of no type yet)"
+        } else if self.isSet(t) {
+            "Set<{self.typeName(ty.key)}>"
+        } else {
+            "[{self.typeName(ty.key)}: {self.typeName(ty.elem)}]"
+        }
+        Fn => if t == tyLambda {
+            "a lambda"
+        } else {
+            let mark = if ty.isEffect { "effect " } else { "" }
+            "{mark}({self.namesOf(ty.params)}) -> {self.typeName(ty.elem)}"
+        }
+    }
+}
+
+fn Program.namesOf(self, ts: [Int]) -> Text {
+    var out = ""
+    for (i, t) in ts.enumerate() {
+        if i > 0 {
+            out += ", "
+        }
+        out += self.typeName(t)
+    }
+    out
+}
+
+// ---- layouts: what lowering needs ----------------------------------------------------------------------------
+// A record's field or a case's data: its type's slots, or 1 when it is boxed (it holds its own type).
+pub fn Program.fieldSlots(self, prm: Int) -> Int = if self.ast.params[prm].boxed {
+    1
+} else {
+    self.slots(self.paramType(prm))
+}
+
+// How many 64-bit slots a value of type t takes: an enum its case and its cases' data, which share slots (below); a
+// record its fields'; an interface 2 (its type's table of functions, its value's
+// address); a function kept as a value 2 (its address, its captured values'); a text, Bytes or an array 2 (address,
+// length); a map, a handle, a pointer, a C function 1; nothing and Never 0.
+pub fn Program.slots(self, t: Int) -> Int {
+    let ty = self.types[t]
+    match ty.kind {
+        Enum => if ty.decl >= 0 { len(self.caseLayout(ty.decl).kinds) } else { 1 }
+        Int | Float | Bool | Handle | Map | Pointer | CFn => 1
+        Fn | Text | Array | Bytes => 2
+        Record => {
+            let d = self.ast.decls[ty.decl]
+            if d.isInterface {
+                return 2
+            }
+            var n = 0
+            for f in d.params {
+                n += self.fieldSlots(f)
+            }
+            n
+        }
+        _ => 0
+    }
+}
+
+// 'I' or 'F' for each of a type's slots
+pub fn Program.slotKinds(self, t: Int) -> Text {
+    let ty = self.types[t]
+    match ty.kind {
+        Float => "F"
+        Record => {
+            let d = self.ast.decls[ty.decl]
+            if d.isInterface {
+                return "II"
+            }
+            var out = ""
+            for f in d.params {
+                out += if self.ast.params[f].boxed {
+                    "I"
+                } else {
+                    self.slotKinds(self.paramType(f))
+                }
+            }
+            out
+        }
+        Enum => if ty.decl >= 0 { self.caseLayout(ty.decl).kinds } else { "I" }
+        _ => "I" * self.slots(t)
+    }
+}
+
+// An enum's slots: its case (slot 0), then its cases' data, which share slots: only one case is there at a time.
+// A slot never changes its kind (an Int's register or a Float's), so each case's data goes, the cases with the most
+// slots first, at the first slot from 1 where the kinds of the slots it covers agree with those placed there.
+// starts: where each case's data begins; kinds: every slot's ('I' where no case has a Float).
+pub type CaseLayout { starts: [Int] = [], kinds: Text = "I" }
+
+pub fn Program.caseLayout(self, d: Int) -> CaseLayout {
+    let cf = self.ast.decls[d].caseFields
+    var each: [Bytes] = []
+    for fields in cf {
+        var k = ""
+        for f in fields {
+            k += if self.ast.params[f].boxed {
+                "I"
+            } else {
+                self.slotKinds(self.paramType(f))
+            }
+        }
+        each.push(k.bytes())
+    }
+    var starts = [1] * len(cf)
+    var done = [false] * len(cf)
+    var placed = ['I'] // 0: no case's yet
+    for _ in 0..len(cf) {
+        var next = -1
+        for (i, k) in each.enumerate() {
+            if not done[i] and (next < 0 or len(k) > len(each[next])) {
+                next = i
+            }
+        }
+        done[next] = true
+        let k = each[next]
+        var at = 1
+        while not fits(placed, k, at) {
+            at += 1
+        }
+        while len(placed) < at + len(k) {
+            placed.push(0)
+        }
+        for (j, kind) in k.enumerate() {
+            placed[at + j] = kind
+        }
+        starts[next] = at
+    }
+    var kinds = ""
+    for kind in placed {
+        kinds += if kind == 'F' { "F" } else { "I" }
+    }
+    CaseLayout(starts, kinds)
+}
+
+fn fits(placed: [Int], k: Bytes, at: Int) -> Bool {
+    for (j, kind) in k.enumerate() {
+        if at + j < len(placed) and placed[at + j] != 0 and placed[at + j] != kind {
+            return false
+        }
+    }
+    true
+}
+
+// Arrays or maps a place could change in place: in the value itself, its fields, its elements (not in boxes, enum
+// cases' data, texts or functions, which never change).
+pub fn Program.holdsContainers(self, t: Int) -> Bool {
+    let ty = self.types[t]
+    match ty.kind {
+        Array | Map => true
+        Record => {
+            if ty.decl < 0 {
+                return false
+            }
+            let d = self.ast.decls[ty.decl]
+            if d.isExtern or d.isInterface {
+                return false
+            }
+            for f in d.params {
+                let prm = self.ast.params[f]
+                if not prm.boxed and prm.binding >= 0 and self.holdsContainers(self.bindings[prm.binding].ty) {
+                    return true
+                }
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+// ---- the built-ins: Expr.builtin (0: none) ---------------------------------------------------------------------
+// By number; a name starting with # is implicit, put in by the checker (#interface: a value
+// made an interface; #never: what never gives a value, where one goes; #entries: a map or a set as a loop's source;
+// #bytes: Ints made Bytes; #fill: [x] * n; #repeat: t * n; #codePointCount).
+pub const builtinNames: [Text] = [
+    "", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow", "abs", "floor", "ceil",
+    "round", "toFloat", "toInt", "min", "max", "clamp", "lerp", "len", "#fill", "map", "filter", "fold", "sum", "any",
+    "all", "toArray", "print", "#readFile", "#writeFile", "#readLine", "#args", "Some", "toText", "push", "split",
+    "trim", "parseInt", "parseFloat", "Ok", "Err", "words", "lines", "contains", "indexOf", "startsWith", "endsWith",
+    "replace", "upper", "lower", "join", "#repeat", "sorted", "sortedBy", "reversed", "first", "last", "count", "minBy",
+    "maxBy", "keys", "values", "remove", "index", "printErr", "#exit", "#env", "#pathExists", "#listDir", "assert",
+    "parallelMap", "#random", "#randomInt", "#seedRandom", "#spawn", "#step", "#yield", "take", "skip", "countBy",
+    "mean", "panic", "get", "add", "toSet", "#interface", "#never", "#entries", "enumerate", "#codePointCount",
+    "#monotonicTime", "#unixTime", "#sleep", "#joinTask", "mapErr", "bytes", "Text", "char", "codePoints", "#readBytes",
+    "#writeBytes", "#appendFile", "#makeDir", "#removePath", "#runProcess", "#bytes", "pop", "Bytes", "parallelFold",
+    "#runtime", "#dump",
+]
+
+pub const bSqrt = 1
+pub const bSin = 2
+pub const bCos = 3
+pub const bTan = 4
+pub const bAsin = 5
+pub const bAcos = 6
+pub const bAtan = 7
+pub const bAtan2 = 8
+pub const bExp = 9
+pub const bLog = 10
+pub const bPow = 11
+pub const bAbs = 12
+pub const bFloor = 13
+pub const bCeil = 14
+pub const bRound = 15
+pub const bToFloat = 16
+pub const bToInt = 17
+pub const bMin = 18
+pub const bMax = 19
+pub const bClamp = 20
+pub const bLerp = 21
+pub const bLen = 22
+pub const bFill = 23
+pub const bMap = 24
+pub const bFilter = 25
+pub const bFold = 26
+pub const bSum = 27
+pub const bAny = 28
+pub const bAll = 29
+pub const bToArray = 30
+pub const bPrint = 31
+pub const bSome = 36
+pub const bToText = 37
+pub const bPush = 38
+pub const bSplit = 39
+pub const bTrim = 40
+pub const bParseInt = 41
+pub const bParseFloat = 42
+pub const bOk = 43
+pub const bErr = 44
+pub const bWords = 45
+pub const bLines = 46
+pub const bContains = 47
+pub const bIndexOf = 48
+pub const bStartsWith = 49
+pub const bEndsWith = 50
+pub const bReplace = 51
+pub const bUpper = 52
+pub const bLower = 53
+pub const bJoin = 54
+pub const bRepeat = 55
+pub const bSort = 56
+pub const bSortBy = 57
+pub const bReverse = 58
+pub const bFirst = 59
+pub const bLast = 60
+pub const bCountOf = 61
+pub const bMinBy = 62
+pub const bMaxBy = 63
+pub const bKeys = 64
+pub const bValues = 65
+pub const bRemove = 66
+pub const bIndex = 67
+pub const bPrintErr = 68
+pub const bAssert = 73
+pub const bParallelMap = 74
+pub const bTake = 81
+pub const bSkip = 82
+pub const bCountBy = 83
+pub const bMean = 84
+pub const bPanic = 85
+pub const bGet = 86
+pub const bAdd = 87
+pub const bToSet = 88
+pub const bInterface = 89
+pub const bNever = 90
+pub const bEntries = 91
+pub const bEnumerate = 92
+pub const bCodePointCount = 93
+pub const bMapErr = 98
+pub const bBytes = 99
+pub const bTextOf = 100
+pub const bChar = 101
+pub const bCodePoints = 102
+pub const bToBytes = 109
+pub const bPop = 110
+pub const bCBytes = 111
+pub const bParallelFold = 112
+
+// runtime(group, name, values...) in compiler/prelude.qk: the runtime's function called with the values' slots
+pub const bRuntime = 113
+
+// #dump(value): the value written as compiler/construn.qk reads it back (a constant worked out by running it)
+pub const bDump = 114

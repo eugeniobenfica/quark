@@ -1,0 +1,293 @@
+// parallelMap and parallelFold: the elements shared out to threads. Each worker has a context of its own and loads the
+// code again (its addresses are its thread's), then runs f on its elements (parallelFold: folds its part from the
+// start); a panic in one stops the call with its message. Results that hold memory (texts, arrays, maps) are copied
+// out of the worker's memory as each is made, into memory the worker keeps, and from there into the caller's when
+// every worker is done.
+use base
+use arena
+use loader
+use loops
+
+extern effect fn osProcessors() -> Int64 as "qkosProcessors"
+extern effect fn osThreadStart(f: Int64, arg: Int64) -> Int64 as "qkosThreadStart" // a handle, or 0
+extern effect fn osThreadJoin(h: Int64) as "qkosThreadJoin"
+extern fn workerAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+// a worker's words
+const wFrom = 0
+const wEntry = 1 // the function's offset in the code
+const wEnv = 2 // its captured values, after the element's slots
+const wIn = 3
+const wOut = 4
+const wFirst = 5
+const wLast = 6
+const wInSlots = 7
+const wOutSlots = 8
+const wFuel = 9
+const wFailed = 10
+const wGlobals = 11
+const wHandle = 12
+const wFold = 13 // 0: map; else the accumulator (malloc'd, wOutSlots of it), its part folded into it
+const wCounted = 14 // the program counts (heap.qk): the worker's memory from a counted heap of its own
+const wDesc = 15 // results that hold memory: an array of them's description (else 0)
+const wKeep = 16 // ... and the arena they are kept in
+const wStride = 17 // the worker's elements: wFirst, then every wStride-th before wLast
+const wText = 18 // 512 bytes
+const workerWords = 82
+
+fn runWorker(w: Int) -> Int {
+    let c = calloc(ctxWords, 8)
+    setWord(c, ctxFuel, word(w, wFuel))
+    let a = arenaNew()
+    setWord(c, ctxArena, a)
+    setWord(c, ctxGlobals, word(w, wGlobals))
+    let was = ctx()
+    setCtx(c)
+    let copy = loadAgain(word(w, wFrom))
+    if copy == 0 {
+        setWord(w, wFailed, 1)
+        let _ = bufAt(w + 8 * wText, panicTextSize).text("parallelMap: a thread could not load the program")
+    } else {
+        let args = malloc(8 * 64)
+        let inSlots = word(w, wInSlots)
+        let outSlots = word(w, wOutSlots)
+        let acc = word(w, wFold)
+        let lead = if acc != 0 {
+            outSlots // fold: the accumulator first
+        } else {
+            0
+        }
+        let desc = word(w, wDesc)
+        var keeper = 0
+        if desc != 0 {
+            let main = word(w, wFrom)
+            setWord(w, wKeep, arenaNew())
+            keeper = copierInto(word(w, wKeep), word(copy, lData), word(main, lDataLen), word(main, lData))
+        }
+        var i = word(w, wFirst)
+        while i < word(w, wLast) and word(w, wFailed) == 0 {
+            if acc != 0 {
+                copyBytes(args, acc, 8 * outSlots)
+            }
+            copyBytes(args + 8 * lead, word(w, wIn) + 8 * i * inSlots, 8 * inSlots)
+            setWord(args, lead + inSlots, word(w, wEnv))
+            let to = if acc != 0 { acc } else { word(w, wOut) + 8 * i * outSlots }
+            if not runEntry(copy, word(copy, lCode) + word(w, wEntry), args, lead + inSlots + 1, to, outSlots) {
+                setWord(w, wFailed, 1)
+                copyBytes(w + 8 * wText, c + 8 * ctxPanicText, panicTextSize)
+            } else if desc != 0 {
+                // before the next element's run clears this thread's memory
+                copyValue(keeper, to, desc)
+                copierForget(keeper)
+            }
+            i += word(w, wStride)
+        }
+        free(args)
+        if keeper != 0 {
+            copierDone(keeper)
+        }
+        unload(copy)
+    }
+    arenaFree(word(c, ctxArena))
+    setCtx(was)
+    free(c)
+    0
+}
+
+pub extern effect fn rtParallelMap(
+    f: Int64,
+    env: Int64,
+    input: Int64,
+    n: Int64,
+    inSlots: Int64,
+    outSlots: Int64,
+    line: Int64,
+    desc: Int64,
+) -> Int64 as "qk_parallelMap" {
+    if inSlots > 63 {
+        panicNow(panicSize, line, inSlots, 0)
+    }
+    let out = alloc(n, outSlots * 8)
+    let l = ctxGet(ctxRunning)
+    let threads = threadsFor(n)
+    // (results that hold memory in a counted program: here, made in its heap)
+    if l == 0 or threads <= 1 or n < 2 {
+        // here, one after the other
+        let args = malloc(8 * 64)
+        for i in 0..n {
+            copyBytes(args, input + 8 * i * inSlots, 8 * inSlots)
+            setWord(args, inSlots, env)
+            if not runEntry(l, f, args, inSlots + 1, out + 8 * i * outSlots, outSlots) {
+                free(args)
+                stopNow()
+            }
+        }
+        free(args)
+        return out
+    }
+    // the elements dealt out in turn (worker t: t, t + threads, ...): the slow ones, often side by side, are shared
+    let ws = calloc(threads * workerWords, 8)
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        setWord(w, wFrom, l)
+        setWord(w, wEntry, f - word(l, lCode))
+        setWord(w, wEnv, env)
+        setWord(w, wIn, input)
+        setWord(w, wOut, out)
+        setWord(w, wFirst, t)
+        setWord(w, wLast, n)
+        setWord(w, wStride, threads)
+        setWord(w, wInSlots, inSlots)
+        setWord(w, wOutSlots, outSlots)
+        setWord(w, wFuel, ctxGet(ctxFuel))
+        setWord(w, wGlobals, globals())
+        setWord(w, wDesc, desc)
+    }
+    let start = workerAddress(w => runWorker(w))
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        setWord(w, wHandle, osThreadStart(start, w))
+    }
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        if word(w, wHandle) != 0 {
+            osThreadJoin(word(w, wHandle))
+        } else {
+            let _ = runWorker(w)
+        }
+    }
+    var failed = -1
+    let into = if desc != 0 { copierInto(arena(), 0, 0, 0) } else { 0 }
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        if word(w, wFailed) != 0 and failed < 0 {
+            failed = t
+        }
+        if word(w, wKeep) != 0 {
+            var i = t
+            while failed < 0 and i < n {
+                copyValue(into, out + 8 * i * outSlots, desc)
+                i += threads
+            }
+            arenaFree(word(w, wKeep))
+        }
+    }
+    if into != 0 {
+        copierDone(into)
+    }
+    if failed >= 0 {
+        copyBytes(panicText(), ws + 8 * workerWords * failed + 8 * wText, panicTextSize)
+        free(ws)
+        stopNow()
+    }
+    free(ws)
+    out
+}
+
+// the threads for n elements: the processor's (64 at most), fewer for few elements
+fn threadsFor(n: Int) -> Int {
+    var threads = osProcessors()
+    if threads > 64 {
+        threads = 64
+    }
+    if n < 2 * threads {
+        threads = if n > 1 { n } else { 1 }
+    }
+    threads
+}
+
+// parallelFold: b holds step's code and captured values, combine's, the elements, their count, an element's slots, the
+// accumulator's, the line, then the start's slots. Each thread folds its part from the start with step; the parts are
+// then combined in order, from the start. Gives the accumulator's slots.
+const fStep = 0
+const fStepEnv = 1
+const fCombine = 2
+const fCombineEnv = 3
+const fIn = 4
+const fCount = 5
+const fInSlots = 6
+const fAccSlots = 7
+const fLine = 8
+const fStart = 9
+
+pub extern effect fn rtParallelFold(b: Int64) -> Int64 as "qk_parallelFold" {
+    let n = word(b, fCount)
+    let inSlots = word(b, fInSlots)
+    let accSlots = word(b, fAccSlots)
+    if accSlots + inSlots > 63 or 2 * accSlots > 63 {
+        panicNow(panicSize, word(b, fLine), accSlots + inSlots, 0)
+    }
+    let out = alloc(1, 8 * (accSlots + 1))
+    copyBytes(out, b + 8 * fStart, 8 * accSlots)
+    let l = ctxGet(ctxRunning)
+    let threads = threadsFor(n)
+    let args = malloc(8 * 64)
+    if l == 0 or threads <= 1 or n < 2 {
+        // here, one after the other
+        for i in 0..n {
+            copyBytes(args, out, 8 * accSlots)
+            copyBytes(args + 8 * accSlots, word(b, fIn) + 8 * i * inSlots, 8 * inSlots)
+            setWord(args, accSlots + inSlots, word(b, fStepEnv))
+            if not runEntry(l, word(b, fStep), args, accSlots + inSlots + 1, out, accSlots) {
+                free(args)
+                stopNow()
+            }
+        }
+        free(args)
+        return out
+    }
+    let ws = calloc(threads * workerWords, 8)
+    let each = (n + threads - 1) / threads
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        let acc = malloc(8 * (accSlots + 1))
+        copyBytes(acc, b + 8 * fStart, 8 * accSlots)
+        setWord(w, wFrom, l)
+        setWord(w, wEntry, word(b, fStep) - word(l, lCode))
+        setWord(w, wEnv, word(b, fStepEnv))
+        setWord(w, wIn, word(b, fIn))
+        setWord(w, wFirst, t * each)
+        setWord(w, wLast, if (t + 1) * each < n { (t + 1) * each } else { n })
+        setWord(w, wStride, 1)
+        setWord(w, wInSlots, inSlots)
+        setWord(w, wOutSlots, accSlots)
+        setWord(w, wFuel, ctxGet(ctxFuel))
+        setWord(w, wGlobals, globals())
+        setWord(w, wFold, acc)
+    }
+    let start = workerAddress(w => runWorker(w))
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        setWord(w, wHandle, osThreadStart(start, w))
+    }
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        if word(w, wHandle) != 0 {
+            osThreadJoin(word(w, wHandle))
+        } else {
+            let _ = runWorker(w)
+        }
+    }
+    var failed = false
+    for t in 0..threads {
+        let w = ws + 8 * workerWords * t
+        if not failed and word(w, wFailed) != 0 {
+            copyBytes(panicText(), w + 8 * wText, panicTextSize)
+            failed = true
+        }
+        if not failed {
+            // the parts in order: out = combine(out, part)
+            copyBytes(args, out, 8 * accSlots)
+            copyBytes(args + 8 * accSlots, word(w, wFold), 8 * accSlots)
+            setWord(args, 2 * accSlots, word(b, fCombineEnv))
+            failed = not runEntry(l, word(b, fCombine), args, 2 * accSlots + 1, out, accSlots)
+        }
+        free(word(w, wFold))
+    }
+    free(ws)
+    free(args)
+    if failed {
+        stopNow()
+    }
+    out
+}

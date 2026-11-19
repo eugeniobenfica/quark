@@ -1,0 +1,1863 @@
+// quark bind: a C header read, and its declarations written as Quark's (extern fn, extern type, constants), so a C
+// library is used without writing its declarations by hand. All of it is here, with no C compiler: a C preprocessor
+// (#include, #define with and without parameters, #if and its expressions, # and ##), a parser of C's declarations
+// (typedefs, structs, unions, enums, pointers, arrays, function types), and the writer.
+//
+//   quark bind header.h [-I dir]... [-D NAME[=value]]... [--lib name] [--prefix P] [--target T] [-o out.qk]
+//
+// What is written:
+//  - each function declared: extern effect fn name(...) -> R [in "lib"] as "c_name" (C says nothing of what a function
+//    changes, so each is an effect); its name camelCase, without the prefix;
+//  - each struct C lays out: extern type Name { fields } (an array field of n elements is n fields); a struct only
+//    named, a union, or one with bit fields is a handle (extern type Name), used through Pointer<Name>;
+//  - each enum's value and each #define that is a number or a text: a constant;
+//  - what could not be said in Quark, as a comment with the reason.
+// A pointer may be NULL in C, so every pointer (a parameter, a result, a struct's field) is optional; const char* is CText; a function
+// pointer is extern (A) -> R (a parameter, a result, a struct's field: Quark calls it), one inside another's types an
+// address (Pointer<UInt8>). C's long is 32 bits on Windows and 64 elsewhere, so the declarations are those of one target (--target, else this machine's).
+use token
+use types
+use source
+use parser
+use format
+
+// ---- tokens ----
+const tIdent = 0
+const tNum = 1
+const tStr = 2
+const tChar = 3
+const tPunct = 4
+
+// a token: where it is (its file, its line, its logical line: a directive's tokens share one), and whether a space
+// came before it
+type CTok { kind: Int, text: Text, line: Int, ll: Int, file: Int, space: Bool }
+
+fn isIdStart(c: Int) -> Bool =
+    c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c == '_' or c == '$'
+
+fn isDigit(c: Int) -> Bool = c >= '0' and c <= '9'
+
+const puncts3 = ["...", "<<=", ">>="]
+
+const puncts2 = [
+    "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "##",
+]
+
+// a file's tokens: comments are spaces, a line ending in \ goes on
+fn lexC(text: Text, file: Int) -> [CTok] {
+    let b = text.bytes()
+    let n = len(b)
+    var out: [CTok] = []
+    var i = 0
+    var line = 1
+    var ll = 1
+    var space = false
+    while i < n {
+        let c = b[i]
+        if c == '\n' {
+            line += 1
+            ll += 1
+            i += 1
+            space = true
+            continue
+        }
+        if c == '\\' and i + 1 < n and (b[i + 1] == '\n' or b[i + 1] == '\r' and i + 2 < n and b[i + 2] == '\n') {
+            i += if b[i + 1] == '\n' { 2 } else { 3 }
+            line += 1
+            space = true
+            continue
+        }
+        if c == ' ' or c == '\t' or c == '\r' or c == 12 or c == 11 {
+            i += 1
+            space = true
+            continue
+        }
+        if c == '/' and i + 1 < n and b[i + 1] == '/' {
+            while i < n and b[i] != '\n' {
+                i += 1
+            }
+            space = true
+            continue
+        }
+        if c == '/' and i + 1 < n and b[i + 1] == '*' {
+            i += 2
+            while i + 1 < n and not (b[i] == '*' and b[i + 1] == '/') {
+                if b[i] == '\n' {
+                    line += 1
+                }
+                i += 1
+            }
+            i += 2
+            space = true
+            continue
+        }
+        let start = i
+        var kind = tPunct
+        if isIdStart(c) {
+            while i < n and (isIdStart(b[i]) or isDigit(b[i])) {
+                i += 1
+            }
+            kind = tIdent
+            // L"..." and u8"...": a text
+            if i < n and (b[i] == '"' or b[i] == '\'') and text[start..i] is "L" | "u" | "U" | "u8" {
+                kind = if b[i] == '"' { tStr } else { tChar }
+                i = quoteEnd(b, i)
+            }
+        } else if isDigit(c) or c == '.' and i + 1 < n and isDigit(b[i + 1]) {
+            while i < n
+                and (isIdStart(b[i])
+                    or isDigit(b[i])
+                    or b[i] == '.'
+                    or (b[i] == '+' or b[i] == '-') and b[i - 1] is 'e' | 'E' | 'p' | 'P') {
+                i += 1
+            }
+            kind = tNum
+        } else if c == '"' or c == '\'' {
+            kind = if c == '"' { tStr } else { tChar }
+            i = quoteEnd(b, i)
+        } else {
+            var size = 1
+            if i + 3 <= n and puncts3.contains(text[i..i + 3]) {
+                size = 3
+            } else if i + 2 <= n and puncts2.contains(text[i..i + 2]) {
+                size = 2
+            }
+            i += size
+        }
+        out.push(CTok(kind, text[start..i], line, ll, file, space))
+        space = false
+    }
+    out
+}
+
+// past a quoted text or character that starts at i (its closing quote, or the line's end)
+fn quoteEnd(b: Bytes, at: Int) -> Int {
+    let q = b[at]
+    var i = at + 1
+    while i < len(b) and b[i] != q and b[i] != '\n' {
+        i += if b[i] == '\\' { 2 } else { 1 }
+    }
+    min(i + 1, len(b))
+}
+
+// ---- numbers and constant expressions ----
+// an integer as C writes it (0x, 0 octal, 0b; suffixes u, l); None: not one (a float)
+fn cInt(t: Text) -> Int? {
+    var s = t.lower()
+    while len(s) > 1 and (s.endsWith("u") or s.endsWith("l")) {
+        s = s[..len(s) - 1]
+    }
+    // (i64, ui64: Microsoft's)
+    if s.endsWith("i64") {
+        s = s[..len(s) - 3]
+        if s.endsWith("u") {
+            s = s[..len(s) - 1]
+        }
+    }
+    var base = 10
+    var from = 0
+    if s.startsWith("0x") {
+        base = 16
+        from = 2
+    } else if s.startsWith("0b") {
+        base = 2
+        from = 2
+    } else if s.startsWith("0") and len(s) > 1 {
+        base = 8
+        from = 1
+    }
+    let b = s.bytes()
+    if from >= len(b) {
+        return None
+    }
+    var v = 0
+    for i in from..len(b) {
+        let c = b[i]
+        let d = if isDigit(c) {
+            c - '0'
+        } else if c >= 'a' and c <= 'f' {
+            c - 'a' + 10
+        } else {
+            99
+        }
+        if d >= base {
+            return None
+        }
+        v = v *% base +% d
+    }
+    v
+}
+
+// a character constant's value ('a', '\n', '\0', '\x41')
+fn cChar(t: Text) -> Int {
+    let b = t.bytes()
+    var i = 0
+    while i < len(b) and b[i] != '\'' {
+        i += 1
+    }
+    i += 1
+    if i >= len(b) {
+        return 0
+    }
+    if b[i] != '\\' or i + 1 >= len(b) {
+        return b[i]
+    }
+    match b[i + 1] {
+        'n' => 10
+        't' => 9
+        'r' => 13
+        '0' => 0
+        'a' => 7
+        'b' => 8
+        'f' => 12
+        'v' => 11
+        'x' => cInt("0x" + t[i + 2..len(b) - 1]) ?? 0
+        other => other
+    }
+}
+
+// A constant expression's value: over tokens, with names' values (an unknown name: 0 when zero says so, as #if has
+// it; else the expression has no value)
+type Ev { t: [CTok], names: [Text: Int], zero: Bool, i: Int = 0, ok: Bool = true }
+
+fn Ev.peek(self) -> Text = if self.i < len(self.t) { self.t[self.i].text } else { "" }
+
+fn Ev.take(var self, p: Text) -> Bool {
+    if self.peek() == p and self.i < len(self.t) and self.t[self.i].kind == tPunct {
+        self.i += 1
+        return true
+    }
+    false
+}
+
+fn Ev.primary(var self) -> Int {
+    if self.i >= len(self.t) {
+        self.ok = false
+        return 0
+    }
+    let t = self.t[self.i]
+    self.i += 1
+    if t.kind == tNum {
+        if cInt(t.text) is Some(v) {
+            return v
+        }
+        self.ok = false
+        return 0
+    }
+    if t.kind == tChar {
+        return cChar(t.text)
+    }
+    if t.kind == tIdent {
+        if self.names[t.text] is Some(v) {
+            return v
+        }
+        if not self.zero {
+            self.ok = false
+        }
+        return 0
+    }
+    if t.text == "(" {
+        let v = self.ternary()
+        if not self.take(")") {
+            self.ok = false
+        }
+        return v
+    }
+    if t.text == "-" {
+        return 0 -% self.primary()
+    }
+    if t.text == "+" {
+        return self.primary()
+    }
+    if t.text == "!" {
+        return if self.primary() == 0 { 1 } else { 0 }
+    }
+    if t.text == "~" {
+        return ~self.primary()
+    }
+    self.ok = false
+    0
+}
+
+fn binLevel(op: Text) -> Int = match op {
+    "*" | "/" | "%" => 10
+    "+" | "-" => 9
+    "<<" | ">>" => 8
+    "<" | "<=" | ">" | ">=" => 7
+    "==" | "!=" => 6
+    "&" => 5
+    "^" => 4
+    "|" => 3
+    "&&" => 2
+    "||" => 1
+    _ => 0
+}
+
+fn truth(b: Bool) -> Int = if b { 1 } else { 0 }
+
+fn Ev.binary(var self, least: Int) -> Int {
+    var a = self.primary()
+    while self.ok and self.i < len(self.t) and self.t[self.i].kind == tPunct {
+        let op = self.peek()
+        let level = binLevel(op)
+        if level == 0 or level < least {
+            break
+        }
+        self.i += 1
+        let b = self.binary(level + 1)
+        if (op == "/" or op == "%") and b == 0 {
+            self.ok = self.ok and self.zero // (#if 1 / 0 in a branch not taken)
+            a = 0
+            continue
+        }
+        a = match op {
+            "*" => a *% b
+            "/" => if a == -9223372036854775807 - 1 and b == -1 { a } else { cDiv(a, b) }
+            "%" => if b == -1 { 0 } else { a - cDiv(a, b) * b }
+            "+" => a +% b
+            "-" => a -% b
+            "<<" => a << (b & 63)
+            ">>" => a >> (b & 63)
+            "<" => truth(a < b)
+            "<=" => truth(a <= b)
+            ">" => truth(a > b)
+            ">=" => truth(a >= b)
+            "==" => truth(a == b)
+            "!=" => truth(a != b)
+            "&" => a & b
+            "^" => a ^ b
+            "|" => a | b
+            "&&" => truth(a != 0 and b != 0)
+            _ => truth(a != 0 or b != 0)
+        }
+    }
+    a
+}
+
+// C's division: toward zero (Quark's is floored)
+fn cDiv(a: Int, b: Int) -> Int {
+    let q = a / b
+    if q * b != a and (a < 0) != (b < 0) { q + 1 } else { q }
+}
+
+fn Ev.ternary(var self) -> Int {
+    let c = self.binary(1)
+    if self.take("?") {
+        let a = self.ternary()
+        if not self.take(":") {
+            self.ok = false
+        }
+        let b = self.ternary()
+        return if c != 0 { a } else { b }
+    }
+    c
+}
+
+// the whole of t as a constant expression
+fn evalTokens(t: [CTok], names: [Text: Int], zero: Bool) -> Int? {
+    if len(t) == 0 {
+        return None
+    }
+    var e = Ev(t, names, zero)
+    let v = e.ternary()
+    if e.ok and e.i == len(t) { Some(v) } else { None }
+}
+
+// ---- the preprocessor ----
+type Macro { isFn: Bool, params: [Text], variadic: Bool, body: [CTok] }
+
+// an #if's state: whether its lines are read, whether a branch was taken, whether the lines around it are read
+type Cond { active: Bool, taken: Bool, outer: Bool }
+
+type Pp {
+    macros: [Text: Macro] = [:]
+    out: [CTok] = []
+    files: [Text] = []
+    emits: [Bool] = [] // by file: its declarations are written (the header's own and what it includes with "")
+    dirs: [Text] = []
+    once: [Text] = []
+    depth: Int = 0
+    notes: [Text] = []
+    defined: [(Text, Int)] = [] // the #defines without parameters of the files written: name, line
+}
+
+fn dirOf(path: Text) -> Text {
+    let b = path.bytes()
+    var i = len(b) - 1
+    while i >= 0 and b[i] != '/' and b[i] != '\\' {
+        i -= 1
+    }
+    if i < 0 { "." } else { path[..i] }
+}
+
+fn Pp.active(self, conds: [Cond]) -> Bool = len(conds) == 0 or conds[len(conds) - 1].active
+
+fn Pp.file(var self, path: Text, emit: Bool) {
+    let Ok(text) = readFile(path) else {
+        self.notes.push("cannot read {path}")
+        return
+    }
+    if self.once.contains(path) or self.depth > 40 {
+        return
+    }
+    self.files.push(path)
+    self.emits.push(emit)
+    let me = len(self.files) - 1
+    let toks = lexC(text, me)
+    self.depth += 1
+    var conds: [Cond] = []
+    var run: [CTok] = []
+    var i = 0
+    while i < len(toks) {
+        // a logical line
+        var j = i
+        while j < len(toks) and toks[j].ll == toks[i].ll {
+            j += 1
+        }
+        if toks[i].text != "#" or toks[i].kind != tPunct {
+            if self.active(conds) {
+                run += toks[i..j]
+            }
+            i = j
+            continue
+        }
+        // a directive: what came before it is expanded with the macros as they are now
+        if len(run) > 0 {
+            self.out += self.expand(run, [])
+            run = []
+        }
+        let d = toks[i + 1..j]
+        i = j
+        if len(d) == 0 {
+            continue
+        }
+        let name = d[0].text
+        let rest = d[1..]
+        let on = self.active(conds)
+        if name == "if" or name == "ifdef" or name == "ifndef" {
+            let yes = on and (if name == "if" {
+                self.condition(rest)
+            } else {
+                (len(rest) > 0 and self.macros.contains(rest[0].text)) == (name == "ifdef")
+            })
+            conds.push(Cond(yes, yes, on))
+        } else if name == "elif" or name == "else" {
+            if len(conds) > 0 {
+                let c = conds[len(conds) - 1]
+                let yes = c.outer and not c.taken and (name == "else" or self.condition(rest))
+                conds[len(conds) - 1] = Cond(yes, c.taken or yes, c.outer)
+            }
+        } else if name == "endif" {
+            if len(conds) > 0 {
+                conds.pop()
+            }
+        } else if not on {
+            continue
+        } else if name == "define" and len(rest) > 0 {
+            self.define(rest, emit)
+        } else if name == "undef" and len(rest) > 0 {
+            self.macros.remove(rest[0].text)
+        } else if name == "include" {
+            self.include(rest, path, emit)
+        } else if name == "pragma" and len(rest) > 0 and rest[0].text == "once" {
+            self.once.push(path)
+        }
+    }
+    if len(run) > 0 {
+        self.out += self.expand(run, [])
+    }
+    self.depth -= 1
+}
+
+fn Pp.define(var self, d: [CTok], emit: Bool) {
+    let name = d[0].text
+    var m = Macro(false, [], false, [])
+    var at = 1
+    if len(d) > 1 and d[1].text == "(" and not d[1].space {
+        m.isFn = true
+        at = 2
+        while at < len(d) and d[at].text != ")" {
+            if d[at].text == "..." {
+                m.variadic = true
+            } else if d[at].kind == tIdent {
+                m.params.push(d[at].text)
+            }
+            at += 1
+        }
+        at += 1
+    }
+    m.body = if at < len(d) { d[at..] } else { [] }
+    self.macros[name] = m
+    if emit and not m.isFn and len(m.body) > 0 {
+        self.defined.push((name, d[0].line))
+    }
+}
+
+fn Pp.include(var self, d: [CTok], from: Text, emit: Bool) {
+    var t = d
+    if len(t) > 0 and t[0].kind == tIdent {
+        t = self.expand(t, []) // #include NAME
+    }
+    if len(t) == 0 {
+        return
+    }
+    var name = ""
+    var quoted = false
+    if t[0].kind == tStr {
+        name = t[0].text[1..len(t[0].text) - 1]
+        quoted = true
+    } else if t[0].text == "<" {
+        for x in t[1..] {
+            if x.text == ">" {
+                break
+            }
+            name += x.text
+        }
+    }
+    if name == "" {
+        return
+    }
+    // "x": beside the file, then the -I folders; <x>: the folders only (the system's own are not read: what they
+    // give is known here, size_t, int32_t...)
+    var places = self.dirs
+    if quoted {
+        places = [dirOf(from)] + places
+    }
+    for p in places {
+        let path = p + "/" + name
+        if pathExists(path) {
+            self.file(path, emit and quoted)
+            return
+        }
+    }
+}
+
+// #if's expression: defined X, defined(X), macros expanded, what is left 0
+fn Pp.condition(var self, d: [CTok]) -> Bool {
+    var t: [CTok] = []
+    var i = 0
+    while i < len(d) {
+        if d[i].text == "defined" and d[i].kind == tIdent {
+            let paren = i + 1 < len(d) and d[i + 1].text == "("
+            let at = if paren { i + 2 } else { i + 1 }
+            let yes = at < len(d) and self.macros.contains(d[at].text)
+            t.push(d[i] with { kind: tNum, text: if yes { "1" } else { "0" } })
+            i = at + (if paren { 2 } else { 1 })
+            continue
+        }
+        t.push(d[i])
+        i += 1
+    }
+    (evalTokens(self.expand(t, []), [:], true) ?? 0) != 0
+}
+
+// t with its macros expanded (active: those being expanded, not expanded again inside themselves)
+fn Pp.expand(var self, t: [CTok], active: [Text]) -> [CTok] {
+    var out: [CTok] = []
+    var i = 0
+    while i < len(t) {
+        let x = t[i]
+        i += 1
+        if x.kind != tIdent or active.contains(x.text) {
+            out.push(x)
+            continue
+        }
+        let Some(m) = self.macros[x.text] else {
+            out.push(x)
+            continue
+        }
+        if not m.isFn {
+            out += self.expand(pasted(m.body.map(b => b with { line: x.line, file: x.file })), active + [x.text])
+            continue
+        }
+        if i >= len(t) or t[i].text != "(" {
+            out.push(x) // a function-like macro's name alone: a name
+            continue
+        }
+        // its arguments, to the matching )
+        var args: [[CTok]] = [[]]
+        var depth = 0
+        i += 1
+        while i < len(t) {
+            let a = t[i]
+            if a.text == ")" and a.kind == tPunct and depth == 0 {
+                break
+            }
+            if a.kind == tPunct and a.text is "(" | "[" | "\{" {
+                depth += 1
+            } else if a.kind == tPunct and a.text is ")" | "]" | "\}" {
+                depth -= 1
+            }
+            if a.text == "," and a.kind == tPunct and depth == 0 and (len(args) < len(m.params) or not m.variadic) {
+                args.push([])
+            } else {
+                args[len(args) - 1].push(a)
+            }
+            i += 1
+        }
+        i += 1
+        out += self.expand(pasted(self.substitute(m, args, x)), active + [x.text])
+    }
+    out
+}
+
+// a macro's body with its parameters replaced (# makes a text, ## joins as written)
+fn Pp.substitute(var self, m: Macro, args: [[CTok]], at: CTok) -> [CTok] {
+    var out: [CTok] = []
+    for (k, b0) in m.body.enumerate() {
+        let b = b0 with { line: at.line, file: at.file }
+        var which = if b.kind == tIdent { m.params.indexOf(b.text) ?? -1 } else { -1 }
+        if b.kind == tIdent and b.text == "__VA_ARGS__" and m.variadic {
+            which = len(m.params)
+        }
+        if which < 0 {
+            out.push(b)
+            continue
+        }
+        var arg: [CTok] = args.get(which) ?? []
+        if which == len(m.params) {
+            // the rest, with their commas
+            arg = []
+            for (n, a) in args.enumerate() {
+                if n >= which {
+                    if n > which {
+                        arg.push(at with { kind: tPunct, text: "," })
+                    }
+                    arg += a
+                }
+            }
+        }
+        let afterHash = k > 0 and m.body[k - 1].text == "#" and m.body[k - 1].kind == tPunct
+        let joined = k > 0 and m.body[k - 1].text == "##" or k + 1 < len(m.body) and m.body[k + 1].text == "##"
+        if afterHash {
+            out.pop()
+            out.push(b with { kind: tStr, text: "\"" + arg.map(a => a.text).join(" ") + "\"" })
+        } else if joined {
+            out += arg
+        } else {
+            out += self.expand(arg, [])
+        }
+    }
+    out
+}
+
+// a ## b: one token
+fn pasted(t: [CTok]) -> [CTok] {
+    if not t.any(x => x.text == "##" and x.kind == tPunct) {
+        return t
+    }
+    var out: [CTok] = []
+    var i = 0
+    while i < len(t) {
+        if t[i].text == "##" and t[i].kind == tPunct and len(out) > 0 and i + 1 < len(t) {
+            let a = out[len(out) - 1]
+            let text = a.text + t[i + 1].text
+            let b = text.bytes()
+            let kind = if isIdStart(b[0]) {
+                tIdent
+            } else if isDigit(b[0]) {
+                tNum
+            } else {
+                tPunct
+            }
+            out[len(out) - 1] = a with { text: text, kind: kind }
+            i += 2
+            continue
+        }
+        if not (t[i].text == "##" and t[i].kind == tPunct) {
+            out.push(t[i])
+        }
+        i += 1
+    }
+    out
+}
+
+// ---- C's types ----
+enum CType {
+    Void
+    Int(bits: Int, signed: Bool)
+    Float(bits: Int)
+    Bool
+    Ptr(to: CType, constTo: Bool)
+    Arr(of: CType, count: Int)
+    Fn(ret: CType, params: [CParam], variadic: Bool)
+    Struct(id: Int)
+    Enum
+    VaList
+    Bad(why: Text)
+}
+
+type CParam { name: Text, ty: CType }
+
+// a struct or a union: its tag and the name a typedef gives it, its fields when its body was read
+type CStruct {
+    tag: Text = ""
+    name: Text = ""
+    fields: [CParam] = []
+    complete: Bool = false
+    isUnion: Bool = false
+    bitFields: Bool = false
+    emit: Bool = false
+    line: Int = 0
+}
+
+type CFn { name: Text, ty: CType, line: Int }
+type CConst { name: Text, value: Text, line: Int }
+
+// The parser of C's declarations, over the preprocessor's tokens
+type Cp {
+    t: [CTok]
+    emits: [Bool]
+    long: Int // long's bits: 32 on Windows, 64 elsewhere
+    i: Int = 0
+    typedefs: [Text: CType] = [:]
+    structs: [CStruct] = []
+    tags: [Text: Int] = [:]
+    values: [Text: Int] = [:] // the enums' values
+    fns: [CFn] = []
+    consts: [CConst] = []
+    notes: [Text] = []
+    failed: Text = ""
+}
+
+fn Cp.peek(self) -> Text = if self.i < len(self.t) { self.t[self.i].text } else { "" }
+
+fn Cp.isIdent(self) -> Bool = self.i < len(self.t) and self.t[self.i].kind == tIdent
+
+fn Cp.take(var self, p: Text) -> Bool {
+    if self.peek() == p {
+        self.i += 1
+        return true
+    }
+    false
+}
+
+fn Cp.fail(var self, why: Text) {
+    if self.failed == "" {
+        self.failed = why
+    }
+}
+
+// past a ( ... ), a [ ... ] or a { ... } that starts here
+fn Cp.skipGroup(var self) {
+    var depth = 0
+    while self.i < len(self.t) {
+        let x = self.t[self.i]
+        self.i += 1
+        if x.kind == tPunct and x.text is "(" | "[" | "\{" {
+            depth += 1
+        } else if x.kind == tPunct and x.text is ")" | "]" | "\}" {
+            depth -= 1
+            if depth <= 0 {
+                return
+            }
+        }
+    }
+}
+
+// words that say nothing here: attributes, calling conventions, qualifiers of the pointer itself
+fn Cp.skipNoise(var self) -> Bool {
+    var constHere = false
+    while self.i < len(self.t) {
+        let w = self.peek()
+        if w is "__attribute__" | "__declspec" | "__asm__" | "__asm" | "asm" | "_Alignas" | "alignas" | "__pragma" {
+            self.i += 1
+            if self.peek() == "(" {
+                self.skipGroup()
+            }
+        } else if w == "const" or w == "__const" {
+            constHere = true
+            self.i += 1
+        } else if w is "volatile" | "restrict" | "__restrict" | "__restrict__" | "__extension__" | "_Atomic" | "__cdecl" | "__stdcall" | "_cdecl" | "_stdcall" | "__fastcall" | "__vectorcall" | "__thiscall" | "__ptr32" | "__ptr64" | "__unaligned" | "_Nullable" | "_Nonnull" | "__nullable" | "__nonnull" | "_Null_unspecified" | "__w64" | "__volatile__" {
+            self.i += 1
+        } else {
+            break
+        }
+    }
+    constHere
+}
+
+type Spec { ty: CType, isConst: Bool, isTypedef: Bool, hasBody: Bool, isStatic: Bool }
+
+// declaration specifiers: the storage class, the qualifiers and the type before a declarator
+fn Cp.specifiers(var self) -> Spec {
+    var s = Spec(.Bad(""), false, false, false, false)
+    var longs = 0
+    var short = false
+    var signedSaid = 0 // 1 signed, 2 unsigned
+    var base = "" // char, int, float, double, void, _Bool
+    var named = false
+    while self.i < len(self.t) {
+        if self.skipNoise() {
+            s.isConst = true
+        }
+        if not self.isIdent() {
+            break
+        }
+        let w = self.peek()
+        if w == "typedef" {
+            s.isTypedef = true
+        } else if w is "static" | "inline" | "__inline" | "__inline__" | "__forceinline" {
+            s.isStatic = true
+        } else if w is "extern" | "register" | "auto" | "_Noreturn" | "__noreturn" | "_Thread_local" | "__thread" | "constexpr" {
+            // nothing to keep
+        } else if w == "long" {
+            longs += 1
+        } else if w == "short" {
+            short = true
+        } else if w is "signed" | "__signed__" | "__signed" {
+            signedSaid = 1
+        } else if w == "unsigned" {
+            signedSaid = 2
+        } else if w is "char" | "int" | "float" | "double" | "void" | "_Bool" | "__int64" | "__int32" | "__int16" | "__int8" | "__int128" | "_Float16" | "__float128" {
+            base = w
+        } else if w == "bool" and not self.typedefs.contains("bool") {
+            base = "_Bool"
+        } else if w is "struct" | "union" {
+            self.i += 1
+            let (ty, body) = self.structSpec(w == "union")
+            s.ty = ty
+            s.hasBody = body
+            named = true
+            continue
+        } else if w == "enum" {
+            self.i += 1
+            s.hasBody = self.enumSpec()
+            s.ty = .Enum
+            named = true
+            continue
+        } else if not named
+            and base == ""
+            and longs == 0
+            and not short
+            and signedSaid == 0
+            and self.typedefs[w] is Some(ty) {
+            s.ty = ty
+            named = true
+        } else if w is "__builtin_va_list" | "va_list" | "__gnuc_va_list" | "__va_list" and not named and base == "" {
+            s.ty = .VaList
+            named = true
+        } else {
+            break
+        }
+        self.i += 1
+    }
+    if named {
+        return s
+    }
+    let unsigned = signedSaid == 2
+    if base == "" and longs == 0 and not short and signedSaid == 0 {
+        return s // no type: Bad
+    }
+    s.ty = match base {
+        "void" => .Void
+        "_Bool" => .Bool
+        "char" | "__int8" => .Int(8, not unsigned)
+        "__int16" => .Int(16, not unsigned)
+        "__int32" => .Int(32, not unsigned)
+        "__int64" => .Int(64, not unsigned)
+        "float" => .Float(32)
+        "double" => if longs > 0 { CType.Bad("long double") } else { CType.Float(64) }
+        "__int128" | "_Float16" | "__float128" => .Bad(base)
+        _ => if short {
+            CType.Int(16, not unsigned)
+        } else if longs >= 2 {
+            CType.Int(64, not unsigned)
+        } else if longs == 1 {
+            CType.Int(self.long, not unsigned)
+        } else {
+            CType.Int(32, not unsigned)
+        }
+    }
+    s
+}
+
+fn Cp.emitHere(self) -> Bool =
+    self.i < len(self.t) and (self.emits.get(self.t[self.i].file) ?? false)
+
+// struct Tag, struct Tag { ... }, struct { ... }: its type, and whether a body was read
+fn Cp.structSpec(var self, isUnion: Bool) -> (CType, Bool) {
+    let _ = self.skipNoise()
+    var tag = ""
+    if self.isIdent() {
+        tag = self.peek()
+        self.i += 1
+    }
+    let _ = self.skipNoise()
+    let key = (if isUnion { "union " } else { "struct " }) + tag
+    var id = if tag != "" { self.tags[key] ?? -1 } else { -1 }
+    if id < 0 {
+        self.structs.push(CStruct(tag: tag, isUnion: isUnion))
+        id = len(self.structs) - 1
+        if tag != "" {
+            self.tags[key] = id
+        }
+    }
+    if self.peek() != "\{" {
+        return (.Struct(id), false)
+    }
+    self.structs[id].emit = self.emitHere()
+    self.structs[id].line = self.t[self.i].line
+    self.i += 1
+    var fields: [CParam] = []
+    var bits = false
+    var unnamed = 0
+    while self.i < len(self.t) and self.peek() != "\}" {
+        let s = self.specifiers()
+        if s.ty is Bad(_) and not s.hasBody {
+            // something not understood: the field's line is passed, and the struct is not laid out
+            bits = true
+            while self.i < len(self.t) and self.peek() != ";" and self.peek() != "\}" {
+                if self.peek() is "(" | "[" | "\{" {
+                    self.skipGroup()
+                } else {
+                    self.i += 1
+                }
+            }
+            let _ = self.take(";")
+            continue
+        }
+        if self.peek() == ";" {
+            // an anonymous struct or union inside: its fields are this one's
+            fields.push(CParam("anon{unnamed}", s.ty))
+            unnamed += 1
+            self.i += 1
+            continue
+        }
+        while self.i < len(self.t) {
+            let (name, ty) = self.declarator(s.ty, s.isConst)
+            if self.take(":") {
+                bits = true // a bit field
+                while self.i < len(self.t) and not self.peek() is "," | ";" | "\}" {
+                    self.i += 1
+                }
+            }
+            let _ = self.skipNoise()
+            fields.push(CParam(name, ty))
+            if not self.take(",") {
+                break
+            }
+        }
+        if not self.take(";") {
+            bits = true
+            while self.i < len(self.t) and self.peek() != ";" and self.peek() != "\}" {
+                self.i += 1
+            }
+            let _ = self.take(";")
+        }
+    }
+    let _ = self.take("\}")
+    let _ = self.skipNoise()
+    self.structs[id].fields = fields
+    self.structs[id].complete = true
+    self.structs[id].bitFields = bits
+    (.Struct(id), true)
+}
+
+// enum Tag { A, B = 2, ... }: its values are constants; whether a body was read
+fn Cp.enumSpec(var self) -> Bool {
+    let _ = self.skipNoise()
+    if self.isIdent() {
+        self.i += 1
+    }
+    if self.peek() == ":" {
+        // enum E : type
+        self.i += 1
+        let _ = self.specifiers()
+    }
+    if self.peek() != "\{" {
+        return false
+    }
+    self.i += 1
+    var next = 0
+    var known = true
+    while self.i < len(self.t) and self.peek() != "\}" {
+        let name = self.peek()
+        let line = self.t[self.i].line
+        let emit = self.emitHere()
+        self.i += 1
+        let _ = self.skipNoise()
+        if self.take("=") {
+            let from = self.i
+            var depth = 0
+            while self.i < len(self.t) and not (depth == 0 and (self.peek() == "," or self.peek() == "\}")) {
+                if self.peek() == "(" {
+                    depth += 1
+                } else if self.peek() == ")" {
+                    depth -= 1
+                }
+                self.i += 1
+            }
+            if evalTokens(self.withoutCasts(self.t[from..self.i]), self.values, false) is Some(v) {
+                next = v
+                known = true
+            } else {
+                known = false
+            }
+        }
+        if known {
+            self.values[name] = next
+            if emit {
+                self.consts.push(CConst(name, "{next}", line))
+            }
+        } else if emit {
+            self.notes.push("{name}: its value could not be worked out")
+        }
+        next += 1
+        if not self.take(",") {
+            break
+        }
+    }
+    let _ = self.take("\}")
+    let _ = self.skipNoise()
+    true
+}
+
+// (type)x is x: a cast to a type's name is left out of a constant's expression
+fn Cp.withoutCasts(self, t: [CTok]) -> [CTok] {
+    var out: [CTok] = []
+    var i = 0
+    while i < len(t) {
+        if t[i].text == "(" and i + 2 < len(t) and t[i + 1].kind == tIdent {
+            var j = i + 1
+            var words = true
+            while j < len(t) and t[j].text != ")" {
+                words = words
+                    and t[j].kind == tIdent
+                    and (self.typedefs.contains(t[j].text)
+                        or t[j].text is "int" | "unsigned" | "long" | "short" | "char" | "signed" | "const")
+                j += 1
+            }
+            if words and j < len(t) {
+                i = j + 1
+                continue
+            }
+        }
+        out.push(t[i])
+        i += 1
+    }
+    out
+}
+
+// A declarator on base: * and qualifiers, a name or a ( declarator ), then ( parameters ) and [ n ]. Its name ("":
+// none) and its type.
+fn Cp.declarator(var self, base0: CType, baseConst: Bool) -> (Text, CType) {
+    var base = base0
+    var isConst = baseConst
+    isConst = self.skipNoise() or isConst
+    while self.peek() == "*" or self.peek() == "^" {
+        self.i += 1
+        base = .Ptr(base, isConst)
+        isConst = self.skipNoise()
+    }
+    var name = ""
+    var inner = -1
+    if self.peek() == "(" and self.i + 1 < len(self.t) and self.startsDeclarator(self.i + 1) {
+        inner = self.i + 1
+        self.skipGroup()
+    } else if self.isIdent() and not self.isTypeWord(self.peek()) {
+        name = self.peek()
+        self.i += 1
+        if self.isIdent()
+            and not self.isTypeWord(self.peek())
+            and self.i + 1 < len(self.t)
+            and self.t[self.i + 1].text == ")" {
+            name = self.peek() // (WORD name): the name is the second
+            self.i += 1
+        }
+    }
+    let _ = self.skipNoise()
+    // what follows: (params) and [n], the first the nearest to the name
+    var suffixes: [CType] = [] // Fn(Void, params, variadic), or Arr(Void, n)
+    while self.i < len(self.t) {
+        if self.peek() == "(" {
+            self.i += 1
+            let (params, variadic) = self.params()
+            suffixes.push(.Fn(.Void, params, variadic))
+        } else if self.peek() == "[" {
+            let from = self.i + 1
+            self.skipGroup()
+            let n = evalTokens(self.withoutCasts(self.t[from..self.i - 1]), self.values, false) ?? 0
+            suffixes.push(.Arr(.Void, n))
+        } else {
+            break
+        }
+        let _ = self.skipNoise()
+    }
+    var ty = base
+    var k = len(suffixes) - 1
+    while k >= 0 {
+        ty = match suffixes[k] {
+            Fn(_, params, variadic) => CType.Fn(ty, params, variadic)
+            Arr(_, n) => CType.Arr(ty, n)
+            _ => ty
+        }
+        k -= 1
+    }
+    if inner >= 0 {
+        // ( * name ): the declarator inside applies to what was built around it
+        let after = self.i
+        self.i = inner
+        let (n, t) = self.declarator(ty, false)
+        self.i = after
+        return (n, t)
+    }
+    (name, ty)
+}
+
+// after a (: a declarator (not a parameter list)
+fn Cp.startsDeclarator(self, at: Int) -> Bool {
+    let x = self.t[at]
+    if x.kind == tPunct {
+        return x.text is "*" | "(" | "^"
+    }
+    if x.text is "__cdecl" | "__stdcall" | "_cdecl" | "_stdcall" | "__fastcall" | "__vectorcall" | "__attribute__" | "__declspec" {
+        return true
+    }
+    if x.kind != tIdent or self.isTypeWord(x.text) or at + 1 >= len(self.t) {
+        return false
+    }
+    // (name), (name)(...), (name[...]), and (WORD name): a calling convention's word no header read here defined
+    let next = self.t[at + 1]
+    next.text is ")" | "(" | "["
+        or next.kind == tIdent
+            and not self.isTypeWord(next.text)
+            and at + 2 < len(self.t)
+            and self.t[at + 2].text == ")"
+}
+
+fn Cp.isTypeWord(self, w: Text) -> Bool =
+    self.typedefs.contains(w)
+        or w is "void" | "char" | "short" | "int" | "long" | "float" | "double" | "signed" | "unsigned" | "struct" | "union" | "enum" | "const" | "volatile" | "_Bool" | "bool" | "__int64" | "va_list" | "__builtin_va_list" | "register" | "restrict"
+
+// a function's parameters, after the (: each one's name and type, and whether ... ends them
+fn Cp.params(var self) -> ([CParam], Bool) {
+    var out: [CParam] = []
+    var variadic = false
+    if self.take(")") {
+        return (out, false)
+    }
+    while self.i < len(self.t) {
+        if self.take("...") {
+            variadic = true
+        } else {
+            let s = self.specifiers()
+            if s.ty is Bad(why) {
+                self.fail(if why != "" {
+                    why
+                } else {
+                    "a parameter's type is not known: {self.peek()}"
+                })
+                // on to the , or the ) that ends it
+                var depth = 0
+                while self.i < len(self.t) and not (depth == 0 and (self.peek() == "," or self.peek() == ")")) {
+                    if self.peek() == "(" {
+                        depth += 1
+                    } else if self.peek() == ")" {
+                        depth -= 1
+                    }
+                    self.i += 1
+                }
+                out.push(CParam("", s.ty))
+            } else {
+                let (name, ty) = self.declarator(s.ty, s.isConst)
+                // an array is its first element's address, a function its address
+                let given = match ty {
+                    Arr(of, _) => CType.Ptr(of, s.isConst)
+                    Fn(_, _, _) => CType.Ptr(ty, false)
+                    _ => ty
+                }
+                out.push(CParam(name, given))
+            }
+        }
+        if not self.take(",") {
+            break
+        }
+    }
+    if not self.take(")") {
+        self.fail("a parameter list does not end")
+        while self.i < len(self.t) and self.peek() != ")" and self.peek() != ";" {
+            self.i += 1
+        }
+        let _ = self.take(")")
+    }
+    if len(out) == 1 and out[0].ty is Void and out[0].name == "" {
+        out = [] // (void)
+    }
+    (out, variadic)
+}
+
+// every declaration of the file
+fn Cp.run(var self) {
+    while self.i < len(self.t) {
+        if self.take(";") {
+            continue
+        }
+        let start = self.i
+        let line = self.t[self.i].line
+        let emit = self.emitHere()
+        self.failed = ""
+        if self.peek() == "extern" and self.i + 1 < len(self.t) and self.t[self.i + 1].kind == tStr {
+            // extern "C" { ... } or extern "C" declaration
+            self.i += 2
+            let _ = self.take("\{")
+            continue
+        }
+        if self.peek() == "\}" {
+            self.i += 1 // (extern "C"'s)
+            continue
+        }
+        if self.peek() is "_Static_assert" | "static_assert" {
+            self.i += 1
+            self.skipGroup()
+            continue
+        }
+        let s = self.specifiers()
+        if s.ty is Bad(why) {
+            if emit and self.isIdent() {
+                self.notes.push("line {line}: {if why != "" { why } else { "not understood: " + self.peek() }}")
+            }
+            self.recover(start)
+            continue
+        }
+        if self.peek() == ";" {
+            self.i += 1 // struct S { ... }; enum { ... };
+            continue
+        }
+        var first = true
+        while self.i < len(self.t) {
+            let (name, ty) = self.declarator(s.ty, s.isConst)
+            if name == "" {
+                if emit {
+                    self.notes.push("line {line}: a declaration not understood")
+                }
+                self.recover(start)
+                break
+            }
+            if s.isTypedef {
+                self.typedefs[name] = ty
+                if ty is Struct(id) and self.structs[id].name == "" {
+                    self.structs[id].name = name
+                }
+            } else if ty is Fn(_, _, _) {
+                if first and self.peek() == "\{" {
+                    self.skipGroup() // a function written here (static inline): nothing to call in the library
+                    break
+                }
+                if emit and not s.isStatic {
+                    if self.failed != "" {
+                        self.notes.push("{name}: {self.failed}")
+                    } else {
+                        self.fns.push(CFn(name, ty, line))
+                    }
+                }
+            } else if emit {
+                self.notes.push("{name}: a variable of the library (only functions are called)")
+            }
+            first = false
+            if self.take("=") {
+                // an initializer
+                while self.i < len(self.t) and not self.peek() is "," | ";" {
+                    if self.peek() is "(" | "\{" | "[" {
+                        self.skipGroup()
+                    } else {
+                        self.i += 1
+                    }
+                }
+            }
+            if not self.take(",") {
+                break
+            }
+        }
+        if not self.take(";") and self.i < len(self.t) and self.i > start and self.t[self.i - 1].text != "\}" {
+            self.recover(self.i)
+        }
+    }
+}
+
+// on to after the next ; outside brackets (never standing still)
+fn Cp.recover(var self, from: Int) {
+    if self.i <= from {
+        self.i = from + 1
+    }
+    while self.i < len(self.t) {
+        let w = self.peek()
+        if w is "(" | "[" | "\{" {
+            self.skipGroup()
+            if w == "\{" and self.peek() != ";" {
+                return
+            }
+        } else {
+            self.i += 1
+            if w == ";" {
+                return
+            }
+        }
+    }
+}
+
+// ---- names ----
+fn allCaps(s: Text) -> Bool = s == s.upper() and s != s.lower()
+
+fn capital(s: Text) -> Text = if len(s) == 0 {
+    s
+} else if allCaps(s) and len(s) > 1 {
+    s[..1] + s[1..].lower()
+} else {
+    s[..1].upper() + s[1..]
+}
+
+fn parts(name: Text) -> [Text] = name.split("_").filter(p => p != "").toArray()
+
+// zlib_version, Z_BEST_SPEED, SDL_CreateWindow as camelCase: zlibVersion, zBestSpeed, sdlCreateWindow
+fn camel(name: Text) -> Text {
+    let ps = parts(name)
+    if len(ps) == 0 {
+        return "x"
+    }
+    var first = ps[0]
+    if allCaps(first) {
+        first = first.lower()
+    } else {
+        // a run of capitals at the start goes down but for its last (the next word's): XMLParser -> xmlParser
+        let b = first.bytes()
+        var caps = 0
+        while caps < len(b) and b[caps] >= 'A' and b[caps] <= 'Z' {
+            caps += 1
+        }
+        let down = if caps <= 1 {
+            caps
+        } else if caps == len(b) {
+            caps
+        } else {
+            caps - 1
+        }
+        first = first[..down].lower() + first[down..]
+    }
+    var out = first
+    for p in ps[1..] {
+        out += capital(p)
+    }
+    if isDigit(out.bytes()[0]) { "n" + out } else { out }
+}
+
+fn pascal(name: Text) -> Text {
+    var out = ""
+    for p in parts(name) {
+        out += capital(p)
+    }
+    if out == "" or isDigit(out.bytes()[0]) { "T" + out } else { out }
+}
+
+fn withoutPrefix(name: Text, prefix: Text) -> Text {
+    if prefix != "" and len(name) > len(prefix) and name[..len(prefix)].lower() == prefix.lower() {
+        let rest = name[len(prefix)..]
+        if not isDigit(rest.bytes()[0]) {
+            return rest
+        }
+    }
+    name
+}
+
+const quarkTypes = [
+    "Int", "Float", "Bool", "Text", "Bytes", "Unit", "Never", "Pointer", "Set", "Task", "Some", "None", "Ok", "Err",
+    "Self", "CText", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float32", "Float64",
+    "Process",
+]
+
+// ---- the writer ----
+type Writer {
+    c: Cp
+    prefix: Text
+    lib: Text
+    used: [Bool] // the structs something written names
+    typeNames: [Text] // each struct's Quark name ("": not named yet)
+    taken: [Text] = []
+    notes: [Text] = []
+}
+
+fn Writer.reserved(self, name: Text) -> Bool =
+    self.taken.contains(name)
+        or keywords.contains(name)
+        or builtinNames.contains(name)
+        or quarkTypes.contains(name)
+        or name is "main" | "self"
+
+// a name nothing written has yet (else the name without its prefix taken off, else numbered)
+fn Writer.fresh(var self, wanted: Text, fallback: Text) -> Text {
+    var name = wanted
+    if self.reserved(name) {
+        name = fallback
+    }
+    if self.reserved(name) and len(name) > 0 and name[..1] == name[..1].lower() and name[..1] != name[..1].upper() {
+        name = "c" + name[..1].upper() + name[1..] // abs is Quark's own: cAbs
+    }
+    var n = 2
+    let stem = name
+    while self.reserved(name) {
+        name = "{stem}{n}"
+        n += 1
+    }
+    self.taken.push(name)
+    name
+}
+
+fn Writer.structName(var self, id: Int) -> Text {
+    if self.typeNames[id] != "" {
+        return self.typeNames[id]
+    }
+    let s = self.c.structs[id]
+    let cName = if s.name != "" {
+        s.name
+    } else if s.tag != "" {
+        s.tag
+    } else {
+        "Anonymous{id}"
+    }
+    let name = self.fresh(pascal(withoutPrefix(cName, self.prefix)), pascal(cName))
+    self.typeNames[id] = name
+    self.used[id] = true
+    name
+}
+
+// whether a struct is written with its fields (C's layout): a body, no union, no bit fields, fields Quark can say
+fn Writer.laidOut(self, id: Int, depth: Int) -> Bool {
+    let s = self.c.structs[id]
+    if not s.complete or s.isUnion or s.bitFields or len(s.fields) == 0 or depth > 8 {
+        return false
+    }
+    s.fields.all(f => self.fieldOk(f.ty, depth))
+}
+
+fn Writer.fieldOk(self, ty: CType, depth: Int) -> Bool = match ty {
+    Int(_, _) | Float(_) | Bool | Enum | Ptr(_, _) => true
+    Arr(of, n) => n > 0 and n <= 64 and self.fieldOk(of, depth + 1) and not of is Arr(_, _)
+    Struct(id) => self.laidOut(id, depth + 1)
+    _ => false
+}
+
+fn intName(bits: Int, signed: Bool) -> Text = (if signed { "Int" } else { "UInt" }) + "{bits}"
+
+// what a pointer points at, as Pointer<...> says it
+fn Writer.pointee(var self, ty: CType) -> Text = match ty {
+    Int(8, _) => "UInt8"
+    // char's bytes, whatever its sign: what Text(p, n) and Bytes(p, n) read
+    Int(bits, signed) => intName(bits, signed)
+    Float(bits) => "Float{bits}"
+    Bool => "Bool"
+    Enum => "Int32"
+    Struct(id) => self.structName(id)
+    Ptr(to, constTo) => self.pointer(to, constTo, false)
+    _ => "UInt8"
+}
+
+// a pointer's type: CText for const char*, else Pointer<T>
+fn Writer.pointer(var self, to: CType, constTo: Bool, optional: Bool) -> Text {
+    let q = if optional { "?" } else { "" }
+    if to is Int(8, true) and constTo {
+        return "CText" + q // const char*: a text (const unsigned char* is bytes)
+    }
+    "Pointer<" + self.pointee(to) + ">" + q
+}
+
+// a parameter's or a result's type; None: Quark cannot say it (why)
+fn Writer.value(var self, ty: CType, isParam: Bool, inFn: Bool) -> Text! {
+    match ty {
+        Int(bits, signed) => Ok(intName(bits, signed))
+        Float(bits) => Ok("Float{bits}")
+        Bool => Ok("Bool")
+        Enum => Ok("Int32")
+        Void => Err("void")
+        VaList => Err("a va_list")
+        Bad(why) => Err(why)
+        Arr(_, _) => Err("an array by value")
+        Fn(_, _, _) => Err("a function by value")
+        Struct(id) => if self.laidOut(id, 0) {
+            Ok(self.structName(id))
+        } else {
+            Err("a struct C does not lay out here, by value")
+        }
+        Ptr(to, constTo) => {
+            // a C function's address: extern (A) -> R, given to C or given back by it
+            if to is Fn(ret, params, variadic) and not inFn and not variadic {
+                if self.fnValue(ret, params) is Ok(t) {
+                    return Ok("(" + t + ")?")
+                }
+            }
+            Ok(self.pointer(to, constTo, not inFn))
+        }
+    }
+}
+
+fn Writer.fnValue(var self, ret: CType, params: [CParam]) -> Text! {
+    var out = "extern ("
+    for (i, p) in params.enumerate() {
+        out += (if i > 0 { ", " } else { "" }) + self.value(p.ty, true, true)?
+    }
+    out += ") -> "
+    out += if ret is Void { "Unit" } else { self.value(ret, false, true)? }
+    Ok(out)
+}
+
+fn Writer.function(var self, f: CFn) -> Text {
+    let Fn(ret, params, variadic) = f.ty else {
+        return ""
+    }
+    var names: [Text] = []
+    var sig = ""
+    for (i, p) in params.enumerate() {
+        let said = self.value(p.ty, true, false)
+        if said is Err(why) {
+            self.notes.push("{f.name}: {why} (parameter {i + 1})")
+            return ""
+        }
+        let t = said ?? ""
+        var name = if p.name == "" { "a{i + 1}" } else { camel(p.name) }
+        if keywords.contains(name) or name == "self" or names.contains(name) {
+            name += "{i + 1}"
+        }
+        names.push(name)
+        sig += (if i > 0 { ", " } else { "" }) + name + ": " + t
+    }
+    if variadic {
+        sig += if len(params) > 0 { ", ..." } else { "..." }
+    }
+    var result = ""
+    if not ret is Void {
+        let said = self.value(ret, false, false)
+        if said is Err(why) {
+            self.notes.push("{f.name}: gives {why}")
+            return ""
+        }
+        result = " -> " + (said ?? "")
+    }
+    let name = self.fresh(camel(withoutPrefix(f.name, self.prefix)), camel(f.name))
+    var out = "pub extern effect fn {name}({sig}){result}"
+    if self.lib != "" {
+        out += " in " + jsonString(self.lib)
+    }
+    if name != f.name {
+        out += " as " + jsonString(f.name)
+    }
+    out + "\n"
+}
+
+fn Writer.fieldType(var self, ty: CType) -> Text = match ty {
+    Int(bits, signed) => intName(bits, signed)
+    Float(bits) => "Float{bits}"
+    Bool => "Bool"
+    Enum => "Int32"
+    Struct(id) => self.structName(id)
+    // a pointer kept in the struct may be NULL too: None
+    Ptr(to, constTo) => if to is Fn(ret, params, false) and self.fnValue(ret, params) is Ok(t) {
+        "(" + t + ")?" // a function kept in the struct: ops.apply(x) calls it
+    } else {
+        self.pointer(to, constTo, true)
+    }
+    _ => "UInt8"
+}
+
+fn Writer.structDecl(var self, id: Int) -> Text {
+    let name = self.structName(id)
+    if not self.laidOut(id, 0) {
+        let s = self.c.structs[id]
+        let why = if not s.complete {
+            ""
+        } else if s.isUnion {
+            " // a union: used through Pointer<{name}>"
+        } else {
+            " // not laid out here (bit fields, long arrays or types Quark has none for): used through Pointer<{name}>"
+        }
+        return "pub extern type {name}{why}\n"
+    }
+    var out = "pub extern type {name} \{\n"
+    var names: [Text] = []
+    for (i, f) in self.c.structs[id].fields.enumerate() {
+        var fname = if f.name == "" { "field{i + 1}" } else { camel(f.name) }
+        if keywords.contains(fname) or fname == "self" or names.contains(fname) {
+            fname += "{i + 1}"
+        }
+        names.push(fname)
+        if f.ty is Arr(of, n) {
+            // C's array inside a struct: its elements, one field each
+            for k in 0..n {
+                out += "    {fname}{k}: {self.fieldType(of)}\n"
+            }
+        } else {
+            out += "    {fname}: {self.fieldType(f.ty)}\n"
+        }
+    }
+    out + "\}\n"
+}
+
+// a #define's value as a Quark constant's: a number, a text; None: neither
+fn constantOf(body: [CTok], values: [Text: Int]) -> Text? {
+    if len(body) == 1 and body[0].kind == tStr and body[0].text.startsWith("\"") {
+        let inner = body[0].text[1..len(body[0].text) - 1]
+        if not inner.contains("\\") and not inner.contains("\{") and not inner.contains("\}") {
+            return Some("\"" + inner + "\"")
+        }
+        return None
+    }
+    if len(body) >= 1 and body[len(body) - 1].kind == tNum and cInt(body[len(body) - 1].text) == None {
+        // a Float: 1.5, -2.0f, 1e-3
+        let neg = len(body) == 2 and body[0].text == "-"
+        if len(body) > 2 or len(body) == 2 and not neg {
+            return None
+        }
+        var t = body[len(body) - 1].text.lower()
+        while t.endsWith("f") or t.endsWith("l") {
+            t = t[..len(t) - 1]
+        }
+        if t.startsWith("0x") or t.startsWith(".") or t.endsWith(".") or not t.contains(".") {
+            let Ok(v) = t.parseFloat() else {
+                return None
+            }
+            t = "{v}"
+            if not t.contains(".") and not t.contains("e") {
+                t += ".0"
+            }
+        }
+        return Some((if neg { "-" } else { "" }) + t)
+    }
+    let v = evalTokens(body, values, false)?
+    Some("{v}")
+}
+
+// ---- the command ----
+type BindOptions {
+    header: Text = ""
+    dirs: [Text] = []
+    defines: [Text] = []
+    lib: Text = ""
+    prefix: Text = ""
+    out: Text = ""
+    windows: Bool = true
+    bad: Text = ""
+}
+
+// the types every C program has without a header read (stddef.h, stdint.h, stdbool.h, sys/types.h)
+fn builtinTypedefs(long: Int) -> [Text: CType] {
+    var t: [Text: CType] = [:]
+    for (name, bits, signed) in [
+        ("int8_t", 8, true),
+        ("int16_t", 16, true),
+        ("int32_t", 32, true),
+        ("int64_t", 64, true),
+        ("uint8_t", 8, false),
+        ("uint16_t", 16, false),
+        ("uint32_t", 32, false),
+        ("uint64_t", 64, false),
+        ("size_t", 64, false),
+        ("ssize_t", 64, true),
+        ("ptrdiff_t", 64, true),
+        ("intptr_t", 64, true),
+        ("uintptr_t", 64, false),
+        ("intmax_t", 64, true),
+        ("uintmax_t", 64, false),
+        ("off_t", long, true),
+        ("off64_t", 64, true),
+        ("time_t", 64, true),
+        ("wchar_t", if long == 32 { 16 } else { 32 }, long != 32),
+        ("char16_t", 16, false),
+        ("char32_t", 32, false),
+        ("int_least8_t", 8, true),
+        ("int_least16_t", 16, true),
+        ("int_least32_t", 32, true),
+        ("int_least64_t", 64, true),
+        ("uint_least8_t", 8, false),
+        ("uint_least16_t", 16, false),
+        ("uint_least32_t", 32, false),
+        ("uint_least64_t", 64, false),
+        ("int_fast8_t", 8, true),
+        ("uint_fast8_t", 8, false),
+        ("int_fast64_t", 64, true),
+        ("uint_fast64_t", 64, false),
+    ] {
+        t[name] = CType.Int(bits, signed)
+    }
+    t
+}
+
+// the header's declarations as Quark's text (its notes said as comments at its end), or None when it is not read
+pub fn bindHeader(o: BindOptions) -> Text? {
+    if not pathExists(o.header) {
+        return None
+    }
+    var pp = Pp(dirs: o.dirs)
+    let none = CTok(tNum, "1", 0, 0, 0, false)
+    // the target, as C compilers say it; and words of the system's headers (not read) that say nothing here
+    var given = ["__STDC__=1", "__STDC_VERSION__=199901", "__x86_64__=1", "CHAR_BIT=8", "SCHAR_MAX=127", "UCHAR_MAX=255", "CHAR_MAX=127", "SHRT_MAX=32767", "USHRT_MAX=65535", "INT_MAX=2147483647", "UINT_MAX=4294967295U", "LLONG_MAX=9223372036854775807LL", "INT8_MAX=127", "INT16_MAX=32767", "INT32_MAX=2147483647", "UINT8_MAX=255", "UINT16_MAX=65535", "UINT32_MAX=4294967295U", "INT64_MAX=9223372036854775807LL", "SIZE_MAX=18446744073709551615ULL", "NULL=0", "SCHAR_MIN=(-128)", "CHAR_MIN=(-128)", "SHRT_MIN=(-32768)", "INT_MIN=(-2147483647-1)", "LLONG_MIN=(-9223372036854775807LL-1)", if o.windows {
+        "LONG_MIN=(-2147483647L-1)"
+    } else {
+        "LONG_MIN=(-9223372036854775807L-1)"
+    }, if o.windows {
+        "LONG_MAX=2147483647L"
+    } else {
+        "LONG_MAX=9223372036854775807L"
+    }, if o.windows {
+        "ULONG_MAX=4294967295UL"
+    } else {
+        "ULONG_MAX=18446744073709551615UL"
+    }]
+    given += if o.windows {
+        ["_WIN32=1", "_WIN64=1", "WINAPI=", "WINAPIV=", "APIENTRY=", "CALLBACK=", "CDECL=", "FAR=", "NEAR=", "PASCAL="]
+    } else {
+        ["__linux__=1", "__unix__=1"]
+    }
+    for d in given + o.defines {
+        let at = d.indexOf("=") ?? -1
+        let name = if at >= 0 { d[..at] } else { d }
+        let value = if at >= 0 { d[at + 1..] } else { "1" }
+        pp.macros[name] = Macro(false, [], false, lexC(value, 0))
+    }
+    pp.files.push("")
+    pp.emits.push(false)
+    pp.file(o.header, true)
+    let long = if o.windows { 32 } else { 64 }
+    var c = Cp(pp.out, pp.emits, long)
+    c.typedefs = builtinTypedefs(long)
+    // the system's own that libraries pass on: FILE, fd_set and jmp_buf are only pointed at, a socket is a number
+    for name in ["FILE", "fd_set", "jmp_buf", "tm", "timeval", "sockaddr"] {
+        c.structs.push(CStruct(tag: name, name: name))
+        c.typedefs[name] = CType.Struct(len(c.structs) - 1)
+        c.tags["struct " + name] = len(c.structs) - 1
+    }
+    c.typedefs["SOCKET"] = if o.windows { CType.Int(64, false) } else { CType.Int(32, true) }
+    c.run()
+    // the #defines: those whose text, expanded, is a number or a text
+    var defines: [CConst] = []
+    for (name, line) in pp.defined {
+        let Some(m) = pp.macros[name] else {
+            continue
+        }
+        if m.isFn or name.startsWith("_") {
+            continue
+        }
+        let body = pp.expand(m.body, [name])
+        if constantOf(c.withoutCasts(body), c.values) is Some(v) {
+            defines.push(CConst(name, v, line))
+        }
+    }
+    var w = Writer(c, o.prefix, o.lib, [false] * len(c.structs), [""] * len(c.structs))
+    // the names of types first, so a function and a type never take the same one
+    for id in 0..len(c.structs) {
+        if c.structs[id].emit and (c.structs[id].name != "" or c.structs[id].tag != "") {
+            let _ = w.structName(id)
+        }
+    }
+    var fns = ""
+    for f in c.fns {
+        if f.name.startsWith("_") {
+            continue
+        }
+        fns += w.function(f)
+    }
+    var types = ""
+    var written = [false] * len(c.structs)
+    var more = true
+    while more {
+        more = false
+        for id in 0..len(c.structs) {
+            if w.used[id] and not written[id] {
+                written[id] = true
+                types += w.structDecl(id)
+                more = true
+            }
+        }
+    }
+    var consts = ""
+    for k in defines + c.consts {
+        if k.name.startsWith("_") {
+            continue
+        }
+        let name = w.fresh(camel(withoutPrefix(k.name, o.prefix)), camel(k.name))
+        consts += "pub const {name} = {k.value}\n"
+    }
+    var out = "// {o.header}, as Quark declares it (quark bind; C's long is {long} bits: {if o.windows { "Windows" } else { "Linux, macOS" }}).\n"
+    out += consts
+    if consts != "" and types != "" {
+        out += "\n"
+    }
+    out += types
+    if fns != "" and (consts != "" or types != "") {
+        out += "\n"
+    }
+    out += fns
+    // as quark fmt writes it, when it reads (else as made: the parser's words say what is wrong)
+    let parsed = parse(Source(o.out, out))
+    var text = if parsed.ok { format(parsed.ast) } else { out }
+    let said = c.notes + w.notes + pp.notes
+    if len(said) > 0 {
+        text += "\n// Not written ({len(said)}):\n"
+        for n in said {
+            text += "//   " + n.replace("\n", " ") + "\n"
+        }
+    }
+    if not parsed.ok {
+        for e in parsed.errors {
+            printErr(e)
+        }
+    }
+    Some(text)
+}
+
+pub fn bindCommand(given: [Text], windows: Bool) -> Int {
+    var o = BindOptions(windows: windows)
+    var i = 1
+    while i < len(given) {
+        let a = given[i]
+        i += 1
+        let more = i < len(given)
+        if a == "-I" and more {
+            o.dirs.push(given[i])
+            i += 1
+        } else if a.startsWith("-I") and len(a) > 2 {
+            o.dirs.push(a[2..])
+        } else if a == "-D" and more {
+            o.defines.push(given[i])
+            i += 1
+        } else if a.startsWith("-D") and len(a) > 2 {
+            o.defines.push(a[2..])
+        } else if a == "--lib" and more {
+            o.lib = given[i]
+            i += 1
+        } else if a == "--prefix" and more {
+            o.prefix = given[i]
+            i += 1
+        } else if a == "--target" and more {
+            o.windows = given[i].endsWith("windows")
+            i += 1
+        } else if a == "-o" and more {
+            o.out = given[i]
+            i += 1
+        } else if not a.startsWith("-") and o.header == "" {
+            o.header = a
+        } else {
+            printErr("quark: unknown option {a}")
+            return 2
+        }
+    }
+    if o.header == "" {
+        printErr(
+            "usage: quark bind header.h [-I dir]... [-D NAME[=value]]... [--lib name] [--prefix P] [--target T] [-o out.qk]",
+        )
+        return 2
+    }
+    let Some(text) = bindHeader(o) else {
+        printErr("quark: cannot read {o.header}")
+        return 1
+    }
+    if o.out != "" {
+        if writeFile(o.out, text) is Err(_) {
+            printErr("quark: cannot write {o.out}")
+            return 1
+        }
+        return 0
+    }
+    if len(text) > 0 {
+        print(text[..len(text) - 1])
+    }
+    0
+}

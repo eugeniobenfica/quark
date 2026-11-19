@@ -1,0 +1,506 @@
+// The runtime's ground: memory as words and bytes, C's library, the context of the running thread, and a message
+// built in place. The runtime IS the arena, so nothing here allocates: Pointers, Ints, Floats, records in
+// registers, loops, and C's functions, as Go's runtime is Go without its heap.
+use std.machine as machine
+
+// ---- C's library (the same names on every system) ----
+pub extern effect fn malloc(size: UInt64) -> Int64
+pub extern effect fn calloc(count: UInt64, size: UInt64) -> Int64
+pub extern effect fn realloc(p: Int64, size: UInt64) -> Int64
+pub extern effect fn free(p: Int64)
+pub extern effect fn memcpy(to: Int64, from: Int64, n: UInt64) -> Int64
+pub extern effect fn memmove(to: Int64, from: Int64, n: UInt64) -> Int64
+pub extern effect fn memset(to: Int64, c: Int32, n: UInt64) -> Int64
+pub extern effect fn memcmp(a: Int64, b: Int64, n: UInt64) -> Int32
+pub extern effect fn strlen(s: Int64) -> UInt64
+pub extern effect fn strtod(s: Int64, end: Int64) -> Float64
+pub extern effect fn strtoll(s: Int64, end: Int64, base: Int32) -> Int64
+pub extern effect fn strerror(code: Int32) -> Int64
+pub extern effect fn cExit(code: Int32) as "exit"
+pub extern fn cFloor(x: Float64) -> Float64 as "floor"
+pub extern fn log10(x: Float64) -> Float64
+pub extern fn fabs(x: Float64) -> Float64
+
+// ---- the system's own (windows.qk, linux.qk: the same symbols, C's calls) ----
+pub extern effect fn osCtx() -> Int64 as "qkosCtx" // the running thread's context (its own storage)
+pub extern effect fn osSetCtx(c: Int64) as "qkosSetCtx"
+pub extern effect fn osWrite(fd: Int64, p: Int64, n: Int64) as "qkosWrite" // 1 stdout, 2 stderr: every byte
+pub extern effect fn osErrno() -> Int64 as "qkosErrno"
+pub extern effect fn osSetErrno(e: Int64) as "qkosSetErrno"
+
+// a Float as C's printf writes it: kind 'g' or 'f', with precision; the length written
+pub extern effect fn osFloatText(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText"
+
+// ---- words and bytes ----
+pub fn word(a: Int, i: Int) -> Int = Pointer<Int64>(a)[i]
+
+pub fn setWord(a: Int, i: Int, v: Int) {
+    Pointer<Int64>(a)[i] = v
+}
+
+pub fn byte(a: Int, i: Int) -> Int = Pointer<UInt8>(a)[i]
+
+pub fn setByte(a: Int, i: Int, v: Int) {
+    Pointer<UInt8>(a)[i] = v
+}
+
+pub fn int32At(a: Int, i: Int) -> Int = Pointer<Int32>(a)[i]
+
+pub fn setInt32(a: Int, i: Int, v: Int) {
+    Pointer<Int32>(a)[i] = v
+}
+
+pub fn floatAt(a: Int, i: Int) -> Float = Pointer<Float64>(a)[i]
+
+pub fn setFloat(a: Int, i: Int, v: Float) {
+    Pointer<Float64>(a)[i] = v
+}
+
+pub fn bitsOf(v: Float) -> Int {
+    let cell = Pointer<Float64>(osScratch())
+    cell[0] = v
+    Pointer<Int64>(cell)[0]
+}
+
+pub fn floatOf(bits: Int) -> Float {
+    let cell = Pointer<Int64>(osScratch())
+    cell[0] = bits
+    Pointer<Float64>(cell)[0]
+}
+
+// eight bytes of the thread's own, for a Float's bits
+fn osScratch() -> Int = ctx() + 8 * ctxScratch
+
+pub fn copyBytes(to: Int, from: Int, n: Int) {
+    if n > 16 {
+        let _ = memcpy(to, from, n)
+    } else if n > 0 {
+        smallMove(to, from, n)
+    }
+}
+
+pub fn moveBytes(to: Int, from: Int, n: Int) {
+    if n > 16 {
+        let _ = memmove(to, from, n)
+    } else if n > 0 {
+        smallMove(to, from, n)
+    }
+}
+
+// 1 to 16 bytes, without a call: all read before any is written (so the two may overlap), as two words, two halves
+// or three bytes that cover them
+fn smallMove(to: Int, from: Int, n: Int) {
+    if n >= 8 {
+        let a = Pointer<Int64>(from)[0]
+        let b = Pointer<Int64>(from + n - 8)[0]
+        Pointer<Int64>(to)[0] = a
+        Pointer<Int64>(to + n - 8)[0] = b
+    } else if n >= 4 {
+        let a = Pointer<UInt32>(from)[0]
+        let b = Pointer<UInt32>(from + n - 4)[0]
+        Pointer<UInt32>(to)[0] = a
+        Pointer<UInt32>(to + n - 4)[0] = b
+    } else {
+        let a = Pointer<UInt8>(from)[0]
+        let b = Pointer<UInt8>(from)[n / 2]
+        let c = Pointer<UInt8>(from)[n - 1]
+        Pointer<UInt8>(to)[0] = a
+        Pointer<UInt8>(to)[n / 2] = b
+        Pointer<UInt8>(to)[n - 1] = c
+    }
+}
+
+pub fn zeroBytes(to: Int, n: Int) {
+    if n > 0 {
+        let _ = memset(to, 0, n)
+    }
+}
+
+// the same n bytes at a and b: eight at a time (the last eight overlapping), C's memcmp only for long runs
+pub fn sameBytes(a: Int, b: Int, n: Int) -> Bool {
+    if n >= 64 {
+        return memcmp(a, b, n) == 0
+    }
+    if n >= 8 {
+        var i = 0
+        while i + 8 < n {
+            if Pointer<Int64>(a + i)[0] != Pointer<Int64>(b + i)[0] {
+                return false
+            }
+            i += 8
+        }
+        return Pointer<Int64>(a + n - 8)[0] == Pointer<Int64>(b + n - 8)[0]
+    }
+    var i = 0
+    while i < n {
+        if Pointer<UInt8>(a)[i] != Pointer<UInt8>(b)[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+// memcmp's sign: the first byte that differs (unsigned); eight at a time up to it
+pub fn compareBytes(a: Int, b: Int, n: Int) -> Int {
+    if n >= 64 {
+        return memcmp(a, b, n)
+    }
+    var i = 0
+    while i + 8 <= n and Pointer<Int64>(a + i)[0] == Pointer<Int64>(b + i)[0] {
+        i += 8
+    }
+    while i < n {
+        let d = Pointer<UInt8>(a)[i] - Pointer<UInt8>(b)[i]
+        if d != 0 {
+            return d
+        }
+        i += 1
+    }
+    0
+}
+
+// ---- eight bytes at a time (SWAR): a word's bytes tested together ----
+pub const lowBytes = 72340172838076673 // 0x0101010101010101
+pub const highBits = -9187201950435737472 // 0x8080808080808080
+
+// the bytes of x that are 0: their high bit set (exact for the first one, which is all a search needs)
+pub fn zeroBytesOf(x: Int) -> Int = (x -% lowBytes) & ~x & highBits
+
+// the first byte at or after i (before n) that is c, else n
+pub fn findByte(t: Int, i0: Int, n: Int, c: Int) -> Int {
+    var i = i0
+    let spread = c * lowBytes
+    while i + 8 <= n {
+        if zeroBytesOf(Pointer<Int64>(t + i)[0] ^ spread) != 0 {
+            break
+        }
+        i += 8
+    }
+    while i < n and Pointer<UInt8>(t)[i] != c {
+        i += 1
+    }
+    i
+}
+
+// the first place at or after i where the pn bytes of part are, else -1: its first byte found eight at a time, its
+// last byte checked, then the rest
+pub fn findBytes(t: Int, i0: Int, n: Int, part: Int, pn: Int) -> Int {
+    if pn == 0 {
+        return if i0 <= n { i0 } else { -1 }
+    }
+    let first = Pointer<UInt8>(part)[0]
+    let last = Pointer<UInt8>(part)[pn - 1]
+    let stop = n - pn + 1 // where a match may start: before stop
+    var i = i0
+    while i < stop {
+        i = findByte(t, i, stop, first)
+        if i >= stop {
+            return -1
+        }
+        if Pointer<UInt8>(t)[i + pn - 1] == last and sameBytes(t + i, part, pn) {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+// ---- the addresses of what Quark holds: a text's bytes, a function's C entry (C gives back what it is given) ----
+pub fn textAt(t: Text) -> Int = machine.address(t)
+
+pub extern fn textAddressOf(p: Int64, n: Int64) -> Int64 as "qkTextAddress" = p
+
+// ---- numbers as C's unsigned ones ----
+pub const intMin = -9223372036854775807 - 1
+
+pub fn shr(x: Int, n: Int) -> Int = if n == 0 { x } else { x >> n & ~(-1 << (64 - n)) }
+
+pub fn below(a: Int, b: Int) -> Bool = a ^ intMin < b ^ intMin // unsigned a < b
+
+// unsigned a / b and a % b
+pub fn udiv(a: Int, b: Int) -> Int {
+    if b < 0 {
+        return if below(a, b) { 0 } else { 1 }
+    }
+    if a >= 0 {
+        return a / b
+    }
+    var q = shr(a, 1) / b << 1
+    let r = a -% q *% b // unsigned
+    if not below(r, b) {
+        q += 1
+    }
+    q
+}
+
+pub fn umod(a: Int, b: Int) -> Int = a -% udiv(a, b) *% b
+
+pub fn mix(x: Int) -> Int {
+    var h = (x ^ shr(x, 30)) *% -4658895280553007687
+    h = (h ^ shr(h, 27)) *% -7723592293110705685
+    h ^ shr(h, 31)
+}
+
+pub fn align16(n: Int) -> Int = (n + 15) & -16
+
+// ---- the context: one per thread that runs Quark ----
+// Words: what the code a loader patched reads and writes (the budget, the panic's frame, the escape, the stack's
+// limit), then the runtime's own: the arena, the code running, a loop's description, the task, the capture.
+pub const ctxFuel = 0
+pub const ctxPanicFrame = 1
+pub const ctxEscapeRsp = 2
+pub const ctxEscapeStub = 3
+pub const ctxStackLimit = 4
+pub const ctxArena = 5
+pub const ctxRunning = 6
+pub const ctxRunningEntry = 7
+pub const ctxDescBase = 8
+pub const ctxTask = 9
+pub const ctxTaskStackLow = 10
+pub const ctxCapture = 11 // print writes into the capture (a value made text) instead of the output
+pub const ctxCaptureBuf = 12
+pub const ctxCaptureLen = 13
+pub const ctxCaptureCap = 14
+pub const ctxGlobals = 15
+pub const ctxScratch = 16 // 128 bytes: an Int's digits, a Float's text, a Float's bits
+pub const ctxPanicText = 32 // 512 bytes: 64 words
+pub const ctxCountLine = 96 // QUARK_VALIDATE=1: the line of the counting call under way (for its check's message)
+pub const ctxWords = 97
+pub const panicTextSize = 512
+
+// The running thread's context: in the context register (machine.context), which every way in from C makes 0; then
+// from the thread's own storage (osCtx), kept in the register for what follows. The Quark code a thread runs calls
+// the runtime the Quark way, so the register goes along.
+pub fn ctx() -> Int {
+    let c = machine.context()
+    if c != 0 { c } else { ctxFromStorage() }
+}
+
+fn ctxFromStorage() -> Int {
+    let c = osCtx()
+    machine.setContext(c)
+    c
+}
+
+// this thread's context set: its storage and the register
+pub fn setCtx(c: Int) {
+    osSetCtx(c)
+    machine.setContext(c)
+}
+
+pub fn ctxGet(i: Int) -> Int = word(ctx(), i)
+
+pub fn ctxSet(i: Int, v: Int) {
+    setWord(ctx(), i, v)
+}
+
+pub fn panicText() -> Int = ctx() + 8 * ctxPanicText
+
+pub fn panicTextLen() -> Int = strlen(panicText())
+
+// ---- what every thread shares ----
+pub const gOutBuf = 0 // print's buffer (stdout), flushed when full, before stderr and at the end
+pub const gOutLen = 1
+pub const gOutCap = 2
+pub const gOutFd = 3 // 1, or 2 while printErr prints
+pub const gArgs = 4 // the program's arguments: (bytes, length) pairs
+pub const gArgCount = 5
+pub const gRuntime = 6 // each runtime function's address (its Quark function), by its number
+pub const gRng = 7 // four words
+pub const gRngSeeded = 11
+pub const gTasks = 12
+pub const gTaskCount = 13
+pub const gTaskCap = 14
+pub const gExitEnds = 15
+pub const gMainCtx = 16
+pub const gMainArena = 17
+pub const gInBuf = 18 // the input, read ahead (readLine)
+pub const gInLen = 19
+pub const gInAt = 20
+pub const gRunPath = 21 // the program's path, as its panics say it (zero-ended; 0: "program")
+pub const gDebug = 22 // the debugger's state (debug.qk), when the command line runs the program under it
+pub const gOutSink = 23 // print's output kept (buffer, length, capacity) rather than written, when not 0
+pub const gBackground = 24 // go(f)'s tasks, by number, that runTasks (and receive, outside a task) step
+pub const gBackgroundCount = 25
+pub const gBackgroundCap = 26
+pub const gChannels = 27 // channel()'s queues, by number
+pub const gChannelCount = 28
+pub const gChannelCap = 29
+pub const gWords = 30
+
+pub fn globals() -> Int = word(ctx(), ctxGlobals)
+
+pub fn gGet(i: Int) -> Int = word(globals(), i)
+
+pub fn gSet(i: Int, v: Int) {
+    setWord(globals(), i, v)
+}
+
+// ---- a message, built in place: bytes at p, room for cap (one kept for the zero) ----
+pub type Buf { p: Int, cap: Int, n: Int }
+
+pub fn bufAt(p: Int, cap: Int) -> Buf {
+    setByte(p, 0, 0)
+    Buf(p, cap, 0)
+}
+
+pub fn Buf.bytes(self, from: Int, count: Int) -> Buf {
+    var k = count
+    if self.n + k > self.cap - 1 {
+        k = self.cap - 1 - self.n
+    }
+    if k <= 0 {
+        return self
+    }
+    copyBytes(self.p + self.n, from, k)
+    setByte(self.p, self.n + k, 0)
+    Buf(self.p, self.cap, self.n + k)
+}
+
+pub fn Buf.text(self, t: Text) -> Buf = self.bytes(textAt(t), len(t))
+
+pub fn Buf.zeroText(self, s: Int) -> Buf = if s == 0 { self } else { self.bytes(s, strlen(s)) }
+
+pub fn Buf.char(self, c: Int) -> Buf {
+    if self.n + 1 > self.cap - 1 {
+        return self
+    }
+    setByte(self.p, self.n, c)
+    setByte(self.p, self.n + 1, 0)
+    Buf(self.p, self.cap, self.n + 1)
+}
+
+pub fn Buf.int(self, v: Int) -> Buf {
+    let s = osScratch() // 24 bytes: an Int's digits, from the end
+    var u = v
+    var at = 23
+    let negative = v < 0
+    if u == 0 {
+        setByte(s, at, '0')
+        at -= 1
+    }
+    while u != 0 {
+        var d = u % 10
+        var next = u / 10
+        if u < 0 and d != 0 {
+            // floored division: back to C's truncation
+            d = 10 - d
+            next += 1
+        }
+        setByte(s, at, '0' + d)
+        at -= 1
+        u = next
+    }
+    if negative {
+        setByte(s, at, '-')
+        at -= 1
+    }
+    self.bytes(s + at + 1, 23 - at)
+}
+
+pub fn Buf.hex(self, v: Int) -> Buf {
+    let s = osScratch()
+    var at = 23
+    var u = v
+    while true {
+        let d = u & 15
+        setByte(s, at, if d < 10 { '0' + d } else { 'a' + d - 10 })
+        at -= 1
+        u = shr(u, 4)
+        if u == 0 {
+            break
+        }
+    }
+    self.bytes(s + at + 1, 23 - at)
+}
+
+// a Float as print writes it: the shortest text that reads back as the same number, with its point
+pub fn Buf.float(self, v: Float) -> Buf {
+    let s = osScratch() + 48 // past an Int's digits: 80 bytes
+    let n = floatText(s, v)
+    self.bytes(s, n)
+}
+
+// v as print writes it, into s (48 bytes); its length
+pub fn floatText(s: Int, v: Float) -> Int {
+    if v != v {
+        return writeText(s, "nan")
+    }
+    if v == 1.0 / 0.0 {
+        return writeText(s, "inf")
+    }
+    if v == -1.0 / 0.0 {
+        return writeText(s, "-inf")
+    }
+    var n = 0
+    for digits in 1..18 {
+        n = osFloatText(s, 48, 'g', digits, v)
+        if strtod(s, 0) != v {
+            continue
+        }
+        let size = fabs(v)
+        if hasByte(s, n, 'e') and size >= 0.0001 and size < 10000000000000000.0 {
+            // 130, not 1.3e+02
+            let decimals = digits - 1 - toInt(cFloor(log10(size)))
+            n = osFloatText(s, 48, 'f', if decimals > 0 { decimals } else { 0 }, v)
+        }
+        break
+    }
+    if not hasByte(s, n, '.') and not hasByte(s, n, 'e') and not hasByte(s, n, 'E') and not hasByte(s, n, 'n') {
+        setByte(s, n, '.')
+        setByte(s, n + 1, '0')
+        n += 2
+    }
+    n
+}
+
+pub fn writeText(s: Int, t: Text) -> Int {
+    copyBytes(s, textAt(t), len(t))
+    len(t)
+}
+
+pub fn hasByte(s: Int, n: Int, c: Int) -> Bool {
+    for i in 0..n {
+        if byte(s, i) == c {
+            return true
+        }
+    }
+    false
+}
+
+// ---- the runtime's own functions, called the C way: what a module below cannot reach by use ----
+pub extern effect fn panicNow(code: Int64, line: Int64, a: Int64, b: Int64) as "qk_panic"
+pub extern effect fn stopNow() as "qkrtStop" // the panic text said; back to the call, or the end
+pub extern effect fn flushOut() as "qkrtFlush" // what print buffered, written
+
+pub const panicIndex = 1
+pub const panicDivide = 2
+pub const panicFuel = 3
+pub const panicEmpty = 5
+pub const panicSize = 6
+pub const panicSliceEnd = 7
+pub const panicSliceStart = 8
+pub const panicStack = 9
+pub const panicTextCut = 10
+pub const panicMemory = 11
+pub const panicOverflow = 12
+pub const panicTooBig = 13
+pub const panicEmptyRange = 14
+pub const panicTask = 15
+pub const panicNanKey = 16
+pub const panicChar = 17
+pub const panicByte = 18
+pub const panicMapFull = 19
+pub const panicFreed = 20 // QUARK_VALIDATE=1: a block counted or let go of after it went back to the heap
+pub const panicDeadlock = 21 // every task waits on a channel, and nothing is left to send on one
+pub const panicClosedChannel = 22
+pub const panicNoChannel = 23
+
+// ---- the runtime's one word of its own: the shared state's address ----
+// Quark has no global variables; the runtime keeps two words in its object's data (quark object --linked makes
+// .data writable, as C's statics are): the bytes of this literal, written once when the program starts (a text is in
+// the data once, however many places use it). qkCell gives it to C.
+pub extern fn cellOfRuntime() -> Int64 as "qkCell" = cell()
+
+pub fn cell() -> Int = textAt("quark-runtime-globals-cell-word!")

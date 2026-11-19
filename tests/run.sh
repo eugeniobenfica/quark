@@ -430,8 +430,9 @@ if bash tests/dap/session.sh "$Q" > "$tmp/out" 2>&1 && cmp -s "$tmp/out" tests/d
 if "$Q" doc tests/doc/shapes.qk | tr -d '\r' | cmp -s - tests/doc/shapes.md; then ok; else bad "quark doc"; fi
 if "$Q" doc tests/doc/shapes.qk -o "$tmp/shapes.html" && grep -qF '<pre><code>pub fn Point.distance(self, other: Point) -&gt; Float</code></pre>' "$tmp/shapes.html"; then ok; else bad "quark doc -o .html"; fi
 # System V calls into a host: records back in registers or through memory, arguments on the stack
-if [ "$CCX" != no-libquark ]; then
-    if "$(dirname "$Q")/sysv-hosts.exe" 2>&1 | tr -d '\r' > "$tmp/out" && cmp -s "$tmp/out" tests/sysv/hosts.out; then ok; else bad "System V host calls"; fi
+# (only with a C compiler: build.sh linked them with this libquark, not an older one)
+if [ "$CCX" != no-libquark ] && command -v "$CCX" > /dev/null 2>&1; then
+    if "$(dirname "$Q")/sysv-hosts.exe" 2>&1 | tr -d '\r' > "$tmp/out" && cmp -s "$tmp/out" tests/sysv/hosts.out; then ok; else bad "System V host calls"; diff tests/sysv/hosts.out "$tmp/out" | head -10; fi
     # embedding: the host example (host functions, events, hot reload, panics, budget, graphs, catalog)
     H=$(dirname "$Q")/host.exe
     if "$H" 2>&1 | tr -d '\r' > "$tmp/out" && cmp -s "$tmp/out" examples/host/host.out; then ok; else bad "host example"; diff examples/host/host.out "$tmp/out" | head -10; fi

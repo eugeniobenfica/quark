@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2
+
+- **System V (x86-64 Linux and macOS).** 0.9.1 brought xmm8-15 back after a call into C over the call's result when
+  the result's home was one of them; they now come back before the results go home.
+- **Tests.** The C hosts run only where a C compiler linked them with the libquark just built (an older one hid
+  this), and a host whose output differs shows how.
+
 ## 0.9.1
 
 Fixes found by the first runs of the CI on every platform.

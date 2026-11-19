@@ -5,6 +5,7 @@ name: Checks
 # (tools/fuzz.qk), and the compiler's own sources in canonical form. On every change, and longer every night.
 on:
   push:
+    branches: ["**"] # not tags: a release's tag is the commit main already ran
   pull_request:
   workflow_dispatch:
   schedule:

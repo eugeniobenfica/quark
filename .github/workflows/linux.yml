@@ -4,6 +4,7 @@ name: Linux
 # point, and runs the whole test suite with it.
 on:
   push:
+    branches: ["**"] # not tags: a release's tag is the commit main already ran
   pull_request:
   workflow_dispatch:
 

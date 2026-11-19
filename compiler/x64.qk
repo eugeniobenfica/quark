@@ -1654,6 +1654,8 @@ fn X64.genHostCall(var self, ins: IrIns) {
         self.movReloc(rax, relocHost, ins.imm)
         self.bytes([0xFF, 0xD0]) // call rax
     }
+    // xmm8-15 back before the results go home (rax, rdx, xmm0, xmm1 or the buffer): a result's home may be one of them
+    self.spillAcrossC(false)
     if hidden {
         for i in 0..ins.retCount {
             let r = self.operands[ins.from + ins.argCount + i]
@@ -1688,7 +1690,6 @@ fn X64.genHostCall(var self, ins: IrIns) {
             self.storeBits(self.operands[ins.from + ins.argCount + 0], rax)
         }
     }
-    self.spillAcrossC(false)
 }
 
 // A comparison whose only reader is the jump right after it: one compare, one conditional jump.

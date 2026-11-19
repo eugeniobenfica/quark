@@ -4,7 +4,7 @@ What Quark promises to keep working, from version 1.0 on, and how anything that 
 `quark version` prints the compiler's version and the version of each contract below.
 
 ```
-quark 0.9.1 (windows, x86_64)
+quark 0.9.2 (windows, x86_64)
 language edition 1, QGN 1, C API 1
 ```
 

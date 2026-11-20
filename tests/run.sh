@@ -162,7 +162,8 @@ printf 'fn main() {
 if [ "$(timeout 30 "$Q" run "$tmp/linear.qk" 2>&1 | tr -d '\r')" = "15263890 1000000" ]; then ok; else bad "building a text or a list is linear"; fi
 # a parser's loops: an outer loop that keeps what it makes (a million turns) calling functions with loops of their own
 # that make memory too, and an inner loop that collects at each call while it adds to the outer loop's array, are
-# linear: four times the turns take about four times as long (quadratic: sixteen)
+# linear: four times the turns take about four times as long (quadratic: sixteen); up to eight, as CI's machines
+# measure 6 to 6.4 times now and then for what takes 4.5 here
 cat > "$tmp/nested.qk" <<'EOF'
 type Tok { kind: Int, text: Text, line: Int }
 
@@ -248,8 +249,8 @@ fn main() {
         }
         times.push(best)
     }
-    print(if times[1] < times[0] * 6 { "linear" } else { "{times[1] / times[0]} times" })
-    print(if times[3] < times[2] * 6 { "linear" } else { "{times[3] / times[2]} times" })
+    print(if times[1] < times[0] * 8 { "linear" } else { "{times[1] / times[0]} times" })
+    print(if times[3] < times[2] * 8 { "linear" } else { "{times[3] / times[2]} times" })
 }
 EOF
 want=$(printf '100000 400000 100000 w99999_1

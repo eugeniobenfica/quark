@@ -2944,10 +2944,10 @@ pub fn localNow() -> DateTime = local(unixTime())
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "3112144647-2235416"
+pub const compilerSources = "2163936936-2260751"
 
 // the runtime's files
-pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "windows"]
+pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
 
 // compiler/runtime/NAME.qk's text
 pub fn runtimeText(name: Text) -> Text? {
@@ -12490,9 +12490,19 @@ pub fn appendTrace(inl: Int) {
 // instructions (compiler/wasm.qk). One thread: no tasks on stacks of their own, no other programs, no sockets.
 use std.machine as machine
 use base
-use start
 use print
 use arena
+use panic
+use text
+use map
+use loops
+use numbers
+use files
+use io
+use tasks
+use threads
+use debug
+use wasimath
 
 const wasi = "wasi_snapshot_preview1"
 
@@ -13139,12 +13149,751 @@ pub extern effect fn wasiBegin() as "qkWasiBegin" {
     begin(count, argv)
 }
 
+// the process's state, its first context and arena, as start.qk's begin makes them, without the runtime's table
+// (what loaded code reads: none is loaded here)
+fn begin(argc: Int, argv: Int) {
+    let g = calloc(gWords, 8)
+    setWord(cell(), 0, g)
+    let c = calloc(ctxWords, 8)
+    setWord(c, ctxFuel, -1 - intMin)
+    setWord(c, ctxGlobals, g)
+    setWord(c, ctxArena, arenaNew())
+    setCtx(c)
+    setWord(g, gMainCtx, c)
+    setWord(g, gMainArena, word(c, ctxArena))
+    setWord(g, gOutBuf, malloc(65536))
+    setWord(g, gOutFd, 1)
+    setWord(g, gExitEnds, 1)
+    let count = if argc > 1 { argc - 1 } else { 0 }
+    let args = malloc(16 * count + 16)
+    for i in 0..count {
+        let s = word(argv, i + 1)
+        setWord(args, 2 * i, s)
+        setWord(args, 2 * i + 1, strlen(s))
+    }
+    setWord(g, gArgs, args)
+    setWord(g, gArgCount, count)
+}
+
 // quark build --memory: the program's limit
 pub extern effect fn wasiLimit(bytes: Int64) as "qkWasiLimit" = setLimit(arena(), bytes)
 
 pub extern effect fn wasiEnd(status: Int64) as "qkWasiEnd" {
     flush()
     procExit(status)
+}
+""" + "\n"
+    }
+    if name == "wasimath" {
+        return r"""
+// The mathematics C's library gives elsewhere, for WebAssembly (runtime/wasi.qk): fdlibm's ways (Sun's, as musl
+// keeps them), below one unit in the last place: sin, cos, tan, asin, acos, atan, atan2, exp, log, log10, pow.
+// The arguments of sin, cos and tan are reduced by pi/2 in three parts (Cody and Waite), exact to 2^20 * pi/2;
+// past that the reduction loses digits (fdlibm's reduction by the bits of 2/pi is not here).
+use base
+
+// a Float's high and low 32 bits (the high signed), and back
+fn hi(x: Float) -> Int = bitsOf(x) >> 32
+
+fn lo(x: Float) -> Int = bitsOf(x) & 4294967295
+
+fn ofWords(h: Int, l: Int) -> Float = floatOf(h << 32 | l & 4294967295)
+
+fn lowZero(x: Float) -> Float = floatOf(bitsOf(x) & -4294967296)
+
+// 2^e, for e from -1022 to 1023
+fn two(e: Int) -> Float = floatOf((1023 + e) << 52)
+
+fn isNan(x: Float) -> Bool = x != x
+
+fn magnitude(x: Float) -> Float = if x < 0.0 { -x } else { x }
+
+// x * 2^n
+fn scalbn(x: Float, n: Int) -> Float {
+    var y = x
+    var k = n
+    if k > 1023 {
+        y *= two(1023)
+        k -= 1023
+        if k > 1023 {
+            y *= two(1023)
+            k -= 1023
+            if k > 1023 {
+                k = 1023
+            }
+        }
+    } else if k < -1022 {
+        y *= two(-1022) * two(53)
+        k += 1022 - 53
+        if k < -1022 {
+            y *= two(-1022) * two(53)
+            k += 1022 - 53
+            if k < -1022 {
+                k = -1022
+            }
+        }
+    }
+    y * two(k)
+}
+
+// ---- sin, cos, tan ----
+fn kernelSin(x: Float, y: Float, iy: Int) -> Float {
+    let z = x * x
+    let w = z * z
+    let r = 0.00833333333332248946124
+        + z * (-0.000198412698298579493134 + z * 0.00000275573137070700676789)
+        + z * w * (-0.0000000250507602534068634195 + z * 0.000000000158969099521155010221)
+    let v = z * x
+    if iy == 0 {
+        x + v * (-0.166666666666666324348 + z * r)
+    } else {
+        x - (z * (0.5 * y - v * r) - y - v * -0.166666666666666324348)
+    }
+}
+
+fn kernelCos(x: Float, y: Float) -> Float {
+    let z = x * x
+    let w = z * z
+    let r = z * (0.0416666666666666019037 + z * (-0.00138888888888741095749 + z * 0.0000248015872894767294178))
+        + w * w * (-0.000000275573143513906633035
+            + z * (0.00000000208757232129817482790 + z * -0.0000000000113596475577881948265))
+    let hz = 0.5 * z
+    let v = 1.0 - hz
+    v + (1.0 - v - hz + (z * r - x * y))
+}
+
+const tanT = [
+    0.333333333333334091986, 0.133333333333201242699, 0.0539682539762260521377, 0.0218694882948595424599,
+    0.00886323982359930005737, 0.00359207910759131235356, 0.00145620945432529025516, 0.000588041240820264096874,
+    0.000246463134818469906812, 0.0000781794442939557092300, 0.0000714072491382608190305, -0.0000185586374855275456654,
+    0.0000259073051863633712884,
+]
+
+fn kernelTan(x0: Float, y0: Float, odd: Int) -> Float {
+    var x = x0
+    var y = y0
+    let hx = hi(x)
+    let big = hx & 0x7fffffff >= 0x3FE59428 // |x| >= 0.6744
+    let negative = hx < 0
+    if big {
+        if negative {
+            x = -x
+            y = -y
+        }
+        x = 0.785398163397448278999 - x + (0.0000000000000000306161699786838301793 - y)
+        y = 0.0
+    }
+    let t = tanT
+    let z = x * x
+    let w = z * z
+    let r0 = t[1] + w * (t[3] + w * (t[5] + w * (t[7] + w * (t[9] + w * t[11]))))
+    let v0 = z * (t[2] + w * (t[4] + w * (t[6] + w * (t[8] + w * (t[10] + w * t[12])))))
+    let s = z * x
+    let r = y + z * (s * (r0 + v0) + y) + s * t[0]
+    let sum = x + r
+    if big {
+        let sg = toFloat(1 - 2 * odd)
+        let v = sg - 2.0 * (x + (r - sum * sum / (sum + sg)))
+        return if negative { -v } else { v }
+    }
+    if odd == 0 {
+        return sum
+    }
+    // -1 / (x + r), accurately
+    let w0 = lowZero(sum)
+    let v = r - (w0 - x)
+    let a = -1.0 / sum
+    let a0 = lowZero(a)
+    a0 + a * (1.0 + a0 * w0 + a0 * v)
+}
+
+// x reduced by pi/2: n (the quarter turns), and the rest as two Floats
+fn remPio2(x: Float) -> (Int, Float, Float) {
+    let ix = hi(x) & 0x7fffffff
+    if ix >= 0x7ff00000 {
+        return (0, x - x, x - x)
+    }
+    let toint = 6755399441055744.0 // 1.5 / epsilon: adding it rounds to an integer
+    let q = x * 0.636619772367581382433 + toint - toint
+    let n = toInt(q)
+    var r = x - q * 1.57079632673412561417
+    var w = q * 0.0000000000607710050650619224932
+    var y0 = r - w
+    let ex = ix >> 20
+    var ey = hi(y0) >> 20 & 0x7ff
+    if ex - ey > 16 {
+        // a second part of pi/2: 118 bits
+        var t = r
+        w = q * 0.0000000000607710050630396597660
+        r = t - w
+        w = q * 0.00000000000000000000202226624879595063154 - (t - r - w)
+        y0 = r - w
+        ey = hi(y0) >> 20 & 0x7ff
+        if ex - ey > 49 {
+            // a third: 151 bits
+            t = r
+            w = q * 0.00000000000000000000202226624871116645580
+            r = t - w
+            w = q * 0.0000000000000000000000000000000847842766036889956997 - (t - r - w)
+            y0 = r - w
+        }
+    }
+    let y1 = r - y0 - w
+    (n, y0, y1)
+}
+
+pub extern fn wasiSin(x: Float64) -> Float64 as "sin" {
+    let ix = hi(x) & 0x7fffffff
+    if ix <= 0x3fe921fb {
+        return if ix < 0x3e500000 { x } else { kernelSin(x, 0.0, 0) }
+    }
+    if ix >= 0x7ff00000 {
+        return x - x
+    }
+    let (n, a, b) = remPio2(x)
+    match n & 3 {
+        0 => kernelSin(a, b, 1)
+        1 => kernelCos(a, b)
+        2 => -kernelSin(a, b, 1)
+        _ => -kernelCos(a, b)
+    }
+}
+
+pub extern fn wasiCos(x: Float64) -> Float64 as "cos" {
+    let ix = hi(x) & 0x7fffffff
+    if ix <= 0x3fe921fb {
+        return if ix < 0x3e46a09e { 1.0 } else { kernelCos(x, 0.0) }
+    }
+    if ix >= 0x7ff00000 {
+        return x - x
+    }
+    let (n, a, b) = remPio2(x)
+    match n & 3 {
+        0 => kernelCos(a, b)
+        1 => -kernelSin(a, b, 1)
+        2 => -kernelCos(a, b)
+        _ => kernelSin(a, b, 1)
+    }
+}
+
+pub extern fn wasiTan(x: Float64) -> Float64 as "tan" {
+    let ix = hi(x) & 0x7fffffff
+    if ix <= 0x3fe921fb {
+        return if ix < 0x3e400000 { x } else { kernelTan(x, 0.0, 0) }
+    }
+    if ix >= 0x7ff00000 {
+        return x - x
+    }
+    let (n, a, b) = remPio2(x)
+    kernelTan(a, b, n & 1)
+}
+
+// ---- atan, atan2, asin, acos ----
+const atanHi = [0.463647609000806093515, 0.785398163397448278999, 0.982793723247329054082, 1.57079632679489655800]
+
+const atanLo = [
+    0.0000000000000000226987774529616870924, 0.0000000000000000306161699786838301793,
+    0.0000000000000000139033110312309984516, 0.0000000000000000612323399573676603587,
+]
+
+const aT = [
+    0.333333333333329318027, -0.199999999998764832476, 0.142857142725034663711, -0.111111104054623557880,
+    0.0909088713343650656196, -0.0769187620504482999495, 0.0666107313738753120669, -0.0583357013379057348645,
+    0.0497687799461593236017, -0.0365315727442169155270, 0.0162858201153657823623,
+]
+
+pub extern fn wasiAtan(x0: Float64) -> Float64 as "atan" {
+    var x = x0
+    let hx = hi(x)
+    let ix = hx & 0x7fffffff
+    let negative = hx < 0
+    if ix >= 0x44100000 {
+        // |x| >= 2^66
+        if isNan(x) {
+            return x
+        }
+        let z = atanHi[3] + two(-120)
+        return if negative { -z } else { z }
+    }
+    var id = -1
+    if ix < 0x3fdc0000 {
+        if ix < 0x3e400000 {
+            return x
+        }
+    } else {
+        x = magnitude(x)
+        if ix < 0x3ff30000 {
+            if ix < 0x3fe60000 {
+                id = 0
+                x = (2.0 * x - 1.0) / (2.0 + x)
+            } else {
+                id = 1
+                x = (x - 1.0) / (x + 1.0)
+            }
+        } else if ix < 0x40038000 {
+            id = 2
+            x = (x - 1.5) / (1.0 + 1.5 * x)
+        } else {
+            id = 3
+            x = -1.0 / x
+        }
+    }
+    let z = x * x
+    let w = z * z
+    let s1 = z * (aT[0] + w * (aT[2] + w * (aT[4] + w * (aT[6] + w * (aT[8] + w * aT[10])))))
+    let s2 = w * (aT[1] + w * (aT[3] + w * (aT[5] + w * (aT[7] + w * aT[9]))))
+    if id < 0 {
+        return x - x * (s1 + s2)
+    }
+    let r = atanHi[id] - (x * (s1 + s2) - atanLo[id] - x)
+    if negative { -r } else { r }
+}
+
+const pi = 3.14159265358979311600
+const piLo = 0.000000000000000122464679914735317720
+
+pub extern fn wasiAtan2(y: Float64, x: Float64) -> Float64 as "atan2" {
+    if isNan(x) or isNan(y) {
+        return x + y
+    }
+    var ix = hi(x)
+    let lx = lo(x)
+    var iy = hi(y)
+    let ly = lo(y)
+    if ix - 0x3ff00000 | lx == 0 {
+        return wasiAtan(y) // x is 1
+    }
+    let m = (if iy < 0 { 1 } else { 0 }) | (if ix < 0 { 2 } else { 0 })
+    ix &= 0x7fffffff
+    iy &= 0x7fffffff
+    if iy | ly == 0 {
+        // y is 0
+        return match m {
+            0 | 1 => y
+            2 => pi
+            _ => -pi
+        }
+    }
+    if ix | lx == 0 {
+        return if m & 1 != 0 { -pi / 2.0 } else { pi / 2.0 }
+    }
+    if ix == 0x7ff00000 {
+        if iy == 0x7ff00000 {
+            return match m {
+                0 => pi / 4.0
+                1 => -pi / 4.0
+                2 => 3.0 * pi / 4.0
+                _ => -3.0 * pi / 4.0
+            }
+        }
+        return match m {
+            0 => 0.0
+            1 => -0.0
+            2 => pi
+            _ => -pi
+        }
+    }
+    if ix + 64 << 20 < iy or iy == 0x7ff00000 {
+        return if m & 1 != 0 { -pi / 2.0 } else { pi / 2.0 }
+    }
+    let z = if m & 2 != 0 and iy + 64 << 20 < ix {
+        0.0
+    } else {
+        wasiAtan(magnitude(y / x))
+    }
+    match m {
+        0 => z
+        1 => -z
+        2 => pi - (z - piLo)
+        _ => z - piLo - pi
+    }
+}
+
+const pio2Hi = 1.57079632679489655800
+const pio2Lo = 0.0000000000000000612323399573676603587
+
+fn rAsin(z: Float) -> Float {
+    let p = z * (0.166666666666666657415
+        + z * (-0.325565818622400915405
+            + z * (0.201212532134862925881
+                + z * (-0.0400555345006794114027 + z * (0.000791534994289814532176 + z * 0.0000347933107596021167570)))))
+    let q = 1.0
+        + z * (-2.40339491173441421878
+            + z * (2.02094576023350569471 + z * (-0.688283971605453293030 + z * 0.0770381505559019352791)))
+    p / q
+}
+
+pub extern fn wasiAsin(x: Float64) -> Float64 as "asin" {
+    let hx = hi(x)
+    let ix = hx & 0x7fffffff
+    if ix >= 0x3ff00000 {
+        if ix - 0x3ff00000 | lo(x) == 0 {
+            return x * pio2Hi + two(-120) // asin(1) = pi/2
+        }
+        return (x - x) / (x - x) // past 1: NaN
+    }
+    if ix < 0x3fe00000 {
+        if ix < 0x3e500000 and ix >= 0x00100000 {
+            return x
+        }
+        return x + x * rAsin(x * x)
+    }
+    let z = (1.0 - magnitude(x)) * 0.5
+    let s = sqrt(z)
+    let r = rAsin(z)
+    var v = 0.0
+    if ix >= 0x3fef3333 {
+        v = pio2Hi - (2.0 * (s + s * r) - pio2Lo)
+    } else {
+        let f = lowZero(s)
+        let c = (z - f * f) / (s + f)
+        v = 0.5 * pio2Hi - (2.0 * s * r - (pio2Lo - 2.0 * c) - (0.5 * pio2Hi - 2.0 * f))
+    }
+    if hx < 0 { -v } else { v }
+}
+
+pub extern fn wasiAcos(x: Float64) -> Float64 as "acos" {
+    let hx = hi(x)
+    let ix = hx & 0x7fffffff
+    if ix >= 0x3ff00000 {
+        if ix - 0x3ff00000 | lo(x) == 0 {
+            return if hx < 0 { 2.0 * pio2Hi + two(-120) } else { 0.0 }
+        }
+        return (x - x) / (x - x)
+    }
+    if ix < 0x3fe00000 {
+        if ix <= 0x3c600000 {
+            return pio2Hi + two(-120)
+        }
+        return pio2Hi - (x - (pio2Lo - x * rAsin(x * x)))
+    }
+    if hx < 0 {
+        let z = (1.0 + x) * 0.5
+        let s = sqrt(z)
+        let w = rAsin(z) * s - pio2Lo
+        return 2.0 * (pio2Hi - (s + w))
+    }
+    let z = (1.0 - x) * 0.5
+    let s = sqrt(z)
+    let df = lowZero(s)
+    let c = (z - df * df) / (s + df)
+    let w = rAsin(z) * s + c
+    2.0 * (df + w)
+}
+
+// ---- exp, log, log10 ----
+const ln2Hi = 0.693147180369123816490
+const ln2Lo = 0.000000000190821492927058770002
+
+fn expPoly(t: Float) -> Float =
+    t * (0.166666666666666019037
+        + t * (-0.00277777777770155933842
+            + t * (0.0000661375632143793436117
+                + t * (-0.00000165339022054652515390 + t * 0.0000000413813679705723846039))))
+
+pub extern fn wasiExp(x0: Float64) -> Float64 as "exp" {
+    var x = x0
+    let h = hi(x)
+    let negative = h < 0
+    let hx = h & 0x7fffffff
+    if hx >= 0x4086232b {
+        // |x| >= 708.39
+        if isNan(x) {
+            return x
+        }
+        if x > 709.782712893383973096 {
+            return x * two(1023) // overflow: infinity
+        }
+        if x < -745.13321910194110842 {
+            return 0.0
+        }
+    }
+    var k = 0
+    var hiPart = 0.0
+    var loPart = 0.0
+    if hx > 0x3fd62e42 {
+        // |x| > ln2 / 2
+        if hx >= 0x3ff0a2b2 {
+            k = toInt(1.44269504088896338700 * x + (if negative { -0.5 } else { 0.5 }))
+        } else {
+            k = if negative { -1 } else { 1 }
+        }
+        hiPart = x - toFloat(k) * ln2Hi
+        loPart = toFloat(k) * ln2Lo
+        x = hiPart - loPart
+    } else if hx > 0x3e300000 {
+        hiPart = x
+    } else {
+        return 1.0 + x
+    }
+    let xx = x * x
+    let c = x - xx * (0.166666666666666019037
+        + xx * (-0.00277777777770155933842
+            + xx * (0.0000661375632143793436117
+                + xx * (-0.00000165339022054652515390 + xx * 0.0000000413813679705723846039))))
+    let y = 1.0 + (x * c / (2.0 - c) - loPart + hiPart)
+    if k == 0 { y } else { scalbn(y, k) }
+}
+
+pub extern fn wasiLog(x0: Float64) -> Float64 as "log" {
+    var x = x0
+    var hx = hi(x) & 4294967295
+    var k = 0
+    if hx < 0x00100000 or hx >> 31 != 0 {
+        if bitsOf(x) << 1 == 0 {
+            return -1.0 / (x * x) // log(0) = -infinity
+        }
+        if hx >> 31 != 0 {
+            return (x - x) / 0.0 // log of a negative: NaN
+        }
+        // subnormal: scaled up
+        k -= 54
+        x *= two(54)
+        hx = hi(x) & 4294967295
+    } else if hx >= 0x7ff00000 {
+        return x
+    } else if hx == 0x3ff00000 and lo(x) == 0 {
+        return 0.0
+    }
+    // x = 2^k * (1 + f), with sqrt(2)/2 < 1 + f < sqrt(2)
+    hx += 0x3ff00000 - 0x3fe6a09e
+    k += hx >> 20 - 0x3ff
+    hx = hx & 0x000fffff + 0x3fe6a09e
+    x = ofWords(hx, lo(x))
+    let f = x - 1.0
+    let hfsq = 0.5 * f * f
+    let s = f / (2.0 + f)
+    let z = s * s
+    let w = z * z
+    let t1 = w * (0.3999999999940941908 + w * (0.2222219843214978396 + w * 0.1531383769920937332))
+    let t2 = z * (0.6666666666666735130
+        + w * (0.2857142874366239149 + w * (0.1818357216161805012 + w * 0.1479819860511658591)))
+    let r = t2 + t1
+    let dk = toFloat(k)
+    s * (hfsq + r) + dk * ln2Lo - hfsq + f + dk * ln2Hi
+}
+
+pub extern fn wasiLog10(x: Float64) -> Float64 as "log10" = wasiLog(x) * 0.434294481903251827651
+
+// ---- pow ----
+pub extern fn wasiPow(x: Float64, y: Float64) -> Float64 as "pow" {
+    let hx = hi(x)
+    let lx = lo(x)
+    let hy = hi(y)
+    let ly = lo(y)
+    var ix = hx & 0x7fffffff
+    let iy = hy & 0x7fffffff
+    if iy | ly == 0 {
+        return 1.0 // x^0, even for NaN
+    }
+    if hx == 0x3ff00000 and lx == 0 {
+        return 1.0 // 1^y, even for NaN
+    }
+    if ix > 0x7ff00000 or ix == 0x7ff00000 and lx != 0 or iy > 0x7ff00000 or iy == 0x7ff00000 and ly != 0 {
+        return x + y
+    }
+    // y an odd integer (1), an even one (2), or not one (0), when x < 0
+    var yisint = 0
+    if hx < 0 {
+        if iy >= 0x43400000 {
+            yisint = 2
+        } else if iy >= 0x3ff00000 {
+            let k = iy >> 20 - 0x3ff
+            if k > 20 {
+                let j = ly >> (52 - k)
+                if j << (52 - k) == ly {
+                    yisint = 2 - j & 1
+                }
+            } else if ly == 0 {
+                let j = iy >> (20 - k)
+                if j << (20 - k) == iy {
+                    yisint = 2 - j & 1
+                }
+            }
+        }
+    }
+    if ly == 0 {
+        if iy == 0x7ff00000 {
+            // y is +-infinity
+            if ix - 0x3ff00000 | lx == 0 {
+                return 1.0
+            }
+            if ix >= 0x3ff00000 {
+                return if hy >= 0 { y } else { 0.0 }
+            }
+            return if hy >= 0 { 0.0 } else { -y }
+        }
+        if iy == 0x3ff00000 {
+            return if hy >= 0 { x } else { 1.0 / x }
+        }
+        if hy == 0x40000000 {
+            return x * x
+        }
+        if hy == 0x3fe00000 and hx >= 0 {
+            return sqrt(x)
+        }
+    }
+    var ax = magnitude(x)
+    if lx == 0 and (ix == 0x7ff00000 or ix == 0 or ix == 0x3ff00000) {
+        // x is +-0, +-infinity, +-1
+        var z = ax
+        if hy < 0 {
+            z = 1.0 / z
+        }
+        if hx < 0 {
+            if ix - 0x3ff00000 | yisint == 0 {
+                z = (z - z) / (z - z)
+            } else if yisint == 1 {
+                z = -z
+            }
+        }
+        return z
+    }
+    var s = 1.0
+    if hx < 0 {
+        if yisint == 0 {
+            return (x - x) / (x - x)
+        }
+        if yisint == 1 {
+            s = -1.0
+        }
+    }
+    let huge = 1.0e300
+    let tiny = 1.0e-300
+    var t1 = 0.0
+    var t2 = 0.0
+    if iy > 0x41e00000 {
+        // |y| > 2^31
+        if iy > 0x43f00000 {
+            if ix <= 0x3fefffff {
+                return if hy < 0 { huge * huge } else { tiny * tiny }
+            }
+            if ix >= 0x3ff00000 {
+                return if hy > 0 { huge * huge } else { tiny * tiny }
+            }
+        }
+        if ix < 0x3fefffff {
+            return if hy < 0 { s * huge * huge } else { s * tiny * tiny }
+        }
+        if ix > 0x3ff00000 {
+            return if hy > 0 { s * huge * huge } else { s * tiny * tiny }
+        }
+        // |1 - x| is tiny: log(x) by x - x^2/2 + x^3/3 - x^4/4
+        let t = ax - 1.0
+        let w = t * t * (0.5 - t * (0.3333333333333333333333 - t * 0.25))
+        let u = 1.44269502162933349609 * t
+        let v = t * 0.0000000192596299112661746887 - w * 1.44269504088896338700
+        t1 = lowZero(u + v)
+        t2 = v - (t1 - u)
+    } else {
+        var n = 0
+        if ix < 0x00100000 {
+            ax *= 9007199254740992.0
+            n -= 53
+            ix = hi(ax)
+        }
+        n += ix >> 20 - 0x3ff
+        let j = ix & 0x000fffff
+        ix = j | 0x3ff00000
+        var k = 0
+        if j <= 0x3988E {
+            k = 0
+        } else if j < 0xBB67A {
+            k = 1
+        } else {
+            k = 0
+            n += 1
+            ix -= 0x00100000
+        }
+        ax = ofWords(ix, lo(ax))
+        let bp = if k == 0 { 1.0 } else { 1.5 }
+        let dpH = if k == 0 { 0.0 } else { 0.584962487220764160156 }
+        let dpL = if k == 0 { 0.0 } else { 0.0000000135003920212974897128 }
+        // ss = (x - 1) / (x + 1) or (x - 1.5) / (x + 1.5)
+        let u0 = ax - bp
+        let v0 = 1.0 / (ax + bp)
+        let ss = u0 * v0
+        let sH = lowZero(ss)
+        let tH0 = ofWords(ix >> 1 | 0x20000000 + 0x00080000 + k << 18, 0)
+        let tL0 = ax - (tH0 - bp)
+        let sL = v0 * (u0 - sH * tH0 - sH * tL0)
+        // log(ax)
+        var s2 = ss * ss
+        var r = s2 * s2 * (0.599999999999994648725
+            + s2 * (0.428571428578550184252
+                + s2 * (0.333333329818377432918
+                    + s2 * (0.272728123808534006489 + s2 * (0.230660745775561754067 + s2 * 0.206975017800338417784)))))
+        r += sL * (sH + ss)
+        s2 = sH * sH
+        let tH = lowZero(3.0 + s2 + r)
+        let tL = r - (tH - 3.0 - s2)
+        let u = sH * tH
+        let v = sL * tH + tL * ss
+        let pH = lowZero(u + v)
+        let pL = v - (pH - u)
+        let zH = 0.961796700954437255859 * pH
+        let zL = -0.00000000702846165095275826516 * pH + pL * 0.961796693925975554329 + dpL
+        let t = toFloat(n)
+        t1 = lowZero(zH + zL + dpH + t)
+        t2 = zL - (t1 - t - dpH - zH)
+    }
+    // (y1 + y2) * (t1 + t2)
+    let y1 = lowZero(y)
+    let pL0 = (y - y1) * t1 + y * t2
+    var pH = y1 * t1
+    var z = pL0 + pH
+    var j = hi(z)
+    let i = lo(z)
+    if j >= 0x40900000 {
+        // z >= 1024
+        if j - 0x40900000 | i != 0 {
+            return s * huge * huge
+        }
+        if pL0 + 0.000000000000000080085662595372944372 > z - pH {
+            return s * huge * huge
+        }
+    } else if j & 0x7fffffff >= 0x4090cc00 {
+        // z <= -1075
+        if j - (0xc090cc00 - 4294967296) | i != 0 {
+            return s * tiny * tiny
+        }
+        if pL0 <= z - pH {
+            return s * tiny * tiny
+        }
+    }
+    // 2^(pH + pL0)
+    let i2 = j & 0x7fffffff
+    var k = i2 >> 20 - 0x3ff
+    var n = 0
+    if i2 > 0x3fe00000 {
+        n = j + 0x00100000 >> (k + 1)
+        k = n & 0x7fffffff >> 20 - 0x3ff
+        let t = ofWords(n & ~(0x000fffff >> k), 0)
+        n = (n & 0x000fffff | 0x00100000) >> (20 - k)
+        if j < 0 {
+            n = -n
+        }
+        pH -= t
+    }
+    let t = lowZero(pL0 + pH)
+    let u = t * 0.693147182464599609375
+    let v = (pL0 - (t - pH)) * 0.693147180559945286227 + t * -0.00000000190465429995776804525
+    z = u + v
+    let w = v - (z - u)
+    let tt = z * z
+    let r1 = z - tt * (0.166666666666666019037
+        + tt * (-0.00277777777770155933842
+            + tt * (0.0000661375632143793436117
+                + tt * (-0.00000165339022054652515390 + tt * 0.0000000413813679705723846039))))
+    let r = z * r1 / (r1 - 2.0) - (w + z * w)
+    z = 1.0 - (r - z)
+    j = hi(z) + n << 20
+    if j >> 20 <= 0 {
+        z = scalbn(z, n) // subnormal
+    } else {
+        z = ofWords(j, lo(z))
+    }
+    s * z
 }
 """ + "\n"
     }

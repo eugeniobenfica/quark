@@ -5,9 +5,19 @@
 // instructions (compiler/wasm.qk). One thread: no tasks on stacks of their own, no other programs, no sockets.
 use std.machine as machine
 use base
-use start
 use print
 use arena
+use panic
+use text
+use map
+use loops
+use numbers
+use files
+use io
+use tasks
+use threads
+use debug
+use wasimath
 
 const wasi = "wasi_snapshot_preview1"
 
@@ -652,6 +662,32 @@ pub extern effect fn wasiBegin() as "qkWasiBegin" {
         setWord(argv, i, int32At(ptrs, i) & 4294967295)
     }
     begin(count, argv)
+}
+
+// the process's state, its first context and arena, as start.qk's begin makes them, without the runtime's table
+// (what loaded code reads: none is loaded here)
+fn begin(argc: Int, argv: Int) {
+    let g = calloc(gWords, 8)
+    setWord(cell(), 0, g)
+    let c = calloc(ctxWords, 8)
+    setWord(c, ctxFuel, -1 - intMin)
+    setWord(c, ctxGlobals, g)
+    setWord(c, ctxArena, arenaNew())
+    setCtx(c)
+    setWord(g, gMainCtx, c)
+    setWord(g, gMainArena, word(c, ctxArena))
+    setWord(g, gOutBuf, malloc(65536))
+    setWord(g, gOutFd, 1)
+    setWord(g, gExitEnds, 1)
+    let count = if argc > 1 { argc - 1 } else { 0 }
+    let args = malloc(16 * count + 16)
+    for i in 0..count {
+        let s = word(argv, i + 1)
+        setWord(args, 2 * i, s)
+        setWord(args, 2 * i + 1, strlen(s))
+    }
+    setWord(g, gArgs, args)
+    setWord(g, gArgCount, count)
 }
 
 // quark build --memory: the program's limit

@@ -117,7 +117,7 @@ fn wasiSig(name: Text) -> (Text, Text)? {
 
 // ---- the module's parts ----
 // A function of the module: the program's (part 1) or the runtime's (part 0), its number there.
-type Part { prog: IrProgram, dataBase: Int, first: Int }
+type Part { dataBase: Int, first: Int }
 
 type Module {
     parts: [Part] = []
@@ -128,6 +128,7 @@ type Module {
     cEntries: [Bool] = [] // by the module's function number (past the imports): a function C calls
     thunkOf: [Int: Int] = [:] // such a function: its thunk's number
     count: Int = 0 // the functions made (imports, the parts', the thunks, _start)
+    reached: [Bool] = [] // by the module's function number (past the imports): code made for it (else a trap)
     heapBase: Int = 0
     missing: [Text] = []
 }
@@ -174,7 +175,7 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     m.heapBase = (pBase + len(pData) + 65535) / 65536 * 65536
     let first0 = len(m.imports)
     let first1 = first0 + len(rt.fns)
-    m.parts = [Part(rt, rtBase, first0), Part(p, pBase, first1)]
+    m.parts = [Part(rtBase, first0), Part(pBase, first1)]
     m.count = first1 + len(p.fns)
     m.cEntries = [false] * (len(rt.fns) + len(p.fns))
     for (part, prog) in [rt, p].enumerate() {
@@ -198,23 +199,30 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     }
     let startFn = m.count
     m.count += 1
+    m.reached = reachedOf(m, rt, p)
     // the code
     var bodies: [Bytes] = []
     var fnTypes: [Int] = []
-    for (part, prog) in [rt, p].enumerate() {
-        for (k, f) in prog.fns.enumerate() {
-            var g = Gen(m, part, prog, f)
-            fnTypes.push(m.quarkType(len(f.params), f.resultCount))
-            bodies.push(g.body())
-            m = g.m
-        }
+    let trap: Bytes = [0, 0x00, 0x0B] // a function nothing reaches: no locals, unreachable
+    var g = Gen(m, 0, rt.externs, IrFn(""))
+    for (k, f) in rt.fns.enumerate() {
+        fnTypes.push(g.m.quarkType(len(f.params), f.resultCount))
+        g.f = f
+        bodies.push(if g.m.reached[k] { g.body() } else { trap })
     }
+    g.part = 1
+    g.externs = p.externs
+    for (k, f) in p.fns.enumerate() {
+        fnTypes.push(g.m.quarkType(len(f.params), f.resultCount))
+        g.f = f
+        bodies.push(if g.m.reached[len(rt.fns) + k] { g.body() } else { trap })
+    }
+    m = g.m
     let cType = m.typeOf(i64s(4), [tI64])
     for i in 0..len(m.cEntries) {
         if m.cEntries[i] {
             let at = first0 + i
-            let (part, k) = if i < len(rt.fns) { (0, i) } else { (1, i - len(rt.fns)) }
-            let f = m.parts[part].prog.fns[k]
+            let f = if i < len(rt.fns) { rt.fns[i] } else { p.fns[i - len(rt.fns)] }
             var b = W()
             b.u8(0)
             if len(f.params) > 4 {
@@ -385,11 +393,73 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     (out.b, m.missing)
 }
 
+// The functions the program reaches, from its entry and the runtime's start and end: through calls (the program's,
+// the runtime's by its qk_ names, C's by the symbols a part gives), functions' addresses and the interface tables.
+// (fillRuntime's table counts none: in WebAssembly nothing loads code that would read it.)
+fn reachedOf(m: Module, rt: IrProgram, p: IrProgram) -> [Bool] {
+    let first0 = m.parts[0].first
+    let n = len(rt.fns) + len(p.fns)
+    var reached = [false] * n
+    var todo: [Int] = []
+    var roots: [Int] = []
+    for name in ["qkWasiBegin", "qkWasiEnd", "qkWasiLimit", "qk_panic", "qk_fuelOut"] {
+        if m.symbol(name) is Some(at) {
+            roots.push(at)
+        }
+    }
+    if p.mainIndex >= 0 {
+        roots.push(m.fnIndex(1, p.mainIndex))
+    }
+    for (part, prog) in [rt, p].enumerate() {
+        for t in prog.tables {
+            for f in t.fns {
+                roots.push(m.fnIndex(part, f))
+            }
+        }
+    }
+    for r in roots {
+        if r >= first0 and r - first0 < n and not reached[r - first0] {
+            reached[r - first0] = true
+            todo.push(r - first0)
+        }
+    }
+    while len(todo) > 0 {
+        let i = todo.pop() ?? 0
+        let part = if i < len(rt.fns) { 0 } else { 1 }
+        let f = if part == 0 { rt.fns[i] } else { p.fns[i - len(rt.fns)] }
+        let externs = if part == 0 { rt.externs } else { p.externs }
+        for ins in f.code {
+            let target = if ins.op == Op.Call and ins.a < 0 or ins.op == Op.Const and ins.c == 2 {
+                m.fnIndex(part, ins.imm)
+            } else if ins.op == Op.RtCall {
+                m.symbol("qk_" + runtimeNames[ins.imm]) ?? -1
+            } else if ins.op == Op.HostCall and ins.a < 0 {
+                m.symbol(externs[ins.imm].name) ?? -1
+            } else {
+                -1
+            }
+            if target >= first0 and target - first0 < n and not reached[target - first0] {
+                reached[target - first0] = true
+                todo.push(target - first0)
+                if env("QUARK_WASM_WHY") == Some("on") {
+                    let g = if target - first0 < len(rt.fns) {
+                        rt.fns[target - first0].name
+                    } else {
+                        p.fns[target - first0 - len(rt.fns)].name
+                    }
+                    printErr("{f.name} -> {g}")
+                }
+            }
+        }
+    }
+    reached
+}
+
 // ---- one function's code ----
 type Gen {
     m: Module
     part: Int
-    prog: IrProgram
+    externs: [IrExtern]
     f: IrFn
     out: W = W()
     segOf: [Int] = [] // each label's segment
@@ -547,6 +617,10 @@ fn Gen.callSymbol(var self, name: Text, args: Int, rets: Int) {
 }
 
 fn Gen.body(var self) -> Bytes {
+    self.out = W()
+    self.seg = 0
+    self.segs = 1
+    self.depth = 0
     let f = self.f
     self.params = len(f.params)
     let n = len(f.kinds)
@@ -647,7 +721,12 @@ fn Gen.machine(var self, kind: Int) {
         for (i, name) in runtimeNames.enumerate() {
             self.get(0)
             self.op(0xA7)
-            self.k(self.m.symbol("qk_" + name) ?? 0)
+            let at = self.m.symbol("qk_" + name) ?? 0
+            self.k(if at > 0 and self.m.reached[at - self.m.parts[0].first] {
+                at
+            } else {
+                0
+            })
             self.out.u8(0x37) // i64.store
             self.out.uleb(3)
             self.out.uleb(8 * i)
@@ -1162,7 +1241,7 @@ fn Gen.hostCall(var self, ins: IrIns) {
         if ins.retCount == 0 { self.op(0x1A) } else { self.results(ins) }
         return
     }
-    let x = self.prog.externs[ins.imm]
+    let x = self.externs[ins.imm]
     let name = x.name
     let args = ins.argCount
     let rets = ins.retCount

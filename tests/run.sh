@@ -223,19 +223,30 @@ fn P.churnAll(var self, n: Int) {
 }
 
 fn main() {
+    // each size's best of three: a busy machine slows one run, not all three
     var times: [Float] = []
     for n in [100000, 400000] {
-        var p = P([], [], 0, [], 0)
-        let t0 = monotonicTime()
-        p.run(n)
-        times.push(monotonicTime() - t0)
-        print(n, len(p.nodes), len(p.toks), p.nodes[len(p.nodes) - 1].name)
+        var best = 1000000.0
+        for round in 0..3 {
+            var p = P([], [], 0, [], 0)
+            let t0 = monotonicTime()
+            p.run(n)
+            best = min(best, monotonicTime() - t0)
+            if round == 0 {
+                print(n, len(p.nodes), len(p.toks), p.nodes[len(p.nodes) - 1].name)
+            }
+        }
+        times.push(best)
     }
     for n in [5000, 20000] {
-        var p = P([], [], 0, [], 0)
-        let t0 = monotonicTime()
-        p.churnAll(n)
-        times.push(monotonicTime() - t0)
+        var best = 1000000.0
+        for _ in 0..3 {
+            var p = P([], [], 0, [], 0)
+            let t0 = monotonicTime()
+            p.churnAll(n)
+            best = min(best, monotonicTime() - t0)
+        }
+        times.push(best)
     }
     print(if times[1] < times[0] * 6 { "linear" } else { "{times[1] / times[0]} times" })
     print(if times[3] < times[2] * 6 { "linear" } else { "{times[3] / times[2]} times" })

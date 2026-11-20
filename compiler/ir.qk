@@ -139,6 +139,29 @@ pub const runtimeNames = [
     "localOffset",
 ]
 
+// the runtime's functions that make nothing in the arena: a loop's turn that calls only these (and pushes onto vars
+// from outside it) has nothing to collect
+const runtimeMakesNothing = [
+    "panic", "printInt", "printFloat", "printBool", "printText", "printSep", "printEnd", "now", "sin", "cos", "tan",
+    "asin", "acos", "atan", "atan2", "exp", "log", "pow", "fuelOut", "printHandle", "textCompare", "fail", "exit",
+    "printTo", "startsWith", "endsWith", "find", "time", "mapGet", "mapRemove", "mapLen", "mapUsed", "mapEntry",
+    "loopCheck", "textCut", "random", "randomInt", "seedRandom", "codePointCount", "remember", "valueEqual",
+    "printBytes",
+]
+
+// by the runtime function's number (a name above that the runtime does not have stops the compiler's build)
+const makesNothing: [Bool] = {
+    var by = [false] * len(runtimeNames)
+    for name in runtimeMakesNothing {
+        by[runtimeNames.indexOf(name) ?? panic("runtimeMakesNothing: the runtime has no {name}")] = true
+    }
+    by
+}
+
+// may the instruction make memory in the arena: a call, of Quark's or of C's, or of the runtime's that makes some
+pub fn IrIns.mayAllocate(self) -> Bool =
+    self.op is Call | HostCall or self.op == Op.RtCall and not makesNothing[self.imm]
+
 // the runtime functions the backends call by name, by number
 pub const rtPanic = 0
 pub const rtFail = 36

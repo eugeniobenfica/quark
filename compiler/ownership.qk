@@ -15,6 +15,7 @@ pub type Ownership {
     blockSays: BlockSays = BlockSays() // the last block's (borrows)
     aliasDeep: [Bool] = [] // by binding: its value may share containers with a deep var (decideAliases)
     borrowed: [Int] = [] // by statement: a let that copies its value (0), borrows it (1) or takes it (2) (decideAliases)
+    takes: [Bool] = [] // by expression: a var's name at its last use, its value handed over, not copied (decideTakes)
 }
 
 // ---- the tree, as these questions read it ----
@@ -1138,4 +1139,139 @@ fn Ownership.aliasBlock(var self, b: Int) {
         }
     }
     self.inBlock = outer
+}
+
+// ---- a var's last use: its value handed over instead of copied ----
+// A var's array or map is copied where it is kept (pushed, stored in a field, given back) so that the var's later
+// changes are not seen there. At its last use there are none: the value is handed over as it is. The last use is the
+// one mention of the var in the last statement of its block that mentions it, not under a loop or a lambda of that
+// statement (which could read it again), with no defer of the block, no lambda's copy of it and no lazy let (a loop
+// worked out where it is used) that reads it later.
+pub fn Ownership.decideTakes(var self) {
+    self.takes = [false] * len(self.p.ast.exprs)
+    if self.debug {
+        return
+    }
+    var captured: Set<Int> = []
+    for x in self.p.bindings {
+        if x.capturedFrom >= 0 {
+            captured.add(x.capturedFrom)
+        }
+    }
+    for b in 0..len(self.p.ast.blocks) {
+        let stmts = self.p.ast.blocks[b].stmts
+        for (i, s) in stmts.enumerate() {
+            let bnd = self.p.ast.stmts[s].binding
+            let Let(mutable, _, _, _, pattern, _) = self.p.ast.stmts[s].node else {
+                continue
+            }
+            if not mutable
+                or pattern >= 0
+                or bnd < 0
+                or captured.contains(bnd)
+                or self.p.bindings[bnd].lazy
+                or not self.tk(self.p.bindings[bnd].ty) is Array | Map {
+                continue
+            }
+            // the statements after it that mention it: the last one's mention, if it is its only one
+            var last = Uses(bnd)
+            var ok = true
+            for j in i + 1..len(stmts) {
+                var u = Uses(bnd)
+                u.stmt(self, stmts[j], false)
+                if u.count == 0 {
+                    continue
+                }
+                let later = self.p.ast.stmts[stmts[j]]
+                if later.node is Defer(_) or later.binding >= 0 and self.p.bindings[later.binding].lazy {
+                    ok = false
+                    break
+                }
+                last = u
+            }
+            if ok and last.count == 1 and not last.guarded and last.at >= 0 {
+                self.takes[last.at] = true
+            }
+        }
+    }
+}
+
+// the mentions of a binding in a statement: how many, the last one, and whether one is under a loop or a lambda
+pub type Uses { binding: Int, count: Int = 0, at: Int = -1, guarded: Bool = false }
+
+pub fn Uses.expr(var self, l: Ownership, e: Int, loop: Bool) {
+    if e < 0 {
+        return
+    }
+    let x = l.p.ast.exprs[e]
+    if x.node is Name(_) and x.binding == self.binding {
+        self.count += 1
+        self.at = e
+        self.guarded = self.guarded or loop
+        return
+    }
+    match x.node {
+        Lambda(_, body) => self.expr(l, body, true)
+        Match(subject, arms, _) => {
+            self.expr(l, subject, loop)
+            for a in arms {
+                self.expr(l, l.p.ast.arms[a].guard, loop)
+                self.expr(l, l.p.ast.arms[a].body, loop)
+            }
+        }
+        Is(value, arm) => {
+            self.expr(l, value, loop)
+            self.expr(l, l.p.ast.arms[arm].guard, loop)
+        }
+        If(cond, then, otherwise) => {
+            self.expr(l, cond, loop)
+            self.block(l, then, loop)
+            self.expr(l, otherwise, loop)
+        }
+        BlockExpr(block, _) => self.block(l, block, loop)
+        _ => {
+            self.expr(l, l.aOf(e), loop)
+            self.expr(l, l.bOf(e), loop)
+            self.expr(l, x.callee, loop)
+            for a in if len(x.ordered) > 0 { x.ordered } else { l.argsOf(e) } {
+                self.expr(l, a, loop)
+            }
+        }
+    }
+}
+
+pub fn Uses.block(var self, l: Ownership, b: Int, loop: Bool) {
+    if b < 0 {
+        return
+    }
+    for s in l.p.ast.blocks[b].stmts {
+        self.stmt(l, s, loop)
+    }
+}
+
+pub fn Uses.stmt(var self, l: Ownership, s: Int, loop: Bool) {
+    let st = l.p.ast.stmts[s]
+    match st.node {
+        Let(_, _, _, value, _, otherwise) => {
+            self.expr(l, value, loop)
+            self.block(l, otherwise, loop)
+        }
+        Assign(target, _, value) => {
+            self.expr(l, target, loop)
+            self.expr(l, value, loop)
+            self.expr(l, st.opValue, loop)
+        }
+        ExprStmt(value) => self.expr(l, value, loop)
+        For(_, _, iter, body) => {
+            self.expr(l, iter, loop)
+            self.block(l, body, true)
+        }
+        While(cond, body) => {
+            self.expr(l, cond, true)
+            self.block(l, body, true)
+        }
+        Return(value) => self.expr(l, value, loop)
+        Defer(body) => self.block(l, body, true)
+        _ => {}
+    }
 }

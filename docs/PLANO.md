@@ -128,9 +128,25 @@ preciso, numa versão mínima.
 > - O critério é `tools/parity.sh`. O IR de 209 programas, nos dois tiers, sai igual byte a byte com o compilador antigo e o novo, e o código de máquina do próprio compilador também.
 > - Custo: a passada separada percorre a árvore mais uma vez. São cerca de 5% do tempo de lowering, uns 2% de compilar o compilador.
 >
+> **A primeira análise nova: último uso (`decideTakes`).** Um `var` de array ou mapa entrega o seu valor no último uso, em vez de copiá-lo:
+> - empurrado numa lista;
+> - guardado num campo;
+> - devolvido.
+>
+> O último uso é a única menção do var no último comando do seu bloco que o menciona. Ela não pode estar sob um laço ou lambda, nem pode haver `defer`, cópia de lambda ou `let` preguiçoso que o leia depois. Com isso some uma cópia inteira por linha em padrões como `rows.push(row)`.
+>
+> Resultados:
+> - O código mudou em 17 dos 209 programas da paridade: json, csv, regex, stdlib e o próprio compilador.
+> - A suíte, o ponto fixo, o difftest (600 programas) e o fuzz passam.
+> - Ganho medido de 2–3% em `bench/json.qk` e num laço de linhas.
+> - Custo de compilação de uns 5 ms.
+>
+> A tabela de funções do runtime que não alocam (para a coleta por turno de laço) era uma lista de números. Virou nomes em `ir.qk` (`runtimeMakesNothing`), e um nome que o runtime não tem impede o build.
+>
 > **Próximos passos:**
 > - As decisões que ainda dependem do estado da emissão: o self por endereço, a área da função e a coleta por turno de laço, que lê o IR emitido.
-> - Depois, as análises novas que isto destrava: escape e reutilização no lugar.
+> - O último uso estendido a campos (`self.items` no fim) e a ramos de `match` e `if`.
+> - Reutilização no lugar (`xs = xs.map(...)` sobre um var único).
 
 **Hoje:** `lower.qk` vai da árvore checada direto para instruções com registradores, decidindo no caminho
 cópias, empréstimos, coleta de laço, C, closures e açúcar.

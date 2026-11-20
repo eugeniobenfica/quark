@@ -272,6 +272,15 @@ coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 - **Reutilização no lugar:** atualizar campo ou elemento de um valor único nunca aloca.
 - **Barreira de escrita filtrada no código gerado** (`remember` ainda custa 5 a 7% em `json`).
 
+> **Medido em 20/11/2026: não vale.** O primeiro teste do `remember` foi posto no código: nenhum loop com marca, ou um container feito depois dela.
+> - Nada mudou em `json` (440 → 450 ms), e `strings` ficou 2% pior pelo código maior em cada escrita.
+> - As chamadas de `json` não saem cedo: são containers velhos mudados, e o custo está em anotá-los.
+> - O que reduziria esse custo é não ter containers velhos apontando para novos: a pré-promoção acima.
+>
+> **Opcionais sem etiqueta (B6), analisados e deixados de lado.**
+> - Ganho: um slot a menos por opcional, sem alocação nem trabalho poupado em laços. O caso quente dos benchmarks (`counts[w] ?? 0`) é um `Int?`, que não tem valor impossível.
+> - Custo: tocar construção, `match`, `??`, `?`, igualdade, hash, descrições e o coletor.
+
 Meta: `records` de 2,2× para menos de 1,5× o C.
 
 ### B8. O grafo sem JSON por dentro

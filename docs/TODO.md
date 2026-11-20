@@ -29,9 +29,9 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [ ] as decisões ainda tomadas durante a emissão: self por endereço, a área da função, a coleta por volta de laço
   - [ ] análise de escape
 - [x] B4 o heap contado removido
-- [~] B5 o runtime inlinável
+- [x] B5 o runtime inlinável
   - [x] alocação de tamanho conhecido no próprio código
-  - [ ] as funções pequenas do runtime (comprimento, índice, push sem crescer, busca em mapa) coladas no código
+  - [x] push, busca em mapa (chave simples no código, de texto numa função do programa), interpolação numa chamada
 - [-] B6 representação dos valores
   - [-] textos curtos dentro do valor: feitos em quatro etapas, medidos mais lentos (json +9%, words +16%), desfeitos
   - [-] opcionais sem etiqueta: um slot a menos, nenhum trabalho poupado em laços; não vale a mudança

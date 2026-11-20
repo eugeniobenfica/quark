@@ -10063,7 +10063,7 @@ extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as 
 // ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
 // ---- each runtime function's address, by its number: its Quark function, which the
 // program calls the Quark way ----
-const runtimeCount = 123 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+const runtimeCount = 124 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
 
 fn runtimeTable() -> Int {
     let t = calloc(runtimeCount, 8)
@@ -11193,6 +11193,46 @@ pub extern effect fn rtTextCompare(x: Int64, xn: Int64, y: Int64, yn: Int64) -> 
 pub extern effect fn rtTextOfInt(v: Int64) -> Int64 as "qk_textOfInt" {
     let b = bufAt(ctx() + 8 * ctxScratch, 32).int(v) // (the digits in the context's scratch: nothing made for them)
     makeText(b.p, b.n)
+}
+
+// the digits of v (and its sign): how many
+fn digitCount(v: Int) -> Int {
+    if v == intMin {
+        return 20
+    }
+    var n = if v < 0 { 2 } else { 1 }
+    var u = if v < 0 { -v } else { v }
+    while u >= 10 {
+        u = u / 10
+        n += 1
+    }
+    n
+}
+
+// "a{x}b{n}...": the text of an interpolation's k pieces at d, made at once (its length first, then its bytes):
+// each piece three words, [0][bytes][length] a text, [1][the Int][0] an Int's digits
+pub extern effect fn rtInterp(d: Int64, k: Int64) -> Int64 as "qk_interp" {
+    var n = 0
+    for i in 0..k {
+        let at = d + 24 * i
+        n += if word(at, 0) == 0 { word(at, 2) } else { digitCount(word(at, 1)) }
+    }
+    let t = allocRaw(n + 8, 1)
+    setWord(arena(), aLastText, t)
+    setWord(t, 0, n)
+    var w = t + 8
+    for i in 0..k {
+        let at = d + 24 * i
+        if word(at, 0) == 0 {
+            copyBytes(w, word(at, 1), word(at, 2))
+            w += word(at, 2)
+        } else {
+            let b = bufAt(ctx() + 8 * ctxScratch, 32).int(word(at, 1))
+            copyBytes(w, b.p, b.n)
+            w += b.n
+        }
+    }
+    t
 }
 
 // x + the digits of v: written from the context's scratch onto x (in place when x has room)

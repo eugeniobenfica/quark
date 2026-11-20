@@ -215,6 +215,22 @@ B3 existir e um dia a contagem voltar, ela volta como um passo sobre a MIR, muit
 > runtime só quando o bloco acaba. `trees` caiu de cerca de 375 para 315 ms (16%); os outros ficaram iguais,
 > dentro da variação que a disposição do código já dava (até 10% em laços apertados). O runtime não recebe esse
 > caminho: as alocações dele são as suas. O resto (texto, mapas e arrays inlinados) continua o próximo passo.
+>
+> **Concluído em 20/11/2026.** Medido por operação antes de mexer (push 4,3 ns contra 1,4 ns de C; busca de chave
+> `Int` 9,6 ns; de texto 15,2 ns; interpolação de três pedaços ~80 ns sob carga):
+> - **`push`:** a sala do array é achada no próprio código (o mesmo hash de `growingRoom`, os quatro lugares do
+>   balde); o `push` do runtime só quando a sala falta ou acabou. 4,3 → 2,3 ns.
+> - **Busca em mapa com chave de um slot simples** (`Int`, `Bool`, caso sem dados): no código, como
+>   `mapFindHashed` (o hash, os slots com etiqueta, a chave comparada). 9,6 → 3,4 ns.
+> - **Chave de texto:** uma função do próprio programa, uma só, chamada de todo lugar (o hash de texto oito bytes
+>   por vez, a sonda, comprimento e bytes comparados): colar em cada lugar aumentaria demais o código. 15,2 → 11,4
+>   ns; `words` de 1,09× para 1,01× de C.
+> - **Interpolação de textos e `Int`s** com três pedaços ou mais: uma só chamada (`rtInterp`) que mede, aloca uma
+>   vez e escreve; os pedaços vão na área da função. ~22% mais rápida.
+> - Comprimento e índice já eram código (o comprimento é um slot; o índice, uma checagem de limite e uma leitura).
+> - **Não feito, e por quê:** guardar a IR do runtime e deixar o otimizador colá-la, como a proposta dizia. Os
+>   caminhos rápidos são poucos e pequenos, e escritos no lowering ficam explícitos e testados; o layout que eles
+>   leem (arena, mapa) está escrito ao lado de cada um, com as palavras do runtime.
 
 **Hoje:** o runtime é compilado à parte e toda operação de texto, mapa e array é uma chamada opaca.
 **Proposta:** como o runtime é Quark, guardar a IR das funções pequenas (comprimento, índice, `push` sem

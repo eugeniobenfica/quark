@@ -136,7 +136,7 @@ pub const runtimeNames = [
     "makeDir", "removePath", "runProcess", "arrayAppend", "sort", "cText", "textOfC", "printPointer", "parallelFold",
     "joinInt", "openFile", "readChunk", "writeChunk", "seekFile", "closeFile", "listen", "connect", "accept",
     "readSocket", "writeSocket", "closeSocket", "go", "runTasks", "channel", "send", "receive", "closeChannel",
-    "localOffset", "cancel",
+    "localOffset", "cancel", "interp",
 ]
 
 // the runtime's functions that make nothing in the arena: a loop's turn that calls only these (and pushes onto vars

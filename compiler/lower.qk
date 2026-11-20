@@ -91,6 +91,7 @@ const rtTime = 54
 const rtMapNew = 55
 const rtMapSet = 56
 const rtMapGet = 57
+const rtInterp = 123
 const rtMapRemove = 58
 const rtMapCopy = 59
 const rtMapLen = 60
@@ -6097,7 +6098,51 @@ fn Lower.constTextCount(self, d: Int) -> Int {
 
 // "a{x}b" joined onto start (a text's slots; [] for none): each piece added in turn, so onto a text with room to grow
 // (s += "{w} ") every piece goes in place and no text is made for the whole
+// "a{x}b{n}..." of texts and Ints alone (no format), three pieces or more: made by one call to the runtime, which
+// measures, allocates once and writes (each piece three words in the function's area: [0][bytes][length] a text,
+// [1][the Int][0] an Int). None when it is not such a one.
+fn Lower.interpAtOnce(var self, values: [Int], parts: [Text], formats: [Text], line: Int) -> [Int]? {
+    var pieces = if parts[0] != "" { 1 } else { 0 }
+    for (i, value) in values.enumerate() {
+        if len(formats) > i and formats[i] != "" or not self.tk(self.ty(value)) is Int | Text {
+            return None
+        }
+        pieces += if parts[i + 1] != "" { 2 } else { 1 }
+    }
+    if pieces < 3 or self.opts.runtime {
+        return None
+    }
+    var words: [[Int]] = []
+    let textKind = self.iconst(0)
+    if parts[0] != "" {
+        let lit = self.literalText(parts[0])
+        words.push([textKind, lit[0], lit[1]])
+    }
+    for (i, value) in values.enumerate() {
+        let v = self.lowerExpr(value)
+        if self.tk(self.ty(value)) == Kind.Int {
+            let intKind = self.iconst(1)
+            let z = self.iconst(0)
+            words.push([intKind, v[0], z])
+        } else {
+            words.push([self.iconst(0), v[0], v[1]])
+        }
+        if parts[i + 1] != "" {
+            let lit = self.literalText(parts[i + 1])
+            words.push([self.iconst(0), lit[0], lit[1]])
+        }
+    }
+    let area = self.areaTake(3 * len(words))
+    let z = self.iconst(0)
+    self.storeSlots(area, z, 0, 0, flat(words))
+    let k = self.iconst(len(words))
+    Some(self.unpackText(self.rtcall(rtInterp, [area, k], 'I', line)))
+}
+
 fn Lower.interpOnto(var self, start: [Int], values: [Int], parts: [Text], formats: [Text], line: Int) -> [Int] {
+    if len(start) == 0 and self.interpAtOnce(values, parts, formats, line) is Some(made) {
+        return made
+    }
     var acc = start
     var empty = len(start) == 0
     if parts[0] != "" or empty {

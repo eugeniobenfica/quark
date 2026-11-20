@@ -1,0 +1,45 @@
+// A for loop's source made in the loop's own expression (a text made by a call, its words; an array taken from), while
+// the body makes enough for the loop's turns to be collected: the source is made before the loop's mark, so no
+// collection takes it back while the loop still goes over it.
+fn made(n: Int) -> Text {
+    var t = ""
+    for i in 0..n {
+        t += "w{i % 10} "
+    }
+    t
+}
+
+fn main() {
+    // the text being gone over is made in the loop's own expression; the body makes enough to be collected
+    var count = 0
+    var sum = 0
+    var keep: [[Int]] = []
+    for w in made(3000).words() {
+        count += 1
+        sum += len(w)
+        keep = [[count] * 5000]
+    }
+    print(count, sum)
+    var cps = 0
+    for c in made(3000).codePoints() {
+        cps += c
+        keep = [[cps] * 5000]
+    }
+    print(cps)
+    var a = 0
+    for (i, w) in made(3000).words().enumerate() {
+        a += i + len(w)
+        keep = [[a] * 5000]
+    }
+    var b = 0
+    for w in made(3000).words().map(w => w + "!") {
+        b += len(w)
+        keep = [[b] * 5000]
+    }
+    var c = 0
+    for w in made(3000).words().take(2500) {
+        c += len(w)
+        keep = [[c] * 5000]
+    }
+    print(a, b, c)
+}

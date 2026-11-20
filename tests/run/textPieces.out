@@ -1,0 +1,23 @@
+true [<>] true [<>] 1
+true [<>, <>] true [<,>] 1
+true [<a>] true [<a>] 1
+true [<a>, <b>] true [<a,b>] 2
+true [<a>, <b>, <>] true [<a,b,>] 3
+true [<>, <a>] true [<,a>] 2
+true [<a>, <>, <b>] true [<a,,b>] 3
+true [<a::b::>] true [<a>, <b>, <>] 1
+true [<::>] true [<>, <>] 1
+true [<a:b::c>, <d>] true [<a:b>, <c,d>] 2
+true [<ção>, <日本::語>] true [<ção,日本>, <語>] 2
+true []
+true []
+true [<a>]
+true [<a>]
+true [<a>, <b>]
+true [<a>, <b>]
+true [<>, <>, <a>]
+true [<a>, <>]
+true [<>]
+true [<x>, <y>]
+6
+3 [x, y]

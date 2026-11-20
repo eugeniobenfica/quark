@@ -1,0 +1,55 @@
+// A text's pieces between separators as for, map and countBy go over them: split by a separator of one byte, of
+// more, or given in a value, and lines; the same pieces as the array made, at the ends, between separators, none at
+// all, empty ones; break and continue.
+fn bySplit(t: Text, sep: Text) -> [Text] {
+    var got: [Text] = []
+    for p in t.split(sep) {
+        got.push(p)
+    }
+    got
+}
+
+fn showSplit(t: Text) {
+    var got: [Text] = []
+    for p in t.split(",") {
+        got.push("<{p}>")
+    }
+    let made = t.split(",").map(p => "<{p}>").toArray()
+    var long: [Text] = []
+    for p in t.split("::") {
+        long.push("<{p}>")
+    }
+    let sep = "::"
+    let longMade = t.split(sep).map(p => "<{p}>").toArray()
+    print(got == made, got, long == longMade, long, len(t.split(",").countBy(p => p)))
+}
+
+fn showLines(t: Text) {
+    var got: [Text] = []
+    for line in t.lines() {
+        got.push("<{line}>")
+    }
+    let made = t.lines().map(l => "<{l}>").toArray()
+    print(got == made, got)
+}
+
+fn main() {
+    for t in ["", ",", "a", "a,b", "a,b,", ",a", "a,,b", "a::b::", "::", "a:b::c,d", "ção,日本::語"] {
+        showSplit(t)
+    }
+    for t in ["", "\n", "a", "a\n", "a\nb", "a\r\nb\r\n", "\n\na", "a\n\n", "\r", "x\r\r\ny"] {
+        showLines(t)
+    }
+    var total = 0
+    for p in "1,2,skip,3,stop,4".split(",") {
+        if p == "skip" {
+            continue
+        }
+        if p == "stop" {
+            break
+        }
+        total += p.parseInt() ?? 0
+    }
+    print(total)
+    print("b,a,b,c,b".split(",").countBy(p => p)["b"] ?? 0, bySplit("x,y", ","))
+}

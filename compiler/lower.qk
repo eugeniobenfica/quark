@@ -322,6 +322,8 @@ pub type Lower {
     preB: Int = 0
     preArray: Int = -1
     preArrayVal: [Int] = []
+    preText: Int = -1 // a fused text source (text.words()) whose text was worked out before the loop's mark
+    preTextVal: [Int] = []
     snapshot: Int = -1
     tables: [TableKey] = []
     inlining: [Frame] = []
@@ -1559,8 +1561,14 @@ fn Lower.forEachInner(var self, from: Int, sink: Sink) {
     if isCall and x.builtin == bWords {
         // a text's words, each handed on as it is found: no array of them made (runtime/text.qk's splitText: a space
         // is ' ', a tab, a new line or a carriage return; a word, the bytes between)
-        let tv = self.lowerExpr(self.arg(src, 0))
-        let t = self.copyVal(tv)
+        var t: [Int] = []
+        if self.preText == src {
+            t = self.preTextVal
+            self.preText = -1
+        } else {
+            let tv = self.lowerExpr(self.arg(src, 0))
+            t = self.copyVal(tv)
+        }
         let at = self.newReg('I')
         let start = self.newReg('I')
         let index = self.newReg('I')
@@ -6338,6 +6346,11 @@ fn Lower.loopTurnEnd(var self, mi: Int, line: Int) {
     self.place(skip)
 }
 
+// a built-in a loop goes through to its source (xs.map(f), .filter, .enumerate, .entries, .take, .skip): what is made
+// for the source is made before the loop's mark
+fn passesThrough(b: Int) -> Bool =
+    b == bMap or b == bFilter or b == bEnumerate or b == bEntries or b == bTake or b == bSkip
+
 // a for loop's source worked out before the loop's mark
 fn Lower.preLowerSource(var self, iter: Int) {
     var base = self.stripImplicit(iter)
@@ -6345,13 +6358,21 @@ fn Lower.preLowerSource(var self, iter: Int) {
         let x = self.p.ast.exprs[base]
         if x.node is Name(_) and x.binding >= 0 and self.p.bindings[x.binding].lazy {
             base = self.stripImplicit(self.p.bindings[x.binding].init)
-        } else if x.node is Call(_, _, _, _, _, _) and x.builtin is 24 | 25 | 92 | 91 {
+        } else if x.node is Call(_, _, _, _, _, _) and passesThrough(x.builtin) {
             base = self.stripImplicit(self.arg(base, 0))
         } else {
             break
         }
     }
     let bx = self.p.ast.exprs[base]
+    if bx.node is Call(_, _, _, _, _, _) and bx.builtin == bWords {
+        // its words are found as the loop goes, in the text: made before the mark, so that no collection of the
+        // loop's turns takes it back
+        let tv = self.lowerExpr(self.arg(base, 0))
+        self.preText = base
+        self.preTextVal = self.copyVal(tv)
+        return
+    }
     if bx.node is Range(lo, hi) {
         let a = self.lowerExpr(lo)[0]
         let b = self.lowerExpr(hi)[0]
@@ -6951,7 +6972,7 @@ fn Lower.lowerStmtInner(var self, s: Int) {
             } else {
                 var base = self.stripImplicit(iter)
                 while self.p.ast.exprs[base].node is Call(_, _, _, _, _, _)
-                    and self.p.ast.exprs[base].builtin is 24 | 25 | 92 | 91 {
+                    and passesThrough(self.p.ast.exprs[base].builtin) {
                     base = self.stripImplicit(self.arg(base, 0))
                 }
                 let root = if self.ek(base) == Kind.Map {

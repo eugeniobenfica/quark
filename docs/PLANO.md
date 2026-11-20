@@ -147,7 +147,11 @@ preciso, numa versão mínima.
 > - **Records.** Um record construído onde o valor precisa ser possuído por inteiro (`self.code[k] = Ins(...)` sobre um var fundo) era montado com cópias rasas e depois copiado fundo por inteiro. Agora cada campo é possuído por si (`Lower.construct(e, deep)`). Uma junção de arrays de valores simples (`args + [x]`) conta como nova (`deepFresh`). No laço quente, as cópias por instrução foram de 3 para 1: records de 123 para 115 ms.
 >   - O que resta contra C (2,1×) é o coletor copiar os arrays novos que sobrevivem por irem para uma estrutura velha. Isso é próprio do desenho geracional por cópia.
 > - **Words.** `len(c)` de um array constante montava o array inteiro a cada volta do laço interno, só para ler o tamanho. Agora é uma constante: words de 1,51× para 1,35× de C.
-> - **As palavras de um texto, sem array.** `text.words()` é entregue palavra por palavra a quem a percorre: `for`, `countBy`, `map`, `filter` e as outras fusões de laço. Um laço no IR acha cada palavra, e o byte comum, acima de `' '`, custa um só teste. Antes, as palavras iam para um buffer de C que crescia, eram copiadas para um array e eram lidas de novo. `text.words().countBy(...)` foi de 246 para 163 ms: words fica em 1,11× de C.
+> - **As palavras de um texto, sem array.** `text.words()` é entregue palavra por palavra a quem a percorre: `for`, `countBy`, `map`, `filter` e as outras fusões de laço. Um laço no IR acha cada palavra, e o byte comum, acima de `' '`, custa um só teste.
+>   - Resultados: um `for` sobre as palavras foi de 85 para 22 ms; `text.words().countBy(...)` de 248 para 163 ms; words fica em 1,08× de C.
+>   - A primeira versão tinha um erro. Num `for`, o texto era feito depois da marca do laço: uma coleta no corpo o tomava de volta enquanto ainda era lido, e o array antigo continuava sendo feito à toa. Agora o texto é feito antes da marca (`preLowerSource`).
+>   - No mesmo lugar havia um erro antigo: `take` e `skip` não eram atravessados até a fonte, e `for x in f().take(n)` lia memória já coletada. Os dois estão cobertos por `tests/run/loopSourceMade`.
+>   - `split` e `lines` foram medidos fundidos do mesmo jeito e ficaram mais lentos: `lines` 22 → 37 ms, `split` 102 → 111 ms. O runtime acha o separador oito bytes por vez, e um laço byte a byte no IR perde. Ficam como estão, e `tests/run/textPieces` fixa o que eles dão.
 > - O `pipeline` deixou de acusar diferença no checksum. Era o mesmo Float escrito de dois jeitos, e `tools/bench.sh` agora compara os números por valor.
 
 > **Próximos passos:**

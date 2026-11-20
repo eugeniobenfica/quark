@@ -6941,18 +6941,7 @@ const gPromoted = 1
 const gLive = 2
 const gBlock = 3
 const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
-const gFromBlock = 5 // where what a minor collection looks at starts: the mark, or past what was promoted in place
-const gFromUsed = 6
-const gSurvival = 7 // what the last minor collection kept of what the turns had made, in thousandths
-const gPromotions = 8 // the collections since the last that copied: each kept what it had in place
-const genWords = 9
-
-// When minor collections keep nearly all the turns make (a loop that builds what it keeps), copying it is all cost:
-// what was made is kept where it is instead, old from then on (promoted in place), and only every fifth collection
-// copies, to look again at how much it keeps. A full collection still copies whatever lives since the mark, so what
-// was promoted and is no longer used goes then.
-const promoteFrom = 600
-const promoteRun = 4
+const genWords = 5
 
 pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
     let a = arena()
@@ -6971,10 +6960,6 @@ pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
     setWord(f, frameTime, word(a, aClock))
     setWord(gen, gLast, word(a, aClock))
     setWord(gen, gArena, a)
-    setWord(gen, gFromBlock, cur)
-    setWord(gen, gFromUsed, word(cur, bUsed))
-    setWord(gen, gSurvival, 0)
-    setWord(gen, gPromotions, 0)
     setMark(a, cur, word(cur, bUsed))
     f
 }
@@ -7764,29 +7749,10 @@ fn lookAgain(c: Int, r: Int, since: Int) {
 }
 
 // the loop's turns made enough: what its vars hold of that, to a survivor, and the arena back to the mark
-// what the turns made since the last collection, kept where it is: old from now on (the vars hold it as they are)
-fn promoteInPlace(a: Int, f: Int, gen: Int) {
-    let cur = word(a, aCurrent)
-    // all of what was made brings the next full collection nearer (what is no longer used goes then)
-    setWord(gen, gPromoted, word(gen, gPromoted) + word(a, aAllocated) - word(f, frameAllocated))
-    setWord(gen, gFromBlock, cur)
-    setWord(gen, gFromUsed, word(cur, bUsed))
-    setMark(a, cur, word(cur, bUsed))
-    setWord(gen, gPromotions, word(gen, gPromotions) + 1)
-    setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was promoted
-    setWord(gen, gLast, word(a, aClock))
-    setWord(f, frameAllocated, word(a, aAllocated))
-}
-
 pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     let a = arena()
     let gen = word(f, frameGen)
     let full = word(gen, gPromoted) >= max(word(gen, gLive), limited(a, nurseryMost))
-    if not full and word(gen, gSurvival) >= promoteFrom and word(gen, gPromotions) < promoteRun {
-        promoteInPlace(a, f, gen)
-        return
-    }
-    let made = word(a, aAllocated) - word(f, frameAllocated) // by the turns since the last collection
     // young: made at this time or later (a full collection: since the mark)
     let since = if full { word(f, frameTime) } else { word(gen, gLast) }
     setWord(a, aClock, word(a, aClock) + 1)
@@ -7794,9 +7760,8 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     if not full {
         setWord(c, cNow, word(gen, gBlock)) // old values go on where the last ones went
     }
-    // young in the blocks: from the mark (full), or from past what was promoted in place
-    let mark = if full { word(f, frameBlock) } else { word(gen, gFromBlock) }
-    let used = if full { word(f, frameUsed) } else { word(gen, gFromUsed) }
+    let mark = word(f, frameBlock)
+    let used = word(f, frameUsed)
     var b = mark
     while b != 0 {
         addYoung(c, if b == mark { word(b, bData) + used } else { word(b, bData) }, word(b, bData) + word(b, bSize), 0)
@@ -7860,13 +7825,9 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     if full {
         setWord(gen, gLive, word(c, cTotal))
         setWord(gen, gPromoted, 0)
-        setWord(gen, gFromBlock, mark)
-        setWord(gen, gFromUsed, used)
     } else {
         setWord(gen, gPromoted, word(gen, gPromoted) + word(c, cTotal))
-        setWord(gen, gSurvival, if made > 0 { min(1000, word(c, cTotal) * 1000 / made) } else { 0 })
     }
-    setWord(gen, gPromotions, 0)
     setWord(gen, gBlock, word(c, cNow))
     setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was kept
     setWord(gen, gLast, word(a, aClock))

@@ -20,7 +20,6 @@ extern effect fn cRead(fd: Int32, p: Int64, n: UInt64) -> Int64 as "read"
 extern effect fn cClose(fd: Int32) -> Int32 as "close"
 extern effect fn cOpen(path: Int64, flags: Int32) -> Int32 as "open"
 extern effect fn errnoLocation() -> Int64 as "__errno_location"
-extern effect fn vsnprintf(buf: Int64, size: UInt64, format: Int64, args: Int64) -> Int32
 extern effect fn clockGettime(clock: Int32, at: Int64) -> Int32 as "clock_gettime"
 extern effect fn usleep(us: UInt32) -> Int32
 extern effect fn fopen(path: Int64, mode: Int64) -> Int64
@@ -76,29 +75,6 @@ pub extern effect fn osWriteImpl(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
 pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = int32At(errnoLocation(), 0)
 
 pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setInt32(errnoLocation(), 0, e)
-
-// printf's way with a Float, called through vsnprintf with a va_list made here (a variadic call would need al on
-// x86-64): the precision and the Float's bits as the stack would hold them, and the list says every register is used
-pub extern effect fn osFloatTextImpl(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText" {
-    let args = calloc(4, 8)
-    setWord(args, 0, precision)
-    setFloat(args, 1, v)
-    let va = calloc(4, 8)
-    if byte(fnAddress(x => run(x)), 0) == 85 {
-        // x86-64 (push rbp): gp_offset 48, fp_offset 176, the overflow area
-        setInt32(va, 0, 48)
-        setInt32(va, 1, 176)
-        setWord(va, 1, args)
-    } else {
-        // ARM64: __stack, __gr_top, __vr_top, __gr_offs 0, __vr_offs 0 (the struct, by its address)
-        setWord(va, 0, args)
-    }
-    let format = if kind == 'f' { textAt("%.*f\0") } else { textAt("%.*g\0") }
-    let n = vsnprintf(buf, size, format, va)
-    free(va)
-    free(args)
-    n
-}
 
 fn clock(which: Int) -> Float {
     let t = calloc(2, 8)

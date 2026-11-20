@@ -28,8 +28,6 @@ pub extern effect fn osErrno() -> Int64 as "qkosErrno"
 pub extern effect fn osSetErrno(e: Int64) as "qkosSetErrno"
 
 // a Float as C's printf writes it: kind 'g' or 'f', with precision; the length written
-pub extern effect fn osFloatText(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText"
-
 // ---- words and bytes ----
 pub fn word(a: Int, i: Int) -> Int = Pointer<Int64>(a)[i]
 
@@ -585,6 +583,98 @@ pub fn floatText(s: Int, v: Float) -> Int {
         at += 1
     }
     at
+}
+
+// v with `decimals` digits after the point (0 to 40: none, and no point, for 0), as C's %.*f writes it, without C:
+// its exact digits rounded half to even (the same on every system), "nan", "inf" and "-inf" as they are; its length
+pub fn fixedText(s: Int, v: Float, decimals: Int) -> Int {
+    if v != v {
+        return writeText(s, "nan")
+    }
+    if v == 1.0 / 0.0 {
+        return writeText(s, "inf")
+    }
+    if v == -1.0 / 0.0 {
+        return writeText(s, "-inf")
+    }
+    let bits = bitsOf(v)
+    var at = 0
+    if bits < 0 {
+        setByte(s, 0, '-')
+        at = 1
+    }
+    let field = shr(bits, 52) & 2047
+    let frac = bits & 4503599627370495
+    var count = 0
+    var ev = 0
+    let w = floatWork()
+    let digits = w + 8 * floatDigitsAt
+    if field != 0 or frac != 0 {
+        let m = if field == 0 { frac } else { frac | 4503599627370496 }
+        let e2 = if field == 0 { -1074 } else { field - 1075 }
+        bigSet(w, m)
+        var k = 0
+        if e2 >= 0 {
+            bigShl(w, e2)
+        } else {
+            bigMulPow5(w, -e2)
+            k = -e2
+        }
+        count = bigDecimal(w, digits)
+        ev = count - 1 - k
+    }
+    // the places from the highest (at least 10^0) down to 10^-decimals: the digit there, else 0
+    let top = if ev > 0 { ev } else { 0 }
+    let from = s + at
+    var n = 0
+    var p = top
+    while p >= -decimals {
+        if p == -1 {
+            setByte(from, n, '.')
+            n += 1
+        }
+        let i = ev - p
+        setByte(from, n, if count > 0 and i >= 0 and i < count { byte(digits, i) } else { '0' })
+        n += 1
+        p -= 1
+    }
+    // the rest: up (half to even) when it is more than half of the last place
+    let i = ev + decimals + 1
+    var up = false
+    if count > 0 and i < count {
+        let next = if i >= 0 { byte(digits, i) } else { '0' }
+        var more = false
+        for j in (if i + 1 > 0 { i + 1 } else { 0 })..count {
+            if byte(digits, j) != '0' {
+                more = true
+                break
+            }
+        }
+        if i < 0 {
+            up = false // below the last place's half: all of it under 10^-decimals / 10
+        } else if next > '5' or next == '5' and more {
+            up = true
+        } else if next == '5' {
+            up = (byte(from, n - 1) - '0') & 1 == 1
+        }
+    }
+    if up {
+        var j = n - 1
+        while j >= 0 and (byte(from, j) == '9' or byte(from, j) == '.') {
+            if byte(from, j) == '9' {
+                setByte(from, j, '0')
+            }
+            j -= 1
+        }
+        if j >= 0 {
+            setByte(from, j, byte(from, j) + 1)
+        } else {
+            moveBytes(from + 1, from, n)
+            setByte(from, 0, '1')
+            n += 1
+        }
+    }
+    at + n
 }
 
 // the work room of a thread's Floats: six big integers, the digits, the rounded digits

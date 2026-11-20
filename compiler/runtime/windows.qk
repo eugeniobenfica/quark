@@ -95,7 +95,6 @@ extern effect fn commandLineToArgvW(line: Int64, count: Int64) -> Int64 as "Comm
 extern effect fn wfopen(name: Int64, mode: Int64) -> Int64 as "_wfopen"
 extern effect fn wgetenv(name: Int64) -> Int64 as "_wgetenv"
 extern effect fn errnoAt() -> Int64 as "_errno"
-extern effect fn snprintfFloat(buf: Int64, size: UInt64, format: Int64, precision: Int32, v: Float64) -> Int32 as "snprintf"
 extern fn fnAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 
 const utf8 = 65001
@@ -179,11 +178,6 @@ pub extern effect fn osWriteImpl(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
 pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = int32At(errnoAt(), 0)
 
 pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setInt32(errnoAt(), 0, e)
-
-pub extern effect fn osFloatTextImpl(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText" {
-    let format = if kind == 'f' { textAt("%.*f\0") } else { textAt("%.*g\0") }
-    snprintfFloat(buf, size, format, precision, v) // v fifth: on the stack, where a variadic call reads it
-}
 
 pub extern effect fn osNowImpl() -> Float64 as "qkosNow" {
     let q = calloc(2, 8)

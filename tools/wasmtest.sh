@@ -20,7 +20,7 @@ for f in tests/run/*.qk; do
         fail=$((fail + 1))
         echo "FAIL $f"
         cat "$tmp/build" | grep -v "^quark: wrote" | head -3
-        diff "${f%.qk}.out" "$tmp/out" | head -6
+        if grep -q "^Error: " "$tmp/out"; then grep -v "^ *$" "$tmp/out" | head -16; else diff "${f%.qk}.out" "$tmp/out" | head -6; fi
     fi
 done
 for f in tests/panics/*.qk; do

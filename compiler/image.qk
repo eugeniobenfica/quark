@@ -1326,62 +1326,8 @@ fn clearCacheArm64() -> Stub {
     Stub("__clear_cache", code)
 }
 
-// snprintf(buf, size, format, precision, v) on Windows: the universal C runtime has it inline in its headers, over
-// __stdio_common_vsprintf(options, buf, size, format, locale, va_list); a va_list is where the variadic arguments
-// are, so the fourth argument's home slot, next to the fifth on the stack
-fn snprintfWindows() -> Stub {
-    let code: Bytes = [
-        0x4C, 0x89, 0x4C, 0x24, 0x20, 0x48, 0x8D, 0x44, 0x24, 0x20, 0x48, 0x83, 0xEC, 0x38, 0x4D, 0x89, 0xC1, 0x49,
-        0x89, 0xD0, 0x48, 0x89, 0xCA, 0xB9, 2, 0, 0, 0, 0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0, 0x48, 0x89, 0x44,
-        0x24, 0x28, 0xFF, 0x15, 0, 0, 0, 0, 0x48, 0x83, 0xC4, 0x38, 0xC3,
-    ]
-    // mov [rsp + 32], r9
-    // lea rax, [rsp + 32] (the va_list)
-    // sub rsp, 56
-    // mov r9, r8 (format)
-    // mov r8, rdx (size)
-    // mov rdx, rcx (buf)
-    // mov ecx, 2 (C99's snprintf: the length it would write)
-    // mov qword [rsp + 32], 0 (the locale)
-    // mov [rsp + 40], rax
-    // call [rip + the cell]
-    // add rsp, 56
-    // ret
-    Stub("snprintf", code, [StubRef(44, "__stdio_common_vsprintf", refRel32)])
-}
-
-// The same on Windows ARM64: precision comes in w3 and the Float in d0 (the runtime declares them so), and a va_list
-// is the address of 8-byte slots, so they go side by side on the stack
-fn snprintfWindowsArm64() -> Stub {
-    let code = bytesOfWords(
-        [
-            0xD100C3FF, 0xA9007BFD, 0x910003FD, 0xF90013E3, 0xFD0017E0, 0x910083E5, 0xD2800004, 0xAA0203E3, 0xAA0103E2,
-            0xAA0003E1, 0xD2800040, 0x90000010, 0xF9400210, 0xD63F0200, 0xA9407BFD, 0x9100C3FF, 0xD65F03C0,
-        ],
-    )
-    // sub sp, sp, #48
-    // stp x29, x30, [sp]
-    // mov x29, sp
-    // str x3, [sp, #32] (the precision)
-    // str d0, [sp, #40] (the Float)
-    // add x5, sp, #32 (the va_list)
-    // mov x4, #0 (the locale)
-    // mov x3, x2 (format)
-    // mov x2, x1 (size)
-    // mov x1, x0 (buf)
-    // mov x0, #2 (C99's snprintf: the length it would write)
-    // adrp x16, the cell
-    // ldr x16, [x16, :lo12:]
-    // blr x16
-    // ldp x29, x30, [sp]
-    // add sp, sp, #48
-    // ret
-    Stub("snprintf", code, [StubRef(44, "__stdio_common_vsprintf", refAdrpLdr)])
-}
-
-// what the runtime of a system needs beside itself
 pub fn stubsFor(os: Os, arm: Bool) -> [Stub] = match os {
-    Windows => if arm { [snprintfWindowsArm64()] } else { [snprintfWindows()] }
+    Windows => []
     Linux => if arm {
         [startArm64(), clearCacheArm64()]
     } else {

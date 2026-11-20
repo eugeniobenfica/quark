@@ -425,7 +425,7 @@ pub extern effect fn rtTextFixed(v: Float64, decimals: Int64) -> Int64 as "qk_te
         decimals
     }
     let s = alloc(400, 1)
-    let n = osFloatText(s, 400, 'f', d, v)
+    let n = fixedText(s, v, d)
     makeText(s, if n < 400 { n } else { 399 })
 }
 

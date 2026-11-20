@@ -390,6 +390,40 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
         data.add(bytes)
     }
     out.section(11, data.b)
+    // the names (a custom section): each function's, as traps and profilers show them
+    var entries = W()
+    var count = 0
+    for (i, name) in m.imports.enumerate() {
+        entries.uleb(i)
+        entries.name(name)
+        count += 1
+    }
+    for (part, prog) in [rt, p].enumerate() {
+        for (k, f) in prog.fns.enumerate() {
+            entries.uleb(m.fnIndex(part, k))
+            entries.name(f.name)
+            count += 1
+        }
+    }
+    for i in 0..len(m.cEntries) {
+        if m.thunkOf[first0 + i] is Some(t) {
+            entries.uleb(t)
+            entries.name("C's way in")
+            count += 1
+        }
+    }
+    entries.uleb(startFn)
+    entries.name("_start")
+    count += 1
+    var fnNames = W()
+    fnNames.uleb(count)
+    fnNames.add(entries.b)
+    var body = W()
+    body.name("name")
+    body.u8(1) // the functions' names
+    body.uleb(len(fnNames.b))
+    body.add(fnNames.b)
+    out.section(0, body.b)
     (out.b, m.missing)
 }
 

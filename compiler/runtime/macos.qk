@@ -24,7 +24,6 @@ extern effect fn cClose(fd: Int32) -> Int32 as "close"
 extern effect fn cOpen(path: Int64, flags: Int32, ...) -> Int32 as "open"
 extern effect fn fcntl(fd: Int32, command: Int32, ...) -> Int32
 extern effect fn errnoLocation() -> Int64 as "__error"
-extern effect fn snprintf(buf: Int64, size: UInt64, format: Int64, ...) -> Int32
 extern effect fn clockGettime(clock: Int32, at: Int64) -> Int32 as "clock_gettime"
 extern effect fn usleep(us: UInt32) -> Int32
 extern effect fn fopen(path: Int64, mode: Int64) -> Int64
@@ -84,12 +83,6 @@ pub extern effect fn osWriteImpl(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
 pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = int32At(errnoLocation(), 0)
 
 pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setInt32(errnoLocation(), 0, e)
-
-// printf's way with a Float: snprintf, a variadic call (the compiler passes its values as each processor's C does)
-pub extern effect fn osFloatTextImpl(buf: Int64, size: Int64, kind: Int64, precision: Int64, v: Float64) -> Int64 as "qkosFloatText" {
-    let format = if kind == 'f' { textAt("%.*f\0") } else { textAt("%.*g\0") }
-    snprintf(buf, size, format, precision, v)
-}
 
 fn clock(which: Int) -> Float {
     let t = calloc(2, 8)

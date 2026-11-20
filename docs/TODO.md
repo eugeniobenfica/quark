@@ -48,7 +48,7 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 - [ ] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
-  - [ ] cancelamento e prazos
+  - [x] cancelamento e prazos (`cancel`, `withTimeout`, `receiveWithin`)
   - [ ] concorrência estruturada
 - [ ] B10 compilação incremental de ponta a ponta
 

@@ -2639,10 +2639,31 @@ fn Checker.checkRuntimeCall(var self, e: Int) -> Int {
     if ret >= 0 { ret } else { tyVoid }
 }
 
-// the capability group a built-in of the prelude needs (its body: runtime(group, ...)), "" none
+// the capability group a built-in of the prelude needs (its body: runtime(group, ...); a block: the group of the
+// first built-in its statements call that needs one), "" none
 fn Checker.builtinGroupOf(self, d: Int) -> Text {
     let body = self.p.ast.decls[d].body
     if body < 0 {
+        return ""
+    }
+    if self.p.ast.exprs[body].node is BlockExpr(block, _) {
+        for st in self.p.ast.blocks[block].stmts {
+            let v = match self.p.ast.stmts[st].node {
+                Let(_, _, _, value, _, _) => value
+                ExprStmt(value) => value
+                _ => -1
+            }
+            if v >= 0 and self.p.ast.exprs[v].node is Call(called, _, _, _, _, _) {
+                for o in self.byName[called] ?? [] {
+                    if o != d and self.p.ast.decls[o].builtin and self.p.ast.decls[o].kind == DeclKind.Fn {
+                        let g = self.builtinGroupOf(o)
+                        if g != "" {
+                            return g
+                        }
+                    }
+                }
+            }
+        }
         return ""
     }
     let Call(name, _, args, _, _, _) = self.p.ast.exprs[body].node else {
@@ -4833,6 +4854,14 @@ fn Checker.checkCall(var self, e: Int) -> Int {
     }
     if d >= 0 {
         let x = self.p.ast.decls[d]
+        if x.kind == DeclKind.Fn
+            and x.builtin
+            and self.c.module != x.module
+            and (ownFn or self.lookup(name) < 0)
+            and self.builtinGroupOf(d) != ""
+            and not self.capable(e, x.name, self.builtinGroupOf(d)) {
+            return tyError // what the program calls (the prelude's own calls are its)
+        }
         if x.kind == DeclKind.Fn and x.isTemplate and (ownFn or self.lookup(name) < 0) {
             return self.checkTemplateCall(e, d, hint)
         }
@@ -4841,9 +4870,6 @@ fn Checker.checkCall(var self, e: Int) -> Int {
             return tyError
         }
         if x.kind == DeclKind.Fn and (ownFn or self.lookup(name) < 0) {
-            if x.builtin and self.builtinGroupOf(d) != "" and not self.capable(e, x.name, self.builtinGroupOf(d)) {
-                return tyError
-            }
             if self.isCFunction(d)
                 and not self.capable(e, if x.externSymbol != "" { x.externSymbol } else { x.name }, "") {
                 return tyError

@@ -2987,6 +2987,8 @@ fn Lower.lowerRuntimeCall(var self, e: Int, a: [Int], t: Int, line: Int) -> [Int
     } else if name == "send" {
         // the value whole, by the address of its slots (a T of any size)
         args = [args[0], self.spill(args[1..], line)]
+    } else if name == "receive" {
+        args.push(self.iconst(self.slots(t))) // the T? it gives: its slots
     }
     let withLine = match self.p.ast.exprs[e].node {
         Call(called, _, _, _, _, _) => called == "runtimeLine"

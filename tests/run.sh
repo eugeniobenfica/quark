@@ -372,6 +372,9 @@ fi
 # capabilities: a program may call only what it is given
 if "$Q" check examples/words.qk --allow print 2>&1 | grep -qF "args is not given to this program"; then ok; else bad "--allow refuses"; fi
 if "$Q" check examples/words.qk --allow "print, args, files, exit" > /dev/null 2>&1; then ok; else bad "--allow allows"; fi
+# ... the generic built-ins too (channel, send, withTimeout), and not the prelude's own calls inside them
+if "$Q" check tests/run/cancel.qk --allow print 2>&1 | grep -qF "withTimeout is not given to this program"; then ok; else bad "--allow refuses a generic built-in"; fi
+if "$Q" check tests/run/cancel.qk --allow "print, tasks, clock" > /dev/null 2>&1; then ok; else bad "--allow allows the group tasks"; fi
 # runProcess is the group process: a program given only print may not start one
 if "$Q" check tests/run/process.qk --allow "print, files" 2>&1 | grep -qF "runProcess is not given to this program (the host allows: print, files); it is in the group process"; then ok; else bad "--allow and the group process"; fi
 # a type error inside len(...) is said once

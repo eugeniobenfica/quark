@@ -122,7 +122,7 @@ pub effect fn sleep(seconds: Float) = runtime("tasks", "wait", seconds)
 
 // ---- tasks in the background, and channels (runtime/tasks.qk) ----
 // f as a task the background runs (runTasks, or a receive outside a task)
-pub effect fn go(f: effect () -> Unit) = runtime("tasks", "go", f)
+pub effect fn go(f: effect () -> Unit) -> Task = runtime("tasks", "go", f)
 
 // every background task, run until all are done
 pub effect fn runTasks() = runtimeLine("tasks", "runTasks")
@@ -137,10 +137,29 @@ pub effect fn channel<T>() -> Channel<T> = runtime("tasks", "channel")
 pub effect fn send<T>(channel: Channel<T>, value: T) = runtimeLine("tasks", "send", channel, value)
 
 // the first value sent and not yet received (it waits for one); None once the channel is closed and empty
-pub effect fn receive<T>(channel: Channel<T>) -> T? = runtimeLine("tasks", "receive", channel)
+pub effect fn receive<T>(channel: Channel<T>) -> T? = runtimeLine("tasks", "receive", channel, -1.0)
 
-// no more values go in: receive gives those left, then None
+// receive, waiting so many seconds at most: None when none came by then too
+pub effect fn receiveWithin<T>(channel: Channel<T>, seconds: Float) -> T? =
+    runtimeLine("tasks", "receive", channel, max(seconds, 0.0))
+
+// no more values go in: receive gives those left, then None (closed and empty, its memory is let go of)
 pub effect fn closeChannel<T>(channel: Channel<T>) = runtimeLine("tasks", "closeChannel", channel)
+
+// the task stops, as a panic stops it (its defers do not run), where it next gives its turn back (now, when it is
+// not running); a call it waits for on a thread (runProcess, connect) ends first. Ended already: nothing.
+pub effect fn cancel(task: Task) = runtimeLine("tasks", "cancel", task)
+
+// f's value, when f ends within so many seconds; None when it does not (it is cancelled then). f runs as a task in
+// the background: what it waits for lets the others go on.
+pub effect fn withTimeout<T>(seconds: Float, f: effect () -> T) -> T? {
+    let out: Channel<T> = channel()
+    let task = go(() => send(out, f()))
+    let got = receiveWithin(out, seconds)
+    cancel(task)
+    closeChannel(out)
+    got
+}
 
 // ---- the clock, and chance ----
 // seconds, for timing: only differences mean something
@@ -3878,7 +3897,8 @@ pub const gChannelArena = 30 // where the values in the channels' queues are, ap
 pub const gChannelQueued = 31 // values in all the queues: none, and the arena is emptied
 pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
 pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
-pub const gWords = 34
+pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
+pub const gWords = 35
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -10038,7 +10058,7 @@ extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as 
 // ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
 // ---- each runtime function's address, by its number: its Quark function, which the
 // program calls the Quark way ----
-const runtimeCount = 122 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+const runtimeCount = 123 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
 
 fn runtimeTable() -> Int {
     let t = calloc(runtimeCount, 8)
@@ -10224,7 +10244,8 @@ const tWaitFd = 102 // a socket it waits on (its number + 1), 0 none: it is step
 const tWaitWrite = 103 // ... to write to it, else to read
 const tWaitChannel = 104 // a channel it waits on (its number + 1), 0 none: stepped again when it has a message
 const tWaitThread = 105 // a system call it waits for, on a thread of its own (its job: offThread), 0 none
-const taskWords = 106
+const tCancelled = 106 // cancel(task) was called: it is let go of where it next gives its turn back
+const taskWords = 107
 
 extern fn startAddress(f: extern () -> Int64) -> Int64 as "qkTextAddress"
 
@@ -10404,16 +10425,29 @@ pub extern effect fn rtStep(n: Int64, line: Int64) -> Int64 as "qk_step" {
     let tasks = word(g, gTasks)
     let caller = ctxGet(ctxTask)
     let home = if caller != 0 { word(caller, tHome) } else { arena() }
-    if n < 0 or n >= word(g, gTaskCount) or word(tasks, n) == 0 or word(word(tasks, n), tHome) != home {
+    if n < 0 or n >= word(g, gTaskCount) {
         panicNow(panicTask, line, n, 0)
     }
     let t = word(tasks, n)
+    if t == 0 {
+        return 0 // it ended (or was cancelled)
+    }
+    if word(t, tHome) != home {
+        panicNow(panicTask, line, n, 0)
+    }
     var active = caller
     while active != 0 {
         if active == t {
             panicNow(panicTask, line, n, 0)
         }
         active = word(active, tCaller)
+    }
+    if word(t, tCancelled) != 0 {
+        if waitsOnThread(t) {
+            return 1 // let go of when its call is done
+        }
+        cancelledEnds(n, t)
+        return 0
     }
     let r = taskStep(t)
     if r < 0 {
@@ -10578,10 +10612,9 @@ fn channelArenaRemade() {
     let a = arenaNew()
     let was = inChannelArena(a)
     let c = channelCopier()
-    let chans = gGet(gChannels)
     for n in 0..gGet(gChannelCount) {
-        let ch = word(chans, n)
-        if word(ch, chDesc) != 0 {
+        let ch = word(channelEntry(n), 0)
+        if ch != 0 and word(ch, chDesc) != 0 {
             for i in 0..word(ch, chCount) {
                 copyValue(c, channelItem(ch, i), word(ch, chDesc))
             }
@@ -10594,16 +10627,39 @@ fn channelArenaRemade() {
     gSet(gChannelKept, word(a, aAllocated))
 }
 
+// A channel's number: its place in the table, and the place's generation above bit 32. A channel closed and empty
+// is let go of: its place is used again, a generation later, and its number from then on is a closed, empty
+// channel's (receive gives None, send stops the program, closeChannel does nothing). The table: [its queue, or 0
+// once let go of][its generation][the next free place + 1] for each place.
+const chanEntry = 3
+
+fn channelEntry(n: Int) -> Int = gGet(gChannels) + 8 * chanEntry * (n & 4294967295)
+
+// the channel numbered n: its queue, or 0 when it was let go of
 fn channelAt(n: Int, line: Int) -> Int {
-    if n < 0 or n >= gGet(gChannelCount) {
+    if n < 0 or n & 4294967295 >= gGet(gChannelCount) {
         panicNow(panicNoChannel, line, n, 0)
     }
-    word(gGet(gChannels), n)
+    let e = channelEntry(n)
+    if word(e, 1) != shr(n, 32) {
+        return 0
+    }
+    word(e, 0)
 }
 
 fn channelReady(n: Int) -> Bool {
-    let c = word(gGet(gChannels), n)
-    word(c, chCount) > 0 or word(c, chClosed) != 0
+    let c = channelAt(n, 0)
+    c == 0 or word(c, chCount) > 0 or word(c, chClosed) != 0
+}
+
+// the channel n, closed and empty, let go of
+fn channelGone(n: Int) {
+    let e = channelEntry(n)
+    free(word(e, 0))
+    setWord(e, 0, 0)
+    setWord(e, 1, word(e, 1) + 1)
+    setWord(e, 2, gGet(gChannelFree))
+    gSet(gChannelFree, n & 4294967295 + 1)
 }
 
 // whether the task can be stepped now: not waiting, or what it waits for came
@@ -10612,7 +10668,8 @@ fn ready(t: Int, now: Float) -> Bool {
         return false // runTasks' poll says when
     }
     if word(t, tWaitChannel) != 0 and not channelReady(word(t, tWaitChannel) - 1) {
-        return false
+        let until = floatAt(t, tWakeAt) // receiveWithin: until its time is over
+        return until != 0.0 and until <= now
     }
     if waitsOnThread(t) {
         return false
@@ -10622,7 +10679,7 @@ fn ready(t: Int, now: Float) -> Bool {
 }
 
 // go(f): a task of f that runTasks (or a receive outside a task) runs; it is no one's to step
-pub extern effect fn rtGo(f: Int64, env: Int64) as "qk_go" {
+pub extern effect fn rtGo(f: Int64, env: Int64) -> Int64 as "qk_go" {
     let n = rtSpawn(f, env)
     let g = globals()
     if word(g, gBackgroundCount) == word(g, gBackgroundCap) {
@@ -10636,11 +10693,13 @@ pub extern effect fn rtGo(f: Int64, env: Int64) as "qk_go" {
     }
     setWord(word(g, gBackground), word(g, gBackgroundCount), n)
     setWord(g, gBackgroundCount, word(g, gBackgroundCount) + 1)
+    n
 }
 
 // one round of the background tasks: each that can go, stepped once (those done let go of); when none could, a
-// wait for the first socket ready or sleep over. false when no task is left.
-fn backgroundRound(line: Int) -> Bool {
+// wait for the first socket ready or sleep over (until: the caller's own time, 0 none: the wait ends then too).
+// false when no task is left.
+fn backgroundRound(line: Int, until: Float) -> Bool {
     let g = globals()
     let now = osNow()
     // sleeps over by now wake in the order they end (a late round finds several over): only the first to end this
@@ -10690,7 +10749,7 @@ fn backgroundRound(line: Int) -> Bool {
             if soonest < 0.0 or left < soonest {
                 soonest = left
             }
-        } else if word(t, tWaitChannel) == 0 or channelReady(word(t, tWaitChannel) - 1) {
+        } else if word(t, tWaitChannel) == 0 or channelReady(word(t, tWaitChannel) - 1) or floatAt(t, tWakeAt) != 0.0 {
             let wake = floatAt(t, tWakeAt)
             let left = if wake == 0.0 { 0.0 } else { max(wake - later, 0.0) }
             if soonest < 0.0 or left < soonest {
@@ -10702,14 +10761,23 @@ fn backgroundRound(line: Int) -> Bool {
         if stepped {
             return true // a channel may have a message now: the next round sees
         }
-        panicNow(panicDeadlock, line, 0, 0) // each waits on a channel, and none ran to send
+        if until == 0.0 {
+            panicNow(panicDeadlock, line, 0, 0) // each waits on a channel, and none ran to send
+        }
+        soonest = max(until - later, 0.0) // none will send: the caller's time waited out
     }
-    let ms = if stepped {
+    var ms = if stepped {
         0
     } else if soonest < 0.0 {
         -1
     } else {
         toInt(soonest * 1000.0) + 1
+    }
+    if until != 0.0 {
+        let left = toInt(max(until - later, 0.0) * 1000.0) + 1
+        if ms < 0 or ms > left {
+            ms = left
+        }
     }
     if sockets == 0 {
         if ms > 0 {
@@ -10746,23 +10814,34 @@ pub extern effect fn rtRunTasks(line: Int64) as "qk_runTasks" {
     if ctxGet(ctxTask) != 0 {
         return // inside a task: whoever runs the tasks runs them
     }
-    while backgroundRound(line) {}
+    while backgroundRound(line, 0.0) {}
 }
 
 // channel(): a new channel of values of slots slots each (desc: an array of their type's description, 0 when they
 // hold no memory), its number
 pub extern effect fn rtChannel(desc: Int64, slots: Int64) -> Int64 as "qk_channel" {
     let g = globals()
-    if word(g, gChannelCount) == word(g, gChannelCap) {
-        let cap = if word(g, gChannelCap) != 0 { word(g, gChannelCap) * 2 } else { 8 }
-        setWord(g, gChannels, realloc(word(g, gChannels), 8 * cap))
-        setWord(g, gChannelCap, cap)
-    }
     let c = calloc(chItems, 8)
     setWord(c, chSlots, slots)
     setWord(c, chDesc, desc)
+    if word(g, gChannelFree) != 0 {
+        // a place let go of, a generation later
+        let slot = word(g, gChannelFree) - 1
+        let e = word(g, gChannels) + 8 * chanEntry * slot
+        setWord(g, gChannelFree, word(e, 2))
+        setWord(e, 0, c)
+        return slot | word(e, 1) << 32
+    }
+    if word(g, gChannelCount) == word(g, gChannelCap) {
+        let cap = if word(g, gChannelCap) != 0 { word(g, gChannelCap) * 2 } else { 8 }
+        setWord(g, gChannels, realloc(word(g, gChannels), 8 * chanEntry * cap))
+        setWord(g, gChannelCap, cap)
+    }
     let n = word(g, gChannelCount)
-    setWord(word(g, gChannels), n, c)
+    let e = word(g, gChannels) + 8 * chanEntry * n
+    setWord(e, 0, c)
+    setWord(e, 1, 0)
+    setWord(e, 2, 0)
     setWord(g, gChannelCount, n + 1)
     n
 }
@@ -10770,7 +10849,7 @@ pub extern effect fn rtChannel(desc: Int64, slots: Int64) -> Int64 as "qk_channe
 // send(channel, value): the value (its slots at p) at the end of the queue, a copy of its own
 pub extern effect fn rtSend(n: Int64, p: Int64, line: Int64) as "qk_send" {
     var c = channelAt(n, line)
-    if word(c, chClosed) != 0 {
+    if c == 0 or word(c, chClosed) != 0 {
         panicNow(panicClosedChannel, line, n, 0)
     }
     let slots = word(c, chSlots)
@@ -10785,7 +10864,7 @@ pub extern effect fn rtSend(n: Int64, p: Int64, line: Int64) as "qk_send" {
         setWord(grown, chHead, 0)
         setWord(grown, chCap, cap)
         free(c)
-        setWord(gGet(gChannels), n, grown)
+        setWord(channelEntry(n), 0, grown)
         c = grown
     }
     let at = channelItem(c, word(c, chCount))
@@ -10801,25 +10880,39 @@ pub extern effect fn rtSend(n: Int64, p: Int64, line: Int64) as "qk_send" {
     }
 }
 
-// receive(channel) -> T?: the first value sent and not yet received; None once it is closed and empty. Waits: in a
-// task, its turn back until a value comes; outside one, the background tasks run until one does.
-pub extern effect fn rtReceive(n: Int64, line: Int64) -> Int64 as "qk_receive" {
+// receive(channel) -> T? (within: seconds at most, -1 as long as it takes; optSlots: the T?'s slots): the first
+// value sent and not yet received; None once it is closed and empty, or when the time is over. Waits: in a task,
+// its turn back until a value comes; outside one, the background tasks run until one does.
+pub extern effect fn rtReceive(n: Int64, within: Float64, optSlots: Int64, line: Int64) -> Int64 as "qk_receive" {
     let _ = channelAt(n, line)
+    let p = alloc(optSlots, 8) // the optional: [Some or None][the value's slots]
+    let until = if within >= 0.0 { osNow() + within } else { 0.0 }
     while not channelReady(n) {
+        if until != 0.0 and osNow() >= until {
+            return p // the time is over
+        }
         let t = ctxGet(ctxTask)
         if t != 0 {
             setWord(t, tWaitChannel, n + 1)
+            setFloat(t, tWakeAt, until)
             rtYield()
             setWord(ctxGet(ctxTask), tWaitChannel, 0)
-        } else if not backgroundRound(line) and not channelReady(n) {
-            panicNow(panicDeadlock, line, 0, 0) // no task is left to send on it
+            setFloat(ctxGet(ctxTask), tWakeAt, 0.0)
+        } else if not backgroundRound(line, until) and not channelReady(n) {
+            if until == 0.0 {
+                panicNow(panicDeadlock, line, 0, 0) // no task is left to send on it
+            }
+            return p // nor will one ever come
         }
     }
-    let c = word(gGet(gChannels), n)
+    let c = channelAt(n, line)
+    if c == 0 {
+        return p // closed and empty: let go of
+    }
     let slots = word(c, chSlots)
-    let p = alloc(1 + slots, 8) // the optional: [Some or None][the value's slots]
     if word(c, chCount) == 0 {
-        return p // closed, and every value received
+        channelGone(n) // closed, and every value received
+        return p
     }
     setWord(p, 0, 1)
     copyBytes(p + 8, channelItem(c, 0), 8 * slots)
@@ -10829,6 +10922,9 @@ pub extern effect fn rtReceive(n: Int64, line: Int64) -> Int64 as "qk_receive" {
         let k = channelCopier() // into this task's memory
         copyValue(k, p + 8, word(c, chDesc))
         copierFreshDone(k)
+    }
+    if word(c, chCount) == 0 and word(c, chClosed) != 0 {
+        channelGone(n)
     }
     gSet(gChannelQueued, gGet(gChannelQueued) - 1)
     if gGet(gChannelQueued) == 0 and gGet(gChannelArena) != 0 {
@@ -10840,9 +10936,60 @@ pub extern effect fn rtReceive(n: Int64, line: Int64) -> Int64 as "qk_receive" {
     p
 }
 
-// closeChannel(channel): no more values go in; receive gives those left, then None
+// closeChannel(channel): no more values go in; receive gives those left, then None (closed and empty, it is let go
+// of)
 pub extern effect fn rtCloseChannel(n: Int64, line: Int64) as "qk_closeChannel" {
-    setWord(channelAt(n, line), chClosed, 1)
+    let c = channelAt(n, line)
+    if c == 0 {
+        return
+    }
+    setWord(c, chClosed, 1)
+    if word(c, chCount) == 0 {
+        channelGone(n)
+    }
+}
+
+// ---- cancelling ----
+// the task t is running: it, or one that stepped it on the way here
+fn running(t: Int) -> Bool {
+    var a = ctxGet(ctxTask)
+    while a != 0 {
+        if a == t {
+            return true
+        }
+        a = word(a, tCaller)
+    }
+    false
+}
+
+// the task n, cancelled, let go of (the call it waited for on a thread is done: its job too)
+fn cancelledEnds(n: Int, t: Int) {
+    let job = word(t, tWaitThread)
+    if job != 0 {
+        osThreadJoin(word(job, jobThread))
+        free(word(job, jobCtx))
+        free(job)
+    }
+    taskFree(t)
+    setWord(gGet(gTasks), n, 0)
+}
+
+// cancel(task): it stops, as a panic stops it (its defers do not run), and is let go of: now when it is not running,
+// else where it next gives its turn back. Waiting on a call on a thread of its own, when the call is done (it writes
+// to the task's memory). Ended already: nothing.
+pub extern effect fn rtCancel(n: Int64, line: Int64) as "qk_cancel" {
+    let g = globals()
+    if n < 0 or n >= word(g, gTaskCount) {
+        panicNow(panicTask, line, n, 0)
+    }
+    let t = word(word(g, gTasks), n)
+    if t == 0 {
+        return
+    }
+    setWord(t, tCancelled, 1)
+    if not running(t) and not waitsOnThread(t) {
+        cancelledEnds(n, t)
+    }
 }
 """ + "\n"
     }

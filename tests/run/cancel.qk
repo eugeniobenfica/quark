@@ -1,0 +1,61 @@
+// Cancellation and deadlines: withTimeout (f's value, or None when it is not done in time: it is cancelled),
+// receiveWithin, cancel on a background task and on a stepped one, and channels let go of once closed and empty.
+fn slow(seconds: Float, value: Int) -> Int {
+    sleep(seconds)
+    value
+}
+
+fn main() {
+    let start = monotonicTime()
+    // within the time, and past it
+    print(withTimeout(0.5, () => slow(0.05, 1)))
+    print(withTimeout(0.05, () => slow(5.0, 2)))
+    print(monotonicTime() - start < 1.0)
+    // a receive with a deadline
+    let ch: Channel<Int> = channel()
+    print(receiveWithin(ch, 0.02))
+    go(() => {
+        sleep(0.01)
+        send(ch, 7)
+    })
+    print(receiveWithin(ch, 1.0))
+    // cancelling a background task: it says nothing more
+    let words: Channel<Text> = channel()
+    let talker = go(() => {
+        for i in 0..1000 {
+            send(words, "word {i}")
+            sleep(0.01)
+        }
+    })
+    print(receive(words), receive(words))
+    cancel(talker)
+    cancel(talker)
+    runTasks()
+    var left = 0
+    while receiveWithin(words, 0.0) is Some(_) {
+        left += 1
+    }
+    print(left <= 1)
+    // a stepped task cancelled: step says it is over
+    let t = spawn(() => {
+        while true {
+            yield()
+        }
+    })
+    print(step(t), step(t))
+    cancel(t)
+    print(step(t))
+    // many timeouts: their channels let go of (each closed and empty)
+    var sum = 0
+    for i in 0..2000 {
+        sum += withTimeout(1.0, () => i) ?? 0
+    }
+    print(sum)
+    // inside a task
+    let late: Channel<Int?> = channel()
+    let soon: Channel<Int?> = channel()
+    go(() => send(late, withTimeout(0.02, () => slow(1.0, 3))))
+    go(() => send(soon, withTimeout(1.0, () => slow(0.01, 4))))
+    print(receive(late), receive(soon))
+    print(monotonicTime() - start < 2.0)
+}

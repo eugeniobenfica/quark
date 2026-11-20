@@ -1218,6 +1218,29 @@ runTasks()
 A panic in a background task stops the program with its message. Everything runs on one thread: `parallelMap` and
 `parallelFold` are for the processor's other cores.
 
+### Cancelling, and deadlines
+
+`go(f)` gives the task it makes, and `cancel(task)` stops it: where it next gives its turn back, as a panic stops
+it (its `defer`s do not run, its memory is let go of), or at once when it is not running. A call it waits for on a
+thread of its own (`runProcess`, `connect`) ends first: that call writes to the task's memory. A task that ended
+already is not touched, and `step` on a cancelled task gives `false`.
+
+`withTimeout(seconds, f)` is `f()`'s value when `f` ends within the time, and `None` when it does not: `f` runs as a
+background task, cancelled then. `receiveWithin(channel, seconds)` is a `receive` that waits so long at most.
+
+```quark
+fn slow(seconds: Float) -> Text {
+    sleep(seconds)
+    "done"
+}
+
+print(withTimeout(0.5, () => slow(0.01))) // Some(done)
+print(withTimeout(0.01, () => slow(5.0))) // None, after 0.01 s
+```
+
+A channel closed and with nothing left in it is let go of; its number from then on is a closed, empty channel's,
+so `withTimeout` in a loop keeps no memory.
+
 ## Threads: parallelMap and parallelFold
 
 `xs.parallelMap(f)` is `xs.map(f)` with the elements shared out to the processor's threads: each thread
@@ -1349,7 +1372,7 @@ when it ends.
 | Tuples | `(a, b)`, `t.0`, `let (q, r) = divmod(7, 2)`, as a map's key |
 | Random | `random()` (a Float in [0, 1)), `randomInt(lo, hi)` (hi not included), `seedRandom(n)`: effects, group `random` |
 | Tasks | `spawn(f)`, `step(task)`, `joinTask(task)`, `yield()`, `sleep(seconds)`: effects, group `tasks` |
-| Background, channels | `go(f)` (f as a task the background runs), `runTasks()` (every such task, to its end), `channel()` (→ `Channel<T>`, its `T` written where it goes), `send(ch, value)`, `receive(ch)` (→ `T?`: `None` once closed and empty), `closeChannel(ch)`: effects, group `tasks` ([below](#tasks-in-the-background-and-channels)) |
+| Background, channels | `go(f)` (f as a task the background runs, → `Task`), `runTasks()` (every such task, to its end), `channel()` (→ `Channel<T>`, its `T` written where it goes), `send(ch, value)`, `receive(ch)` (→ `T?`: `None` once closed and empty), `receiveWithin(ch, seconds)`, `closeChannel(ch)`, `cancel(task)`, `withTimeout(seconds, f)` (→ `T?`): effects, group `tasks` ([below](#tasks-in-the-background-and-channels)) |
 | Files a part at a time | `openFile(path, mode)` (→ `File!`; `"r"`, `"w"`, `"a"`, `"r+"`, `"w+"`, bytes as they are), `readChunk(file, most)` (→ `Bytes!`: none at the end), `writeChunk(file, bytes)` (→ `Unit!`), `seekFile(file, at, from)` (→ `Int!`, the place now; `from` 0 the start (left out), 1 where it is, 2 the end), `closeFile(file)`: effects, group `files` |
 | Sockets (TCP) | `listen(host, port)` (→ `Socket!`; host `"0.0.0.0"` every address), `accept(listener)` (→ `Socket!`), `connect(host, port)` (→ `Socket!`), `readSocket(socket, most)` (→ `Bytes!`: none when the other end closed it), `writeSocket(socket, bytes)` (→ `Unit!`, every byte), `closeSocket(socket)`: effects, group `net`; a read, write or accept waits only the task that makes it |
 | Local time | `localOffset(seconds)` (→ `Int`: the system's time zone's offset from UTC at that moment, in seconds east), group `clock` |

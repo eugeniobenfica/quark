@@ -319,7 +319,18 @@ simplifica `graph.qk`/`collab.qk` (4.000 linhas) e deixa programas Quark manipul
   visível). `connect` sem bloquear e com espera pelo socket seria a forma nativa, mas a resolução de nomes
   bloqueia de qualquer jeito, e uma thread por conexão custa dezenas de microssegundos diante da rede. Medido:
   três processos de 0,5 s em três tarefas, 0,54 s no total, e as outras tarefas seguem; teste em `process.qk`.
-- **Cancelamento e prazos:** `timeout(seconds, f)`, fechar um canal acorda quem espera.
+- **Cancelamento e prazos:** `timeout(seconds, f)`, fechar um canal acorda quem espera. **Feito:** `go` dá a
+  `Task`; `cancel(task)` a para onde ela devolve a vez, como um pânico (sem `defer`, a memória liberada), ou já, se
+  não está rodando; esperando uma chamada numa thread, só quando a chamada acaba (ela escreve na memória da tarefa).
+  `withTimeout(seconds, f) -> T?` roda `f` como tarefa de fundo e recebe o valor por um canal com prazo
+  (`receiveWithin`); no fim cancela a tarefa e fecha o canal. Um canal fechado e vazio é liberado: o número dele
+  leva uma geração (bits acima do 32), e um número antigo age como um canal fechado e vazio; assim 2.000
+  `withTimeout` seguidos não deixam canais para trás. O agendador respeita o prazo de quem recebe (a espera no
+  `poll` vai até ele, e sem tarefas que enviem a espera acaba nele em vez de um impasse). Fechar um canal já
+  acordava quem esperava. Teste: `cancel`. De passagem: as capacidades (`--allow`) passaram a ser conferidas antes
+  de escolher o template, porque desde `Channel<T>` os built-ins genéricos (`send`, `receive`) escapavam da
+  conferência na chamada; as chamadas do próprio prelúdio não são conferidas, e um built-in com corpo em bloco
+  (`withTimeout`) tem o grupo do primeiro built-in que chama.
 - **Concorrência estruturada:** um escopo que só termina quando as tarefas que abriu terminam, e propaga o pânico
   com a origem (`go` solto fica para servidores).
 - **Decisão a tomar e escrever:** uma thread por agendador (hoje) ou um agendador por núcleo com roubo de trabalho.

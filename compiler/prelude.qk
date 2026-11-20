@@ -116,7 +116,7 @@ pub effect fn sleep(seconds: Float) = runtime("tasks", "wait", seconds)
 
 // ---- tasks in the background, and channels (runtime/tasks.qk) ----
 // f as a task the background runs (runTasks, or a receive outside a task)
-pub effect fn go(f: effect () -> Unit) = runtime("tasks", "go", f)
+pub effect fn go(f: effect () -> Unit) -> Task = runtime("tasks", "go", f)
 
 // every background task, run until all are done
 pub effect fn runTasks() = runtimeLine("tasks", "runTasks")
@@ -131,10 +131,29 @@ pub effect fn channel<T>() -> Channel<T> = runtime("tasks", "channel")
 pub effect fn send<T>(channel: Channel<T>, value: T) = runtimeLine("tasks", "send", channel, value)
 
 // the first value sent and not yet received (it waits for one); None once the channel is closed and empty
-pub effect fn receive<T>(channel: Channel<T>) -> T? = runtimeLine("tasks", "receive", channel)
+pub effect fn receive<T>(channel: Channel<T>) -> T? = runtimeLine("tasks", "receive", channel, -1.0)
 
-// no more values go in: receive gives those left, then None
+// receive, waiting so many seconds at most: None when none came by then too
+pub effect fn receiveWithin<T>(channel: Channel<T>, seconds: Float) -> T? =
+    runtimeLine("tasks", "receive", channel, max(seconds, 0.0))
+
+// no more values go in: receive gives those left, then None (closed and empty, its memory is let go of)
 pub effect fn closeChannel<T>(channel: Channel<T>) = runtimeLine("tasks", "closeChannel", channel)
+
+// the task stops, as a panic stops it (its defers do not run), where it next gives its turn back (now, when it is
+// not running); a call it waits for on a thread (runProcess, connect) ends first. Ended already: nothing.
+pub effect fn cancel(task: Task) = runtimeLine("tasks", "cancel", task)
+
+// f's value, when f ends within so many seconds; None when it does not (it is cancelled then). f runs as a task in
+// the background: what it waits for lets the others go on.
+pub effect fn withTimeout<T>(seconds: Float, f: effect () -> T) -> T? {
+    let out: Channel<T> = channel()
+    let task = go(() => send(out, f()))
+    let got = receiveWithin(out, seconds)
+    cancel(task)
+    closeChannel(out)
+    got
+}
 
 // ---- the clock, and chance ----
 // seconds, for timing: only differences mean something

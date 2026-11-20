@@ -1310,6 +1310,20 @@ fn family(d: Decl) -> Int = if d.kind == DeclKind.Use {
 }
 
 // a text in quotes, as JSON writes it
+// a Float as C's (int) makes it
+pub fn truncate(x: Float) -> Int = if x != x or x > 9.0e18 or x < -9.0e18 { 0 } else { toInt(x) }
+
+// C's %g, at a precision (6 for %g, 15 for %.15g)
+pub fn floatG(x: Float, precision: Int) -> Text {
+    if x == toFloat(truncate(x)) and abs(x) < 1.0e15 {
+        let n = truncate(x)
+        if precision >= 15 or abs(n) < 1000000 {
+            return "{n}"
+        }
+    }
+    "{x}"
+}
+
 pub fn jsonString(s: Text) -> Text {
     var out = "\""
     var from = 0

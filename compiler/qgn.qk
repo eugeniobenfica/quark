@@ -43,7 +43,7 @@ const renamed: [(Text, Text)] = [
     ("pub", "isPub"),
 ]
 
-fn fieldOf(key: Text) -> Text = renamed.first(r => r.0 == key)?.1 ?? key
+pub fn fieldOf(key: Text) -> Text = renamed.first(r => r.0 == key)?.1 ?? key
 
 fn keyOf(field: Text) -> Text = renamed.first(r => r.1 == field)?.0 ?? field
 

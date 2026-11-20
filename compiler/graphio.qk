@@ -1,0 +1,624 @@
+// A program's graph as std.graph's values, and its two notations: QGN (Quark Graph Notation: the values as Quark
+// writes them, what quark graph writes) and JSON (the export, --json). Both are written here from the values, each
+// record's fields in their order and those with the value a left-out field has left out; both are read into the
+// values (QGN by way of its JSON: compiler/qgn.qk). The graph's code (graph.qk, collab.qk) works on the values.
+//
+// JSON keeps a few names Quark keeps as words (type: typeName, fn: function, else: otherwise, var: mutable, effect:
+// effects, interface: isInterface, pub: isPub), says a case without data as its name, and a member's comments as
+// [above, after or null].
+use format
+use json
+use qgn
+use graphvalue as g
+
+// ---- writing: one writer, two notations ----
+type GWriter { json: Bool, out: Text = "", firsts: [Bool] = [] }
+
+fn GWriter.open(var self, role: Text) {
+    self.out += if self.json { "\{" } else { role + "(" }
+    self.firsts.push(true)
+}
+
+fn GWriter.close(var self) {
+    self.out += if self.json { "\}" } else { ")" }
+    let _ = self.firsts.pop()
+}
+
+// the next field's name (its JSON key: QGN says the field's)
+fn GWriter.key(var self, key: Text) {
+    let n = len(self.firsts)
+    if n > 0 and not self.firsts[n - 1] {
+        self.out += ", "
+    }
+    if n > 0 {
+        self.firsts[n - 1] = false
+    }
+    self.out += if self.json { jsonString(key) + ": " } else { fieldOf(key) + ": " }
+}
+
+fn GWriter.str(var self, t: Text) {
+    self.out += if self.json { jsonString(t) } else { quoteText(t) }
+}
+
+fn GWriter.text(var self, key: Text, v: Text) {
+    if v != "" {
+        self.key(key)
+        self.str(v)
+    }
+}
+
+fn GWriter.int(var self, key: Text, v: Int) {
+    if v != 0 {
+        self.key(key)
+        self.out += "{v}"
+    }
+}
+
+fn GWriter.flag(var self, key: Text, b: Bool) {
+    if b {
+        self.key(key)
+        self.out += "true"
+    }
+}
+
+fn GWriter.texts(var self, key: Text, list: [Text]) {
+    if len(list) > 0 {
+        self.key(key)
+        self.out += "["
+        for (i, t) in list.enumerate() {
+            if i > 0 {
+                self.out += ", "
+            }
+            self.str(t)
+        }
+        self.out += "]"
+    }
+}
+
+fn GWriter.ints(var self, key: Text, list: [Int]) {
+    self.key(key)
+    self.out += "[" + list.map(i => "{i}").join(", ") + "]"
+}
+
+fn GWriter.pin(var self, key: Text, p: g.Pin) {
+    if p == g.Pin() {
+        return
+    }
+    self.key(key)
+    self.pinValue(p)
+}
+
+fn GWriter.pinValue(var self, p: g.Pin) {
+    self.open("Pin")
+    self.int("node", p.node)
+    self.text("value", p.value)
+    self.text("of", p.of)
+    self.text("name", p.name)
+    self.text("case", p.case)
+    self.text("fn", p.function)
+    self.close()
+}
+
+fn GWriter.pins(var self, key: Text, list: [g.Pin]) {
+    if len(list) == 0 {
+        return
+    }
+    self.key(key)
+    self.out += "["
+    for (i, p) in list.enumerate() {
+        if i > 0 {
+            self.out += ", "
+        }
+        self.pinValue(p)
+    }
+    self.out += "]"
+}
+
+fn GWriter.block(var self, key: Text, b: g.Block) {
+    self.key(key)
+    self.open("Block")
+    self.ints("stmts", b.stmts)
+    self.text("closing", b.closing)
+    self.close()
+}
+
+fn GWriter.param(var self, p: g.Param) {
+    self.open("Param")
+    self.int("id", p.id)
+    self.text("name", p.name)
+    self.flag("var", p.mutable)
+    self.text("type", p.typeName)
+    self.text("key", p.key)
+    self.pin("default", p.default)
+    self.close()
+}
+
+fn GWriter.params(var self, key: Text, list: [g.Param], always: Bool) {
+    if len(list) == 0 and not always {
+        return
+    }
+    self.key(key)
+    self.out += "["
+    for (i, p) in list.enumerate() {
+        if i > 0 {
+            self.out += ", "
+        }
+        self.param(p)
+    }
+    self.out += "]"
+}
+
+fn GWriter.field(var self, f: g.Field) {
+    self.open("Field")
+    self.text("name", f.name)
+    self.text("type", f.typeName)
+    self.pin("default", f.default)
+    self.close()
+}
+
+fn GWriter.fields(var self, key: Text, list: [g.Field], always: Bool) {
+    if len(list) == 0 and not always {
+        return
+    }
+    self.key(key)
+    self.out += "["
+    for (i, f) in list.enumerate() {
+        if i > 0 {
+            self.out += ", "
+        }
+        self.field(f)
+    }
+    self.out += "]"
+}
+
+// a pattern's own fields (an arm's, a bind's inside, an alternative's, an is's, a let's or a for's)
+fn GWriter.pattern(var self, pattern: Text, wholeId: Int, alternatives: [g.Alt], binds: [g.Bind], tuple: Bool) {
+    self.text("pattern", pattern)
+    self.int("wholeId", wholeId)
+    if len(alternatives) > 0 {
+        self.key("alternatives")
+        self.out += "["
+        for (i, a) in alternatives.enumerate() {
+            if i > 0 {
+                self.out += ", "
+            }
+            self.open("Alt")
+            self.pattern(a.pattern, 0, [], a.binds, a.pattern == "(,)")
+            self.close()
+        }
+        self.out += "]"
+    }
+    if len(binds) > 0 or tuple {
+        self.key("binds")
+        self.out += "["
+        for (i, b) in binds.enumerate() {
+            if i > 0 {
+                self.out += ", "
+            }
+            self.open("Bind")
+            if b.pattern != "" {
+                self.pattern(b.pattern, 0, b.alternatives, b.binds, b.pattern == "(,)")
+            } else {
+                self.int("id", b.id)
+                self.text("name", b.name)
+            }
+            self.close()
+        }
+        self.out += "]"
+    }
+}
+
+fn GWriter.arm(var self, a: g.Arm) {
+    self.open("Arm")
+    self.pattern(a.pattern, a.wholeId, a.alternatives, a.binds, a.pattern == "(,)")
+    self.pin("guard", a.guard)
+    self.text("comment", a.comment)
+    if a.value != g.Pin() {
+        self.pin("value", a.value)
+    } else {
+        self.block("block", a.block)
+    }
+    self.close()
+}
+
+fn GWriter.node(var self, n: g.Node) {
+    self.open("Node")
+    self.int("id", n.id)
+    self.text("kind", n.kind)
+    self.text("key", n.key)
+    self.text("hash", n.hash)
+    self.int("line", n.line)
+    self.text("uid", n.uid)
+    if len(n.pos) > 0 {
+        self.key("pos")
+        self.out += "[" + n.pos.map(x => if self.json { floatG(x, 6) } else { positionText(x) }).join(", ") + "]"
+    }
+    self.text("type", n.typeName)
+    self.text("name", n.name)
+    self.text("op", n.op)
+    self.text("fn", n.function)
+    self.text("qualifier", n.qualifier)
+    self.text("field", n.field)
+    self.text("annotation", n.annotation)
+    self.flag("effect", n.effects)
+    self.flag("method", n.method)
+    self.flag("dotted", n.dotted)
+    self.flag("jump", n.jump)
+    self.flag("chain", n.chain)
+    self.flag("multiline", n.multiline)
+    self.text("open", n.open)
+    self.texts("names", n.names)
+    self.texts("parts", n.parts)
+    self.texts("formats", n.formats)
+    self.params("params", n.params, n.kind == "lambda")
+    self.pattern(n.pattern, n.wholeId, n.alternatives, n.binds, n.pattern == "(,)")
+    self.pins("inputs", n.inputs)
+    if n.kind == "if" {
+        self.block("then", n.then)
+    }
+    self.int("elseIf", n.elseIf)
+    if n.otherwise is Some(b) {
+        self.block("else", b)
+    }
+    if len(n.arms) > 0 {
+        self.key("arms")
+        self.out += "["
+        for (i, a) in n.arms.enumerate() {
+            if i > 0 {
+                self.out += ", "
+            }
+            self.arm(a)
+        }
+        self.out += "]"
+    }
+    if n.kind == "block" {
+        self.block("block", n.block)
+    }
+    if n.kind is "for" | "while" | "defer" {
+        self.block("body", n.body)
+    }
+    self.text("comment", n.comment)
+    self.text("trailing", n.trailing)
+    self.flag("blank", n.blank)
+    self.close()
+}
+
+// one item a line, as both notations lay a graph's declarations and a function's nodes out
+fn GWriter.lines(var self, key: Text, count: Int, indent: Int) {
+    self.key(key)
+    self.out += "["
+    if count > 0 {
+        self.out += "\n" + " " * indent
+    }
+}
+
+fn GWriter.decl(var self, d: g.Decl) {
+    self.open("Decl")
+    self.text("kind", d.kind)
+    self.text("name", d.name)
+    self.flag("pub", d.isPub)
+    self.texts("typeParams", d.typeParams)
+    self.text("comment", d.comment)
+    self.text("trailing", d.trailing)
+    if len(d.memberComments) > 0 {
+        self.key("memberComments")
+        self.out += "["
+        for (i, n) in d.memberComments.enumerate() {
+            if i > 0 {
+                self.out += ", "
+            }
+            if self.json {
+                self.out += "["
+                    + jsonString(n.above)
+                    + ", "
+                    + (if n.after is Some(t) { jsonString(t) } else { "null" })
+                    + "]"
+            } else {
+                self.out += "Note(above: " + quoteText(n.above)
+                if n.after is Some(t) {
+                    self.out += ", after: " + quoteText(t)
+                }
+                self.out += ")"
+            }
+        }
+        self.out += "]"
+    }
+    self.text("alias", d.alias)
+    if d.kind == "enum" {
+        self.key("cases")
+        self.out += "["
+        for (i, c) in d.cases.enumerate() {
+            if i > 0 {
+                self.out += ", "
+            }
+            if len(c.fields) == 0 and self.json {
+                self.str(c.name) // a case without data: its name
+            } else {
+                self.open("Case")
+                self.text("name", c.name)
+                self.fields("fields", c.fields, false)
+                self.close()
+            }
+        }
+        self.out += "]"
+    }
+    self.flag("opaque", d.opaque)
+    self.flag("interface", d.isInterface)
+    if d.isInterface {
+        self.texts("functions", d.functions)
+    }
+    self.fields("fields", d.fields, d.kind == "type" and not d.isInterface)
+    if d.kind is "fn" | "extern fn" | "test" {
+        self.params("params", d.params, true)
+    }
+    self.text("returns", d.returns)
+    self.flag("effect", d.effects)
+    self.flag("effectDeclared", d.effectDeclared)
+    self.text("externSymbol", d.externSymbol)
+    self.text("library", d.library)
+    self.flag("variadic", d.variadic)
+    self.text("annotation", d.annotation)
+    self.text("form", d.form)
+    if d.form == "block" {
+        self.block("body", d.body)
+    }
+    self.pin("result", d.result)
+    if len(d.nodes) > 0 {
+        let indent = if self.json { 4 } else { 8 }
+        if self.json {
+            self.out += ",\n   " + jsonString("nodes") + ": [\n" + " " * indent
+            self.firsts[len(self.firsts) - 1] = false
+        } else {
+            self.lines("nodes", len(d.nodes), indent)
+        }
+        for (i, n) in d.nodes.enumerate() {
+            if i > 0 {
+                self.out += if self.json { ",\n" + " " * indent } else { ",\n" + " " * indent }
+            }
+            self.node(n)
+        }
+        self.out += if self.json { "]" } else { ",\n" + " " * (indent - 4) + "]" }
+    }
+    self.close()
+}
+
+// a position as QGN writes it: a Float, with its point
+fn positionText(x: Float) -> Text {
+    let t = floatG(x, 6)
+    if t.contains(".") or t.contains("e") { t } else { t + ".0" }
+}
+
+fn graphText(gr: g.Graph, json: Bool) -> Text {
+    var w = GWriter(json)
+    w.open("Graph")
+    w.int("quark", gr.quark)
+    if json {
+        w.key("decls")
+        w.out += "[\n"
+        for (i, d) in gr.decls.enumerate() {
+            w.out += if i > 0 { ",\n  " } else { "  " }
+            w.decl(d)
+        }
+        w.out += "]"
+        if gr.closing != "" {
+            w.out += ",\n " + jsonString("closing") + ": " + jsonString(gr.closing)
+        }
+    } else {
+        w.lines("decls", len(gr.decls), 4)
+        for (i, d) in gr.decls.enumerate() {
+            if i > 0 {
+                w.out += ",\n    "
+            }
+            w.decl(d)
+        }
+        if len(gr.decls) > 0 {
+            w.out += ",\n"
+        }
+        w.out += "]"
+        w.text("closing", gr.closing)
+    }
+    w.close()
+    w.out + "\n"
+}
+
+// a graph's JSON (quark graph --json)
+pub fn jsonOfGraph(gr: g.Graph) -> Text = graphText(gr, true)
+
+// a graph's QGN (quark graph)
+pub fn qgnOfGraph(gr: g.Graph) -> Text = graphText(gr, false)
+
+// ---- reading: JSON into the values ----
+type GReader { j: Json }
+
+fn GReader.str(self, o: Int, key: Text) -> Text = self.j.text(self.j.get(o, key)) ?? ""
+
+fn GReader.int(self, o: Int, key: Text) -> Int = self.j.int(self.j.get(o, key), 0)
+
+fn GReader.flag(self, o: Int, key: Text) -> Bool = self.j.isBool(self.j.get(o, key), true)
+
+fn GReader.texts(self, o: Int, key: Text) -> [Text] =
+    self.j.items(self.j.get(o, key)).map(v => self.j.text(v) ?? "").toArray()
+
+fn GReader.pin(self, v: Int) -> g.Pin {
+    if v < 0 or self.j.kind(v) != JKind.Obj {
+        return g.Pin()
+    }
+    g.Pin(
+        node: self.int(v, "node"),
+        value: self.str(v, "value"),
+        of: self.str(v, "of"),
+        name: self.str(v, "name"),
+        case: self.str(v, "case"),
+        function: self.str(v, "fn"),
+    )
+}
+
+fn GReader.block(self, v: Int) -> g.Block =
+    g.Block(
+        stmts: self.j.items(self.j.get(v, "stmts")).map(i => self.j.int(i, 0)).toArray(),
+        closing: self.str(v, "closing"),
+    )
+
+fn GReader.param(self, v: Int) -> g.Param =
+    g.Param(
+        id: self.int(v, "id"),
+        name: self.str(v, "name"),
+        typeName: self.str(v, "type"),
+        key: self.str(v, "key"),
+        mutable: self.flag(v, "var"),
+        default: self.pin(self.j.get(v, "default")),
+    )
+
+fn GReader.field(self, v: Int) -> g.Field =
+    g.Field(name: self.str(v, "name"), typeName: self.str(v, "type"), default: self.pin(self.j.get(v, "default")))
+
+fn GReader.binds(self, o: Int) -> [g.Bind] {
+    var out: [g.Bind] = []
+    for v in self.j.items(self.j.get(o, "binds")) {
+        out.push(
+            g.Bind(
+                id: self.int(v, "id"),
+                name: self.str(v, "name"),
+                pattern: self.str(v, "pattern"),
+                binds: self.binds(v),
+                alternatives: self.alternatives(v),
+            ),
+        )
+    }
+    out
+}
+
+fn GReader.alternatives(self, o: Int) -> [g.Alt] =
+    self.j.items(self.j.get(o, "alternatives")).map(v => g.Alt(pattern: self.str(v, "pattern"), binds: self.binds(v))).toArray()
+
+fn GReader.arm(self, v: Int) -> g.Arm =
+    g.Arm(
+        pattern: self.str(v, "pattern"),
+        binds: self.binds(v),
+        alternatives: self.alternatives(v),
+        wholeId: self.int(v, "wholeId"),
+        guard: self.pin(self.j.get(v, "guard")),
+        value: self.pin(self.j.get(v, "value")),
+        block: self.block(self.j.get(v, "block")),
+        comment: self.str(v, "comment"),
+    )
+
+fn GReader.node(self, v: Int) -> g.Node {
+    let pos = self.j.items(self.j.get(v, "pos"))
+    let otherwise = self.j.get(v, "else")
+    g.Node(
+        id: self.int(v, "id"),
+        kind: self.str(v, "kind"),
+        key: self.str(v, "key"),
+        uid: self.str(v, "uid"),
+        hash: self.str(v, "hash"),
+        line: self.int(v, "line"),
+        pos: pos.map(p => self.j.nodes[p].num).toArray(),
+        typeName: self.str(v, "type"),
+        name: self.str(v, "name"),
+        op: self.str(v, "op"),
+        function: self.str(v, "fn"),
+        qualifier: self.str(v, "qualifier"),
+        field: self.str(v, "field"),
+        annotation: self.str(v, "annotation"),
+        pattern: self.str(v, "pattern"),
+        comment: self.str(v, "comment"),
+        trailing: self.str(v, "trailing"),
+        blank: self.flag(v, "blank"),
+        effects: self.flag(v, "effect"),
+        method: self.flag(v, "method"),
+        dotted: self.flag(v, "dotted"),
+        jump: self.flag(v, "jump"),
+        chain: self.flag(v, "chain"),
+        multiline: self.flag(v, "multiline"),
+        open: self.str(v, "open"),
+        elseIf: self.int(v, "elseIf"),
+        wholeId: self.int(v, "wholeId"),
+        inputs: self.j.items(self.j.get(v, "inputs")).map(p => self.pin(p)).toArray(),
+        params: self.j.items(self.j.get(v, "params")).map(p => self.param(p)).toArray(),
+        binds: self.binds(v),
+        alternatives: self.alternatives(v),
+        arms: self.j.items(self.j.get(v, "arms")).map(a => self.arm(a)).toArray(),
+        names: self.texts(v, "names"),
+        parts: self.texts(v, "parts"),
+        formats: self.texts(v, "formats"),
+        body: self.block(self.j.get(v, "body")),
+        block: self.block(self.j.get(v, "block")),
+        then: self.block(self.j.get(v, "then")),
+        otherwise: if otherwise >= 0 { Some(self.block(otherwise)) } else { None },
+    )
+}
+
+fn GReader.decl(self, v: Int) -> g.Decl {
+    var cases: [g.Case] = []
+    for c in self.j.items(self.j.get(v, "cases")) {
+        cases.push(if self.j.kind(c) == JKind.Str {
+            g.Case(name: self.j.text(c) ?? "")
+        } else {
+            g.Case(
+                name: self.str(c, "name"),
+                fields: self.j.items(self.j.get(c, "fields")).map(f => self.field(f)).toArray(),
+            )
+        })
+    }
+    var notes: [g.Note] = []
+    for n in self.j.items(self.j.get(v, "memberComments")) {
+        let parts = self.j.items(n)
+        let after = if len(parts) > 1 { self.j.text(parts[1]) } else { None }
+        notes.push(g.Note(above: if len(parts) > 0 { self.j.text(parts[0]) ?? "" } else { "" }, after: after))
+    }
+    g.Decl(
+        kind: self.str(v, "kind"),
+        name: self.str(v, "name"),
+        comment: self.str(v, "comment"),
+        trailing: self.str(v, "trailing"),
+        alias: self.str(v, "alias"),
+        isPub: self.flag(v, "pub"),
+        opaque: self.flag(v, "opaque"),
+        effects: self.flag(v, "effect"),
+        effectDeclared: self.flag(v, "effectDeclared"),
+        isInterface: self.flag(v, "interface"),
+        variadic: self.flag(v, "variadic"),
+        externSymbol: self.str(v, "externSymbol"),
+        library: self.str(v, "library"),
+        typeParams: self.texts(v, "typeParams"),
+        params: self.j.items(self.j.get(v, "params")).map(p => self.param(p)).toArray(),
+        returns: self.str(v, "returns"),
+        annotation: self.str(v, "annotation"),
+        form: self.str(v, "form"),
+        result: self.pin(self.j.get(v, "result")),
+        body: self.block(self.j.get(v, "body")),
+        nodes: self.j.items(self.j.get(v, "nodes")).map(n => self.node(n)).toArray(),
+        fields: self.j.items(self.j.get(v, "fields")).map(f => self.field(f)).toArray(),
+        cases: cases,
+        functions: self.texts(v, "functions"),
+        memberComments: notes,
+    )
+}
+
+// the graph a JSON text says; None when it is not a graph's JSON (version: what its "quark" says)
+pub fn graphOfJson(text: Text) -> g.Graph? {
+    let Some(j) = parseJson(text) else {
+        return None
+    }
+    if j.kind(0) != JKind.Obj or j.kind(j.get(0, "decls")) != JKind.Arr {
+        return None
+    }
+    let r = GReader(j)
+    Some(
+        g.Graph(
+            quark: r.int(0, "quark"),
+            decls: j.items(j.get(0, "decls")).map(d => r.decl(d)).toArray(),
+            closing: r.str(0, "closing"),
+        ),
+    )
+}
+
+// the graph a text says, in either notation (JSON starts with {), or what is wrong with it (path:line: why)
+pub fn graphOfText(text: Text, path: Text) -> g.Graph! {
+    let json = graphJson(text, path)?
+    let Some(gr) = graphOfJson(json) else {
+        return Err("{path}: this is not a Quark graph")
+    }
+    Ok(gr)
+}

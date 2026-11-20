@@ -57,5 +57,5 @@ fn main() {
     go(() => send(late, withTimeout(0.02, () => slow(1.0, 3))))
     go(() => send(soon, withTimeout(1.0, () => slow(0.01, 4))))
     print(receive(late), receive(soon))
-    print(monotonicTime() - start < 2.0)
+    print(monotonicTime() - start < 1.0)
 }

@@ -10667,9 +10667,10 @@ fn ready(t: Int, now: Float) -> Bool {
     if word(t, tWaitFd) != 0 {
         return false // runTasks' poll says when
     }
-    if word(t, tWaitChannel) != 0 and not channelReady(word(t, tWaitChannel) - 1) {
-        let until = floatAt(t, tWakeAt) // receiveWithin: until its time is over
-        return until != 0.0 and until <= now
+    if word(t, tWaitChannel) != 0 {
+        // a value came (or the channel closed); receiveWithin's time (tWakeAt) is over
+        let until = floatAt(t, tWakeAt)
+        return channelReady(word(t, tWaitChannel) - 1) or until != 0.0 and until <= now
     }
     if waitsOnThread(t) {
         return false

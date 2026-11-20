@@ -664,13 +664,26 @@ pub fn Ownership.deepFresh(self, e: Int) -> Bool {
             if x.builtin != 0 {
                 return self.isFresh(e) and self.tk(x.ty) == Kind.Array and not self.holdsContainers(self.elemOf(x.ty))
             }
-            if x.decl < 0 or x.callee >= 0 or x.binding >= 0 or not self.dl(x.decl).kind is Type | Enum {
+            if not self.constructs(e) {
                 return false
             }
             x.ordered.all(o => self.deepFresh(o))
         }
+        // a join of arrays whose elements hold no containers: a new array, all of it its own
+        Binary(_, _, _) => self.isJoin(e) and not self.holdsContainers(self.elemOf(x.ty))
         _ => false
     }
+}
+
+// a record's or a case's making (not a function's call)
+pub fn Ownership.constructs(self, e: Int) -> Bool {
+    let x = self.p.ast.exprs[e]
+    x.node is Call(_, _, _, _, _, _)
+        and x.builtin == 0
+        and x.decl >= 0
+        and x.callee < 0
+        and x.binding < 0
+        and self.dl(x.decl).kind is Type | Enum
 }
 
 pub fn Ownership.isJoin(self, e: Int) -> Bool {

@@ -24,7 +24,9 @@ best() { # best EXE: the least "ms" of $runs runs, and the checksum line
     for _ in $(seq "$runs"); do
         local o
         o=$("$@")
-        sum=$(echo "$o" | grep '^checksum')
+        # the checksum's numbers to 15 significant digits: a Float as Quark writes it (the shortest that reads back
+        # the same) and as C's printf does are the same number
+        sum=$(echo "$o" | grep '^checksum' | awk '{for (i = 2; i <= NF; i++) $i = sprintf("%.15g", $i); print}')
         local ms
         ms=$(echo "$o" | awk '/^ms/ {printf "%d", $2}')
         if [ -z "$least" ] || [ "$ms" -lt "$least" ]; then least=$ms; fi

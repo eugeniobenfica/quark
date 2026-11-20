@@ -1065,6 +1065,9 @@ fn Lower.lowerStored(var self, e: Int) -> [Int] {
 fn Lower.lowerOwned(var self, e: Int, deep: Bool) -> [Int] {
     let t = self.ty(e)
     if (deep or self.own.aliasesDeep(e)) and self.holdsContainers(t) {
+        if self.own.constructs(e) and not self.own.deepFresh(e) {
+            return self.construct(e, true) // each field its own, not the whole value copied after
+        }
         let v = self.lowerExpr(e)
         return if self.own.deepFresh(e) {
             v
@@ -3348,6 +3351,14 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
             let m = self.lowerExpr(src)
             return [self.rtcall(rtMapLen, m[..1], 'I', line)]
         }
+        if sk == Kind.Array and sx.node is Name(_) and sx.binding < 0 and sx.decl >= 0 {
+            // a constant array's length: known, no array made for it
+            let d = self.dl(sx.decl)
+            let v = if d.folded >= 0 { d.folded } else { d.body }
+            if d.kind == DeclKind.Const and v >= 0 and self.p.ast.exprs[v].node is ArrayLit(items) {
+                return [self.iconst(len(items))]
+            }
+        }
         if sk == Kind.Array and not self.isLazyName(src) {
             return [self.lowerExpr(src)[1]]
         }
@@ -4762,8 +4773,9 @@ fn Lower.lowerCall(var self, e: Int) -> [Int] {
     self.callOperator(e)
 }
 
-// a call of a function, a record's or a case's making, or an operator of a type (its function)
-fn Lower.callOperator(var self, e: Int) -> [Int] {
+// a record's or a case's making (x.decl a type or an enum): each field's value kept (deep: all it holds its own,
+// as a deep var's value is, so the value made needs no deep copy after)
+fn Lower.construct(var self, e: Int, deep: Bool) -> [Int] {
     let x = self.p.ast.exprs[e]
     let d = self.boundExtern(x.decl)
     let dx = self.dl(d)
@@ -4772,7 +4784,11 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
         for pass in 0..2 {
             for (f, prm) in dx.params.enumerate() {
                 if self.addressRead(x.ordered[f]) == (pass == 1) {
-                    let v = self.lowerStored(x.ordered[f])
+                    let v = if deep {
+                        self.lowerOwned(x.ordered[f], true)
+                    } else {
+                        self.lowerStored(x.ordered[f])
+                    }
                     let off = self.recordOffset(d, f)
                     self.setField(prm, r[off..], v, x.line)
                 }
@@ -4780,13 +4796,25 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
         }
         return r
     }
-    if dx.kind == DeclKind.Enum {
-        let n = len(self.caseFields(d, x.caseIndex))
-        var fields: [[Int]] = []
-        for i in 0..n {
-            fields.push(self.lowerStored(x.ordered[i]))
-        }
-        return self.caseValue(dx.ty, x.caseIndex, Some(fields))
+    let n = len(self.caseFields(d, x.caseIndex))
+    var fields: [[Int]] = []
+    for i in 0..n {
+        fields.push(if deep {
+            self.lowerOwned(x.ordered[i], true)
+        } else {
+            self.lowerStored(x.ordered[i])
+        })
+    }
+    self.caseValue(dx.ty, x.caseIndex, Some(fields))
+}
+
+// a call of a function, a record's or a case's making, or an operator of a type (its function)
+fn Lower.callOperator(var self, e: Int) -> [Int] {
+    let x = self.p.ast.exprs[e]
+    let d = self.boundExtern(x.decl)
+    let dx = self.dl(d)
+    if dx.kind is Type | Enum {
+        return self.construct(e, false)
     }
     let values = if len(x.ordered) > 0 { x.ordered } else { self.writtenArgs(e) }
     let count = len(values)

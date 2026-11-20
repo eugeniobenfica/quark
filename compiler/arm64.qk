@@ -7,9 +7,10 @@
 // calls into C, and with x16, x17, d0-d3 they are this backend's scratch registers.
 //
 // The frame is the one the panic's stack of calls walks: x29 points at the saved x29 and the return address (x30),
-// as rbp does on x86-64. Calls between Quark functions are the same as there: arguments go to [sp + 8i] of the
-// caller (its outgoing area), the callee reads them at [x29 + 16 + 8i] and writes its results there before
-// returning. Calls into C follow AAPCS64: x0-x7 for ints and d0-d7 for floats, each counted on its own, the rest
+// as rbp does on x86-64. Calls between Quark functions (and of the runtime's, and std.machine's) are as there: the
+// first eight slots of the arguments go in x0-x7, the rest to [sp + 8i] of the caller (its outgoing area), where the
+// callee reads them at [x29 + 16 + 8i]; the results come back the same way. No value has x0-x7 for its home, so
+// the moves in and out of them are in any order. Calls into C follow AAPCS64: x0-x7 for ints and d0-d7 for floats, each counted on its own, the rest
 // on the stack; a record comes back in x0-x1, in d0-d3 when it is all floats (four at most), or through the
 // address in x8.
 use ir
@@ -49,6 +50,9 @@ const floatCond = [eq, ne, mi, ls, gt, ge] // false when unordered, but !=
 const floatNotCond = [ne, eq, pl, hi, le, lt] // their negations, NaN included
 const nop = 0xD503201F
 const ret = 0xD65F03C0
+
+// a Quark call's first argument and result slots go in x0 to x7 (the rest in the outgoing area)
+const quarkRegs = 8
 
 // how a fixup's distance goes into its word
 enum FixKind { Branch, BranchCond, Cbz, BranchLink, Adr }
@@ -508,17 +512,37 @@ fn Arm64.coldWord(var self, w: Int, code: Int, line: Int, a: Int, b: Int) {
     self.ins(w)
 }
 
-// x2, x3 hold what it reports: rtPanic(code, line, x2, x3), the Quark way (in the outgoing area, four words at
-// least), never back
+// x2, x3 hold what it reports: rtPanic(code, line, x2, x3), the Quark way (in x0-x3), never back
 fn Arm64.panicCall(var self, code: Int, line: Int) {
     self.markPanicFrame()
-    self.access(false, false, x2, sp, 16)
-    self.access(false, false, x3, sp, 24)
-    self.movImm(x16, code)
-    self.access(false, false, x16, sp, 0)
-    self.movImm(x16, line)
-    self.access(false, false, x16, sp, 8)
+    self.movImm(x0, code)
+    self.movImm(x1, line)
     self.callRuntime(rtPanic)
+}
+
+// a Quark call's arguments in place: those past the registers to the outgoing area, then x0-x7 (from homes that
+// are none of them)
+fn Arm64.quarkArgs(var self, ins: IrIns) {
+    for i in quarkRegs..ins.argCount {
+        self.loadBits(x16, self.operands[ins.from + i])
+        self.access(false, false, x16, sp, 8 * i)
+    }
+    for i in 0..min(ins.argCount, quarkRegs) {
+        self.loadBits(i, self.operands[ins.from + i])
+    }
+}
+
+// ... and its results to their homes
+fn Arm64.quarkResults(var self, ins: IrIns) {
+    for i in 0..ins.retCount {
+        let r = self.operands[ins.from + ins.argCount + i]
+        if i < quarkRegs {
+            self.storeBits(r, i)
+        } else {
+            self.access(true, false, x16, sp, 8 * i)
+            self.storeBits(r, x16)
+        }
+    }
 }
 
 fn Arm64.emitCold(var self) {
@@ -888,11 +912,7 @@ fn Arm64.genIns(var self, ins: IrIns) {
             self.fixup(ins.imm, .Cbz, (if ins.op == .Jz { 0xB4000000 } else { 0xB5000000 }) | a)
         }
         Call => {
-            for i in 0..ins.argCount {
-                let arg = self.operands[ins.from + i]
-                self.loadBits(x16, arg)
-                self.access(false, false, x16, sp, 8 * i)
-            }
+            self.quarkArgs(ins)
             if ins.a >= 0 {
                 // blr: a function kept as a value
                 self.loadBits(x16, ins.a)
@@ -902,28 +922,16 @@ fn Arm64.genIns(var self, ins: IrIns) {
                 self.ins(0x94000000)
             }
             self.sites.push(CallSite(self.here(), ins.line, self.fnIndex, int32(ins.imm), ins.inl))
-            for i in 0..ins.retCount {
-                let r = self.operands[ins.from + ins.argCount + i]
-                self.access(true, false, x16, sp, 8 * i)
-                self.storeBits(r, x16)
-            }
+            self.quarkResults(ins)
         }
         RtCall => {
             // the runtime's Quark function, called the Quark way (the context register goes along)
             if ins.imm == rtFail or self.target.checks and countingCall(ins.imm) {
                 self.markPanicFrame()
             }
-            for i in 0..ins.argCount {
-                let arg = self.operands[ins.from + i]
-                self.loadBits(x16, arg)
-                self.access(false, false, x16, sp, 8 * i)
-            }
+            self.quarkArgs(ins)
             self.callRuntime(ins.imm)
-            for i in 0..ins.retCount {
-                let r = self.operands[ins.from + ins.argCount + i]
-                self.access(true, false, x16, sp, 8 * i)
-                self.storeBits(r, x16)
-            }
+            self.quarkResults(ins)
         }
         Ctx => {
             if ins.cond == 1 {
@@ -934,10 +942,13 @@ fn Arm64.genIns(var self, ins: IrIns) {
         }
         HostCall => self.genHostCall(ins)
         Ret => {
-            for i in 0..ins.argCount {
-                let arg = self.operands[ins.from + i]
-                self.loadBits(x16, arg)
+            // the results past the registers to the caller's outgoing area, then x0-x7
+            for i in quarkRegs..ins.argCount {
+                self.loadBits(x16, self.operands[ins.from + i])
                 self.access(false, false, x16, fp, 16 + 8 * i)
+            }
+            for i in 0..min(ins.argCount, quarkRegs) {
+                self.loadBits(i, self.operands[ins.from + i])
             }
             self.bLabel(self.epilogue)
         }
@@ -1282,8 +1293,14 @@ fn Arm64.cEntryStub(var self, f: IrFn, cArgs: Bytes) -> Int {
             self.access(false, false, x16, sp, 8 * k)
         }
     }
+    for k in 0..min(n, quarkRegs) {
+        self.access(true, false, k, sp, 8 * k) // the Quark way: the first slots in x0-x7
+    }
     let at = self.here()
     self.ins(0x94000000) // bl the body
+    for k in 0..min(f.resultCount, quarkRegs) {
+        self.access(false, false, k, sp, 8 * k)
+    }
     var ri = 0
     var rf = 0
     for k in 0..f.resultCount {
@@ -1302,14 +1319,12 @@ fn Arm64.cEntryStub(var self, f: IrFn, cArgs: Bytes) -> Int {
     at
 }
 
-// std.machine's built-ins, called the Quark way: arguments at [sp], [sp + 8], a result written at [sp].
+// std.machine's built-ins, called the Quark way: arguments in x0, x1..., a result in x0.
 // switchStack(save, load): sp, x29, x30, x19-x28, d8-d15 (21 words) into save, the same from load, then ret (to
 // load's x30, on its stack). frame(): x29. cpu(): 0 (its bits are x86-64's). call(f, a, b, c, d): C's call of f
-// with x0-x3; x0 written back.
+// with x0-x3; its x0 the result.
 fn Arm64.genMachine(var self, kind: Int) {
     if kind == machineSwitchStack {
-        self.access(true, false, x0, sp, 0)
-        self.access(true, false, x1, sp, 8)
         self.movRR(x2, sp)
         self.access(false, false, x2, x0, 0)
         self.access(false, false, fp, x0, 8)
@@ -1333,17 +1348,16 @@ fn Arm64.genMachine(var self, kind: Int) {
     } else if kind == machineCall {
         self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
         self.movRR(fp, sp)
-        self.access(true, false, x16, fp, 16)
+        self.movRR(x16, x0)
         for i in 0..4 {
-            self.access(true, false, i, fp, 24 + 8 * i)
+            self.movRR(i, i + 1)
         }
         self.ins(0xD63F0200) // blr x16
-        self.access(false, false, x0, fp, 16)
         self.ins(0xA8C17BFD) // ldp x29, x30, [sp], #16
     } else if kind == machineFrame {
-        self.access(false, false, fp, sp, 0)
+        self.movRR(x0, fp)
     } else {
-        self.access(false, false, xzr, sp, 0)
+        self.movImm(x0, 0)
     }
     self.ins(ret)
 }
@@ -1409,7 +1423,9 @@ fn Arm64.genFn(var self, f: IrFn) {
         self.coldJump(lo, panicStack, f.line, -1, -1)
     }
     for (i, v) in f.params.enumerate() {
-        if self.inReg(v) and self.isFloat(v) {
+        if i < quarkRegs {
+            self.storeBits(v, i) // from x0-x7 (nothing before has changed them)
+        } else if self.inReg(v) and self.isFloat(v) {
             self.access(true, true, self.fprOf(v), fp, 16 + 8 * i)
         } else if self.inReg(v) {
             self.access(true, false, self.gprOf(v), fp, 16 + 8 * i)
@@ -1471,13 +1487,13 @@ fn Arm64.genTrampoline(var self) -> (Int, Int) {
     self.movRR(x17, sp)
     self.access(false, false, x17, x16, 0) // ours
     self.movRR(x19, x0) // e
-    // the outgoing area: 8 bytes per slot (arguments or results, the larger), 16 aligned
+    // the outgoing area: 8 bytes per slot (arguments or results, the larger), and room for x0-x7, 16 aligned
     self.access(true, false, x1, x19, 16)
     self.access(true, false, x2, x19, 32)
     self.cmpRR(x1, x2)
     self.ins(0x9A800000 | x2 << 16 | ge << 12 | x1 << 5 | x1) // csel x1, x1, x2, ge
     self.ins(0xD37DF021) // lsl x1, x1, #3
-    self.addImm(x1, x1, 31)
+    self.addImm(x1, x1, 31 + 8 * quarkRegs)
     self.ins(0xD344FC21) // lsr x1, x1, #4
     self.ins(0xD37CEC21) // lsl x1, x1, #4
     self.ins(0xCB2163FF) // sub sp, sp, x1
@@ -1487,7 +1503,13 @@ fn Arm64.genTrampoline(var self) -> (Int, Int) {
     self.movImm(x4, 0)
     self.copyLoop(0xF8647845, 0xF8247BE5) // ldr x5, [x2, x4, lsl #3]; str x5, [sp, x4, lsl #3]
     self.access(true, false, x16, x19, 0)
+    for i in 0..quarkRegs {
+        self.access(true, false, i, sp, 8 * i) // the first slots, the Quark way
+    }
     self.ins(0xD63F0000 | x16 << 5) // blr x16
+    for i in 0..quarkRegs {
+        self.access(false, false, i, sp, 8 * i)
+    }
     // results
     self.access(true, false, x2, x19, 24)
     self.access(true, false, x3, x19, 32)

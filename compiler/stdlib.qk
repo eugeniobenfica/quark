@@ -2944,7 +2944,7 @@ pub fn localNow() -> DateTime = local(unixTime())
 
 // what this compiler is: its sources' checksum (CRC and length, by cksum): what it makes of the runtime's texts
 // depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "1434413555-1714222"
+pub const compilerSources = "2432674008-1714939"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "windows"]

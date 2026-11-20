@@ -177,10 +177,28 @@ preciso, numa versão mínima.
 >   - Tentados e não mantidos: endereçamento aberto com marcas ou com deslocamento para trás (json 4–7% pior em todas as variantes); salas quentes e frias por coleta (counting 50% pior); crescer no lugar com a tabela nova (21 ms contra 19,5 ms de um array novo: juntar arrays pequenos já é barato).
 >   - **O que falta é de desenho.** É preciso não copiar o que sobrevive com certeza (alocar direto no espaço velho quando o valor vai para uma estrutura velha) e ter arrays com cabeçalho de capacidade.
 
-> **Próximos passos:**
-> - As decisões que ainda dependem do estado da emissão: o self por endereço, a área da função e a coleta por turno de laço, que lê o IR emitido.
-> - O último uso estendido a campos (`self.items` no fim) e a ramos de `match` e `if`.
-> - Reutilização no lugar (`xs = xs.map(...)` sobre um var único).
+> **Concluído em 20/11/2026.**
+> - **As decisões que dependiam da emissão.** O tamanho e o custo dos corpos (a política de inlining), o self por
+>   endereço, mantê-lo na memória e trazê-lo aos registradores num laço só liam a árvore e os tipos: foram para
+>   `ownership.qk` com os seus memos. `tools/parity.sh`: o mesmo IR em 229 de 229 programas.
+>   - **Ficam na emissão, de propósito:** a checagem de fim de turno do laço lê o IR emitido porque é ele que diz,
+>     exatamente, se o turno aloca; prever isso pela árvore repetiria tudo o que o lowering sabe sobre o que aloca.
+>     A área da função é armazenamento que a emissão pede quando precisa.
+> - **Último uso em ramos.** Quando o último comando que menciona o var é um `if` ou um `match`, cada ramo é
+>   decidido como um bloco (recursivo); condição, sujeito e guardas são lidos antes. Uma linha empurrada numa lista
+>   ou noutra conforme o ramo não é mais copiada: 4 cópias para 0 num laço, 48 → 38 ms; 3 dos 229 programas
+>   mudam, o compilador entre eles.
+>   - **Campos (`self.items` no fim):** não feito. Devolver um campo de `var self` deixa o mesmo valor no var de
+>     quem chamou, que segue vivo; tomá-lo exigiria esvaziar o campo, uma mudança de semântica.
+> - **Reutilização no lugar.** `xs = xs.map(f)` num var escreve cada valor onde estava o elemento, como
+>   `xs[i] = f(xs[i])` faria (o buffer de um var é dele). Só quando `f` é um lambda que não lê `xs`, `xs` não foi
+>   capturado, os elementos mantêm o tipo e não guardam memória (um valor novo num array velho pediria a barreira
+>   do coletor). 50 maps de um milhão de `Int`s: 30 → 6 ms.
+> - **Análise de escape.** Um literal de array de poucos elementos sem memória, num `let` lido só por índice (sem
+>   fatia), por `len` ou por um `for`, nunca sai da função: nenhuma chamada o recebe, nenhum lambda o captura, não é
+>   devolvido, guardado nem dado a outro nome. A memória dele é a área da função, feita uma vez por chamada e usada
+>   de novo a cada volta: um laço que faz um por volta não faz nada para o coletor. 2,2 → 0,9 ns por volta, o mesmo
+>   que sem array. Teste: `escapes` (os que saem: fatia, chamada, retorno, captura, outro nome, lista).
 
 **Hoje:** `lower.qk` vai da árvore checada direto para instruções com registradores, decidindo no caminho
 cópias, empréstimos, coleta de laço, C, closures e açúcar.

@@ -21,13 +21,16 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 
 - [x] B1 built-ins de sistema declarados em Quark (`compiler/prelude.qk`)
 - [x] B2 constantes por execução (`compiler/construn.qk`)
-- [~] B3 um passo intermediário antes da IR de máquina
+- [x] B3 um passo intermediário antes da IR de máquina
   - [-] passo 1 (desaçucarar): medido, pouco a ganhar
   - [x] as decisões de memória fora de `lower.qk`, em `compiler/ownership.qk`; o aliasing fundo calculado antes
   - [x] o último uso de um var entrega o valor (`decideTakes`)
   - [x] resultado todo seu dispensa cópia funda (`decideResults`)
-  - [ ] as decisões ainda tomadas durante a emissão: self por endereço, a área da função, a coleta por volta de laço
-  - [ ] análise de escape
+  - [x] as decisões que só leem a árvore fora da emissão (inlining, self por endereço); a checagem de fim de turno
+    lê o IR de propósito
+  - [x] último uso em ramos de `if` e `match`
+  - [x] reutilização no lugar (`xs = xs.map(f)` num var)
+  - [x] análise de escape: arrays literais que não saem da função ficam na área dela
 - [x] B4 o heap contado removido
 - [x] B5 o runtime inlinável
   - [x] alocação de tamanho conhecido no próprio código

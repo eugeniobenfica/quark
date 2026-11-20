@@ -57,6 +57,7 @@ pub const largeFrom = 65536
 const largeSpare = 4
 const growingFirstBits = 10 // 1024 buckets to start with
 const growingWays = 4
+const growingMostBits = 14 // at most 16384 buckets: a loop's collection looks through all of them
 const blockSize = 16777216
 
 pub fn arena() -> Int = ctxGet(ctxArena)
@@ -371,10 +372,24 @@ pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
 }
 
 // twice the buckets, the rooms put in again
-fn growingDouble(a: Int) {
+fn growingDouble(a: Int) = growingResize(a, word(a, aGrowingBits) + 1)
+
+// after a loop's collection (rooms: those it left): a table grown for rooms that went back to the size they need (a
+// quarter of its slots at most), so that the next collections look through no more than that
+pub fn growingFit(a: Int, rooms: Int) {
+    var bits = word(a, aGrowingBits)
+    while bits > growingFirstBits and 8 * rooms < 1 << (bits - 1) * growingWays {
+        bits -= 1
+    }
+    if bits != word(a, aGrowingBits) {
+        growingResize(a, bits)
+    }
+}
+
+fn growingResize(a: Int, bits: Int) {
     let old = word(a, aGrowing)
     let oldSlots = growingSlots(a)
-    setWord(a, aGrowingBits, word(a, aGrowingBits) + 1)
+    setWord(a, aGrowingBits, bits)
     setWord(a, aGrowing, calloc(growingSlots(a), 16))
     setWord(a, aGrowingEvicted, 0)
     for i in 0..oldSlots {

@@ -195,7 +195,7 @@ type TableKey { have: Int, want: Int, at: Int }
 
 // a function made after the program's: a printer of a type (byValue: its slots as the arguments, else a box's
 // address), or (owns) one that copies the insides of an array's or a map's elements
-type Helper { t: Int, index: Int, byValue: Bool, owns: Bool }
+type Helper { t: Int, index: Int, byValue: Bool, owns: Bool, textFind: Bool = false }
 
 // xs.push(v) on a var's own name: the function, the push, the var
 type Growth { fnId: Int, at: Int, holder: Int }
@@ -940,6 +940,84 @@ fn Lower.allocInline(var self, bytes0: Int, count: Int, line: Int) -> Int {
     r
 }
 
+// The room the arena knows at address p (bytes; 0 none), found here in the code: runtime/arena.qk's growingRoom,
+// the same hash (a logical shift is an arithmetic one masked) and the bucket's four entries. The words read are
+// arena.qk's (ctxArena 5; aGrowing 5, aGrowingBits 6; a bucket: growingWays (address, bytes) pairs).
+fn Lower.roomAt(var self, p: Int) -> Int {
+    let room = self.newReg('I')
+    let z = self.iconst(0)
+    self.mov(room, z)
+    let done = self.label()
+    let cx = self.newReg('I')
+    self.emit(.Ctx, cx, -1, -1)
+    self.jz(cx, done)
+    let a = self.loadMem('I', cx, -1, 1, 8 * 5, mem64)
+    let k4 = self.iconst(4)
+    let h0 = self.op2(.Sar, p, k4, 'I')
+    let k17 = self.iconst(17)
+    let h1 = self.op2(.Sar, h0, k17, 'I')
+    let h2 = self.op2(.Xor, h0, h1, 'I')
+    let mixer = self.iconst(-7046029254386353131)
+    let h = self.op2(.Mul, h2, mixer, 'I')
+    let bits = self.loadMem('I', a, -1, 1, 8 * 6, mem64)
+    let k64 = self.iconst(64)
+    let shift = self.op2(.Sub, k64, bits, 'I')
+    let top = self.op2(.Sar, h, shift, 'I')
+    let one = self.iconst(1)
+    let span = self.op2(.Shl, one, bits, 'I')
+    let mask = self.op2(.Sub, span, one, 'I')
+    let index = self.op2(.And, top, mask, 'I')
+    let k6 = self.iconst(6)
+    let offset = self.op2(.Shl, index, k6, 'I') // growingWays * 16 bytes a bucket
+    let table = self.loadMem('I', a, -1, 1, 8 * 5, mem64)
+    let bucket = self.op2(.Add, table, offset, 'I')
+    for i in 0..4 {
+        let next = self.label()
+        let at = self.loadMem('I', bucket, -1, 1, 16 * i, mem64)
+        let same = self.cmp(condEq, at, p)
+        self.jz(same, next)
+        let r = self.loadMem('I', bucket, -1, 1, 16 * i + 8, mem64)
+        self.mov(room, r)
+        self.jmp(done)
+        self.place(next)
+    }
+    self.place(done)
+    room
+}
+
+// xs.push's array (p, n): p when its room holds one more of bytes (found here in the code), else the runtime's push
+// (it moves to twice the room). growth: the var whose push it is (its loop's check: Growth), -1 none.
+fn Lower.pushRoom(var self, p: Int, n: Int, bytes: Int, growth: Int, line: Int) -> Int {
+    let kb = self.iconst(bytes)
+    if self.opts.runtime {
+        let q = self.rtcall(rtPush, [p, n, kb], 'I', line)
+        if growth >= 0 {
+            self.growths.push(Growth(self.fnId, len(self.cur.code) - 1, growth))
+        }
+        return q
+    }
+    let r = self.newReg('I')
+    let slow = self.label()
+    let done = self.label()
+    self.jz(p, slow)
+    let room = self.roomAt(p)
+    let one = self.iconst(1)
+    let more = self.op2(.Add, n, one, 'I')
+    let need = self.op2(.Mul, more, kb, 'I')
+    let over = self.cmp(condGt, need, room)
+    self.jnz(over, slow)
+    self.mov(r, p)
+    self.jmp(done)
+    self.place(slow)
+    let q = self.rtcall(rtPush, [p, n, kb], 'I', line)
+    if growth >= 0 {
+        self.growths.push(Growth(self.fnId, len(self.cur.code) - 1, growth))
+    }
+    self.mov(r, q)
+    self.place(done)
+    r
+}
+
 // 1 when byte c is a space between words (' ', a tab, a new line, a carriage return), else 0: a byte above ' ' (most
 // of them) by one test
 fn Lower.spaceTest(var self, c: Int) -> Int {
@@ -1283,7 +1361,7 @@ fn Lower.sink(var self, sk: Sink, elem: [Int], index: Int) {
             let kv = self.lowerExpr(self.lambdaBody(lambda))
             let k = self.copyVal(kv)
             let ka = self.keyArgs(k, key)
-            let p = self.rtcall(rtMapGet, [acc] + ka, 'I', line)
+            let p = self.mapLookup(acc, ka, key, line)
             let fresh = self.label()
             let done = self.label()
             self.jz(p, fresh)
@@ -1454,7 +1532,7 @@ fn Lower.entrySink(var self, s: EntrySink, key: [Int], value: [Int]) {
                 return
             }
             let ka = self.keyArgs(key, keyType)
-            let p = self.rtcall(rtMapGet, [other] + ka, 'I', line)
+            let p = self.mapLookup(other, ka, keyType, line)
             let skip = self.label()
             if both { self.jz(p, skip) } else { self.jnz(p, skip) }
             self.mapSet([out], key, keyType, [], line)
@@ -2009,7 +2087,7 @@ fn Lower.textOfVal(var self, v: [Int], t: Int, line: Int) -> [Int] {
 fn Lower.helperIndex(var self, t: Int, byValue: Bool, owns: Bool) -> Int {
     var index = -1
     for h in self.helpers {
-        if h.t == t and (if owns { h.owns } else { h.byValue == byValue and not h.owns }) {
+        if not h.textFind and h.t == t and (if owns { h.owns } else { h.byValue == byValue and not h.owns }) {
             index = h.index
         }
     }
@@ -2017,6 +2095,18 @@ fn Lower.helperIndex(var self, t: Int, byValue: Bool, owns: Bool) -> Int {
         index = self.outCount - self.helpersDone + len(self.helpers)
         self.helpers.push(Helper(t, index, byValue, owns))
     }
+    index
+}
+
+// the program's function that finds a text key in a map (Lower.textFindHelper), its index
+fn Lower.textFindIndex(var self) -> Int {
+    for h in self.helpers {
+        if h.textFind {
+            return h.index
+        }
+    }
+    let index = self.outCount - self.helpersDone + len(self.helpers)
+    self.helpers.push(Helper(-1, index, false, false, textFind: true))
     index
 }
 
@@ -2735,9 +2825,258 @@ fn Lower.mapSet(var self, m: [Int], k: [Int], key: Int, v: [Int], line: Int) {
     self.storeSlots(p, z, 0, 0, v)
 }
 
+// x >> n as the runtime's shr does it (logical): the arithmetic shift, masked
+fn Lower.shrLogical(var self, x: Int, n: Int) -> Int {
+    let kn = self.iconst(n)
+    let shifted = self.op2(.Sar, x, kn, 'I')
+    let mask = self.iconst(1 << (64 - n) - 1)
+    self.op2(.And, shifted, mask, 'I')
+}
+
+// runtime/base.qk's mix, here in the code
+fn Lower.mixHere(var self, x: Int) -> Int {
+    let a1 = self.shrLogical(x, 30)
+    let a2 = self.op2(.Xor, x, a1, 'I')
+    let m1 = self.iconst(-4658895280553007687)
+    let a = self.op2(.Mul, a2, m1, 'I')
+    let b1 = self.shrLogical(a, 27)
+    let b2 = self.op2(.Xor, a, b1, 'I')
+    let m2 = self.iconst(-7723592293110705685)
+    let b = self.op2(.Mul, b2, m2, 'I')
+    let c1 = self.shrLogical(b, 31)
+    self.op2(.Xor, b, c1, 'I')
+}
+
+// where m's value for the key ka (keyArgs) is, 0 when it has none: the runtime's mapGet. A key of one plain slot (an
+// Int, a Bool, a case without data) is looked for here in the code, as runtime/map.qk's mapFindHashed does: its hash,
+// then the table's slots from there (a slot: the entry's index + 1, the hash's high 32 bits above), the entry's
+// key compared where the tags match. The words read are map.qk's (mValueBytes 3, mTableCap 5, mEntries 6, mTable 7,
+// mKeySlots 9; an entry: [alive][key's slots][value]).
+fn Lower.mapLookup(var self, m: Int, ka: [Int], key: Int, line: Int) -> Int {
+    let kind = mapKeyKind(self.typeDesc(key))
+    if not self.opts.runtime and kind == 1 {
+        // a text: the program's own function for it (one, called from every place)
+        let index = self.textFindIndex()
+        let c = self.emitAt(.Call, -1, -1, -1, imm: index, line: line)
+        self.cur.setArgs(c, [m] + ka)
+        let r = self.newReg('I')
+        self.setRets(c, [r])
+        self.maxOut(3)
+        return r
+    }
+    if self.opts.runtime or kind != 0 {
+        return self.rtcall(rtMapGet, [m] + ka, 'I', line)
+    }
+    let k = ka[0]
+    let r = self.newReg('I')
+    let z = self.iconst(0)
+    self.mov(r, z)
+    let done = self.label()
+    self.jz(m, done)
+    let tableCap = self.loadMem('I', m, -1, 1, 8 * 5, mem64)
+    self.jz(tableCap, done)
+    let seed = self.iconst(-7046029254386353131)
+    let seeded = self.op2(.Add, k, seed, 'I')
+    let h = self.mixHere(seeded)
+    let one = self.iconst(1)
+    let mask = self.op2(.Sub, tableCap, one, 'I')
+    let table = self.loadMem('I', m, -1, 1, 8 * 7, mem64)
+    let tagBits = self.iconst(-4294967296)
+    let tag = self.op2(.And, h, tagBits, 'I')
+    let i = self.newReg('I')
+    let i0 = self.op2(.And, h, mask, 'I')
+    self.mov(i, i0)
+    let entries = self.loadMem('I', m, -1, 1, 8 * 6, mem64)
+    let keySlots = self.loadMem('I', m, -1, 1, 8 * 9, mem64)
+    let valueBytes = self.loadMem('I', m, -1, 1, 8 * 3, mem64)
+    let k3 = self.iconst(3)
+    let keyBytes = self.op2(.Shl, keySlots, k3, 'I')
+    let k8 = self.iconst(8)
+    let valueAt = self.op2(.Add, keyBytes, k8, 'I')
+    let stride = self.op2(.Add, valueAt, valueBytes, 'I')
+    let top = self.label()
+    let next = self.label()
+    self.place(top)
+    let slot = self.loadMem('I', table, i, 8, 0, mem64)
+    self.jz(slot, done)
+    let slotTag = self.op2(.And, slot, tagBits, 'I')
+    let tagged = self.cmp(condEq, slotTag, tag)
+    self.jz(tagged, next)
+    let indexBits = self.iconst(4294967295)
+    let index1 = self.op2(.And, slot, indexBits, 'I')
+    let index = self.op2(.Sub, index1, one, 'I')
+    let off = self.op2(.Mul, index, stride, 'I')
+    let e = self.op2(.Add, entries, off, 'I')
+    let alive = self.loadMem('I', e, -1, 1, 0, mem64)
+    self.jz(alive, next)
+    let held = self.loadMem('I', e, -1, 1, 8, mem64)
+    let same = self.cmp(condEq, held, k)
+    self.jz(same, next)
+    let at = self.op2(.Add, e, valueAt, 'I')
+    self.mov(r, at)
+    self.jmp(done)
+    self.place(next)
+    let i1 = self.op2(.Add, i, one, 'I')
+    let i2 = self.op2(.And, i1, mask, 'I')
+    self.mov(i, i2)
+    self.jmp(top)
+    self.place(done)
+    r
+}
+
+// runtime/map.qk's textHash of n bytes at p, here in the code: eight bytes at a time multiplied in, the last few
+// as one word, mixed at the end
+fn Lower.textHashHere(var self, p: Int, n: Int) -> Int {
+    let mul = self.iconst(-7046029254386353131)
+    let h = self.newReg('I')
+    let n1 = self.op2(.Mul, n, mul, 'I')
+    let basis = self.iconst(1469598103934665603)
+    let h0 = self.op2(.Xor, n1, basis, 'I')
+    self.mov(h, h0)
+    let i = self.newReg('I')
+    let z = self.iconst(0)
+    self.mov(i, z)
+    let words = self.label()
+    let tail = self.label()
+    self.place(words)
+    let k8 = self.iconst(8)
+    let i8 = self.op2(.Add, i, k8, 'I')
+    let past = self.cmp(condGt, i8, n)
+    self.jnz(past, tail)
+    let w = self.loadMem('I', p, i, 1, 0, mem64)
+    let hw = self.op2(.Xor, h, w, 'I')
+    let hm = self.op2(.Mul, hw, mul, 'I')
+    let hs = self.shrLogical(hm, 29)
+    let hx = self.op2(.Xor, hm, hs, 'I')
+    self.mov(h, hx)
+    self.mov(i, i8)
+    self.jmp(words)
+    self.place(tail)
+    let last = self.newReg('I')
+    let shift = self.newReg('I')
+    let z2 = self.iconst(0)
+    self.mov(last, z2)
+    self.mov(shift, z2)
+    let bytes = self.label()
+    let fin = self.label()
+    self.place(bytes)
+    let more = self.cmp(condLt, i, n)
+    self.jz(more, fin)
+    let b = self.loadByte(p, i)
+    let bs = self.op2(.Shl, b, shift, 'I')
+    let l2 = self.op2(.Or, last, bs, 'I')
+    self.mov(last, l2)
+    let k8b = self.iconst(8)
+    let s2 = self.op2(.Add, shift, k8b, 'I')
+    self.mov(shift, s2)
+    let one = self.iconst(1)
+    let i2 = self.op2(.Add, i, one, 'I')
+    self.mov(i, i2)
+    self.jmp(bytes)
+    self.place(fin)
+    let hl = self.op2(.Xor, h, last, 'I')
+    self.mixHere(hl)
+}
+
+// The program's function for a map's text key (m, p, n): where its value is, or 0 (runtime/map.qk's mapGet of a
+// text key: the hash, the table's slots from there, an entry's length and then its bytes compared where the tags
+// match), here in the program rather than a call to the runtime.
+fn Lower.textFindHelper(var self) {
+    let m = self.newReg('I')
+    let p = self.newReg('I')
+    let n = self.newReg('I')
+    self.cur.params = [m, p, n]
+    self.cur.maxOut = 3
+    let r = self.newReg('I')
+    let z = self.iconst(0)
+    self.mov(r, z)
+    let done = self.label()
+    self.jz(m, done)
+    let tableCap = self.loadMem('I', m, -1, 1, 8 * 5, mem64)
+    self.jz(tableCap, done)
+    let h = self.textHashHere(p, n)
+    let one = self.iconst(1)
+    let mask = self.op2(.Sub, tableCap, one, 'I')
+    let table = self.loadMem('I', m, -1, 1, 8 * 7, mem64)
+    let tagBits = self.iconst(-4294967296)
+    let tag = self.op2(.And, h, tagBits, 'I')
+    let i = self.newReg('I')
+    let i0 = self.op2(.And, h, mask, 'I')
+    self.mov(i, i0)
+    let entries = self.loadMem('I', m, -1, 1, 8 * 6, mem64)
+    let keySlots = self.loadMem('I', m, -1, 1, 8 * 9, mem64)
+    let valueBytes = self.loadMem('I', m, -1, 1, 8 * 3, mem64)
+    let k3 = self.iconst(3)
+    let keyBytes = self.op2(.Shl, keySlots, k3, 'I')
+    let k8 = self.iconst(8)
+    let valueAt = self.op2(.Add, keyBytes, k8, 'I')
+    let stride = self.op2(.Add, valueAt, valueBytes, 'I')
+    let top = self.label()
+    let next = self.label()
+    self.place(top)
+    let slot = self.loadMem('I', table, i, 8, 0, mem64)
+    self.jz(slot, done)
+    let slotTag = self.op2(.And, slot, tagBits, 'I')
+    let tagged = self.cmp(condEq, slotTag, tag)
+    self.jz(tagged, next)
+    let indexBits = self.iconst(4294967295)
+    let index1 = self.op2(.And, slot, indexBits, 'I')
+    let index = self.op2(.Sub, index1, one, 'I')
+    let off = self.op2(.Mul, index, stride, 'I')
+    let e = self.op2(.Add, entries, off, 'I')
+    let alive = self.loadMem('I', e, -1, 1, 0, mem64)
+    self.jz(alive, next)
+    let len2 = self.loadMem('I', e, -1, 1, 16, mem64)
+    let sameLen = self.cmp(condEq, len2, n)
+    self.jz(sameLen, next)
+    // the bytes: eight at a time, then one at a time
+    let q = self.loadMem('I', e, -1, 1, 8, mem64)
+    let j = self.newReg('I')
+    let z3 = self.iconst(0)
+    self.mov(j, z3)
+    let words = self.label()
+    let bytes = self.label()
+    let found = self.label()
+    self.place(words)
+    let k8w = self.iconst(8)
+    let j8 = self.op2(.Add, j, k8w, 'I')
+    let past = self.cmp(condGt, j8, n)
+    self.jnz(past, bytes)
+    let wa = self.loadMem('I', p, j, 1, 0, mem64)
+    let wb = self.loadMem('I', q, j, 1, 0, mem64)
+    let same8 = self.cmp(condEq, wa, wb)
+    self.jz(same8, next)
+    self.mov(j, j8)
+    self.jmp(words)
+    self.place(bytes)
+    let more = self.cmp(condLt, j, n)
+    self.jz(more, found)
+    let ba = self.loadByte(p, j)
+    let bb = self.loadByte(q, j)
+    let same1 = self.cmp(condEq, ba, bb)
+    self.jz(same1, next)
+    let j1 = self.op2(.Add, j, one, 'I')
+    self.mov(j, j1)
+    self.jmp(bytes)
+    self.place(found)
+    let at = self.op2(.Add, e, valueAt, 'I')
+    self.mov(r, at)
+    self.jmp(done)
+    self.place(next)
+    let i1 = self.op2(.Add, i, one, 'I')
+    let i2 = self.op2(.And, i1, mask, 'I')
+    self.mov(i, i2)
+    self.jmp(top)
+    self.place(done)
+    self.cur.resultCount = 1
+    let rt = self.emitAt(.Ret, -1, -1, -1)
+    self.cur.setArgs(rt, [r])
+    self.touch(r)
+}
+
 fn Lower.mapGet(var self, m: [Int], k: [Int], key: Int, option: Int, line: Int) -> [Int] {
     let ka = self.keyArgs(k, key)
-    let p = self.rtcall(rtMapGet, [m[0], ka[0], ka[1]], 'I', line)
+    let p = self.mapLookup(m[0], ka, key, line)
     let r = self.valOf(option)
     let z = self.iconst(0)
     let found = self.cmp(condNe, p, z)
@@ -2755,7 +3094,7 @@ fn Lower.mapGet(var self, m: [Int], k: [Int], key: Int, option: Int, line: Int) 
 // m[k] in a place: where its value is; a key the map does not hold stops the program
 fn Lower.mapAt(var self, m: [Int], k: [Int], t: Int, line: Int) -> Int {
     let ka = self.keyArgs(k, self.keyOf(t))
-    let p = self.rtcall(rtMapGet, [m[0], ka[0], ka[1]], 'I', line)
+    let p = self.mapLookup(m[0], ka, self.keyOf(t), line)
     let found = self.label()
     self.jnz(p, found)
     var why = self.literalText("no key ")
@@ -3184,7 +3523,7 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
             let k = self.lowerExpr(a[1])
             let ka = self.keyArgs(k, self.keyOf(st))
             let z = self.iconst(0)
-            let p = self.rtcall(rtMapGet, [m[0], ka[0], ka[1]], 'I', line)
+            let p = self.mapLookup(m[0], ka, self.keyOf(st), line)
             return [self.cmp(condNe, p, z)]
         }
         let nv = self.lowerExpr(a[1])
@@ -3766,9 +4105,7 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
         if own {
             let holder = self.p.ast.exprs[a[0]].binding
             let arr = self.regsOf(holder)[..2]
-            let kb = self.iconst(bytes)
-            let ptr = self.rtcall(rtPush, [arr[0], arr[1], kb], 'I', line)
-            self.growths.push(Growth(self.fnId, len(self.cur.code) - 1, holder))
+            let ptr = self.pushRoom(arr[0], arr[1], bytes, holder, line)
             self.mov(arr[0], ptr)
             self.storeSlots(arr[0], arr[1], bytes, 0, v)
             let one = self.iconst(1)
@@ -3781,8 +4118,7 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
         }
         let p = self.changePlace(a[0])
         let arr = self.readPlace(p, at0)
-        let kb = self.iconst(bytes)
-        let g0 = self.rtcall(rtPush, [arr[0], arr[1], kb], 'I', line)
+        let g0 = self.pushRoom(arr[0], arr[1], bytes, -1, line)
         self.storeSlots(g0, arr[1], bytes, 0, v)
         let one = self.iconst(1)
         let g1 = self.op2(.Add, arr[1], one, 'I')
@@ -7234,7 +7570,14 @@ fn Lower.lowerEntry(var self, main: Int, index: Int) {
 }
 
 fn Lower.lowerHelper(var self, h: Helper, index: Int) {
-    self.cur = IrFn((if h.owns { "own " } else { "print " }) + self.p.typeName(h.t))
+    let name = if h.textFind {
+        "find a text key"
+    } else if h.owns {
+        "own " + self.p.typeName(h.t)
+    } else {
+        "print " + self.p.typeName(h.t)
+    }
+    self.cur = IrFn(name)
     self.fnId = index
     self.current = -1
     self.depth = 0
@@ -7243,7 +7586,10 @@ fn Lower.lowerHelper(var self, h: Helper, index: Int) {
     self.printing = []
     self.areaAt = -1 // (no area of its own: refOf allocates)
     self.defers = []
-    if h.owns {
+    if h.textFind {
+        self.textFindHelper()
+        return
+    } else if h.owns {
         self.lowerOwnHelper(h.t)
     } else if h.byValue {
         let v = self.valOf(h.t)

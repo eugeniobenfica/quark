@@ -25,6 +25,39 @@ extern effect fn osSend(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "q
 extern effect fn osCloseSocket(s: Int64) as "qkosCloseSocket"
 extern effect fn osLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" // seconds east of UTC, then
 
+extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+// the job of a connect or a listen (tasks.qk offThread): host, port, why, then the socket made
+fn connectJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 3, osConnect(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn listenJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 3, osListen(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+// the socket connected to host:port (listen: listening there), the name looked up and the connection made on a
+// thread of its own when in a task: the others go on meanwhile; or -1 with why
+fn socketOn(listen: Bool, host: Int, port: Int, why: Int) -> Int {
+    let j = calloc(jobArgs + 4, 8)
+    setWord(j, jobArgs, host)
+    setWord(j, jobArgs + 1, port)
+    setWord(j, jobArgs + 2, why)
+    let f = if listen { jobAddress(x => listenJob(x)) } else { jobAddress(x => connectJob(x)) }
+    if not offThread(f, j) {
+        let _ = if listen { listenJob(j) } else { connectJob(j) }
+    }
+    let s = word(j, jobArgs + 3)
+    free(j)
+    s
+}
+
 fn failed(what: Text, why: Int) -> Int = errResult(message().text(what).text(": ").zeroText(why))
 
 // ---- files ----
@@ -102,7 +135,7 @@ fn why() -> Int {
 // listen(host, port) -> Socket!
 pub extern effect fn rtListen(host: Int64, hostLen: Int64, port: Int64) -> Int64 as "qk_listen" {
     let w = why()
-    let s = osListen(cString(host, hostLen), port, w)
+    let s = socketOn(true, cString(host, hostLen), port, w)
     if s < 0 {
         return errResult(message().text("cannot listen on port ").int(port).text(": ").zeroText(w))
     }
@@ -113,7 +146,7 @@ pub extern effect fn rtListen(host: Int64, hostLen: Int64, port: Int64) -> Int64
 pub extern effect fn rtConnect(host: Int64, hostLen: Int64, port: Int64) -> Int64 as "qk_connect" {
     let w = why()
     let name = cString(host, hostLen)
-    let s = osConnect(name, port, w)
+    let s = socketOn(false, name, port, w)
     if s < 0 {
         return errResult(message().text("cannot connect to ").zeroText(name).text(":").int(port).text(": ").zeroText(w))
     }

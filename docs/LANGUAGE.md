@@ -1169,9 +1169,12 @@ arena of its own (see [Memory](#memory)), so tasks that are alive keep no one's 
 
 `go(f)` makes a task of `f` that is no one's to step: the background runs it. `runTasks()` runs every background
 task until all are done (those they `go` too), and a `receive` outside a task runs them until a value comes. What
-a task waits for gives its turn back: `sleep`, a `receive` on an empty channel, and a socket's read, write or
-accept that would wait. When every task waits, the program waits on the system (the sockets' readiness, the
-soonest sleep's end), so a thousand idle connections cost no processor time.
+a task waits for gives its turn back: `sleep`, a `receive` on an empty channel, a socket's read, write or accept
+that would wait, and the calls the system makes wait: `connect` and `listen` (the name looked up, the connection
+made), `runProcess`, `readLine`. Those run on a thread of their own while the task waits, so three processes run
+from three tasks run at once. When every task waits, the program waits on the system (the sockets' readiness, the
+soonest sleep's end), so a thousand idle connections cost no processor time; while one waits on such a call, it
+looks again every few milliseconds.
 
 A `Channel<T>` carries values of `T` from task to task, in the order they were sent: numbers, texts, records,
 enums, arrays, maps, functions, other channels. Each is copied, with all it holds: a task's memory is its own.

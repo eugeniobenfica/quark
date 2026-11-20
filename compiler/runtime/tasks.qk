@@ -41,7 +41,8 @@ const tCallerRegs = 70 // 32 words
 const tWaitFd = 102 // a socket it waits on (its number + 1), 0 none: it is stepped again when the socket is ready
 const tWaitWrite = 103 // ... to write to it, else to read
 const tWaitChannel = 104 // a channel it waits on (its number + 1), 0 none: stepped again when it has a message
-const taskWords = 105
+const tWaitThread = 105 // a system call it waits for, on a thread of its own (its job: offThread), 0 none
+const taskWords = 106
 
 extern fn startAddress(f: extern () -> Int64) -> Int64 as "qkTextAddress"
 
@@ -258,6 +259,9 @@ pub extern effect fn rtJoinTask(n: Int64, line: Int64) as "qk_joinTask" {
             let _ = osPoll(items, 1, -1)
             setWord(t, tWaitFd, 0)
         }
+        if waitsOnThread(t) {
+            osSleep(threadLookAgain)
+        }
         let wake = floatAt(t, tWakeAt)
         let left = if wake != 0.0 { wake - osNow() } else { 0.0 }
         if left > 0.0 {
@@ -285,6 +289,61 @@ pub fn waitSocket(fd: Int, write: Bool) {
     rtYield()
     setWord(ctxGet(ctxTask), tWaitFd, 0)
 }
+
+// ---- system calls that wait, on a thread of their own ----
+// A call the system makes wait (a name looked up, a connection made, a process run, a line typed) made in a task
+// runs on a thread of its own, and the task gives its turn back until it is done: the others go on meanwhile. The
+// call's job is malloc'd words: [done][the thread][its context][what the call takes and gives...]. The thread runs
+// with a copy of the waiting task's context (its globals, its arena: the task does not run meanwhile); the call
+// touches only the job, malloc'd memory and the task's, and does not panic.
+// The scheduler cannot be woken by the thread (a pipe would be no socket on Windows): while a task waits on one, it
+// looks again every few milliseconds. Outside a task, the call is made here.
+pub const jobDone = 0
+const jobThread = 1
+const jobCtx = 2 // the thread's context, or 0: the call made where it was asked for
+pub const jobArgs = 3 // the call's own words from here
+const threadLookAgain = 2 // ms between looks while a task waits on a thread and nothing else is ready
+
+extern effect fn osThreadStart(f: Int64, arg: Int64) -> Int64 as "qkosThreadStart" // a handle, or 0
+extern effect fn osThreadJoin(h: Int64) as "qkosThreadJoin"
+extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+// f(job) (an extern fn that sets job's jobDone last) run on a thread while this task waits: false outside a task, or
+// when no thread could be made (the caller makes the call itself)
+pub fn offThread(f: Int, job: Int) -> Bool {
+    let t = ctxGet(ctxTask)
+    if t == 0 {
+        return false
+    }
+    setWord(job, jobDone, 0)
+    let c = malloc(8 * ctxWords)
+    copyBytes(c, ctx(), 8 * ctxWords)
+    setWord(job, jobCtx, c)
+    let h = osThreadStart(f, job)
+    if h == 0 {
+        setWord(job, jobCtx, 0)
+        free(c)
+        return false
+    }
+    setWord(job, jobThread, h)
+    setWord(t, tWaitThread, job)
+    while word(job, jobDone) == 0 {
+        rtYield()
+    }
+    setWord(ctxGet(ctxTask), tWaitThread, 0)
+    osThreadJoin(h) // what the thread wrote, seen from here on
+    free(c)
+    true
+}
+
+// first in a job's function: on its thread, the context offThread made for it
+pub fn jobBegins(job: Int) {
+    if word(job, jobCtx) != 0 {
+        setCtx(word(job, jobCtx))
+    }
+}
+
+fn waitsOnThread(t: Int) -> Bool = word(t, tWaitThread) != 0 and word(word(t, tWaitThread), jobDone) == 0
 
 // A channel: [closed][count][capacity][head][slots][description][items: a value's slots each]. The values in the
 // queues are copies, in an arena of the channels' own (gChannelArena): they go from one task's memory to another's.
@@ -372,6 +431,9 @@ fn ready(t: Int, now: Float) -> Bool {
     if word(t, tWaitChannel) != 0 and not channelReady(word(t, tWaitChannel) - 1) {
         return false
     }
+    if waitsOnThread(t) {
+        return false
+    }
     let wake = floatAt(t, tWakeAt)
     wake == 0.0 or wake <= now
 }
@@ -440,6 +502,11 @@ fn backgroundRound(line: Int) -> Bool {
         let t = word(word(g, gTasks), word(word(g, gBackground), k))
         if word(t, tWaitFd) != 0 {
             sockets += 1
+        } else if waitsOnThread(t) {
+            let left = 0.002 // threadLookAgain: looked at again soon
+            if soonest < 0.0 or left < soonest {
+                soonest = left
+            }
         } else if word(t, tWaitChannel) == 0 or channelReady(word(t, tWaitChannel) - 1) {
             let wake = floatAt(t, tWakeAt)
             let left = if wake == 0.0 { 0.0 } else { max(wake - later, 0.0) }

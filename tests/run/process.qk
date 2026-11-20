@@ -1,4 +1,5 @@
 // runProcess: a program run to its end, its status and what it wrote (here quark itself, from the repository's root).
+// In tasks, processes run at once, and the other tasks go on while they wait.
 fn main() {
     let me = runProcess("build/quark.exe", ["fmt", "tests/run/process.qk"])?
     print(me.status, me.out == readFile("tests/run/process.qk")?, me.err)
@@ -10,4 +11,34 @@ fn main() {
     let bad = runProcess("build/quark.exe", ["check", "tests/errors/byteSet.qk"])?
     print(bad.status, len(bad.out), bad.err.contains("is not set in place"))
     print(runProcess("no-such-program-anywhere", []) is Err(_))
+    // three at once, each in a task: about as long as one, and the other tasks go on meanwhile
+    let sleeper = ["run", "tests/run/lib/sleeper.qk"]
+    let start = monotonicTime()
+    let first = runProcess("build/quark.exe", sleeper)?
+    let one = monotonicTime() - start
+    let done: Channel<Text> = channel()
+    let ticks: Channel<Int> = channel()
+    let atOnce = monotonicTime()
+    for _ in 0..3 {
+        go(() => send(done, (runProcess("build/quark.exe", sleeper) ?? panic("no quark")).out.trim()))
+    }
+    go(() => {
+        for _ in 0..5 {
+            send(ticks, 1)
+            sleep(0.02)
+        }
+    })
+    runTasks()
+    let three = monotonicTime() - atOnce
+    closeChannel(done)
+    closeChannel(ticks)
+    var said: [Text] = []
+    while receive(done) is Some(t) {
+        said.push(t)
+    }
+    var n = 0
+    while receive(ticks) is Some(k) {
+        n += k
+    }
+    print(first.out.trim(), said, n, three < 2.0 * one)
 }

@@ -47,7 +47,7 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 - [ ] B8 o grafo sem JSON por dentro
 - [ ] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
-  - [ ] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado)
+  - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
   - [ ] cancelamento e prazos
   - [ ] concorrência estruturada
 - [ ] B10 compilação incremental de ponta a ponta

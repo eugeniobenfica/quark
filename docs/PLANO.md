@@ -309,6 +309,16 @@ simplifica `graph.qk`/`collab.qk` (4.000 linhas) e deixa programas Quark manipul
   `malloc`: 139 ms). Testes: `channelsTyped` (registros, tuplas, enums, `Float`, funções, mapas, canais de canais,
   interfaces, `Unit`, opcionais, resultados).
 - **Tudo o que espera é cooperativo:** `connect`, resolução de nomes, `runProcess`, leitura do teclado.
+  **Feito:** numa tarefa, essas chamadas rodam numa thread própria (`offThread` em `runtime/tasks.qk`) e a tarefa
+  devolve a vez até a thread marcar o fim; fora de uma tarefa, são feitas ali mesmo. Um mecanismo só para
+  `connect` e `listen` (nome e conexão), `runProcess`, `readLine` e a leitura da entrada: a thread roda com uma cópia
+  do contexto da tarefa que espera (sem ela, o `connect` do winsock caía: o código lê o contexto), e a chamada toca
+  só a sua tarefa (memória com `malloc` e a da tarefa, que não roda enquanto isso). O
+  agendador não é acordado pela thread (um pipe não seria socket no Windows, e `WSAPoll` só vê sockets): enquanto
+  uma tarefa espera uma, ele olha de novo a cada 2 ms; ao ver o fim, junta a thread (o que ela escreveu fica
+  visível). `connect` sem bloquear e com espera pelo socket seria a forma nativa, mas a resolução de nomes
+  bloqueia de qualquer jeito, e uma thread por conexão custa dezenas de microssegundos diante da rede. Medido:
+  três processos de 0,5 s em três tarefas, 0,54 s no total, e as outras tarefas seguem; teste em `process.qk`.
 - **Cancelamento e prazos:** `timeout(seconds, f)`, fechar um canal acorda quem espera.
 - **Concorrência estruturada:** um escopo que só termina quando as tarefas que abriu terminam, e propaga o pânico
   com a origem (`go` solto fica para servidores).

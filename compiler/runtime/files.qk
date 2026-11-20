@@ -5,6 +5,7 @@ use base
 use arena
 use text
 use print
+use tasks
 
 extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
 extern effect fn fwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
@@ -113,6 +114,69 @@ pub extern effect fn rtWriteFile(path: Int64, pathLen: Int64, text: Int64, n: In
 pub extern effect fn rtAppendFile(path: Int64, pathLen: Int64, text: Int64, n: Int64) -> Int64 as "qk_appendFile" =
     writeWhole(path, pathLen, text, n, "ab\0", "append to")
 
+extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+// The calls that wait for the input or a process, on a thread of their own in a task (tasks.qk offThread): the
+// others go on meanwhile. Their jobs: what the call takes, then what it gives.
+fn readInJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 2, osReadIn(word(j, jobArgs), word(j, jobArgs + 1)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn readLineJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 1, osReadLine(word(j, jobArgs)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn runProcessJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 4, osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+// the word at give of the job, once done
+fn jobGives(j: Int, give: Int) -> Int {
+    let r = word(j, jobArgs + give)
+    free(j)
+    r
+}
+
+fn readIn(p: Int, n: Int) -> Int {
+    let j = calloc(jobArgs + 3, 8)
+    setWord(j, jobArgs, p)
+    setWord(j, jobArgs + 1, n)
+    if not offThread(jobAddress(x => readInJob(x)), j) {
+        let _ = readInJob(j)
+    }
+    jobGives(j, 2)
+}
+
+fn readLineTyped(out: Int) -> Int {
+    let j = calloc(jobArgs + 2, 8)
+    setWord(j, jobArgs, out)
+    if not offThread(jobAddress(x => readLineJob(x)), j) {
+        let _ = readLineJob(j)
+    }
+    jobGives(j, 1)
+}
+
+fn runProcessWaited(name: Int, args: Int, count: Int, out: Int) -> Int {
+    let j = calloc(jobArgs + 5, 8)
+    setWord(j, jobArgs, name)
+    setWord(j, jobArgs + 1, args)
+    setWord(j, jobArgs + 2, count)
+    setWord(j, jobArgs + 3, out)
+    if not offThread(jobAddress(x => runProcessJob(x)), j) {
+        let _ = runProcessJob(j)
+    }
+    jobGives(j, 4)
+}
+
 // the input, a byte at a time from a buffer of the program's own
 fn nextByte() -> Int {
     let g = globals()
@@ -120,7 +184,7 @@ fn nextByte() -> Int {
         if word(g, gInBuf) == 0 {
             setWord(g, gInBuf, malloc(65536))
         }
-        let got = osReadIn(word(g, gInBuf), 65536)
+        let got = readIn(word(g, gInBuf), 65536)
         setWord(g, gInAt, 0)
         setWord(g, gInLen, if got > 0 { got } else { 0 })
         if got <= 0 {
@@ -136,7 +200,7 @@ fn nextByte() -> Int {
 pub extern effect fn rtReadLine() -> Int64 as "qk_readLine" {
     flush() // what was printed before the question shows first
     let typed = alloc(2, 8)
-    let console = osReadLine(typed)
+    let console = readLineTyped(typed)
     if console >= 0 {
         if console == 0 {
             return optional(false, 0, 0)
@@ -288,7 +352,7 @@ pub extern effect fn rtRunProcess(prog: Int64, progLen: Int64, args: Int64, coun
     flush() // what was printed before comes first
     let out = alloc(5, 8) // status, out (malloc'd), its length, err, its length; or the message (malloc'd)
     let p = alloc(6, 8)
-    if osRunProcess(name, args, count, out) != 0 {
+    if runProcessWaited(name, args, count, out) != 0 {
         let m = word(out, 1)
         let k = strlen(m)
         setWord(p, 1, cString(m, k))

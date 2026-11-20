@@ -265,7 +265,7 @@ pub const ctxCaptureCap = 14
 pub const ctxGlobals = 15
 pub const ctxScratch = 16 // 128 bytes: an Int's digits, a Float's text, a Float's bits
 pub const ctxPanicText = 32 // 512 bytes: 64 words
-pub const ctxCountLine = 96 // QUARK_VALIDATE=1: the line of the counting call under way (for its check's message)
+pub const ctxFloatWork = 96 // floatText's room for its big integers (made at the thread's first Float written)
 pub const ctxWords = 97
 pub const panicTextSize = 512
 
@@ -422,7 +422,10 @@ pub fn Buf.float(self, v: Float) -> Buf {
     self.bytes(s, n)
 }
 
-// v as print writes it, into s (48 bytes); its length
+// v as print writes it, into s (48 bytes); its length. The shortest digits that read back as the same number (rounded
+// as printf rounds, half to even, and read back as strtod reads, the nearest, half to even), worked out exactly with
+// big integers: no C library. As %g writes them, then a number from 0.0001 to 1e16 in plain digits, and ".0" when
+// there is no point.
 pub fn floatText(s: Int, v: Float) -> Int {
     if v != v {
         return writeText(s, "nan")
@@ -433,26 +436,403 @@ pub fn floatText(s: Int, v: Float) -> Int {
     if v == -1.0 / 0.0 {
         return writeText(s, "-inf")
     }
-    var n = 0
-    for digits in 1..18 {
-        n = osFloatText(s, 48, 'g', digits, v)
-        if strtod(s, 0) != v {
-            continue
-        }
-        let size = fabs(v)
-        if hasByte(s, n, 'e') and size >= 0.0001 and size < 10000000000000000.0 {
-            // 130, not 1.3e+02
-            let decimals = digits - 1 - toInt(cFloor(log10(size)))
-            n = osFloatText(s, 48, 'f', if decimals > 0 { decimals } else { 0 }, v)
-        }
-        break
+    let bits = bitsOf(v)
+    var at = 0
+    if bits < 0 {
+        setByte(s, 0, '-')
+        at = 1
     }
-    if not hasByte(s, n, '.') and not hasByte(s, n, 'e') and not hasByte(s, n, 'E') and not hasByte(s, n, 'n') {
-        setByte(s, n, '.')
-        setByte(s, n + 1, '0')
-        n += 2
+    let field = shr(bits, 52) & 2047
+    let frac = bits & 4503599627370495
+    if field == 0 and frac == 0 {
+        return at + writeText(s + at, "0.0")
     }
-    n
+    // v = m * 2^e2
+    let m = if field == 0 { frac } else { frac | 4503599627370496 }
+    let e2 = if field == 0 { -1074 } else { field - 1075 }
+    let w = floatWork()
+    // its exact digits: B * 10^-k, B = m * 2^e2 or m * 5^-e2 (k = -e2)
+    let big = w
+    bigSet(big, m)
+    var k = 0
+    if e2 >= 0 {
+        bigShl(big, e2)
+    } else {
+        bigMulPow5(big, -e2)
+        k = -e2
+    }
+    let digits = w + 8 * floatDigitsAt
+    let count = bigDecimal(big, digits)
+    let ev = count - 1 - k // v's exponent: its first digit's place
+    // the rounding interval, scaled to integers: 2^a and 10^b clear every fraction below
+    let a = if e2 < 2 { 2 - e2 } else { 0 }
+    let b = if ev < 17 { 17 - ev } else { 0 }
+    let y = w + 8 * floatLimbs
+    bigSet(y, m)
+    bigShl(y, e2 + a)
+    bigMulPow10(y, b)
+    let up = w + 8 * 2 * floatLimbs
+    bigSet(up, 1)
+    bigShl(up, e2 - 1 + a)
+    bigMulPow10(up, b)
+    let boundary = frac == 0 and field > 1 // the number below is half as far
+    let down = w + 8 * 3 * floatLimbs
+    bigSet(down, 1)
+    bigShl(down, e2 - (if boundary { 2 } else { 1 }) + a)
+    bigMulPow10(down, b)
+    let x = w + 8 * 4 * floatLimbs
+    let diff = w + 8 * 5 * floatLimbs
+    let r = w + 8 * floatRoundedAt // the digits rounded: d of them
+    var d = 1
+    var ex = ev
+    while d <= 17 {
+        ex = roundDigits(digits, count, ev, d, r)
+        // the candidate: D * 10^q, read back as v when within the interval (on its edge: when m is even)
+        var dv = 0
+        for i in 0..d {
+            dv = dv * 10 + byte(r, i) - '0'
+        }
+        let q = ex - d + 1
+        bigSet(x, dv)
+        bigMulPow10(x, q + b)
+        bigShl(x, a)
+        let c = bigCompare(x, y)
+        if c == 0 {
+            break
+        }
+        if c > 0 {
+            bigDifference(diff, x, y)
+        } else {
+            bigDifference(diff, y, x)
+        }
+        let h = bigCompare(diff, if c > 0 { up } else { down })
+        if h < 0 or h == 0 and m & 1 == 0 {
+            break
+        }
+        d += 1
+    }
+    // the digits without the zeros that end them, as %g writes them
+    var sig = d
+    while sig > 1 and byte(r, sig - 1) == '0' {
+        sig -= 1
+    }
+    let size = if v < 0.0 { -v } else { v }
+    let exponential = ex < -4 or ex >= d
+    if exponential and size >= 0.0001 and size < 10000000000000000.0 {
+        // in plain digits: v rounded to a whole number (130, not 1.3e+02)
+        return at + wholeDigits(s + at, digits, count, ev)
+    }
+    if exponential {
+        setByte(s, at, byte(r, 0))
+        at += 1
+        if sig > 1 {
+            setByte(s, at, '.')
+            at += 1
+            for i in 1..sig {
+                setByte(s, at, byte(r, i))
+                at += 1
+            }
+        }
+        setByte(s, at, 'e')
+        setByte(s, at + 1, if ex < 0 { '-' } else { '+' })
+        at += 2
+        let e = if ex < 0 { -ex } else { ex }
+        if e >= 100 {
+            setByte(s, at, '0' + e / 100)
+            at += 1
+        }
+        setByte(s, at, '0' + e / 10 % 10)
+        setByte(s, at + 1, '0' + e % 10)
+        return at + 2
+    }
+    // plain: the point after the digit of 10^0
+    if ex < 0 {
+        setByte(s, at, '0')
+        setByte(s, at + 1, '.')
+        at += 2
+        for _ in 0..-ex - 1 {
+            setByte(s, at, '0')
+            at += 1
+        }
+        for i in 0..sig {
+            setByte(s, at, byte(r, i))
+            at += 1
+        }
+        return at
+    }
+    for i in 0..ex + 1 {
+        setByte(s, at, if i < sig { byte(r, i) } else { '0' })
+        at += 1
+    }
+    setByte(s, at, '.')
+    at += 1
+    if sig > ex + 1 {
+        for i in ex + 1..sig {
+            setByte(s, at, byte(r, i))
+            at += 1
+        }
+    } else {
+        setByte(s, at, '0')
+        at += 1
+    }
+    at
+}
+
+// the work room of a thread's Floats: six big integers, the digits, the rounded digits
+const floatLimbs = 104 // a big integer: its count of 32-bit limbs, then the limbs (up to 3300 bits)
+const floatDigitsAt = 6 * floatLimbs // 800 bytes: up to 790 digits
+const floatRoundedAt = floatDigitsAt + 100
+const floatWorkWords = floatRoundedAt + 4
+
+fn floatWork() -> Int {
+    let c = ctx()
+    if word(c, ctxFloatWork) == 0 {
+        setWord(c, ctxFloatWork, calloc(floatWorkWords, 8))
+    }
+    word(c, ctxFloatWork)
+}
+
+// the d digits of the number written digits * 10^(ev - count + 1) rounded half to even, into r; their exponent (one
+// more when 9...9 rounds up)
+fn roundDigits(digits: Int, count: Int, ev: Int, d: Int, r: Int) -> Int {
+    for i in 0..d {
+        setByte(r, i, if i < count { byte(digits, i) } else { '0' })
+    }
+    if d >= count {
+        return ev
+    }
+    let next = byte(digits, d)
+    var up = next > '5'
+    if next == '5' {
+        var more = false
+        for i in d + 1..count {
+            if byte(digits, i) != '0' {
+                more = true
+                break
+            }
+        }
+        up = more or (byte(r, d - 1) - '0') & 1 == 1
+    }
+    if not up {
+        return ev
+    }
+    var i = d - 1
+    while i >= 0 and byte(r, i) == '9' {
+        setByte(r, i, '0')
+        i -= 1
+    }
+    if i >= 0 {
+        setByte(r, i, byte(r, i) + 1)
+        return ev
+    }
+    setByte(r, 0, '1') // 9...9 up: 10...0, one place more
+    ev + 1
+}
+
+// v rounded to a whole number (half to even) from its exact digits, with ".0"; its length
+fn wholeDigits(s: Int, digits: Int, count: Int, ev: Int) -> Int {
+    let n = ev + 1 // the whole digits
+    for i in 0..n {
+        setByte(s, i, if i < count { byte(digits, i) } else { '0' })
+    }
+    var len = n
+    if n < count {
+        let next = byte(digits, n)
+        var up = next > '5'
+        if next == '5' {
+            var more = false
+            for i in n + 1..count {
+                if byte(digits, i) != '0' {
+                    more = true
+                    break
+                }
+            }
+            up = more or (byte(s, n - 1) - '0') & 1 == 1
+        }
+        if up {
+            var i = n - 1
+            while i >= 0 and byte(s, i) == '9' {
+                setByte(s, i, '0')
+                i -= 1
+            }
+            if i >= 0 {
+                setByte(s, i, byte(s, i) + 1)
+            } else {
+                moveBytes(s + 1, s, n)
+                setByte(s, 0, '1')
+                len += 1
+            }
+        }
+    }
+    setByte(s, len, '.')
+    setByte(s, len + 1, '0')
+    len + 2
+}
+
+// ---- big integers for floatText: word 0 their limbs' count, then 32-bit limbs, the lowest first ----
+const low32 = 4294967295
+
+fn bigSet(x: Int, v: Int) {
+    if v == 0 {
+        setWord(x, 0, 0)
+        return
+    }
+    setWord(x, 1, v & low32)
+    let high = shr(v, 32)
+    if high == 0 {
+        setWord(x, 0, 1)
+    } else {
+        setWord(x, 2, high)
+        setWord(x, 0, 2)
+    }
+}
+
+// x *= f (f below 2^32)
+fn bigMulSmall(x: Int, f: Int) {
+    let n = word(x, 0)
+    var carry = 0
+    for i in 1..n + 1 {
+        let t = word(x, i) *% f +% carry
+        setWord(x, i, t & low32)
+        carry = shr(t, 32)
+    }
+    if carry != 0 {
+        setWord(x, n + 1, carry)
+        setWord(x, 0, n + 1)
+    }
+}
+
+fn bigMulPow10(x: Int, n0: Int) {
+    var n = n0
+    while n >= 9 {
+        bigMulSmall(x, 1000000000)
+        n -= 9
+    }
+    var f = 1
+    for _ in 0..n {
+        f *= 10
+    }
+    if f > 1 {
+        bigMulSmall(x, f)
+    }
+}
+
+fn bigMulPow5(x: Int, n0: Int) {
+    var n = n0
+    while n >= 13 {
+        bigMulSmall(x, 1220703125) // 5^13
+        n -= 13
+    }
+    var f = 1
+    for _ in 0..n {
+        f *= 5
+    }
+    if f > 1 {
+        bigMulSmall(x, f)
+    }
+}
+
+// x *= 2^bits
+fn bigShl(x: Int, bits: Int) {
+    let n = word(x, 0)
+    if n == 0 or bits <= 0 {
+        return
+    }
+    let whole = bits / 32
+    let part = bits % 32
+    var top = n + whole
+    if part != 0 {
+        setWord(x, top + 1, 0)
+        var i = n
+        while i >= 1 {
+            let v = word(x, i)
+            setWord(x, i + whole + 1, word(x, i + whole + 1) | shr(v, 32 - part))
+            setWord(x, i + whole, v << part & low32)
+            i -= 1
+        }
+        if word(x, top + 1) != 0 {
+            top += 1
+        }
+    } else {
+        var i = n
+        while i >= 1 {
+            setWord(x, i + whole, word(x, i))
+            i -= 1
+        }
+    }
+    for i in 1..whole + 1 {
+        setWord(x, i, 0)
+    }
+    setWord(x, 0, top)
+}
+
+// -1, 0, 1: x below, equal to, above y
+fn bigCompare(x: Int, y: Int) -> Int {
+    let n = word(x, 0)
+    if n != word(y, 0) {
+        return if n < word(y, 0) { -1 } else { 1 }
+    }
+    var i = n
+    while i >= 1 {
+        if word(x, i) != word(y, i) {
+            return if word(x, i) < word(y, i) { -1 } else { 1 }
+        }
+        i -= 1
+    }
+    0
+}
+
+// out = x - y (x at least y)
+fn bigDifference(out: Int, x: Int, y: Int) {
+    let n = word(x, 0)
+    var borrow = 0
+    var top = 0
+    for i in 1..n + 1 {
+        var t = word(x, i) - borrow - (if i <= word(y, 0) { word(y, i) } else { 0 })
+        borrow = 0
+        if t < 0 {
+            t += 4294967296
+            borrow = 1
+        }
+        setWord(out, i, t)
+        if t != 0 {
+            top = i
+        }
+    }
+    setWord(out, 0, top)
+}
+
+// x's decimal digits into s (x is used up); their count
+fn bigDecimal(x: Int, s: Int) -> Int {
+    var chunks = 0 // nine digits each, the lowest first, written from the end of s's room backwards
+    let room = 792
+    var at = room
+    while word(x, 0) > 0 {
+        var rem = 0
+        var i = word(x, 0)
+        while i >= 1 {
+            let cur = rem << 32 | word(x, i)
+            setWord(x, i, cur / 1000000000)
+            rem = cur % 1000000000
+            i -= 1
+        }
+        while word(x, 0) > 0 and word(x, word(x, 0)) == 0 {
+            setWord(x, 0, word(x, 0) - 1)
+        }
+        for _ in 0..9 {
+            at -= 1
+            setByte(s, at, '0' + rem % 10)
+            rem /= 10
+        }
+        chunks += 1
+    }
+    // the zeros before the first digit go
+    while at < room - 1 and byte(s, at) == '0' {
+        at += 1
+    }
+    let count = room - at
+    moveBytes(s, s + at, count)
+    count
 }
 
 pub fn writeText(s: Int, t: Text) -> Int {

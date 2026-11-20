@@ -312,6 +312,11 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 > byte a saída atual, comparada contra o C em milhões de números.
 
 - **ARM64 em paridade:** argumentos em registradores, SIMD NEON, e uma máquina ou VM no ciclo.
+> **Feito em 20/11/2026: escrever `Float` sem o C.** `floatText` (runtime/base.qk) acha os dígitos mais curtos que voltam ao mesmo número com inteiros grandes exatos: a expansão decimal do `double`, o arredondamento para *d* dígitos (metade para o par) e a volta decidida contra o intervalo de arredondamento, empates incluídos.
+> - Antes eram até 34 chamadas ao C por número (`snprintf` e `strtod` para cada precisão de 1 a 17). Agora é 2× mais rápido.
+> - Comparado com o antigo em 200 mil números de todo tipo, a saída é igual, menos 230 empates exatos (`1000000000000000.25`). Neles o `printf` do Windows arredondava para cima e o da glibc para o par, então a saída do Windows e a do Linux diferiam. Agora é a mesma em todo sistema (`tests/run/floatText`).
+> - Ler um `Float` (`parseFloat`) ainda usa o `strtod`.
+
 - **Sem libc onde der:** Ryū para escrever `Float`, parser próprio para ler, memória direto do sistema. No Windows
   e no Linux o executável passa a depender só do kernel; no macOS a `libSystem` é obrigatória.
 - **Informação de depuração padrão:** DWARF e PDB/CodeView, para depuradores e perfiladores externos.

@@ -1,0 +1,38 @@
+// A Float as print writes it: the shortest digits that read back as the same number, the same on every system (a
+// tie rounds half to even: 1000000000000000.25 is 1000000000000000.2); plain from 0.0001 to 1e16, else with an
+// exponent; ".0" when there is no point; the smallest and largest, subnormals, negative zero.
+fn main() {
+    let values = [
+        0.0,
+        -0.0,
+        0.1,
+        0.2 + 0.1,
+        1.0 / 3.0,
+        100.0,
+        1e15,
+        1e16,
+        1e21,
+        1e22,
+        1e23,
+        0.0001,
+        0.00001,
+        123456789.0,
+        9007199254740993.0,
+        1.7976931348623157e308,
+        5e-324,
+        2.2250738585072014e-308,
+        1000000000000000.25,
+        12951356256354.8125,
+        275938324428776.125,
+        2.5,
+        999.9999999999999,
+        9999999999999998.0,
+        1e300 * 10.0,
+        -1.5e-7,
+        120000.0,
+        1234.5678,
+    ]
+    for v in values {
+        print(v)
+    }
+}

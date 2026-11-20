@@ -205,6 +205,8 @@ fn compileCommand(host: Host, given: [Text]) -> Int {
             o.noAvx = true
         } else if a == "--release" {
             o.release = true
+        } else if a == "-g" {
+            o.debugInfo = true
         } else if a == "--linked" {
             o.linked = true
         } else if a == "--abi" and more {
@@ -309,7 +311,10 @@ fn object(host: Host, o: RunOptions) -> Int {
     let Some(c) = compileFile(host, o.path, o, Purpose(target: target, object: true, linked: o.linked)) else {
         return 1
     }
-    let info = ImageInfo(c.os, o.linked, c.features, c.data, runtimeNames)
+    var info = ImageInfo(c.os, o.linked, c.features, c.data, runtimeNames)
+    if o.debugInfo {
+        info.debug = debugInfoOf(host, c)
+    }
     let Some(obj) = objectFile(c.mc, c.prog, info, o.symbol ?? "quarkProgram") else {
         printErr("quark: no object format for this target yet")
         return 1

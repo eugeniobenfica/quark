@@ -402,3 +402,41 @@ pub fn debugNew(interactive: Bool, tracePath: Int, remote: Bool) -> Int {
     gSet(gDebug, d)
     d
 }
+
+// ---- other debuggers (gdb, lldb): the code a built executable loads, made known (quark build -g) ----
+// gdb's JIT interface: the descriptor a debugger reads (its version 1 and what changed, that entry, the first entry)
+// at the C name __jit_debug_descriptor, which the executable's symbols give (compiler/image.qk writes the version
+// in), and the function it breaks on, __jit_debug_register_code, called once an entry is in.
+pub fn jitDescriptor() -> Int = textAt("__jit_debug_descriptor: quark!!!")
+
+// (a parameter its definition has not: a C call, to the address the debugger breaks on, not the function inlined)
+extern effect fn jitDebugHook(unused: Int64) as "__jit_debug_register_code"
+
+pub extern effect fn jitDebugRegisterCode() as "__jit_debug_register_code" {
+    let _ = 0 // nothing: where the debugger breaks
+}
+
+// The object the compiler made for code now at `code` (n bytes at obj: an ELF, compiler/dwarf.qk's jitObjectOf),
+// its addresses made the code's (patches: count offsets of 8-byte addresses), put in the debugger's list.
+pub fn registerDebug(code: Int, obj: Int, n: Int, patches: Int, count: Int) {
+    let copy = malloc(n)
+    copyBytes(copy, obj, n)
+    for i in 0..count {
+        let at = copy + word(patches, i)
+        setWord(at, 0, word(at, 0) + code)
+    }
+    let entry = calloc(4, 8) // next, previous, the object, its size
+    let d = jitDescriptor()
+    let first = word(d, 2)
+    setWord(entry, 0, first)
+    setWord(entry, 2, copy)
+    setWord(entry, 3, n)
+    if first != 0 {
+        setWord(first, 1, entry)
+    }
+    setWord(d, 2, entry)
+    setWord(d, 1, entry)
+    setWord(d, 0, 1 | 1 << 32) // version 1, an object registered
+    jitDebugHook(0)
+    setWord(d, 0, 1)
+}

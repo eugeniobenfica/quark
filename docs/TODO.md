@@ -71,8 +71,8 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 
 - [x] escrever `Float` sem o C (dígitos mais curtos, exato)
 - [x] ler `Float` sem o C (`strtod` não é mais usado)
-- [ ] ARM64 em paridade (argumentos em registradores, NEON): precisa de uma máquina no ciclo
-- [ ] informação de depuração DWARF e PDB
+- [x] ARM64 em paridade: argumentos em registradores (x0-x7; o código do compilador 8,8% menor), NEON já com as operações do x86-64
+- [x] informação de depuração (`-g`): DWARF 4 nos objetos e CodeView no COFF (o PDB pelo linker); executáveis pela interface JIT do gdb
 - [ ] a suíte em wasm32
 - [x] libquark no macOS (Mach-O ligado, arquivo BSD), a API C revista (`qkVersion`, as bibliotecas do sistema, ARM64)
 - [x] executáveis menores: só o runtime que o programa alcança (hello 911 → 136 KB)

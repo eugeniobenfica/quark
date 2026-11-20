@@ -2944,7 +2944,7 @@ pub fn localNow() -> DateTime = local(unixTime())
 
 // what this compiler is: its sources' checksum (CRC and length, by cksum): what it makes of the runtime's texts
 // depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "2432674008-1714939"
+pub const compilerSources = "1647346135-1745847"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "windows"]
@@ -5328,6 +5328,44 @@ pub fn debugNew(interactive: Bool, tracePath: Int, remote: Bool) -> Int {
     setWord(d, dWords - 1, malloc(2048)) // the messages' room
     gSet(gDebug, d)
     d
+}
+
+// ---- other debuggers (gdb, lldb): the code a built executable loads, made known (quark build -g) ----
+// gdb's JIT interface: the descriptor a debugger reads (its version 1 and what changed, that entry, the first entry)
+// at the C name __jit_debug_descriptor, which the executable's symbols give (compiler/image.qk writes the version
+// in), and the function it breaks on, __jit_debug_register_code, called once an entry is in.
+pub fn jitDescriptor() -> Int = textAt("__jit_debug_descriptor: quark!!!")
+
+// (a parameter its definition has not: a C call, to the address the debugger breaks on, not the function inlined)
+extern effect fn jitDebugHook(unused: Int64) as "__jit_debug_register_code"
+
+pub extern effect fn jitDebugRegisterCode() as "__jit_debug_register_code" {
+    let _ = 0 // nothing: where the debugger breaks
+}
+
+// The object the compiler made for code now at `code` (n bytes at obj: an ELF, compiler/dwarf.qk's jitObjectOf),
+// its addresses made the code's (patches: count offsets of 8-byte addresses), put in the debugger's list.
+pub fn registerDebug(code: Int, obj: Int, n: Int, patches: Int, count: Int) {
+    let copy = malloc(n)
+    copyBytes(copy, obj, n)
+    for i in 0..count {
+        let at = copy + word(patches, i)
+        setWord(at, 0, word(at, 0) + code)
+    }
+    let entry = calloc(4, 8) // next, previous, the object, its size
+    let d = jitDescriptor()
+    let first = word(d, 2)
+    setWord(entry, 0, first)
+    setWord(entry, 2, copy)
+    setWord(entry, 3, n)
+    if first != 0 {
+        setWord(first, 1, entry)
+    }
+    setWord(d, 2, entry)
+    setWord(d, 1, entry)
+    setWord(d, 0, 1 | 1 << 32) // version 1, an object registered
+    jitDebugHook(0)
+    setWord(d, 0, 1)
 }
 """ + "\n"
     }
@@ -10134,7 +10172,7 @@ fn runtimeTable() -> Int {
 }
 
 // ---- the start ----
-const trailerBytes = 104
+const trailerBytes = 120
 
 fn say(t: Text) {
     flush()
@@ -10248,6 +10286,11 @@ fn runProgram(t: Int, payload: Int, owned: Bool) -> Int {
     let l = load(code, codeLen, data, dataLen, relocs, relocCount, word(t, 5), word(t, 6), hosts)
     if l == 0 {
         return 1
+    }
+    if word(t, 13) > 0 {
+        // -g: its debug information, for gdb and lldb (after the C functions' names: the object, its patches)
+        let obj = relocs + 16 * relocCount + word(t, 11)
+        registerDebug(word(l, lCode), obj, word(t, 13), obj + word(t, 13), word(t, 14))
     }
     if owned {
         free(payload) // loaded: the code and data have places of their own

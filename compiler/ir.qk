@@ -237,6 +237,7 @@ pub fn IrFn.setRet(var self, k: Int, i: Int, v: Int) {
 pub type IrFn {
     name: Text
     line: Int = 0
+    file: Int = 0 // its module (IrProgram.files)
     params: [Int] = []
     resultCount: Int = 0
     labelCount: Int = 0
@@ -285,6 +286,7 @@ pub type Target {
     lanes: Int = 0
     sse42: Bool = false
     apple: Bool = false // macOS, iOS: ARM64's variadic arguments on the stack
+    lines: Bool = false // -g: the code's lines and frames kept (MachineCode.lines, frames) for debug information
     checks: Bool = false // QUARK_VALIDATE=1: the counting calls mark the panic's frame (their checks say where)
 }
 
@@ -305,6 +307,7 @@ pub type IrProgram {
     runtime: [RtSig] = []
     tables: [IrTable] = []
     cSigs: [IrExtern] = [] // the C functions called through an address (HostCall with a: the address): their slots
+    files: [Text] = [] // its modules' paths, by number (IrFn.file)
 }
 
 // ---- a program's functions, only those it reaches ----
@@ -389,6 +392,8 @@ pub type MachineCode {
     fnAt: [Int] = []
     enter: Int = 0
     escape: Int = 0
+    lines: [Int] = [] // Target.lines: where each line's code starts, as pairs (offset, line | inlined call << 32)
+    frames: [Int] = [] // ... and where each frame's prologue starts (push rbp / stp x29, x30)
 }
 
 // A change to code already written: value's `width` low bytes ORed in at `at` (a jump's distance, once its target

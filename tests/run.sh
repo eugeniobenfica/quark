@@ -368,6 +368,34 @@ if command -v ld64.lld > /dev/null 2>&1 && command -v llvm-objdump > /dev/null 2
     if ld64.lld -arch x86_64 -platform_version macos 11.0 11.0 -dylib -undefined dynamic_lookup -o "$tmp/demo64.dylib" "$tmp/demo-x86_64-macos.o" &&
         llvm-objdump -d "$tmp/demo64.dylib" | grep -q "<_demo+0x78>"; then ok; else bad "Mach-O x86-64 linked"; fi
 fi
+# -g: debug information in the objects (DWARF 4; COFF's CodeView too), whole by LLVM's checker when it is here, and
+# a debugger's breakpoint on a Quark function's line when gdb, a C compiler and libquark are
+for t in arm64-macos x86_64-macos arm64-linux x86_64-linux x86_64-windows; do
+    if "$Q" object tests/object/demo.qk --target $t -g --symbol demo -o "$tmp/g-$t.o" && grep -qaF debug_line "$tmp/g-$t.o"; then ok; else bad "quark object -g --target $t"; fi
+done
+if grep -qaF ".debug\$S" "$tmp/g-x86_64-windows.o"; then ok; else bad "quark object -g: CodeView"; fi
+if command -v llvm-dwarfdump > /dev/null 2>&1; then
+    for t in arm64-macos x86_64-linux x86_64-windows; do
+        if llvm-dwarfdump --verify "$tmp/g-$t.o" > /dev/null 2>&1; then ok; else bad "DWARF of quark object -g --target $t"; fi
+    done
+    # greet's lines, in order: its declaration, the loop, the print, the loop again
+    lines=$(llvm-dwarfdump --debug-line "$tmp/g-x86_64-linux.o" | awk '$1 ~ /^0x/ && $4 == 1 {print $2}' | tr '\n' ' ')
+    case "$lines" in *"6 7 8 7 "*) ok ;; *) bad "quark object -g: the lines ($lines)" ;; esac
+fi
+if [ "$CCX" != no-libquark ] && command -v "$CCX" > /dev/null 2>&1 && command -v gdb > /dev/null 2>&1; then
+    "$Q" object tests/object/demo.qk -g --symbol demo -o "$tmp/gdemo.o"
+    if "$CCX" -Iinclude tests/object/host.c "$tmp/gdemo.o" "$(dirname "$Q")/libquark.a" $CLIBS -o "$tmp/ghost" &&
+        printf 'break greet\nrun\nnext\nnext\ninfo line *$pc\n' > "$tmp/gcmds" &&
+        gdb -q -batch -x "$tmp/gcmds" "$tmp/ghost" 2>&1 | grep -q 'Line 8 of ".*demo.qk"'; then ok; else bad "gdb on quark object -g"; fi
+fi
+# ... and in an executable (quark build -g): its code, loaded when it starts, made known to gdb (its JIT interface)
+if command -v gdb > /dev/null 2>&1 && "$Q" build -g tests/debug/native.qk -o "$tmp/native.exe" > /dev/null 2>&1; then
+    printf 'set breakpoint pending on
+break native.qk:10
+run
+' > "$tmp/gcmds2"
+    if gdb -q -batch -x "$tmp/gcmds2" "$tmp/native.exe" 2>&1 | grep -q 'main () at .*native.qk:10'; then ok; else bad "gdb on quark build -g"; fi
+fi
 # capabilities: a program may call only what it is given
 if "$Q" check examples/words.qk --allow print 2>&1 | grep -qF "args is not given to this program"; then ok; else bad "--allow refuses"; fi
 if "$Q" check examples/words.qk --allow "print, args, files, exit" > /dev/null 2>&1; then ok; else bad "--allow allows"; fi

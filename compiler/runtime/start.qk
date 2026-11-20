@@ -35,7 +35,7 @@ fn runtimeTable() -> Int {
 }
 
 // ---- the start ----
-const trailerBytes = 104
+const trailerBytes = 120
 
 fn say(t: Text) {
     flush()
@@ -149,6 +149,11 @@ fn runProgram(t: Int, payload: Int, owned: Bool) -> Int {
     let l = load(code, codeLen, data, dataLen, relocs, relocCount, word(t, 5), word(t, 6), hosts)
     if l == 0 {
         return 1
+    }
+    if word(t, 13) > 0 {
+        // -g: its debug information, for gdb and lldb (after the C functions' names: the object, its patches)
+        let obj = relocs + 16 * relocCount + word(t, 11)
+        registerDebug(word(l, lCode), obj, word(t, 13), obj + word(t, 13), word(t, 14))
     }
     if owned {
         free(payload) // loaded: the code and data have places of their own

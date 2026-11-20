@@ -93,6 +93,9 @@ type X64 {
     sysv: Bool
     xmmFirst: Int // the first callee-saved xmm: 6 (Windows), 8 (System V)
     code: Bytes = []
+    lines: [Int] = [] // -g: MachineCode.lines, frames
+    frames: [Int] = []
+    lastLine: Int = -1
     patches: [Patch] = []
     relocs: [Reloc] = []
     sites: [CallSite] = []
@@ -155,7 +158,17 @@ pub fn genX64(p: IrProgram) -> MachineCode {
             g.patch(fx.at, (stubAt[fx.target] ?? 0) - (fx.at + 4), 4)
         }
     }
-    MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape)
+    MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape, lines: g.lines, frames: g.frames)
+}
+
+// -g: where ins's code starts, when its line is another than the last one's
+fn X64.lineOf(var self, ins: IrIns) {
+    let line = ins.line | ins.inl << 32
+    if self.target.lines and ins.line > 0 and line != self.lastLine {
+        self.lines.push(self.here())
+        self.lines.push(line)
+        self.lastLine = line
+    }
 }
 
 // ---- encoding ----
@@ -709,6 +722,7 @@ fn X64.emitCold(var self) {
     self.rm(true, opMovLoad, rdx, r10, 0)
     self.callRuntime(rtPanic)
     for c in cold {
+        self.lineOf(IrIns(Op.Nop, line: c.line, inl: c.inl))
         self.patch(c.at, self.here() - (c.at + 4), 4)
         if c.a >= 0 {
             self.loadBits(rax, c.a)
@@ -1861,6 +1875,7 @@ fn X64.cEntryStub(var self, f: IrFn, cArgs: Bytes) -> Int {
     let n = len(f.params)
     let slots = max(n, f.resultCount)
     let area = (8 * max(slots, 1) + 15) & ~15
+    self.frames.push(self.here()) // (debug information: a frame starts)
     self.byte(0x55) // push rbp
     self.movRR(rbp, rsp)
     self.bytes([0x41, 0x57]) // push r15: C's, given back
@@ -1994,6 +2009,7 @@ fn X64.genMachine(var self, kind: Int) {
     }
     if kind == machineCall {
         let args = if self.sysv { [rdi, rsi, rdx, rcx] } else { [rcx, rdx, r8, r9] }
+        self.frames.push(self.here()) // (debug information: a frame starts)
         self.byte(0x55) // push rbp: rsp 16-aligned
         self.movRR(rbp, rsp)
         let room = if self.sysv {
@@ -2104,6 +2120,7 @@ fn X64.genFn(var self, f: IrFn) {
     self.fixups = []
 
     // prologue
+    self.frames.push(self.here()) // (debug information: a frame starts)
     self.byte(0x55) // push rbp
     self.movRR(rbp, rsp)
     for r in gprs[..self.pushed] {
@@ -2159,7 +2176,9 @@ fn X64.genFn(var self, f: IrFn) {
     self.afterJump = false
     let count = len(f.code)
     var k = 0
+    self.lastLine = -1
     while k < count {
+        self.lineOf(f.code[k])
         if k + 1 < count and self.fusedBranch(f.code[k], f.code[k + 1]) {
             k += 2
             self.afterJump = false
@@ -2218,6 +2237,7 @@ fn X64.genTrampoline(var self) -> (Int, Int) {
     let saved = [rbx, rsi, rdi, r12, r13, r14, r15]
     self.align(0xCC)
     let enter = self.here()
+    self.frames.push(self.here()) // (debug information: a frame starts)
     self.byte(0x55) // push rbp
     self.movRR(rbp, rsp)
     for r in saved {

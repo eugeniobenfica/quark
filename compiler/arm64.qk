@@ -82,6 +82,9 @@ type Arm64 {
     savedGpr: Int = 0
     savedFpr: Int = 0
     out: Int = 0 // bytes of the outgoing area at sp
+    lines: [Int] = [] // -g: MachineCode.lines, frames
+    frames: [Int] = []
+    lastLine: Int = -1
     frame: Int = 0 // bytes below x29
     labelAt: [Int] = []
     fixups: [Fixup] = []
@@ -112,7 +115,17 @@ pub fn genArm64(p: IrProgram) -> MachineCode {
             g.patch(fx.at + 8, rel >> 16 & 0xFFFF << 5)
         }
     }
-    MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape)
+    MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape, lines: g.lines, frames: g.frames)
+}
+
+// -g: where ins's code starts, when its line is another than the last one's
+fn Arm64.lineOf(var self, ins: IrIns) {
+    let line = ins.line | ins.inl << 32
+    if self.target.lines and ins.line > 0 and line != self.lastLine {
+        self.lines.push(self.here())
+        self.lines.push(line)
+        self.lastLine = line
+    }
 }
 
 // ---- encoding ----
@@ -549,6 +562,7 @@ fn Arm64.emitCold(var self) {
     let cold = self.cold
     self.cold = []
     for c in cold {
+        self.lineOf(IrIns(Op.Nop, line: c.line, inl: c.inl))
         self.patch(c.at, (self.here() - c.at) / 4 & 0x7FFFF << 5)
         if c.a >= 0 { self.loadBits(x2, c.a) } else { self.movImm(x2, 0) }
         if c.b >= 0 { self.loadBits(x3, c.b) } else { self.movImm(x3, 0) }
@@ -1269,6 +1283,7 @@ fn Arm64.cEntryStub(var self, f: IrFn, cArgs: Bytes) -> Int {
     let n = len(f.params)
     let slots = max(n, f.resultCount)
     let area = (8 * max(slots, 1) + 15) & ~15
+    self.frames.push(self.here()) // (debug information: a frame starts)
     self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
     self.movRR(fp, sp)
     self.ins(0xF81F0FFC) // str x28, [sp, #-16]!: C's, given back
@@ -1346,6 +1361,7 @@ fn Arm64.genMachine(var self, kind: Int) {
             self.access(true, true, 8 + i, x1, 104 + 8 * i)
         }
     } else if kind == machineCall {
+        self.frames.push(self.here()) // (debug information: a frame starts)
         self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
         self.movRR(fp, sp)
         self.movRR(x16, x0)
@@ -1395,6 +1411,7 @@ fn Arm64.genFn(var self, f: IrFn) {
     self.fixups = []
 
     // prologue
+    self.frames.push(self.here()) // (debug information: a frame starts)
     self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
     self.movRR(fp, sp) // mov x29, sp
     self.addImm(sp, sp, -self.frame)
@@ -1437,7 +1454,9 @@ fn Arm64.genFn(var self, f: IrFn) {
     self.uses = useCounts(f)
     let count = len(f.code)
     var k = 0
+    self.lastLine = -1
     while k < count {
+        self.lineOf(f.code[k])
         if k + 1 < count and self.fusedBranch(f.code[k], f.code[k + 1]) {
             k += 2
             continue
@@ -1472,6 +1491,7 @@ fn Arm64.genFn(var self, f: IrFn) {
 fn Arm64.genTrampoline(var self) -> (Int, Int) {
     self.align()
     let enter = self.here()
+    self.frames.push(self.here()) // (debug information: a frame starts)
     self.ins(0xA9BF7BFD) // stp x29, x30, [sp, #-16]!
     self.movRR(fp, sp)
     self.addImm(sp, sp, -160)

@@ -17,6 +17,7 @@ use cache
 use x64
 use arm64
 use image
+use dwarf
 use imagecli
 use stdlib
 use graph
@@ -32,6 +33,7 @@ pub type RunOptions {
     fuel: Int = 0
     memory: Int = 0 // bytes (--memory MB)
     release: Bool = false
+    debugInfo: Bool = false // -g: debug information (compiler/dwarf.qk) in the object, the executable, or for the JIT
     noAvx: Bool = false
     sysv: Bool = false // --abi sysv
     linked: Bool = false
@@ -201,6 +203,7 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         lanes: lanes,
         sse42: cpu & 4 != 0 and target == "",
         apple: os == .Macos,
+        lines: o.debugInfo and not runtime,
         checks: false,
     )
     let t2 = monotonicTime()
@@ -244,6 +247,38 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     let prog = low.program // taken
     low.program = IrProgram()
     Compiled(prog, mc, low.data, low.inlines, tests, if avx { 1 } else { 0 }, os, purpose.linked)
+}
+
+// -g: the program's debug information (its inlined calls shown at their outermost call), its files' paths whole
+pub fn debugInfoOf(host: Host, c: Compiled) -> DebugInfo {
+    var d = debugOf(
+        c.mc,
+        c.prog,
+        outerLinesOf(c.inlines.map(k => k.parent).toArray(), c.inlines.map(k => k.line).toArray()),
+    )
+    let here = currentDir(host)
+    let windows = host.os == .Windows
+    d.files = d.files.map(f => {
+        let whole = f.startsWith("/") or f.startsWith("<") or len(f) > 1 and f[1..2] == ":" or here == ""
+        let path = if whole { f } else { here + "/" + f }
+        if windows and not f.startsWith("<") {
+            path.replace("/", "\\")
+        } else {
+            path
+        }
+    }).toArray()
+    d
+}
+
+// the process's working folder ("" when the system does not say)
+pub fn currentDir(host: Host) -> Text {
+    let f = host.cFunction(if host.os == .Windows { "_getcwd" } else { "getcwd" })
+    if f == 0 {
+        return ""
+    }
+    let room = malloc(4096) // (once a compile)
+    let p = machine.call(Pointer<UInt8>(f), room, 4096, 0, 0)
+    if p == 0 { "" } else { textAtC(room) }
 }
 
 // ---- constants worked out by running them (compiler/construn.qk) ----
@@ -484,7 +519,14 @@ pub fn fixed(x: Float, digits: Int) -> Text {
 }
 
 // ---- the program as a built executable carries it: the payload, then the trailer ----
-pub fn programBytes(c: Compiled, mc: MachineCode, entry: Int, fuel: Int, memory: Int) -> Bytes {
+pub fn programBytes(
+    c: Compiled,
+    mc: MachineCode,
+    entry: Int,
+    fuel: Int,
+    memory: Int,
+    jit: JitObject = JitObject([], []),
+) -> Bytes {
     var b = Buf()
     b.add(mc.code)
     b.add(c.data)
@@ -498,6 +540,12 @@ pub fn programBytes(c: Compiled, mc: MachineCode, entry: Int, fuel: Int, memory:
         b.cText(x.name)
         b.cText(x.lib ?? "")
     }
+    let externBytes = b.len() - externsAt
+    // -g: the object a debugger reads of the code once loaded (compiler/dwarf.qk), and its addresses to make whole
+    b.add(jit.bytes)
+    for at in jit.patches {
+        b.u64(at)
+    }
     let size = b.len()
     b.add("QUARKPRG".bytes())
     b.u64(len(mc.code))
@@ -510,8 +558,10 @@ pub fn programBytes(c: Compiled, mc: MachineCode, entry: Int, fuel: Int, memory:
     b.u64(memory)
     b.u64(c.features)
     b.u64(len(c.prog.externs))
-    b.u64(size - externsAt)
+    b.u64(externBytes)
     b.u64(size)
+    b.u64(len(jit.bytes))
+    b.u64(len(jit.patches))
     b.b
 }
 
@@ -1184,7 +1234,12 @@ pub fn buildExecutable(host: Host, target: Text, c: Compiled, o: RunOptions) -> 
         printErr("quark: an executable starts at fn main()")
         return 1
     }
-    let program = programBytes(c, c.mc, c.mc.fnAt[c.prog.mainIndex], o.fuel, o.memory)
+    let jit = if o.debugInfo {
+        jitObjectOf(debugInfoOf(host, c))
+    } else {
+        JitObject([], [])
+    }
+    let program = programBytes(c, c.mc, c.mc.fnAt[c.prog.mainIndex], o.fuel, o.memory, jit)
     let os = c.os
     let arm = c.prog.target.arch == .Arm64
     let out = o.outPath ?? defaultOutput(os, o.path)

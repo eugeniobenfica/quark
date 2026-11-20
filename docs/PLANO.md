@@ -530,6 +530,19 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 - **Sem libc onde der:** Ryū para escrever `Float`, parser próprio para ler, memória direto do sistema. No Windows
   e no Linux o executável passa a depender só do kernel; no macOS a `libSystem` é obrigatória.
 - **Informação de depuração padrão:** DWARF e PDB/CodeView, para depuradores e perfiladores externos.
+
+> **Feito em 21/11/2026: ARM64 em paridade.** As chamadas entre funções Quark passam os oito primeiros slots em x0–x7, como o x86-64 faz com cinco registradores.
+> - Nenhum valor tem x0–x7 por casa, então os movimentos de entrada e saída vão em qualquer ordem.
+> - O código do compilador ficou 8,8% menor (21,78 → 19,86 MB) e o da libquark 13% menor.
+> - O NEON já cobria as mesmas operações vetoriais do x86-64.
+> - Verde no Linux ARM64 e no Apple silicon, com o ponto fixo e a suíte inteira.
+>
+> **Feito em 21/11/2026: informação de depuração (`-g`).** `compiler/dwarf.qk` escreve DWARF 4 (`.debug_info`, `.debug_abbrev`, `.debug_line`, `.debug_frame`) e CodeView (`.debug$S`).
+> - Os backends guardam onde começa o código de cada linha e cada prólogo, e só com `-g`.
+> - `quark object -g` põe isso no objeto: ELF, Mach-O (`__DWARF`) e COFF. No COFF vão DWARF, para as ferramentas GNU, e CodeView, de que o `lld-link /debug` faz um PDB.
+> - Verificado com `llvm-dwarfdump --verify`, `llvm-pdbutil` e o gdb: no Windows, num host C ligado com o objeto, `break greet`, `next` e `bt` funcionam nas linhas Quark.
+> - O executável carrega o programa ao começar. Com `quark build -g`, o compilador põe no payload um ELF com o DWARF, e o runtime o registra pela interface JIT do gdb (`__jit_debug_descriptor`, `__jit_debug_register_code`). Os executáveis agora têm tabela de símbolos (COFF, ELF `.symtab`, Mach-O `LC_SYMTAB`) com as funções do runtime e esses dois nomes.
+> - `quark run -g` não tem isso: o runtime do `quark run` é mapeado na memória, sem símbolos que o gdb ache; o depurador próprio (`quark debug`) cobre esse caso.
 - **wasm32:** rodar a suíte num runtime wasm; `std` sem sistema bem delimitada.
 - **libquark no macOS** e a API C revisada uma última vez antes de congelar.
 - **Executáveis menores:** só o que o programa usa do runtime (hoje vai inteiro).

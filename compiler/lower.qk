@@ -4959,7 +4959,7 @@ fn Lower.lowerCEntry(var self, late: Late) {
     let x = self.dl(d)
     let n = len(late.cTypes) - 1
     let cRet = late.cTypes[n]
-    self.cur = IrFn(x.name + " (from C)", line: x.line, exportName: late.exportName)
+    self.cur = IrFn(x.name + " (from C)", line: x.line, file: x.module, exportName: late.exportName)
     self.current = d
     self.depth = 0
     self.inl = 0
@@ -7412,7 +7412,7 @@ fn Lower.lowerStmtInner(var self, s: Int) {
 // ---- functions ----
 fn Lower.lowerFn(var self, d: Int, index: Int) {
     let x = self.dl(d)
-    self.cur = IrFn(x.name, line: x.line)
+    self.cur = IrFn(x.name, line: x.line, file: x.module)
     self.fnId = index
     self.current = d
     self.depth = 0
@@ -7503,7 +7503,7 @@ fn Lower.lowerFn(var self, d: Int, index: Int) {
 // fn main() -> Int as an executable's entry: its value the exit status
 fn Lower.lowerEntry(var self, main: Int, index: Int) {
     let x = self.dl(main)
-    self.cur = IrFn("#entry", line: x.line)
+    self.cur = IrFn("#entry", line: x.line, file: x.module)
     self.fnId = index
     self.current = main
     self.depth = 0
@@ -7715,6 +7715,7 @@ pub fn Lowered.lowerFrom(var self, p: Program, opts: LowerOptions) {
     l.fns = []
     l.out.fns = fns
     l.out.dataLen = len(l.data)
+    l.out.files = l.p.modules.map(m => m.path).toArray()
     let out = l.out // taken
     l.out = IrProgram()
     self.program = out

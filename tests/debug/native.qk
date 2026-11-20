@@ -1,0 +1,13 @@
+// quark build -g: a debugger (gdb, lldb) stops on its lines (tests/run.sh breaks on line 9)
+fn square(x: Int) -> Int {
+    let y = x * x
+    y + 1
+}
+
+fn main() {
+    var total = 0
+    for i in 0..3 {
+        total += square(i)
+    }
+    print("total {total}")
+}

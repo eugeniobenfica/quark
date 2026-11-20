@@ -1191,7 +1191,6 @@ fn Gen.divide(var self, ins: IrIns, line: Int) {
     self.get(self.t0)
     self.op(0x7D)
     self.get(self.t0)
-    self.get(self.t1)
     self.k(-1)
     self.get(self.t1)
     self.op(0x52) // b != -1: b, else 1 (any divisor that cannot trap)

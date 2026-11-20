@@ -21,6 +21,9 @@ jobs:
       - name: Build
         run: QUARK=boot/quark-x86_64-linux ./build.sh
       - name: wasmtime
-        run: curl -sSf https://wasmtime.dev/install.sh | bash && echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+        run: |
+          gh release download --repo bytecodealliance/wasmtime --pattern 'wasmtime-v*-x86_64-linux.tar.xz' --dir wt
+          tar -xJf wt/*.tar.xz -C wt
+          echo "$(ls -d $PWD/wt/wasmtime-v*-x86_64-linux)" >> "$GITHUB_PATH"
       - name: The suite in WebAssembly
         run: bash tools/wasmtest.sh build/quark.exe

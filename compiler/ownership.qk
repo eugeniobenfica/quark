@@ -22,6 +22,7 @@ pub type Ownership {
     sizeMemo: [Int] = [] // by declaration index: its body's size (bodySize), -1 not known yet
     inlineCost: [Int] = [] // by declaration index: what putting it in line costs (inlineCostOf), 0 not known yet
     selfMemo: [Int] = [] // by declaration index: keepsSelfInMemory's answer (0 not known, 3 being worked out)
+    local: Set<Int> = [] // array literals whose value never leaves the function (decideEscapes)
 }
 
 // ---- the tree, as these questions read it ----
@@ -1671,4 +1672,133 @@ pub fn Ownership.mapsInPlace(self, target: Int, value: Int) -> Bool {
     var u = Uses(b)
     u.expr(self, args[1], false)
     u.count == 0
+}
+
+// ---- escape analysis: values that never leave the function ----
+// An array literal of a few elements that hold no memory, held by a let that is only read by index (not sliced), by
+// len, or gone through by a for, never leaves the function: no call is given it, no lambda captures it, it is never
+// returned, stored or held by another name. Its memory is the function's area (made once a call, used again by each
+// turn of a loop: the let's value of the turn before is gone), not the arena: a loop that makes one a turn makes
+// nothing for its collector.
+const localMost = 64
+
+pub fn Ownership.decideEscapes(var self) {
+    self.local = []
+    if self.debug {
+        return
+    }
+    var captured: Set<Int> = []
+    for x in self.p.bindings {
+        if x.capturedFrom >= 0 {
+            captured.add(x.capturedFrom)
+        }
+    }
+    for b in 0..len(self.p.ast.blocks) {
+        let stmts = self.p.ast.blocks[b].stmts
+        for (i, s) in stmts.enumerate() {
+            let bnd = self.p.ast.stmts[s].binding
+            let Let(mutable, _, _, value, pattern, _) = self.p.ast.stmts[s].node else {
+                continue
+            }
+            if mutable or pattern >= 0 or bnd < 0 or value < 0 or captured.contains(bnd) or self.p.bindings[bnd].lazy {
+                continue
+            }
+            let ArrayLit(items) = self.p.ast.exprs[value].node else {
+                continue
+            }
+            let t = self.p.bindings[bnd].ty
+            if len(items) == 0 or len(items) > localMost or self.tk(t) != Kind.Array or self.holdsMemory(self.elemOf(t)) {
+                continue
+            }
+            var stays = true
+            for later in stmts[i + 1..] {
+                stays = stays and self.readOnlyIn(later, bnd, t)
+            }
+            if stays {
+                self.local.add(value)
+            }
+        }
+    }
+}
+
+// whether every mention of the binding b (an array of type t) in the statement s is a read that keeps nothing of it
+fn Ownership.readOnlyIn(self, s: Int, b: Int, t: Int) -> Bool {
+    let st = self.p.ast.stmts[s]
+    match st.node {
+        Let(_, _, _, value, _, otherwise) => self.readsOnly(value, b, t) and self.blockReadsOnly(otherwise, b, t)
+        Assign(target, _, value) => self.readsOnly(target, b, t)
+            and self.readsOnly(value, b, t)
+            and self.readsOnly(st.opValue, b, t)
+        ExprStmt(value) => self.readsOnly(value, b, t)
+        For(_, _, iter, body) => {
+            let over = self.p.ast.exprs[iter]
+            (over.node is Name(_) and over.binding == b or self.readsOnly(iter, b, t))
+                and self.blockReadsOnly(body, b, t)
+        }
+        While(cond, body) => self.readsOnly(cond, b, t) and self.blockReadsOnly(body, b, t)
+        Return(value) => self.readsOnly(value, b, t)
+        Defer(body) => self.blockReadsOnly(body, b, t)
+        _ => true
+    }
+}
+
+fn Ownership.blockReadsOnly(self, block: Int, b: Int, t: Int) -> Bool {
+    if block < 0 {
+        return true
+    }
+    for s in self.p.ast.blocks[block].stmts {
+        if not self.readOnlyIn(s, b, t) {
+            return false
+        }
+    }
+    true
+}
+
+fn Ownership.readsOnly(self, e: Int, b: Int, t: Int) -> Bool {
+    if e < 0 {
+        return true
+    }
+    let x = self.p.ast.exprs[e]
+    if x.node is Name(_) and x.binding == b {
+        return false // the value itself, where it may be kept
+    }
+    match x.node {
+        Index(target, index) => {
+            let base = self.p.ast.exprs[target]
+            if base.node is Name(_) and base.binding == b {
+                return x.ty != t and self.readsOnly(index, b, t) // an element (a slice shares the memory)
+            }
+            self.readsOnly(target, b, t) and self.readsOnly(index, b, t)
+        }
+        Lambda(_, body) => self.readsOnly(body, b, t)
+        Match(subject, arms, _) => {
+            var ok = self.readsOnly(subject, b, t)
+            for a in arms {
+                ok = ok
+                    and self.readsOnly(self.p.ast.arms[a].guard, b, t)
+                    and self.readsOnly(self.p.ast.arms[a].body, b, t)
+            }
+            ok
+        }
+        Is(value, arm) => self.readsOnly(value, b, t) and self.readsOnly(self.p.ast.arms[arm].guard, b, t)
+        If(cond, then, otherwise) => self.readsOnly(cond, b, t)
+            and self.blockReadsOnly(then, b, t)
+            and self.readsOnly(otherwise, b, t)
+        BlockExpr(block, _) => self.blockReadsOnly(block, b, t)
+        _ => {
+            let args = if len(x.ordered) > 0 { x.ordered } else { self.argsOf(e) }
+            if x.builtin == bLen and len(args) == 1 {
+                let a = self.p.ast.exprs[args[0]]
+                if a.node is Name(_) and a.binding == b {
+                    return true // its length
+                }
+            }
+            var ok = self.readsOnly(self.aOf(e), b, t) and self.readsOnly(self.bOf(e), b, t)
+            ok = ok and self.readsOnly(x.callee, b, t)
+            for a in args {
+                ok = ok and self.readsOnly(a, b, t)
+            }
+            ok
+        }
+    }
 }

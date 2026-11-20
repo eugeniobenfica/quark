@@ -6150,7 +6150,12 @@ fn Lower.lowerExprInner(var self, e: Int) -> [Int] {
         ArrayLit(items) => {
             let bytes = self.slots(self.elemOf(x.ty)) * 8
             let n = self.iconst(len(items))
-            let ptr = self.alloc(n, bytes, line)
+            // one that never leaves the function: in its area (Ownership.decideEscapes)
+            let ptr = if self.own.local.contains(e) and self.areaAt >= 0 {
+                self.areaTake(len(items) * bytes / 8)
+            } else {
+                self.alloc(n, bytes, line)
+            }
             for (i, item) in items.enumerate() {
                 let v = self.lowerStored(item)
                 let at = self.iconst(i)
@@ -7506,6 +7511,7 @@ pub fn Lowered.lowerFrom(var self, p: Program, opts: LowerOptions) {
     l.own.decideAliases()
     l.own.decideTakes()
     l.own.decideResults()
+    l.own.decideEscapes()
     l.markInPlace()
     var count = 0
     var main = -1

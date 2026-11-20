@@ -1,0 +1,37 @@
+// Array literals that never leave the function live in its area, one a turn of a loop: read by index, by len, by a
+// for; the ones that leave (a slice, a call, a return, a lambda, another name, a list) are made as always.
+fn sumOf(xs: [Int]) -> Int = xs.sum()
+
+fn pairOf(a: Int, b: Int) -> [Int] {
+    let p = [a, b]
+    p
+}
+
+fn main() {
+    var total = 0
+    var kept: [[Int]] = []
+    var slices: [[Int]] = []
+    for i in 0..1000 {
+        let local = [i, i * 2, i * 3]
+        total += local[0] + local[2] - local[1] + len(local)
+        for v in local {
+            total += v % 3
+        }
+        for j in 0..3 {
+            let inner = [j, i]
+            total += inner[0] * inner[1] % 5
+        }
+        let given = [i, 1]
+        total += sumOf(given)
+        let held = [i, i + 1]
+        kept.push(held)
+        let sliced = [i, i + 1, i + 2]
+        slices.push(sliced[1..])
+        let named = [7, i]
+        let other = named
+        total += other[1]
+    }
+    let captured = [1, 2, 3]
+    let f = () => captured[2]
+    print(total, len(kept), kept[10], kept[999], slices[3], slices[998], pairOf(4, 5), f())
+}

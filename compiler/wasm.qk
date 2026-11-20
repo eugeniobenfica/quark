@@ -1,0 +1,1250 @@
+// The WebAssembly backend (wasm32, WASI): a program and the runtime (compiler/runtime/wasi.qk), both in IR, made
+// one module, every byte of it here. quark build --target wasm32-wasi file.qk -o file.wasm; wasmtime file.wasm.
+//
+// - Each virtual register is a local of its kind (i64, f64); between functions every slot is an i64 (a Float's
+//   bits), as the other backends keep 64 bits in a register whatever they are.
+// - Jumps: a function's code is cut at its labels into segments, each after the end of a block of its own inside a
+//   loop: a jump sets the segment's number and goes back to the loop's top, where br_table goes to it (any shape of
+//   jumps, as the IR has them).
+// - A function's address is its number in the table. A function C calls (pub extern fn) is in the table as a thunk
+//   of C's one shape here, four i64s in and one out, which machine.call and calls through C's pointers use.
+// - C's functions: WASI's (imports from wasi_snapshot_preview1), a few made of instructions (memcpy, memset,
+//   floor...), the runtime's own definitions (malloc, sin...: runtime/wasi.qk), else a trap where it is called.
+// - Memory: nothing below 1024, then the runtime's data, the program's data, then the heap (runtime/wasi.qk's malloc
+//   grows the memory). A panic ends the process (proc_exit), as it does everywhere without a host's call to go back
+//   to; tasks on stacks of their own, threads and other programs are not here (wasm has neither).
+use ir
+
+// ---- bytes ----
+type W { b: Bytes = [] }
+
+fn W.u8(var self, v: Int) {
+    self.b.push(v & 255)
+}
+
+fn W.uleb(var self, v: Int) {
+    var x = v
+    while true {
+        let low = x & 127
+        x = x >> 7 & 0x1FFFFFFFFFFFFFF
+        if x == 0 {
+            self.b.push(low)
+            return
+        }
+        self.b.push(low | 128)
+    }
+}
+
+fn W.sleb(var self, v: Int) {
+    var x = v
+    while true {
+        let low = x & 127
+        x = x >> 7
+        if x == 0 and low & 64 == 0 or x == -1 and low & 64 != 0 {
+            self.b.push(low)
+            return
+        }
+        self.b.push(low | 128)
+    }
+}
+
+fn W.add(var self, x: Bytes) {
+    self.b += x
+}
+
+fn W.name(var self, t: Text) {
+    self.uleb(len(t))
+    self.b += t.bytes()
+}
+
+fn W.vec(var self, items: [Bytes]) {
+    self.uleb(len(items))
+    for x in items {
+        self.b += x
+    }
+}
+
+fn W.section(var self, id: Int, body: Bytes) {
+    self.u8(id)
+    self.uleb(len(body))
+    self.b += body
+}
+
+fn W.len(self) -> Int = len(self.b)
+
+const tI32 = 0x7F
+const tI64 = 0x7E
+const tF32 = 0x7D
+const tF64 = 0x7C
+
+// ---- WASI's functions: the types of their parameters and results (i: i32, I: i64) ----
+pub const wasiModule = "wasi_snapshot_preview1"
+
+const wasiFns = [
+    ("fd_write", "iiii", "i"),
+    ("fd_read", "iiii", "i"),
+    ("fd_close", "i", "i"),
+    ("fd_seek", "iIii", "i"),
+    ("fd_tell", "ii", "i"),
+    ("fd_filestat_get", "ii", "i"),
+    ("fd_readdir", "iiiIi", "i"),
+    ("fd_prestat_get", "ii", "i"),
+    ("fd_prestat_dir_name", "iii", "i"),
+    ("path_open", "iiiiiIIii", "i"),
+    ("path_filestat_get", "iiiii", "i"),
+    ("path_create_directory", "iii", "i"),
+    ("path_unlink_file", "iii", "i"),
+    ("path_remove_directory", "iii", "i"),
+    ("args_sizes_get", "ii", "i"),
+    ("args_get", "ii", "i"),
+    ("environ_sizes_get", "ii", "i"),
+    ("environ_get", "ii", "i"),
+    ("clock_time_get", "iIi", "i"),
+    ("random_get", "ii", "i"),
+    ("poll_oneoff", "iiii", "i"),
+    ("sched_yield", "", "i"),
+    ("proc_exit", "i", ""),
+]
+
+fn wasiSig(name: Text) -> (Text, Text)? {
+    for (n, ps, rs) in wasiFns {
+        if n == name {
+            return Some((ps, rs))
+        }
+    }
+    None
+}
+
+// ---- the module's parts ----
+// A function of the module: the program's (part 1) or the runtime's (part 0), its number there.
+type Part { prog: IrProgram, dataBase: Int, first: Int }
+
+type Module {
+    parts: [Part] = []
+    types: [Bytes] = [] // each function type, as the type section has it
+    imports: [Text] = [] // WASI's functions imported, in order (their numbers come first)
+    bySymbol: [Text: Int] = [:] // C's names the runtime or the program gives (pub extern fn): the function's number
+    shapes: [Int: (Int, Int)] = [:] // such a function's parameters and results
+    cEntries: [Bool] = [] // by the module's function number (past the imports): a function C calls
+    thunkOf: [Int: Int] = [:] // such a function: its thunk's number
+    count: Int = 0 // the functions made (imports, the parts', the thunks, _start)
+    heapBase: Int = 0
+    missing: [Text] = []
+}
+
+fn Module.typeOf(var self, params: Bytes, results: Bytes) -> Int {
+    var t = W()
+    t.u8(0x60)
+    t.uleb(len(params))
+    t.add(params)
+    t.uleb(len(results))
+    t.add(results)
+    if self.types.indexOf(t.b) is Some(i) {
+        return i
+    }
+    self.types.push(t.b)
+    len(self.types) - 1
+}
+
+// i64 n times
+fn i64s(n: Int) -> Bytes = [tI64] * n
+
+fn Module.quarkType(var self, args: Int, rets: Int) -> Int = self.typeOf(i64s(args), i64s(rets))
+
+// the module's number of a part's function k
+fn Module.fnIndex(self, part: Int, k: Int) -> Int = self.parts[part].first + k
+
+// the function a symbol names: the runtime's first (qk_..., qkos..., malloc...), then the program's
+fn Module.symbol(self, name: Text) -> Int? = self.bySymbol[name]
+
+// The module: the runtime (rt) and the program (p), each with its data; its budget of steps (fuel, 0: none) and
+// its memory limit (bytes, 0: none). Also the C names nothing here gives (a trap where they are called).
+pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel: Int, memory: Int) -> (Bytes, [Text]) {
+    var m = Module()
+    // the imports: every WASI function either part calls
+    for prog in [rt, p] {
+        for x in prog.externs {
+            if x.lib == Some(wasiModule) and wasiSig(x.name) != None and not m.imports.contains(x.name) {
+                m.imports.push(x.name)
+            }
+        }
+    }
+    let rtBase = 1024
+    let pBase = (rtBase + len(rtData) + 15) / 16 * 16
+    m.heapBase = (pBase + len(pData) + 65535) / 65536 * 65536
+    let first0 = len(m.imports)
+    let first1 = first0 + len(rt.fns)
+    m.parts = [Part(rt, rtBase, first0), Part(p, pBase, first1)]
+    m.count = first1 + len(p.fns)
+    m.cEntries = [false] * (len(rt.fns) + len(p.fns))
+    for (part, prog) in [rt, p].enumerate() {
+        for (k, f) in prog.fns.enumerate() {
+            let at = m.fnIndex(part, k)
+            if f.exportName is Some(sym) and not m.bySymbol.contains(sym) {
+                m.bySymbol[sym] = at
+                m.shapes[at] = (len(f.params), f.resultCount)
+            }
+            if f.cArgs != None {
+                m.cEntries[at - first0] = true
+            }
+        }
+    }
+    // the thunks: C's shape for each function C calls
+    for i in 0..len(m.cEntries) {
+        if m.cEntries[i] {
+            m.thunkOf[first0 + i] = m.count
+            m.count += 1
+        }
+    }
+    let startFn = m.count
+    m.count += 1
+    // the code
+    var bodies: [Bytes] = []
+    var fnTypes: [Int] = []
+    for (part, prog) in [rt, p].enumerate() {
+        for (k, f) in prog.fns.enumerate() {
+            var g = Gen(m, part, prog, f)
+            fnTypes.push(m.quarkType(len(f.params), f.resultCount))
+            bodies.push(g.body())
+            m = g.m
+        }
+    }
+    let cType = m.typeOf(i64s(4), [tI64])
+    for i in 0..len(m.cEntries) {
+        if m.cEntries[i] {
+            let at = first0 + i
+            let (part, k) = if i < len(rt.fns) { (0, i) } else { (1, i - len(rt.fns)) }
+            let f = m.parts[part].prog.fns[k]
+            var b = W()
+            b.u8(0)
+            if len(f.params) > 4 {
+                b.u8(0x00)
+            } else {
+                for j in 0..len(f.params) {
+                    b.u8(0x20)
+                    b.uleb(j)
+                }
+                b.u8(0x10)
+                b.uleb(at)
+                for _ in 1..max(f.resultCount, 1) {
+                    b.u8(0x1A) // drop all but the first
+                }
+                if f.resultCount == 0 {
+                    b.u8(0x42)
+                    b.sleb(0)
+                } else if f.resultCount > 1 {
+                    // the first is under the others: kept by moving through a local
+                    b.b = []
+                    b.uleb(1)
+                    b.uleb(1)
+                    b.u8(tI64)
+                    for j in 0..len(f.params) {
+                        b.u8(0x20)
+                        b.uleb(j)
+                    }
+                    b.u8(0x10)
+                    b.uleb(at)
+                    for _ in 1..f.resultCount {
+                        b.u8(0x1A)
+                    }
+                }
+            }
+            b.u8(0x0B)
+            bodies.push(b.b)
+            fnTypes.push(cType)
+        }
+    }
+    // _start: the runtime begins, the program's entry runs, its status ends the process
+    var s = W()
+    s.u8(0)
+    if m.symbol("qkWasiBegin") is Some(begin) {
+        s.u8(0x10)
+        s.uleb(begin)
+    }
+    if memory > 0 and m.symbol("qkWasiLimit") is Some(limit) {
+        s.u8(0x42)
+        s.sleb(memory)
+        s.u8(0x10)
+        s.uleb(limit)
+    }
+    if p.mainIndex >= 0 {
+        s.u8(0x10)
+        s.uleb(m.fnIndex(1, p.mainIndex))
+        let n = p.fns[p.mainIndex].resultCount
+        for _ in 1..max(n, 1) {
+            s.u8(0x1A)
+        }
+        if n == 0 {
+            s.u8(0x42)
+            s.sleb(0)
+        }
+    } else {
+        s.u8(0x42)
+        s.sleb(0)
+    }
+    if m.symbol("qkWasiEnd") is Some(end) {
+        s.u8(0x10)
+        s.uleb(end)
+    } else {
+        s.u8(0x1A)
+    }
+    s.u8(0x0B)
+    bodies.push(s.b)
+    fnTypes.push(m.typeOf([], []))
+    // the import types
+    var importTypes: [Int] = []
+    for name in m.imports {
+        let (ps, rs) = wasiSig(name) ?? ("", "")
+        let params = ps.bytes().map(c => if c == 'I' { tI64 } else { tI32 }).toArray()
+        let results = rs.bytes().map(c => if c == 'I' { tI64 } else { tI32 }).toArray()
+        importTypes.push(m.typeOf(params, results))
+    }
+    // the sections
+    var out = W()
+    out.add([0, 'a', 's', 'm', 1, 0, 0, 0])
+    var types = W()
+    types.vec(m.types)
+    out.section(1, types.b)
+    var imports = W()
+    imports.uleb(len(m.imports))
+    for (i, name) in m.imports.enumerate() {
+        imports.name(wasiModule)
+        imports.name(name)
+        imports.u8(0)
+        imports.uleb(importTypes[i])
+    }
+    out.section(2, imports.b)
+    var funcs = W()
+    funcs.uleb(len(fnTypes))
+    for t in fnTypes {
+        funcs.uleb(t)
+    }
+    out.section(3, funcs.b)
+    var table = W()
+    table.uleb(1)
+    table.u8(0x70)
+    table.u8(0)
+    table.uleb(m.count)
+    out.section(4, table.b)
+    var mem = W()
+    mem.uleb(1)
+    mem.u8(0)
+    mem.uleb(m.heapBase / 65536 + 16)
+    out.section(5, mem.b)
+    var globals = W()
+    globals.uleb(2)
+    globals.add([tI64, 1, 0x42, 0, 0x0B]) // the context
+    globals.add([tI64, 1, 0x42])
+    globals.sleb(if fuel > 0 {
+        fuel // the budget
+    } else {
+        9223372036854775807
+    })
+    globals.u8(0x0B)
+    out.section(6, globals.b)
+    var exports = W()
+    exports.uleb(2)
+    exports.name("_start")
+    exports.u8(0)
+    exports.uleb(startFn)
+    exports.name("memory")
+    exports.u8(2)
+    exports.uleb(0)
+    out.section(7, exports.b)
+    // the table: each function at its own number (one C calls: its thunk); the imports' places empty
+    var elems = W()
+    elems.uleb(1)
+    elems.u8(0)
+    elems.add([0x41])
+    elems.sleb(first0)
+    elems.u8(0x0B)
+    elems.uleb(len(m.cEntries))
+    for i in 0..len(m.cEntries) {
+        let at = first0 + i
+        elems.uleb(m.thunkOf[at] ?? at)
+    }
+    out.section(9, elems.b)
+    var code = W()
+    code.uleb(len(bodies))
+    for b in bodies {
+        code.uleb(len(b))
+        code.add(b)
+    }
+    out.section(10, code.b)
+    var data = W()
+    data.uleb(2)
+    for (base, bytes) in [(rtBase, rtData), (pBase, pData)] {
+        data.u8(0)
+        data.u8(0x41)
+        data.sleb(base)
+        data.u8(0x0B)
+        data.uleb(len(bytes))
+        data.add(bytes)
+    }
+    out.section(11, data.b)
+    (out.b, m.missing)
+}
+
+// ---- one function's code ----
+type Gen {
+    m: Module
+    part: Int
+    prog: IrProgram
+    f: IrFn
+    out: W = W()
+    segOf: [Int] = [] // each label's segment
+    seg: Int = 0 // the segment being made
+    segs: Int = 1
+    depth: Int = 0 // blocks opened inside the segment (an if: 1)
+    params: Int = 0
+    pc: Int = 0
+    t0: Int = 0 // scratch: i64, i64, i64
+    t1: Int = 0
+    t2: Int = 0
+}
+
+const opUnreachable = 0x00
+const opEnd = 0x0B
+const opBr = 0x0C
+const opCall = 0x10
+const opLocalGet = 0x20
+const opLocalSet = 0x21
+const opLocalTee = 0x22
+const opGlobalGet = 0x23
+const opGlobalSet = 0x24
+const opI64Const = 0x42
+
+fn Gen.op(var self, o: Int) {
+    self.out.u8(o)
+}
+
+fn Gen.get(var self, local: Int) {
+    self.out.u8(opLocalGet)
+    self.out.uleb(local)
+}
+
+fn Gen.set(var self, local: Int) {
+    self.out.u8(opLocalSet)
+    self.out.uleb(local)
+}
+
+fn Gen.k(var self, v: Int) {
+    self.out.u8(opI64Const)
+    self.out.sleb(v)
+}
+
+fn Gen.isF(self, v: Int) -> Bool = self.f.kinds[v] == 'F'
+
+fn Gen.local(self, v: Int) -> Int = self.params + v
+
+// v's value, as its kind has it (an Int i64, a Float f64)
+fn Gen.read(var self, v: Int) {
+    if v >= 0 and v < len(self.f.isConst) and self.f.isConst[v] {
+        self.k(self.f.constValue[v])
+        if self.isF(v) {
+            self.op(0xBF) // f64.reinterpret_i64
+        }
+        return
+    }
+    self.get(self.local(v))
+}
+
+// v's 64 bits, as an i64
+fn Gen.bits(var self, v: Int) {
+    self.read(v)
+    if self.isF(v) {
+        self.op(0xBD) // i64.reinterpret_f64
+    }
+}
+
+// v's value as a Float
+fn Gen.float(var self, v: Int) {
+    self.read(v)
+    if not self.isF(v) {
+        self.op(0xBF)
+    }
+}
+
+// the i64 on the stack into v (a Float's bits made the Float)
+fn Gen.fromBits(var self, v: Int) {
+    if self.isF(v) {
+        self.op(0xBF)
+    }
+    self.set(self.local(v))
+}
+
+// the f64 on the stack into v
+fn Gen.fromFloat(var self, v: Int) {
+    if not self.isF(v) {
+        self.op(0xBD)
+    }
+    self.set(self.local(v))
+}
+
+// the i32 truth on the stack into v (0 or 1)
+fn Gen.fromBool(var self, v: Int) {
+    self.op(0xAD) // i64.extend_i32_u
+    self.fromBits(v)
+}
+
+fn Gen.opnd(self, ins: IrIns, i: Int) -> Int = self.f.operands[ins.from + i]
+
+// to label's segment
+fn Gen.jump(var self, label: Int) {
+    self.out.u8(0x41)
+    self.out.sleb(self.segOf[label])
+    self.set(self.pc)
+    self.out.u8(opBr)
+    self.out.uleb(self.segs - 1 - self.seg + self.depth)
+}
+
+fn Gen.ifOpen(var self) {
+    self.out.u8(0x04)
+    self.out.u8(0x40)
+    self.depth += 1
+}
+
+fn Gen.ifClose(var self) {
+    self.op(opEnd)
+    self.depth -= 1
+}
+
+// rtPanic(code, line, a, b): never back
+fn Gen.panic(var self, code: Int, line: Int, a: Int, b: Int) {
+    self.k(code)
+    self.k(line)
+    if a >= 0 { self.bits(a) } else { self.k(0) }
+    if b >= 0 { self.bits(b) } else { self.k(0) }
+    self.callSymbol("qk_panic", 4, 0)
+    self.op(opUnreachable)
+}
+
+// a function by its C name (args i64s already pushed): rets i64s left; the function's own shape met (arguments
+// past its parameters dropped, missing ones 0; results it lacks 0, ones past rets dropped); a trap when none has it
+fn Gen.callSymbol(var self, name: Text, args: Int, rets: Int) {
+    let Some(at) = self.m.symbol(name) else {
+        if not self.m.missing.contains(name) {
+            self.m.missing.push(name)
+        }
+        self.op(opUnreachable)
+        return
+    }
+    let (params, results) = self.m.shapes[at] ?? (args, rets)
+    for _ in params..args {
+        self.op(0x1A)
+    }
+    for _ in args..params {
+        self.k(0)
+    }
+    self.out.u8(opCall)
+    self.out.uleb(at)
+    for _ in rets..results {
+        self.op(0x1A)
+    }
+    for _ in results..rets {
+        self.k(0)
+    }
+}
+
+fn Gen.body(var self) -> Bytes {
+    let f = self.f
+    self.params = len(f.params)
+    let n = len(f.kinds)
+    self.pc = self.params + n
+    self.t0 = self.pc + 1
+    self.t1 = self.pc + 2
+    self.t2 = self.pc + 3
+    // the locals: each register's, then pc (i32) and the scratch ones
+    var locals = W()
+    var groups: [(Int, Int)] = []
+    for v in 0..n {
+        let t = if f.kinds[v] == 'F' { tF64 } else { tI64 }
+        if len(groups) > 0 and groups[len(groups) - 1].1 == t {
+            groups[len(groups) - 1] = (groups[len(groups) - 1].0 + 1, t)
+        } else {
+            groups.push((1, t))
+        }
+    }
+    groups += [(1, tI32), (3, tI64)]
+    locals.uleb(len(groups))
+    for (count, t) in groups {
+        locals.uleb(count)
+        locals.u8(t)
+    }
+    if f.machine != machineNone {
+        self.machine(f.machine)
+        self.op(opEnd)
+        return locals.b + self.out.b
+    }
+    // the parameters, into their registers
+    for (i, v) in f.params.enumerate() {
+        self.get(i)
+        self.fromBits(v)
+    }
+    // the segments: one before the first label, one from each
+    self.segOf = [0] * (f.labelCount + 1)
+    var segs = 1
+    for ins in f.code {
+        if ins.op == .Label {
+            self.segOf[ins.imm] = segs
+            segs += 1
+        }
+    }
+    self.segs = segs
+    self.out.u8(0x03) // loop
+    self.out.u8(0x40)
+    for _ in 0..segs {
+        self.out.u8(0x02) // block
+        self.out.u8(0x40)
+    }
+    self.get(self.pc)
+    self.out.u8(0x0E) // br_table
+    self.out.uleb(segs)
+    for j in 0..segs {
+        self.out.uleb(j)
+    }
+    self.out.uleb(segs - 1)
+    self.op(opEnd) // segment 0 starts
+    self.seg = 0
+    for ins in f.code {
+        if ins.op == .Label {
+            self.op(opEnd)
+            self.seg += 1
+        } else {
+            self.ins(ins)
+        }
+    }
+    self.op(opUnreachable) // the last segment does not fall off
+    self.op(opEnd) // the loop
+    self.op(opUnreachable)
+    self.op(opEnd)
+    locals.b + self.out.b
+}
+
+// std.machine's built-ins
+fn Gen.machine(var self, kind: Int) {
+    if kind == machineCall {
+        for i in 1..5 {
+            self.get(i)
+        }
+        self.get(0)
+        self.op(0xA7) // i32.wrap_i64
+        self.out.u8(0x11)
+        self.out.uleb(self.m.typeOf(i64s(4), [tI64]))
+        self.out.u8(0)
+    } else if kind == machineFrame or kind == machineCpu {
+        self.k(0)
+    } else if kind == machineAddress {
+        self.get(0)
+    } else if kind == machineContext {
+        self.out.u8(opGlobalGet)
+        self.out.uleb(0)
+    } else if kind == machineSetContext {
+        self.get(0)
+        self.out.u8(opGlobalSet)
+        self.out.uleb(0)
+    } else if kind == machineFillRuntime {
+        for (i, name) in runtimeNames.enumerate() {
+            self.get(0)
+            self.op(0xA7)
+            self.k(self.m.symbol("qk_" + name) ?? 0)
+            self.out.u8(0x37) // i64.store
+            self.out.uleb(3)
+            self.out.uleb(8 * i)
+        }
+    } else {
+        self.op(opUnreachable) // switchStack: no stacks to switch in wasm
+    }
+    // the results the function has, zero when the built-in gives none
+    let gives = [machineAddress, machineFrame, machineCpu, machineCall, machineContext]
+    if gives.contains(kind) {
+        for _ in 1..self.f.resultCount {
+            self.k(0)
+        }
+    } else {
+        for _ in 0..self.f.resultCount {
+            self.k(0)
+        }
+    }
+}
+
+// [a + b * imm + c], as wasm's i32 address
+fn Gen.address(var self, ins: IrIns) {
+    self.bits(ins.a)
+    if ins.b >= 0 {
+        self.bits(ins.b)
+        if ins.imm != 1 {
+            self.k(ins.imm)
+            self.op(0x7E)
+        }
+        self.op(0x7C)
+    }
+    if ins.c != 0 {
+        self.k(ins.c)
+        self.op(0x7C)
+    }
+    self.op(0xA7)
+}
+
+fn Gen.memarg(var self, op: Int, align: Int) {
+    self.out.u8(op)
+    self.out.uleb(align)
+    self.out.uleb(0)
+}
+
+// a call's arguments, as i64s
+fn Gen.args(var self, ins: IrIns) {
+    for i in 0..ins.argCount {
+        self.bits(self.f.operands[ins.from + i])
+    }
+}
+
+// ... and its results (as i64s on the stack) into their registers
+fn Gen.results(var self, ins: IrIns) {
+    var i = ins.retCount - 1
+    while i >= 0 {
+        self.fromBits(self.f.operands[ins.from + ins.argCount + i])
+        i -= 1
+    }
+}
+
+const intCmp = [0x51, 0x52, 0x53, 0x57, 0x55, 0x59] // i64 eq ne lt_s le_s gt_s ge_s
+const floatCmp = [0x61, 0x62, 0x63, 0x65, 0x64, 0x66] // f64 eq ne lt le gt ge
+
+fn Gen.ins(var self, ins: IrIns) {
+    let line = ins.line | ins.inl << 32
+    match ins.op {
+        Const => {
+            if ins.c == 1 {
+                self.k(self.m.parts[self.part].dataBase + ins.imm)
+                self.fromBits(ins.dst)
+            } else if ins.c == 2 {
+                self.k(self.m.fnIndex(self.part, ins.imm))
+                self.fromBits(ins.dst)
+            } else {
+                self.k(ins.imm)
+                self.fromBits(ins.dst)
+            }
+        }
+        Mov => {
+            self.bits(ins.a)
+            self.fromBits(ins.dst)
+        }
+        Add | Sub | Mul => self.arith(ins, line)
+        Div | Mod => self.divide(ins, line)
+        Neg => {
+            if ins.cond == 1 {
+                self.read(ins.a)
+                self.k(-9223372036854775807 - 1)
+                self.op(0x51)
+                self.ifOpen()
+                self.panic(panicOverflow, line, -1, -1)
+                self.ifClose()
+            }
+            self.k(0)
+            self.read(ins.a)
+            self.op(0x7D)
+            self.fromBits(ins.dst)
+        }
+        Fadd | Fsub | Fmul | Fdiv => {
+            self.float(ins.a)
+            self.float(ins.b)
+            self.op(match ins.op {
+                Fadd => 0xA0
+                Fsub => 0xA1
+                Fmul => 0xA2
+                _ => 0xA3
+            })
+            self.fromFloat(ins.dst)
+        }
+        Fneg => {
+            self.float(ins.a)
+            self.op(0x9A)
+            self.fromFloat(ins.dst)
+        }
+        Sqrt => {
+            self.float(ins.a)
+            self.op(0x9F)
+            self.fromFloat(ins.dst)
+        }
+        Fmin | Fmax => {
+            // as minsd / maxsd: b when either is NaN
+            self.float(ins.a)
+            self.float(ins.b)
+            self.float(ins.a)
+            self.float(ins.b)
+            self.op(if ins.op == .Fmin { 0x63 } else { 0x64 })
+            self.op(0x1B)
+            self.fromFloat(ins.dst)
+        }
+        Cmp => {
+            self.read(ins.a)
+            self.read(ins.b)
+            self.op(intCmp[ins.cond])
+            self.fromBool(ins.dst)
+        }
+        Fcmp => {
+            self.float(ins.a)
+            self.float(ins.b)
+            self.op(floatCmp[ins.cond])
+            self.fromBool(ins.dst)
+        }
+        Not => {
+            self.bits(ins.a)
+            self.op(0x50)
+            self.fromBool(ins.dst)
+        }
+        IntToFloat => {
+            self.read(ins.a)
+            self.op(0xB9)
+            self.fromFloat(ins.dst)
+        }
+        FloatToInt => {
+            if ins.cond == 1 {
+                // past an Int's range, or NaN: a panic
+                self.float(ins.a)
+                self.f64k(-4332462841530417152) // -2^63's bits
+                self.op(0x66)
+                self.float(ins.a)
+                self.f64k(4890909195324358656) // 2^63's
+                self.op(0x63)
+                self.op(0x71) // i32.and
+                self.op(0x45) // i32.eqz
+                self.ifOpen()
+                self.panic(panicTooBig, line, -1, -1)
+                self.ifClose()
+            }
+            self.float(ins.a)
+            self.out.add([0xFC, 6]) // i64.trunc_sat_f64_s
+            self.fromBits(ins.dst)
+        }
+        Round => {
+            self.float(ins.a)
+            if ins.imm == 3 {
+                // to C's float: its 32 bits, low in the 64
+                self.op(0xB6)
+                self.op(0xBC)
+                self.op(0xAD)
+                self.op(0xBF)
+            } else if ins.imm == 4 {
+                self.op(0xBD)
+                self.op(0xA7)
+                self.op(0xBE)
+                self.op(0xBB)
+            } else {
+                self.op(match ins.imm {
+                    1 => 0x9C
+                    2 => 0x9B
+                    _ => 0x9E
+                })
+            }
+            self.fromFloat(ins.dst)
+        }
+        Load => {
+            self.address(ins)
+            let fl = self.isF(ins.dst)
+            match ins.cond {
+                1 => self.memarg(0x31, 0)
+                2 => self.memarg(0x30, 0)
+                3 => self.memarg(0x33, 1)
+                4 => self.memarg(0x32, 1)
+                5 => self.memarg(0x35, 2)
+                6 => self.memarg(0x34, 2)
+                7 => {
+                    self.memarg(0x2A, 2)
+                    self.op(0xBB)
+                    self.op(0xBD)
+                }
+                8 => {
+                    self.memarg(0x28, 2)
+                    self.op(0xAD)
+                }
+                _ => self.memarg(0x29, 3)
+            }
+            let _ = fl
+            self.fromBits(ins.dst)
+        }
+        Store => {
+            self.address(ins)
+            match ins.cond {
+                1 | 2 => {
+                    self.bits(ins.dst)
+                    self.memarg(0x3C, 0)
+                }
+                3 | 4 => {
+                    self.bits(ins.dst)
+                    self.memarg(0x3D, 1)
+                }
+                5 | 6 => {
+                    self.bits(ins.dst)
+                    self.memarg(0x3E, 2)
+                }
+                7 => {
+                    self.float(ins.dst)
+                    self.op(0xB6)
+                    self.memarg(0x38, 2)
+                }
+                8 => {
+                    self.bits(ins.dst)
+                    self.op(0xA7)
+                    self.memarg(0x36, 2)
+                }
+                _ => {
+                    self.bits(ins.dst)
+                    self.memarg(0x37, 3)
+                }
+            }
+        }
+        Bounds => {
+            self.read(ins.a)
+            self.read(ins.b)
+            self.op(0x5A) // i64.ge_u: not below
+            self.ifOpen()
+            self.panic(ins.imm, line, ins.a, ins.b)
+            self.ifClose()
+        }
+        Label => {}
+        Jmp => self.jump(ins.imm)
+        Jz | Jnz => {
+            self.bits(ins.a)
+            self.op(0x50)
+            if ins.op == .Jnz {
+                self.op(0x45)
+            }
+            self.ifOpen()
+            self.jump(ins.imm)
+            self.ifClose()
+        }
+        Call => {
+            self.args(ins)
+            if ins.a >= 0 {
+                self.bits(ins.a)
+                self.op(0xA7)
+                self.out.u8(0x11)
+                self.out.uleb(self.m.quarkType(ins.argCount, ins.retCount))
+                self.out.u8(0)
+            } else {
+                self.out.u8(opCall)
+                self.out.uleb(self.m.fnIndex(self.part, ins.imm))
+            }
+            self.results(ins)
+        }
+        RtCall => {
+            self.args(ins)
+            self.callSymbol("qk_" + runtimeNames[ins.imm], ins.argCount, ins.retCount)
+            self.results(ins)
+        }
+        Ret => {
+            for i in 0..ins.argCount {
+                self.bits(self.f.operands[ins.from + i])
+            }
+            self.op(0x0F)
+        }
+        Fuel => {
+            self.out.u8(opGlobalGet)
+            self.out.uleb(1)
+            self.k(1)
+            self.op(0x7D)
+            self.op(opLocalTee)
+            self.out.uleb(self.t0)
+            self.out.u8(opGlobalSet)
+            self.out.uleb(1)
+            self.get(self.t0)
+            self.k(0)
+            self.op(0x53)
+            self.ifOpen()
+            self.panic(panicFuel, line, -1, -1)
+            self.ifClose()
+        }
+        HostCall => self.hostCall(ins)
+        Nop | Vend => {}
+        And | Or | Xor | Shl | Sar => {
+            self.read(ins.a)
+            self.read(ins.b)
+            self.op(match ins.op {
+                And => 0x83
+                Or => 0x84
+                Xor => 0x85
+                Shl => 0x86
+                _ => 0x87
+            })
+            self.fromBits(ins.dst)
+        }
+        Ctx => {
+            if ins.cond == 1 {
+                self.bits(ins.a)
+                self.out.u8(opGlobalSet)
+                self.out.uleb(0)
+            } else {
+                self.out.u8(opGlobalGet)
+                self.out.uleb(0)
+                self.fromBits(ins.dst)
+            }
+        }
+        _ => self.op(opUnreachable)
+    }
+    // vectors: wasm's code is made without them
+}
+
+// the Float whose bits these are
+fn Gen.f64k(var self, bits: Int) {
+    self.k(bits)
+    self.op(0xBF)
+}
+
+// Add, Sub, Mul; checked (cond 1): past an Int's limits, a panic
+fn Gen.arith(var self, ins: IrIns, line: Int) {
+    let op = match ins.op {
+        Add => 0x7C
+        Sub => 0x7D
+        _ => 0x7E
+    }
+    if ins.cond != 1 {
+        self.read(ins.a)
+        self.read(ins.b)
+        self.op(op)
+        self.fromBits(ins.dst)
+        return
+    }
+    self.read(ins.a)
+    self.set(self.t0)
+    self.read(ins.b)
+    self.set(self.t1)
+    self.get(self.t0)
+    self.get(self.t1)
+    self.op(op)
+    self.set(self.t2)
+    if ins.op == .Add {
+        // (a ^ r) & (b ^ r) < 0
+        self.get(self.t0)
+        self.get(self.t2)
+        self.op(0x85)
+        self.get(self.t1)
+        self.get(self.t2)
+        self.op(0x85)
+        self.op(0x83)
+        self.k(0)
+        self.op(0x53)
+    } else if ins.op == .Sub {
+        // (a ^ b) & (a ^ r) < 0
+        self.get(self.t0)
+        self.get(self.t1)
+        self.op(0x85)
+        self.get(self.t0)
+        self.get(self.t2)
+        self.op(0x85)
+        self.op(0x83)
+        self.k(0)
+        self.op(0x53)
+    } else {
+        // a == -1: b is the least Int; else a != 0 and r / a != b
+        self.get(self.t0)
+        self.k(-1)
+        self.op(0x51)
+        self.out.u8(0x04)
+        self.out.u8(tI32)
+        self.get(self.t1)
+        self.k(-9223372036854775807 - 1)
+        self.op(0x51)
+        self.op(0x05) // else
+        self.get(self.t0)
+        self.op(0x50)
+        self.out.u8(0x04)
+        self.out.u8(tI32)
+        self.out.u8(0x41)
+        self.out.sleb(0)
+        self.op(0x05)
+        self.get(self.t2)
+        self.get(self.t0)
+        self.op(0x7F)
+        self.get(self.t1)
+        self.op(0x52)
+        self.op(opEnd)
+        self.op(opEnd)
+    }
+    self.ifOpen()
+    self.panic(panicOverflow, line, -1, -1)
+    self.ifClose()
+    self.get(self.t2)
+    self.fromBits(ins.dst)
+}
+
+// floored: a quotient rounded down, a remainder with the divisor's sign; by zero, a panic
+fn Gen.divide(var self, ins: IrIns, line: Int) {
+    self.read(ins.a)
+    self.set(self.t0)
+    self.read(ins.b)
+    self.set(self.t1)
+    if ins.cond & divNonNeg == 0 {
+        self.get(self.t1)
+        self.op(0x50)
+        self.ifOpen()
+        self.panic(panicDivide, line, -1, -1)
+        self.ifClose()
+    }
+    // the remainder (rem_s gives 0 for the least Int by -1, without a trap)
+    self.get(self.t0)
+    self.get(self.t1)
+    self.op(0x81)
+    self.set(self.t2)
+    if ins.op == .Mod {
+        // r != 0 and (r ^ b) < 0: r + b
+        self.get(self.t2)
+        self.get(self.t2)
+        self.get(self.t1)
+        self.op(0x7C)
+        self.get(self.t2)
+        self.k(0)
+        self.op(0x52)
+        self.get(self.t2)
+        self.get(self.t1)
+        self.op(0x85)
+        self.k(0)
+        self.op(0x53)
+        self.op(0x71)
+        self.op(0x1B) // select: r + b where both hold
+        self.fromBits(ins.dst)
+        return
+    }
+    // the quotient: b == -1 gives -a (wrapping, without div_s's trap); then down by one where r != 0 and
+    // (r ^ b) < 0
+    self.k(0)
+    self.get(self.t0)
+    self.op(0x7D)
+    self.get(self.t0)
+    self.get(self.t1)
+    self.k(-1)
+    self.get(self.t1)
+    self.op(0x52) // b != -1: b, else 1 (any divisor that cannot trap)
+    self.out.u8(0x04)
+    self.out.u8(tI64)
+    self.get(self.t1)
+    self.op(0x05)
+    self.k(1)
+    self.op(opEnd)
+    self.op(0x7F)
+    self.get(self.t1)
+    self.k(-1)
+    self.op(0x51)
+    self.op(0x1B) // select: -a where b == -1
+    self.get(self.t2)
+    self.k(0)
+    self.op(0x52)
+    self.get(self.t2)
+    self.get(self.t1)
+    self.op(0x85)
+    self.k(0)
+    self.op(0x53)
+    self.op(0x71)
+    self.op(0xAD)
+    self.op(0x7D) // minus one where both hold
+    self.fromBits(ins.dst)
+}
+
+// A call of C's: WASI's (its i32s narrowed, its result widened), one made of instructions, the runtime's or the
+// program's own (by its C name), through a C pointer (a), else a trap.
+fn Gen.hostCall(var self, ins: IrIns) {
+    if ins.a >= 0 {
+        // through a pointer: C's one shape here (four i64s, one i64)
+        if ins.argCount > 4 {
+            self.op(opUnreachable)
+            return
+        }
+        self.args(ins)
+        for _ in ins.argCount..4 {
+            self.k(0)
+        }
+        self.bits(ins.a)
+        self.op(0xA7)
+        self.out.u8(0x11)
+        self.out.uleb(self.m.typeOf(i64s(4), [tI64]))
+        self.out.u8(0)
+        if ins.retCount == 0 { self.op(0x1A) } else { self.results(ins) }
+        return
+    }
+    let x = self.prog.externs[ins.imm]
+    let name = x.name
+    let args = ins.argCount
+    let rets = ins.retCount
+    if x.lib == Some(wasiModule) and wasiSig(name) is Some((ps, rs)) {
+        let at = self.m.imports.indexOf(name) ?? 0
+        for i in 0..min(args, len(ps)) {
+            self.bits(self.opnd(ins, i))
+            if ps.bytes()[i] == 'i' {
+                self.op(0xA7)
+            }
+        }
+        self.out.u8(opCall)
+        self.out.uleb(at)
+        if len(rs) > 0 {
+            self.op(0xAD)
+            if rets > 0 { self.results(ins) } else { self.op(0x1A) }
+        } else if rets > 0 {
+            self.k(0)
+            self.results(ins)
+        }
+        return
+    }
+    if name is "memcpy" | "memmove" | "memset" and args == 3 {
+        // dst, then src / the byte, then n: memory.copy / memory.fill; dst given back
+        self.bits(self.opnd(ins, 0))
+        self.op(0xA7)
+        self.bits(self.opnd(ins, 1))
+        if name == "memset" { self.op(0xA7) } else { self.op(0xA7) }
+        self.bits(self.opnd(ins, 2))
+        self.op(0xA7)
+        if name == "memset" {
+            self.out.add([0xFC, 11, 0])
+        } else {
+            self.out.add([0xFC, 10, 0, 0])
+        }
+        if rets > 0 {
+            self.bits(self.opnd(ins, 0))
+            self.results(ins)
+        }
+        return
+    }
+    if name is "floor" | "fabs" | "ceil" | "trunc" | "sqrt" and args == 1 and rets == 1 {
+        self.float(self.opnd(ins, 0))
+        self.op(match name {
+            "floor" => 0x9C
+            "fabs" => 0x99
+            "ceil" => 0x9B
+            "trunc" => 0x9D
+            _ => 0x9F
+        })
+        self.op(0xBD)
+        self.results(ins)
+        return
+    }
+    if name == "__wasm_memory_grow" and args == 1 {
+        self.bits(self.opnd(ins, 0))
+        self.op(0xA7)
+        self.out.add([0x40, 0])
+        self.op(0xAC) // i64.extend_i32_s: -1 when it could not
+        if rets > 0 { self.results(ins) } else { self.op(0x1A) }
+        return
+    }
+    if name == "__wasm_memory_size" and rets == 1 {
+        self.out.add([0x3F, 0])
+        self.op(0xAD)
+        self.results(ins)
+        return
+    }
+    if name == "__wasm_heap_base" and rets == 1 {
+        self.k(self.m.heapBase)
+        self.results(ins)
+        return
+    }
+    // the runtime's or the program's own, by its C name
+    if self.m.symbol(name) != None {
+        self.args(ins)
+        self.callSymbol(name, args, rets)
+        self.results(ins)
+        return
+    }
+    if not self.m.missing.contains(name) {
+        self.m.missing.push(name)
+    }
+    self.op(opUnreachable)
+}

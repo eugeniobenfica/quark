@@ -1,0 +1,26 @@
+name: WebAssembly
+
+# The suite in wasm32-wasi: Quark built (stage1, then build/quark.exe) with the latest release's compiler, each test
+# program built for WebAssembly and run by wasmtime against its recorded output (tools/wasmtest.sh).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  wasm:
+    name: wasm32-wasi
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern quark-x86_64-linux --dir boot && chmod 755 boot/quark-x86_64-linux
+      - name: Build
+        run: QUARK=boot/quark-x86_64-linux ./build.sh
+      - name: wasmtime
+        run: curl -sSf https://wasmtime.dev/install.sh | bash && echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: The suite in WebAssembly
+        run: bash tools/wasmtest.sh build/quark.exe

@@ -284,7 +284,7 @@ fn build(host: Host, o: RunOptions) -> Int {
         target = targetName(t)
         if target == "" {
             printErr(
-                "quark: --target is x86_64-windows, x86_64-linux, x86_64-macos, arm64-windows, arm64-linux or arm64-macos",
+                "quark: --target is x86_64-windows, x86_64-linux, x86_64-macos, arm64-windows, arm64-linux, arm64-macos or wasm32-wasi",
             )
             return 2
         }

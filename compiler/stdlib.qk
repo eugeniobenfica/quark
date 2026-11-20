@@ -2942,12 +2942,12 @@ pub fn localNow() -> DateTime = local(unixTime())
     None
 }
 
-// what this compiler is: its sources' checksum (CRC and length, by cksum): what it makes of the runtime's texts
-// depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "1647346135-1745847"
+// what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
+// what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
+pub const compilerSources = "3112144647-2235416"
 
 // the runtime's files
-pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "windows"]
+pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "windows"]
 
 // compiler/runtime/NAME.qk's text
 pub fn runtimeText(name: Text) -> Text? {
@@ -12478,6 +12478,673 @@ pub fn appendTrace(inl: Int) {
         i += 1
     }
     free(calls)
+}
+""" + "\n"
+    }
+    if name == "wasi" {
+        return r"""
+// The runtime's system calls in WebAssembly (wasm32, WASI preview 1: wasmtime, wasmer, a browser's shim): WASI's
+// functions behind the runtime's own symbols (qkos*, as linux.qk gives them), and what the C library gives elsewhere,
+// made here: the heap (malloc...), the C names the runtime calls (strlen, strtoll...), files over WASI's file
+// descriptors (a FILE* is a word of ours), and the mathematics (sin, exp, pow...). memcpy, memset, floor and fabs are
+// instructions (compiler/wasm.qk). One thread: no tasks on stacks of their own, no other programs, no sockets.
+use std.machine as machine
+use base
+use start
+use print
+use arena
+
+const wasi = "wasi_snapshot_preview1"
+
+extern effect fn fdWrite(fd: Int64, iovs: Int64, count: Int64, written: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_write"
+extern effect fn fdRead(fd: Int64, iovs: Int64, count: Int64, read: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_read"
+extern effect fn fdClose(fd: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_close"
+extern effect fn fdSeek(fd: Int64, offset: Int64, whence: Int64, at: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_seek"
+extern effect fn fdReaddir(fd: Int64, buf: Int64, n: Int64, cookie: Int64, used: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_readdir"
+extern effect fn fdPrestatGet(fd: Int64, buf: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_prestat_get"
+extern effect fn fdPrestatDirName(fd: Int64, path: Int64, n: Int64) -> Int64 in "wasi_snapshot_preview1" as "fd_prestat_dir_name"
+
+extern effect fn pathOpen(
+    fd: Int64,
+    dirflags: Int64,
+    path: Int64,
+    n: Int64,
+    oflags: Int64,
+    base: Int64,
+    inheriting: Int64,
+    fdflags: Int64,
+    out: Int64,
+) -> Int64 in "wasi_snapshot_preview1" as "path_open"
+
+extern effect fn pathFilestatGet(fd: Int64, flags: Int64, path: Int64, n: Int64, out: Int64) -> Int64 in "wasi_snapshot_preview1" as "path_filestat_get"
+extern effect fn pathCreateDirectory(fd: Int64, path: Int64, n: Int64) -> Int64 in "wasi_snapshot_preview1" as "path_create_directory"
+extern effect fn pathUnlinkFile(fd: Int64, path: Int64, n: Int64) -> Int64 in "wasi_snapshot_preview1" as "path_unlink_file"
+extern effect fn pathRemoveDirectory(fd: Int64, path: Int64, n: Int64) -> Int64 in "wasi_snapshot_preview1" as "path_remove_directory"
+extern effect fn argsSizesGet(count: Int64, size: Int64) -> Int64 in "wasi_snapshot_preview1" as "args_sizes_get"
+extern effect fn argsGet(argv: Int64, buf: Int64) -> Int64 in "wasi_snapshot_preview1" as "args_get"
+extern effect fn environSizesGet(count: Int64, size: Int64) -> Int64 in "wasi_snapshot_preview1" as "environ_sizes_get"
+extern effect fn environGet(env: Int64, buf: Int64) -> Int64 in "wasi_snapshot_preview1" as "environ_get"
+extern effect fn clockTimeGet(id: Int64, precision: Int64, out: Int64) -> Int64 in "wasi_snapshot_preview1" as "clock_time_get"
+extern effect fn randomGet(buf: Int64, n: Int64) -> Int64 in "wasi_snapshot_preview1" as "random_get"
+extern effect fn pollOneoff(subs: Int64, events: Int64, n: Int64, count: Int64) -> Int64 in "wasi_snapshot_preview1" as "poll_oneoff"
+extern effect fn procExit(code: Int64) in "wasi_snapshot_preview1" as "proc_exit"
+
+// what compiler/wasm.qk makes of these: memory.grow (pages; the old size, or -1), memory.size, the heap's start
+extern effect fn memoryGrow(pages: Int64) -> Int64 as "__wasm_memory_grow"
+extern effect fn memorySize() -> Int64 as "__wasm_memory_size"
+extern effect fn heapBase() -> Int64 as "__wasm_heap_base"
+
+// ---- the runtime's words here (cell(): the globals, the context, errno, the heap's state) ----
+fn wasiCell() -> Int = textAt("quark-wasi-runtime-cell-words-64-bytes-of-state-kept-here!!!!!!")
+
+const wHeap = 0 // the heap's state (malloc)
+const wPreopens = 1 // the folders the runtime may open: fd, name (malloc'd), as pairs; then a zero
+const wErrno = 2
+const wCtx = 3
+
+// ---- the heap: sizes in steps of 16 (a free list each) up to 4 KB, larger ones by 4 KB, first fit; a block's
+// size in the word before it ----
+const smallMost = 4096
+const largeList = 257 // the free list of larger blocks (the heap's state: 258 words, the lists' heads, then the top)
+const topWord = 258
+
+fn heap() -> Int {
+    let h = word(wasiCell(), wHeap)
+    if h != 0 {
+        return h
+    }
+    // the state at the heap's start, then the blocks
+    let start = (heapBase() + 15) & -16
+    let have = memorySize() * 65536
+    if start + 8 * 260 > have {
+        let _ = memoryGrow((start + 8 * 260 - have + 65535) / 65536)
+    }
+    for i in 0..260 {
+        setWord(start, i, 0)
+    }
+    setWord(start, topWord, start + 8 * 260)
+    setWord(wasiCell(), wHeap, start)
+    start
+}
+
+// n bytes more at the top: their address (after a word for the size), or 0
+fn bump(h: Int, n: Int) -> Int {
+    let at = (word(h, topWord) + 15) & -16
+    let end = at + 16 + n
+    let have = memorySize() * 65536
+    if end > have {
+        let pages = (end - have + 65535) / 65536
+        if memoryGrow(max(pages, 16)) < 0 and memoryGrow(pages) < 0 {
+            return 0
+        }
+    }
+    setWord(h, topWord, end)
+    setWord(at + 8, 0, n)
+    at + 16
+}
+
+fn roundedSize(n: Int) -> Int = if n <= smallMost {
+    max((n + 15) & -16, 16)
+} else {
+    (n + 4095) & -4096
+}
+
+pub extern effect fn wasiMalloc(size: UInt64) -> Int64 as "malloc" {
+    let h = heap()
+    let n = roundedSize(size)
+    if n <= smallMost {
+        let list = n / 16
+        let p = word(h, list)
+        if p != 0 {
+            setWord(h, list, word(p, 0))
+            return p
+        }
+        return bump(h, n)
+    }
+    // the first large free block big enough (kept whole)
+    var prev = 0
+    var p = word(h, largeList)
+    while p != 0 {
+        if word(p - 8, 0) >= n {
+            let next = word(p, 0)
+            if prev == 0 {
+                setWord(h, largeList, next)
+            } else {
+                setWord(prev, 0, next)
+            }
+            return p
+        }
+        prev = p
+        p = word(p, 0)
+    }
+    bump(h, n)
+}
+
+pub extern effect fn wasiFree(p: Int64) as "free" {
+    if p == 0 {
+        return
+    }
+    let h = heap()
+    let n = word(p - 8, 0)
+    let list = if n <= smallMost { n / 16 } else { largeList }
+    setWord(p, 0, word(h, list))
+    setWord(h, list, p)
+}
+
+pub extern effect fn wasiCalloc(count: UInt64, size: UInt64) -> Int64 as "calloc" {
+    let n = count * size
+    let p = wasiMalloc(n)
+    if p != 0 {
+        let _ = memset(p, 0, roundedSize(n))
+    }
+    p
+}
+
+pub extern effect fn wasiRealloc(p: Int64, size: UInt64) -> Int64 as "realloc" {
+    if p == 0 {
+        return wasiMalloc(size)
+    }
+    let had = word(p - 8, 0)
+    if roundedSize(size) <= had {
+        return p
+    }
+    let q = wasiMalloc(size)
+    if q != 0 {
+        let _ = memcpy(q, p, had)
+        wasiFree(p)
+    }
+    q
+}
+
+// ---- what else the runtime asks of the C library ----
+pub extern effect fn wasiMemcmp(a: Int64, b: Int64, n: UInt64) -> Int32 as "memcmp" {
+    for i in 0..n {
+        let x = byte(a, i)
+        let y = byte(b, i)
+        if x != y {
+            return x - y
+        }
+    }
+    0
+}
+
+pub extern effect fn wasiStrlen(s: Int64) -> UInt64 as "strlen" {
+    var n = 0
+    while byte(s, n) != 0 {
+        n += 1
+    }
+    n
+}
+
+pub extern effect fn wasiStrtoll(s: Int64, end: Int64, base: Int32) -> Int64 as "strtoll" {
+    var i = 0
+    while byte(s, i) == ' ' or byte(s, i) == '\t' {
+        i += 1
+    }
+    var negative = false
+    if byte(s, i) == '-' or byte(s, i) == '+' {
+        negative = byte(s, i) == '-'
+        i += 1
+    }
+    var v = 0
+    while true {
+        let c = byte(s, i)
+        let d = if c >= '0' and c <= '9' {
+            c - '0'
+        } else if c >= 'a' and c <= 'z' {
+            c - 'a' + 10
+        } else if c >= 'A' and c <= 'Z' {
+            c - 'A' + 10
+        } else {
+            99
+        }
+        if d >= base {
+            break
+        }
+        v = v *% base +% d
+        i += 1
+    }
+    if end != 0 {
+        setWord(end, 0, s + i)
+    }
+    if negative { 0 -% v } else { v }
+}
+
+// WASI's errno numbers, said as C's strerror says POSIX's
+pub extern effect fn wasiStrerror(code: Int32) -> Int64 as "strerror" = textAt(match code {
+    2 => "Permission denied\0"
+    8 => "Bad file descriptor\0"
+    20 => "File exists\0"
+    28 => "Invalid argument\0"
+    29 => "Input/output error\0"
+    31 => "Is a directory\0"
+    44 => "No such file or directory\0"
+    48 => "Not enough space\0"
+    51 => "No space left on device\0"
+    52 => "Function not implemented\0"
+    54 => "Not a directory\0"
+    55 => "Directory not empty\0"
+    58 => "Not supported\0"
+    63 => "Operation not permitted\0"
+    76 => "Capabilities insufficient\0"
+    _ => "Unknown error\0"
+})
+
+pub extern effect fn wasiExit(code: Int32) as "exit" = procExit(code)
+
+pub extern effect fn wasiTime(t: Int64) -> Int64 as "time" {
+    let s = toInt(clock(0))
+    if t != 0 {
+        setWord(t, 0, s)
+    }
+    s
+}
+
+// ---- the context, the output, numbers ----
+pub extern effect fn wasiCtx() -> Int64 as "qkosCtx" = word(wasiCell(), wCtx)
+
+pub extern effect fn wasiSetCtx(c: Int64) as "qkosSetCtx" = setWord(wasiCell(), wCtx, c)
+
+// iovec's two i32s, with n bytes at p, in a scratch of 16 bytes: how many went
+fn ioOnce(write: Bool, fd: Int, p: Int, n: Int) -> Int {
+    let v = calloc(2, 8)
+    setInt32(v, 0, p)
+    setInt32(v, 1, n)
+    let e = if write { fdWrite(fd, v, 1, v + 8) } else { fdRead(fd, v, 1, v + 8) }
+    let done = if e == 0 { int32At(v, 2) & 4294967295 } else { -1 }
+    free(v)
+    if e != 0 {
+        setWord(wasiCell(), wErrno, e)
+    }
+    done
+}
+
+pub extern effect fn wasiWrite(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
+    var at = 0
+    while at < n {
+        let k = ioOnce(true, fd, p + at, n - at)
+        if k <= 0 {
+            break
+        }
+        at += k
+    }
+}
+
+pub extern effect fn wasiErrno() -> Int64 as "qkosErrno" = word(wasiCell(), wErrno)
+
+pub extern effect fn wasiSetErrno(e: Int64) as "qkosSetErrno" = setWord(wasiCell(), wErrno, e)
+
+fn clock(which: Int) -> Float {
+    let t = calloc(1, 8)
+    let _ = clockTimeGet(which, 1000, t)
+    let ns = word(t, 0)
+    free(t)
+    toFloat(ns / 1000000000) + toFloat(ns % 1000000000) * 0.000000001
+}
+
+pub extern effect fn wasiNow() -> Float64 as "qkosNow" = clock(1) // monotonic
+
+pub extern effect fn wasiTimeNow() -> Float64 as "qkosTime" = clock(0) // realtime
+
+pub extern effect fn wasiSleep(ms: Int64) as "qkosSleep" {
+    // poll_oneoff with one clock subscription, relative
+    let sub = calloc(6, 8)
+    setByte(sub, 8, 0) // a clock
+    setInt32(sub, 4, 1) // monotonic
+    setWord(sub, 3, ms * 1000000)
+    setWord(sub, 4, 1000)
+    let event = calloc(4, 8)
+    let n = calloc(1, 8)
+    let _ = pollOneoff(sub, event, 1, n)
+    free(sub)
+    free(event)
+    free(n)
+}
+
+pub extern effect fn wasiLocalOffset(t: Int64) -> Int64 as "qkosLocalOffset" = t - t // UTC
+
+pub extern effect fn wasiProcessors() -> Int64 as "qkosProcessors" = 1
+
+// ---- files: over the folders the runtime was given (wasmtime --dir: the preopens) ----
+fn preopens() -> Int {
+    let have = word(wasiCell(), wPreopens)
+    if have != 0 {
+        return have
+    }
+    var list = calloc(65, 16)
+    var k = 0
+    let buf = calloc(1, 8)
+    for fd in 3..64 {
+        if fdPrestatGet(fd, buf) != 0 {
+            break
+        }
+        if byte(buf, 0) == 0 and k < 64 {
+            let n = int32At(buf, 1)
+            let name = calloc(1, n + 1)
+            let _ = fdPrestatDirName(fd, name, n)
+            setWord(list, 2 * k, fd)
+            setWord(list, 2 * k + 1, name)
+            k += 1
+        }
+    }
+    free(buf)
+    setWord(list, 2 * k, -1)
+    setWord(wasiCell(), wPreopens, list)
+    list
+}
+
+// a path's folder (a preopen's fd) and the rest of it, past that folder's name; (-1, 0) when none has it
+fn resolve(path: Int) -> (Int, Int) {
+    let list = preopens()
+    var best = -1
+    var bestLen = -1
+    var rest = path
+    var i = 0
+    while word(list, 2 * i) >= 0 {
+        let name = word(list, 2 * i + 1)
+        let n = strlen(name)
+        let dot = n == 1 and byte(name, 0) == '.'
+        // "." takes a path that is not absolute; another name its own beginning, then a separator or the end
+        let fits = if dot {
+            byte(path, 0) != '/'
+        } else {
+            n > 0
+                and sameBytes(path, name, n)
+                and (byte(path, n) == 0 or byte(path, n) == '/' or byte(name, n - 1) == '/')
+        }
+        if fits and n > bestLen {
+            best = word(list, 2 * i)
+            bestLen = n
+            rest = if dot { path } else { path + n }
+        }
+        i += 1
+    }
+    while byte(rest, 0) == '/' {
+        rest += 1
+    }
+    if byte(rest, 0) == '.' and byte(rest, 1) == '/' {
+        rest += 2
+    }
+    if byte(rest, 0) == 0 {
+        rest = textAt(".\0")
+    }
+    (best, rest)
+}
+
+const allRights = 536870911 // every right WASI names (29)
+
+// path opened: its fd, or -1 (errno set); oflags 1 create, 2 a folder, 8 truncate; fdflags 1 append
+fn openPath(path: Int, oflags: Int, fdflags: Int) -> Int {
+    let (dir, rest) = resolve(path)
+    if dir < 0 {
+        setWord(wasiCell(), wErrno, 76)
+        return -1
+    }
+    let out = calloc(1, 8)
+    let e = pathOpen(dir, 1, rest, strlen(rest), oflags, allRights, allRights, fdflags, out)
+    let fd = int32At(out, 0)
+    free(out)
+    if e != 0 {
+        setWord(wasiCell(), wErrno, e)
+        return -1
+    }
+    fd
+}
+
+// a FILE* here: the fd, an error seen, the end seen
+pub extern effect fn wasiOpen(path: Int64, mode: Int64) -> Int64 as "qkosOpen" {
+    let m = byte(mode, 0)
+    let plus = byte(mode, 1) == '+' or byte(mode, 2) == '+'
+    let oflags = if m == 'w' {
+        9
+    } else if m == 'a' {
+        1
+    } else {
+        0
+    }
+    let fdflags = if m == 'a' { 1 } else { 0 }
+    let fd = openPath(path, oflags, fdflags)
+    let _ = plus
+    if fd < 0 {
+        return 0
+    }
+    let f = calloc(3, 8)
+    setWord(f, 0, fd)
+    f
+}
+
+pub extern effect fn wasiFread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64 as "fread" {
+    let total = size * n
+    var at = 0
+    while at < total {
+        let k = ioOnce(false, word(f, 0), p + at, total - at)
+        if k < 0 {
+            setWord(f, 1, 1)
+            break
+        }
+        if k == 0 {
+            setWord(f, 2, 1)
+            break
+        }
+        at += k
+    }
+    if size > 0 { at / size } else { 0 }
+}
+
+pub extern effect fn wasiFwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64 as "fwrite" {
+    let total = size * n
+    var at = 0
+    while at < total {
+        let k = ioOnce(true, word(f, 0), p + at, total - at)
+        if k <= 0 {
+            setWord(f, 1, 1)
+            break
+        }
+        at += k
+    }
+    if size > 0 { at / size } else { 0 }
+}
+
+pub extern effect fn wasiFclose(f: Int64) -> Int32 as "fclose" {
+    let e = fdClose(word(f, 0))
+    free(f)
+    if e == 0 { 0 } else { -1 }
+}
+
+pub extern effect fn wasiFerror(f: Int64) -> Int32 as "ferror" = word(f, 1)
+
+pub extern effect fn wasiFflush(f: Int64) -> Int32 as "fflush" = f - f
+
+pub extern effect fn wasiSeek(f: Int64, at: Int64, from: Int64) -> Int64 as "qkosSeek" {
+    let out = calloc(1, 8)
+    let e = fdSeek(word(f, 0), at, from, out)
+    let now = word(out, 0)
+    free(out)
+    if e != 0 {
+        setWord(wasiCell(), wErrno, e)
+        return -1
+    }
+    now
+}
+
+pub extern effect fn wasiEnv(name: Int64) -> Int64 as "qkosEnv" {
+    let sizes = calloc(2, 8)
+    let _ = environSizesGet(sizes, sizes + 8)
+    let count = word(sizes, 0)
+    let bytes = word(sizes, 1)
+    free(sizes)
+    let ptrs = calloc(count + 1, 4)
+    let buf = calloc(1, bytes + 1)
+    let _ = environGet(ptrs, buf)
+    let n = strlen(name)
+    var found = 0
+    for i in 0..count {
+        let e = int32At(ptrs, i) & 4294967295
+        if sameBytes(e, name, n) and byte(e, n) == '=' {
+            let v = e + n + 1
+            let k = strlen(v)
+            found = malloc(k + 1)
+            copyBytes(found, v, k + 1)
+            break
+        }
+    }
+    free(ptrs)
+    free(buf)
+    found
+}
+
+pub extern effect fn wasiPathKind(path: Int64) -> Int64 as "qkosPathKind" {
+    let (dir, rest) = resolve(path)
+    if dir < 0 {
+        return -1
+    }
+    let st = calloc(8, 8)
+    let e = pathFilestatGet(dir, 1, rest, strlen(rest), st)
+    let kind = byte(st, 16)
+    free(st)
+    if e != 0 {
+        -1
+    } else if kind == 3 {
+        1
+    } else {
+        0
+    }
+}
+
+pub extern effect fn wasiMakeDir(path: Int64) -> Int64 as "qkosMakeDir" {
+    let (dir, rest) = resolve(path)
+    let e = if dir < 0 {
+        76
+    } else {
+        pathCreateDirectory(dir, rest, strlen(rest))
+    }
+    if e != 0 {
+        setWord(wasiCell(), wErrno, e)
+        return -1
+    }
+    0
+}
+
+pub extern effect fn wasiRemove(path: Int64, folder: Int64) -> Int64 as "qkosRemove" {
+    let (dir, rest) = resolve(path)
+    let e = if dir < 0 {
+        76
+    } else if folder == 1 {
+        pathRemoveDirectory(dir, rest, strlen(rest))
+    } else {
+        pathUnlinkFile(dir, rest, strlen(rest))
+    }
+    if e != 0 {
+        setWord(wasiCell(), wErrno, e)
+        return -1
+    }
+    0
+}
+
+pub extern effect fn wasiSeparator(c: Int64) -> Int64 as "qkosSeparator" =
+    if c == '/' { 1 } else { 0 }
+
+// the folder's names, each zero-ended, then a zero (not . or ..)
+pub extern effect fn wasiListDir(path: Int64) -> Int64 as "qkosListDir" {
+    let fd = openPath(path, 2, 0)
+    if fd < 0 {
+        return 0
+    }
+    var cap = 1024
+    var out = malloc(cap)
+    var used = 0
+    let size = 8192
+    let buf = malloc(size)
+    let got = calloc(1, 8)
+    var cookie = 0
+    while true {
+        if fdReaddir(fd, buf, size, cookie, got) != 0 {
+            break
+        }
+        let n = int32At(got, 0) & 4294967295
+        var at = 0
+        var whole = 0
+        // each entry: d_next, d_ino, d_namlen (u32), d_type, then its name
+        while at + 24 <= n {
+            let k = int32At(buf + at, 4) & 4294967295
+            if at + 24 + k > n {
+                break
+            }
+            let name = buf + at + 24
+            let dots = k == 1 and byte(name, 0) == '.' or k == 2 and byte(name, 0) == '.' and byte(name, 1) == '.'
+            if not dots {
+                while used + k + 2 > cap {
+                    cap *= 2
+                    out = realloc(out, cap)
+                }
+                copyBytes(out + used, name, k)
+                setByte(out, used + k, 0)
+                used += k + 1
+            }
+            cookie = word(buf + at, 0)
+            at += 24 + k
+            whole += 1
+        }
+        if n < size or whole == 0 {
+            break
+        }
+    }
+    free(got)
+    free(buf)
+    let _ = fdClose(fd)
+    setByte(out, used, 0)
+    out
+}
+
+pub extern effect fn wasiReadIn(p: Int64, n: Int64) -> Int64 as "qkosReadIn" {
+    let k = ioOnce(false, 0, p, n)
+    if k > 0 { k } else { 0 }
+}
+
+pub extern effect fn wasiReadLine(out: Int64) -> Int64 as "qkosReadLine" = -1 + out - out
+
+pub extern effect fn wasiRunProcess(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosRunProcess" {
+    let m = malloc(200)
+    let _ = bufAt(m, 200).text("cannot run ").zeroText(name).text(": WebAssembly runs no other programs")
+    setWord(out, 1, m)
+    let _ = args + count
+    1
+}
+
+pub extern effect fn wasiThreadStart(f: Int64, arg: Int64) -> Int64 as "qkosThreadStart" =
+    f - f + arg - arg
+
+pub extern effect fn wasiStackLow() -> Int64 as "qkosStackLow" = 0
+
+pub extern effect fn wasiCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" {
+    let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(": WebAssembly links no C library")
+    let _ = lib
+    0
+}
+
+// ---- the start: the arguments, the state; and the end: what print kept written, the status ----
+pub extern effect fn wasiBegin() as "qkWasiBegin" {
+    let sizes = calloc(2, 8)
+    let _ = argsSizesGet(sizes, sizes + 8)
+    let count = word(sizes, 0) & 4294967295
+    let bytes = word(sizes, 1) & 4294967295
+    free(sizes)
+    let ptrs = calloc(count + 1, 4)
+    let buf = calloc(1, bytes + 1)
+    let _ = argsGet(ptrs, buf)
+    let argv = calloc(count + 1, 8)
+    for i in 0..count {
+        setWord(argv, i, int32At(ptrs, i) & 4294967295)
+    }
+    begin(count, argv)
+}
+
+// quark build --memory: the program's limit
+pub extern effect fn wasiLimit(bytes: Int64) as "qkWasiLimit" = setLimit(arena(), bytes)
+
+pub extern effect fn wasiEnd(status: Int64) as "qkWasiEnd" {
+    flush()
+    procExit(status)
 }
 """ + "\n"
     }

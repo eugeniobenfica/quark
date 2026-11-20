@@ -29,9 +29,9 @@ texts() { # the files of a folder, each a raw text by its name
     echo "pub fn stdText(name: Text) -> Text? {"
     texts std
     echo
-    echo "// what this compiler is: its sources' checksum (CRC and length, by cksum): what it makes of the runtime's texts"
-    echo "// depends on them alone (memory.qk keeps the runtime it compiled under it)"
-    echo "pub const compilerSources = \"$(for f in compiler/*.qk; do [ "$f" = compiler/stdlib.qk ] || cat "$f"; done | cksum | tr -d '' | awk '{print $1 "-" $2}')\""
+    echo "// what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:"
+    echo "// what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)"
+    echo "pub const compilerSources = \"$(for f in compiler/*.qk compiler/runtime/*.qk std/*.qk; do [ "$f" = compiler/stdlib.qk ] || cat "$f"; done | cksum | tr -d '' | awk '{print $1 "-" $2}')\""
     echo
     echo "// the runtime's files"
     echo "pub const runtimeFiles: [Text] = [$(for f in compiler/runtime/*.qk; do printf '"%s", ' "$(basename "$f" .qk)"; done | sed 's/, $//')]"

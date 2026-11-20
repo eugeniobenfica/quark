@@ -18,6 +18,7 @@ use x64
 use arm64
 use image
 use dwarf
+use wasm
 use imagecli
 use stdlib
 use graph
@@ -76,8 +77,8 @@ fn targetOs(host: Host, target: Text) -> Os = if target == "" {
     host.os
 } else if target.endsWith("windows") {
     Os.Windows
-} else if target.endsWith("linux") {
-    Os.Linux
+} else if target.endsWith("linux") or target.startsWith("wasm32") {
+    Os.Linux // (wasm32: the IR is made as for System V; compiler/wasm.qk makes the module)
 } else {
     Os.Macos
 }
@@ -85,6 +86,9 @@ fn targetOs(host: Host, target: Text) -> Os = if target == "" {
 // --target's names (x86_64 or arm64, then windows, linux or macos), as setTarget reads them: the
 // canonical one, or "" when it names none
 pub fn targetName(t: Text) -> Text {
+    if t is "wasm32" | "wasm32-wasi" | "wasm32-wasip1" {
+        return "wasm32-wasi"
+    }
     let arm = t.startsWith("arm64") or t.startsWith("aarch64")
     let x64 = t.startsWith("x86_64") or t.startsWith("x64")
     let dash = t.indexOf("-") ?? -1
@@ -188,7 +192,10 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         low.program.keepReachable(roots)
     }
-    let lanes = if arm {
+    let wasm = target.startsWith("wasm32")
+    let lanes = if wasm {
+        0 // (no vector loops: the wasm backend makes none)
+    } else if arm {
         2
     } else if avx and cpu & 2 != 0 {
         4
@@ -226,9 +233,13 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         low.program.optimize(release)
     }
     let t3 = monotonicTime()
-    let mc = match low.program.target.arch {
-        X64 => genX64(low.program)
-        Arm64 => genArm64(low.program)
+    let mc = if wasm {
+        MachineCode() // the module is made from the IR (compiler/wasm.qk)
+    } else {
+        match low.program.target.arch {
+            X64 => genX64(low.program)
+            Arm64 => genArm64(low.program)
+        }
     }
     if o.timed and not runtime {
         let t4 = monotonicTime()
@@ -247,6 +258,36 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     let prog = low.program // taken
     low.program = IrProgram()
     Compiled(prog, mc, low.data, low.inlines, tests, if avx { 1 } else { 0 }, os, purpose.linked)
+}
+
+// quark build --target wasm32-wasi: the program and the runtime (runtime/wasi.qk) as one WebAssembly module
+fn buildWasm(host: Host, c: Compiled, o: RunOptions) -> Int {
+    let Some(text) = runtimeText("wasi") else {
+        printErr("quark: this compiler keeps no runtime for WebAssembly")
+        return 1
+    }
+    let Some(rt) = compileText(
+        host,
+        Source(embeddedRuntime + "wasi.qk", text),
+        RunOptions(),
+        Purpose(target: "wasm32-wasi", linked: true, runtime: true),
+        false,
+    ) else {
+        return 1
+    }
+    let (module, missing) = wasmModule(rt.prog, rt.data, c.prog, c.data, o.fuel, o.memory)
+    if env("QUARK_WASM_MISSING") == Some("on") {
+        for name in missing {
+            printErr("quark: wasm32: {name} is not here (a trap where it is called)")
+        }
+    }
+    let out = o.outPath ?? fileNameOf(o.path).replace(".qk", "") + ".wasm"
+    if writeBytes(out, module) is Err(_) {
+        printErr("quark: cannot write {out}")
+        return 1
+    }
+    printErr("quark: wrote {out} ({len(module)} bytes)")
+    0
 }
 
 // -g: the program's debug information (its inlined calls shown at their outermost call), its files' paths whole
@@ -1233,6 +1274,9 @@ pub fn buildExecutable(host: Host, target: Text, c: Compiled, o: RunOptions) -> 
     if c.prog.mainIndex < 0 {
         printErr("quark: an executable starts at fn main()")
         return 1
+    }
+    if target.startsWith("wasm32") {
+        return buildWasm(host, c, o)
     }
     let jit = if o.debugInfo {
         jitObjectOf(debugInfoOf(host, c))

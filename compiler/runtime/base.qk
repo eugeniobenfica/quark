@@ -13,7 +13,6 @@ pub extern effect fn memmove(to: Int64, from: Int64, n: UInt64) -> Int64
 pub extern effect fn memset(to: Int64, c: Int32, n: UInt64) -> Int64
 pub extern effect fn memcmp(a: Int64, b: Int64, n: UInt64) -> Int32
 pub extern effect fn strlen(s: Int64) -> UInt64
-pub extern effect fn strtod(s: Int64, end: Int64) -> Float64
 pub extern effect fn strtoll(s: Int64, end: Int64, base: Int32) -> Int64
 pub extern effect fn strerror(code: Int32) -> Int64
 pub extern effect fn cExit(code: Int32) as "exit"
@@ -579,9 +578,9 @@ pub fn floatText(s: Int, v: Float) -> Int {
 }
 
 // the work room of a thread's Floats: six big integers, the digits, the rounded digits
-const floatLimbs = 104 // a big integer: its count of 32-bit limbs, then the limbs (up to 3300 bits)
-const floatDigitsAt = 6 * floatLimbs // 800 bytes: up to 790 digits
-const floatRoundedAt = floatDigitsAt + 100
+const floatLimbs = 130 // a big integer: its count of 32-bit limbs, then the limbs (up to 4100 bits)
+const floatDigitsAt = 6 * floatLimbs // 808 bytes: up to 800 digits
+const floatRoundedAt = floatDigitsAt + 101
 const floatWorkWords = floatRoundedAt + 4
 
 fn floatWork() -> Int {
@@ -667,6 +666,438 @@ fn wholeDigits(s: Int, digits: Int, count: Int, ev: Int) -> Int {
     setByte(s, len, '.')
     setByte(s, len + 1, '0')
     len + 2
+}
+
+// ---- a Float read from text, without C: what strtod reads, rounded as it rounds (the nearest, half to even) ----
+// The whole text is the number: a sign, then digits with a point and an exponent (1, 1.5, .5, 5., 1e-7), inf or
+// infinity, nan or nan(...), or hexadecimal (0x1.8p3). Up to 800 digits are kept, and whether any after them is not 0:
+// no number halfway between two Floats has more. False when it is not a number; else its bits in out's word.
+pub fn textFloat(t: Int, n: Int, out: Int) -> Bool {
+    var i = 0
+    var negative = false
+    if i < n and (byte(t, i) == '+' or byte(t, i) == '-') {
+        negative = byte(t, i) == '-'
+        i += 1
+    }
+    let sign = if negative { intMin } else { 0 }
+    if wordAt(t, i, n, "infinity") or wordAt(t, i, n, "inf") and i + 3 == n {
+        setWord(out, 0, sign | 9218868437227405312)
+        return true
+    }
+    if wordAt(t, i, n, "nan") {
+        if i + 3 != n {
+            // nan(letters, digits, _)
+            if byte(t, i + 3) != '(' or byte(t, n - 1) != ')' {
+                return false
+            }
+            for k in i + 4..n - 1 {
+                let c = byte(t, k)
+                if not (c >= '0' and c <= '9' or c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c == '_') {
+                    return false
+                }
+            }
+        }
+        setWord(out, 0, sign | 9221120237041090560)
+        return true
+    }
+    if i + 1 < n and byte(t, i) == '0' and (byte(t, i + 1) == 'x' or byte(t, i + 1) == 'X') {
+        return hexFloat(t, i + 2, n, sign, out)
+    }
+    let w = floatWork()
+    let digits = w + 8 * floatDigitsAt
+    var kept = 0
+    var started = false
+    var more = false // a digit not 0 after the kept ones
+    var dexp = 0 // the number is digits * 10^dexp
+    var seen = false // a digit at all
+    var point = false
+    while i < n {
+        let c = byte(t, i)
+        if c == '.' {
+            if point {
+                return false
+            }
+            point = true
+            i += 1
+            continue
+        }
+        if c < '0' or c > '9' {
+            break
+        }
+        seen = true
+        if c != '0' or started {
+            started = true
+            if kept < floatDigitsKept {
+                setByte(digits, kept, c)
+                kept += 1
+                if point {
+                    dexp -= 1
+                }
+            } else {
+                more = more or c != '0'
+                if not point {
+                    dexp += 1
+                }
+            }
+        } else if point {
+            dexp -= 1 // a 0 before the first digit, after the point
+        }
+        i += 1
+    }
+    if not seen {
+        return false
+    }
+    if i < n and (byte(t, i) == 'e' or byte(t, i) == 'E') {
+        i += 1
+        var exponentNegative = false
+        if i < n and (byte(t, i) == '+' or byte(t, i) == '-') {
+            exponentNegative = byte(t, i) == '-'
+            i += 1
+        }
+        if i >= n {
+            return false
+        }
+        var e = 0
+        while i < n and byte(t, i) >= '0' and byte(t, i) <= '9' {
+            if e < 100000000 {
+                e = e * 10 + byte(t, i) - '0'
+            }
+            i += 1
+        }
+        dexp += if exponentNegative { -e } else { e }
+    }
+    if i != n {
+        return false
+    }
+    // the 0s that end the digits go into the exponent
+    while kept > 0 and byte(digits, kept - 1) == '0' {
+        kept -= 1
+        dexp += 1
+    }
+    if kept == 0 {
+        setWord(out, 0, sign)
+        return true
+    }
+    let size = kept + dexp // the number is below 10^size, at least 10^(size - 1)
+    if size > 310 {
+        setWord(out, 0, sign | 9218868437227405312)
+        return true
+    }
+    if size < -324 {
+        setWord(out, 0, sign)
+        return true
+    }
+    // exact with Floats: at most 15 digits, times or over a power of ten that is a Float exactly
+    if kept <= 15 and dexp >= -22 and dexp <= 22 and not more {
+        var whole = 0
+        for k in 0..kept {
+            whole = whole * 10 + byte(digits, k) - '0'
+        }
+        var p = 1.0
+        for _ in 0..(if dexp < 0 { -dexp } else { dexp }) {
+            p *= 10.0
+        }
+        let v = if dexp >= 0 { toFloat(whole) * p } else { toFloat(whole) / p }
+        setWord(out, 0, sign | bitsOf(v))
+        return true
+    }
+    // else a guess from the first digits, made right by comparing exactly with the halfway numbers around it
+    var lead = 0
+    let used = if kept < 17 { kept } else { 17 }
+    for k in 0..used {
+        lead = lead * 10 + byte(digits, k) - '0'
+    }
+    var guess = toFloat(lead)
+    var x = dexp + kept - used
+    while x >= 22 {
+        guess *= 10000000000000000000000.0
+        x -= 22
+    }
+    while x <= -22 {
+        guess /= 10000000000000000000000.0
+        x += 22
+    }
+    while x > 0 {
+        guess *= 10.0
+        x -= 1
+    }
+    while x < 0 {
+        guess /= 10.0
+        x += 1
+    }
+    var g = bitsOf(guess)
+    if g <= 0 {
+        g = 1 // the least subnormal
+    }
+    if g >= 9218868437227405312 {
+        g = 9218868437227405311 // the greatest finite
+    }
+    let s = w // the digits as a big integer
+    bigFromDigits(s, digits, kept)
+    while true {
+        let field = shr(g, 52) & 2047
+        let frac = g & 4503599627370495
+        let m = if field == 0 { frac } else { frac | 4503599627370496 }
+        let e2 = if field == 0 { -1074 } else { field - 1075 }
+        // above the halfway number to the next one up: (2m + 1) * 2^(e2 - 1)
+        let above = halfwayCompare(s, dexp, more, 2 * m + 1, e2 - 1)
+        if above > 0 or above == 0 and m & 1 == 1 {
+            if g == 9218868437227405311 {
+                g = 9218868437227405312 // past the greatest: infinite
+                break
+            }
+            g += 1
+            continue
+        }
+        // below the halfway number to the next one down
+        let boundary = frac == 0 and field > 1
+        let below = if boundary {
+            halfwayCompare(s, dexp, more, 4 * m - 1, e2 - 2)
+        } else {
+            halfwayCompare(s, dexp, more, 2 * m - 1, e2 - 1)
+        }
+        if below < 0 or below == 0 and m & 1 == 1 {
+            g -= 1
+            if g == 0 {
+                break
+            }
+            continue
+        }
+        break
+    }
+    setWord(out, 0, sign | g)
+    true
+}
+
+const floatDigitsKept = 800
+
+// does the word w (lower case) begin t at i, in any case
+fn wordAt(t: Int, i: Int, n: Int, w: Text) -> Bool {
+    let k = len(w)
+    if i + k > n {
+        return false
+    }
+    let wb = textAt(w)
+    for j in 0..k {
+        var c = byte(t, i + j)
+        if c >= 'A' and c <= 'Z' {
+            c += 32
+        }
+        if c != byte(wb, j) {
+            return false
+        }
+    }
+    i + k == n or k == 3 // inf and nan may have more after them (infinity, nan(...)): their callers look
+}
+
+// digits * 10^dexp (plus a little more when more) against k * 2^p: -1, 0, 1
+fn halfwayCompare(s: Int, dexp: Int, more: Bool, k: Int, p: Int) -> Int {
+    let w = floatWork()
+    let a = w + 8 * 4 * floatLimbs
+    let b = w + 8 * 5 * floatLimbs
+    bigCopy(a, s)
+    if dexp > 0 {
+        bigMulPow10(a, dexp)
+    }
+    if p < 0 {
+        bigShl(a, -p)
+    }
+    bigSet(b, k)
+    if p > 0 {
+        bigShl(b, p)
+    }
+    if dexp < 0 {
+        bigMulPow10(b, -dexp)
+    }
+    let c = bigCompare(a, b)
+    if c == 0 and more { 1 } else { c }
+}
+
+fn bigCopy(to: Int, from: Int) {
+    for i in 0..word(from, 0) + 1 {
+        setWord(to, i, word(from, i))
+    }
+}
+
+// x = the decimal digits s[0..count]
+fn bigFromDigits(x: Int, s: Int, count: Int) {
+    setWord(x, 0, 0)
+    var i = 0
+    while i < count {
+        var chunk = 0
+        var f = 1
+        var k = 0
+        while k < 9 and i < count {
+            chunk = chunk * 10 + byte(s, i) - '0'
+            f *= 10
+            k += 1
+            i += 1
+        }
+        if word(x, 0) == 0 {
+            bigSet(x, chunk)
+        } else {
+            bigMulSmall(x, f)
+            bigAddSmall(x, chunk)
+        }
+    }
+}
+
+// x += v (v below 2^32)
+fn bigAddSmall(x: Int, v: Int) {
+    var carry = v
+    var i = 1
+    while carry != 0 {
+        if i > word(x, 0) {
+            setWord(x, i, carry)
+            setWord(x, 0, i)
+            return
+        }
+        let t = word(x, i) + carry
+        setWord(x, i, t & low32)
+        carry = shr(t, 32)
+        i += 1
+    }
+}
+
+// 0x digits [. digits] [p exponent], from i: its value rounded to 53 bits (half to even), into out
+fn hexFloat(t: Int, i0: Int, n: Int, sign: Int, out: Int) -> Bool {
+    var i = i0
+    var mant = 0 // the first 60 bits of the digits
+    var bits = 0 // how many bits mant holds
+    var exp = 0 // the number is mant * 2^exp (plus more)
+    var more = false
+    var seen = false
+    var point = false
+    while i < n {
+        let c = byte(t, i)
+        if c == '.' {
+            if point {
+                return false
+            }
+            point = true
+            i += 1
+            continue
+        }
+        let d = if c >= '0' and c <= '9' {
+            c - '0'
+        } else if c >= 'a' and c <= 'f' {
+            c - 'a' + 10
+        } else if c >= 'A' and c <= 'F' {
+            c - 'A' + 10
+        } else {
+            -1
+        }
+        if d < 0 {
+            break
+        }
+        seen = true
+        if mant == 0 and d == 0 {
+            if point {
+                exp -= 4
+            }
+        } else if bits <= 56 {
+            mant = mant << 4 | d
+            bits = if mant == d { hexBits(d) } else { bits + 4 }
+            if point {
+                exp -= 4
+            }
+        } else {
+            more = more or d != 0
+            if not point {
+                exp += 4
+            }
+        }
+        i += 1
+    }
+    if not seen {
+        return false
+    }
+    if i < n and (byte(t, i) == 'p' or byte(t, i) == 'P') {
+        i += 1
+        var negative = false
+        if i < n and (byte(t, i) == '+' or byte(t, i) == '-') {
+            negative = byte(t, i) == '-'
+            i += 1
+        }
+        if i >= n {
+            return false
+        }
+        var e = 0
+        while i < n and byte(t, i) >= '0' and byte(t, i) <= '9' {
+            if e < 100000000 {
+                e = e * 10 + byte(t, i) - '0'
+            }
+            i += 1
+        }
+        exp += if negative { -e } else { e }
+    }
+    if i != n {
+        return false
+    }
+    if mant == 0 {
+        setWord(out, 0, sign)
+        return true
+    }
+    // mant * 2^exp: its top bit at 2^top
+    var top = 0
+    var probe = mant
+    while probe > 1 {
+        probe = shr(probe, 1)
+        top += 1
+    }
+    let topExp = top + exp
+    if topExp > 1023 {
+        setWord(out, 0, sign | 9218868437227405312)
+        return true
+    }
+    // the bits that stay: 53 for a normal number, fewer below 2^-1022
+    let keep = if topExp >= -1022 { 53 } else { 53 - (-1022 - topExp) }
+    if keep < 0 {
+        // below half the least subnormal
+        setWord(out, 0, sign)
+        return true
+    }
+    let drop = top + 1 - keep // the low bits that go
+    var m = mant
+    if drop > 0 {
+        let lowMask = 1 << drop - 1
+        let low = m & lowMask
+        let half = 1 << (drop - 1)
+        m = shr(m, drop)
+        if low > half or low == half and (more or m & 1 == 1) {
+            m += 1
+        }
+    } else if drop < 0 {
+        m = m << -drop
+    }
+    // m has keep bits (or keep + 1 after rounding up): the Float's fields
+    var e2 = topExp
+    if keep < 53 {
+        // subnormal (or the least normal, rounded up)
+        let field = if m >= 4503599627370496 { 1 } else { 0 }
+        setWord(out, 0, sign | field << 52 | m & 4503599627370495)
+        return true
+    }
+    if m >= 9007199254740992 {
+        m = shr(m, 1)
+        e2 += 1
+        if e2 > 1023 {
+            setWord(out, 0, sign | 9218868437227405312)
+            return true
+        }
+    }
+    setWord(out, 0, sign | (e2 + 1023) << 52 | m & 4503599627370495)
+    true
+}
+
+fn hexBits(d: Int) -> Int = if d >= 8 {
+    4
+} else if d >= 4 {
+    3
+} else if d >= 2 {
+    2
+} else {
+    1
 }
 
 // ---- big integers for floatText: word 0 their limbs' count, then 32-bit limbs, the lowest first ----

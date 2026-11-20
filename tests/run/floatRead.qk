@@ -1,0 +1,17 @@
+// A Float read from text, as C's strtod reads it but without it: the nearest Float, halfway rounded to the even one;
+// a point, an exponent, inf, nan, hexadecimal; the least subnormal and past the greatest; what is not a number.
+fn main() {
+    let texts = [
+        "0", "-0", "1.5", ".5", "5.", "+3.25", "1e23", "1.7976931348623157e308", "1.7976931348623159e308", "1e400",
+        "2.4703282292062327e-324", "2.4703282292062328e-324", "1e-400",
+        "1.00000000000000011102230246251565404236316680908203125",
+        "1.00000000000000011102230246251565404236316680908203124", "0x1.8p3", "0x1p-1074", "inf", "-Infinity", "NaN",
+        "123456789012345678901234567890", "1e", "1e+", ".", "e5", " 1", "1 ", "1_0", "0x", "0x1p", "infinite", "--1",
+    ]
+    for t in texts {
+        match t.parseFloat() {
+            Ok(v) => print("{t}: {v}")
+            Err(why) => print("{t}: {why}")
+        }
+    }
+}

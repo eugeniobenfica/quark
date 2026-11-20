@@ -781,12 +781,9 @@ pub extern effect fn rtParseInt(t: Int64, n: Int64) -> Int64 as "qk_parseInt" {
 }
 
 pub extern effect fn rtParseFloat(t: Int64, n: Int64) -> Int64 as "qk_parseFloat" {
-    let s = numberCopy(t, n)
-    let endAt = alloc(1, 8)
-    setWord(endAt, 0, s)
-    let v = if n != 0 { strtod(s, endAt) } else { 0.0 }
-    if not wholeNumber(s, n, word(endAt, 0)) {
+    let out = alloc(1, 8)
+    if not textFloat(t, n, out) {
         return notANumber("not a number", t, n)
     }
-    okFloatResult(bitsOf(v))
+    okFloatResult(word(out, 0))
 }

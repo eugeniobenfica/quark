@@ -1,0 +1,10 @@
+// An opaque type with fields of its own and one its users may read and change (tests/run/pubFields.qk)
+pub opaque type Wallet { pub owner: Text, coins: Int }
+
+pub fn wallet(owner: Text) -> Wallet = Wallet(owner, 0)
+
+pub fn Wallet.add(var self, n: Int) {
+    self.coins += n
+}
+
+pub fn Wallet.coinsOf(self) -> Int = self.coins

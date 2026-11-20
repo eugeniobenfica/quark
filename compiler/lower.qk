@@ -6296,6 +6296,16 @@ fn Lower.lowerTry(var self, e: Int, value: Int) -> [Int] {
         let where = self.lineHere(line)
         self.rtv(rtFailId, [msg[0], msg[1], where], line)
     } else {
+        let conversion = self.p.ast.exprs[e].caseIndex
+        if x.resultOf >= 0 and returnsResult and conversion != -1 {
+            // the Err passed on as the function's: as text, or in the case of its enum that holds it
+            let to = self.dl(self.tdecl(rt)).errorOf
+            msg = if conversion == -2 {
+                self.copyVal(self.textOfVal(msg, x.errorOf, line))
+            } else {
+                self.caseValue(to, conversion, Some([msg]))
+            }
+        }
         let fail = self.caseValue(rt, 0, if x.resultOf >= 0 { Some([msg]) } else { None })
         self.lowerReturn(fail)
     }

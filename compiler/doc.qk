@@ -121,6 +121,7 @@ fn shown(d: Decl) -> Bool =
         and not d.builtin
         and d.templateOf < 0
         and not d.lifted
+        and not d.fromDefault
         and not d.isTest
         and d.kind != DeclKind.Use
 

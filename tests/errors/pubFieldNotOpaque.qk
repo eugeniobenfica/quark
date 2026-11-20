@@ -1,0 +1,6 @@
+// error: Point's fields are all public: pub goes on a field of an opaque type
+type Point { pub x: Int, y: Int }
+
+fn main() {
+    print(Point(1, 2))
+}

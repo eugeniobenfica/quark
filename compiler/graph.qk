@@ -769,7 +769,7 @@ fn Out.declOf(var self, d: Decl) -> g.Decl {
             } else if not d.isExtern or d.cStruct {
                 for at in d.params {
                     let prm = self.p.ast.params[at]
-                    var f = g.Field(name: prm.name, typeName: self.typeString(prm.ty))
+                    var f = g.Field(name: prm.name, typeName: self.typeString(prm.ty), isPub: prm.isPub)
                     if prm.fallback >= 0 {
                         f.default = self.writeInput(prm.fallback, d.name + "/" + prm.name + "=")
                     }
@@ -818,7 +818,7 @@ pub fn graphValueOf(p: Program, layoutText: Text) -> g.Graph {
     var decls: [g.Decl] = []
     for at in p.decls {
         let d = p.ast.decls[at]
-        if d.fromPrelude or d.templateOf >= 0 or d.module != 0 or d.lifted {
+        if d.fromPrelude or d.templateOf >= 0 or d.module != 0 or d.lifted or d.fromDefault {
             continue // the host's: in the catalog; another file's: in its own graph
         }
         decls.push(o.declOf(d))
@@ -1529,7 +1529,7 @@ pub fn programOfGraph(gr: g.Graph, path: Text) -> Imported {
             r.startDecl(dj)
             for f in dj.fields {
                 let ty = r.typeOf(if f.typeName != "" { f.typeName } else { "Int" })
-                var prm = Param(f.name, ty, 0, 0)
+                var prm = Param(f.name, ty, 0, 0, isPub: f.isPub)
                 if f.default != g.Pin() {
                     let v = r.input(f.default)
                     prm.fallback = v

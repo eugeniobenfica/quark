@@ -254,6 +254,10 @@ fn Writer.interfaceFn(var self, a: Ast, f: Param) {
         self.put(" -> ")
         self.typeExpr(a, result)
     }
+    if f.fallback >= 0 {
+        self.put(" = ") // its default
+        self.expr(a, f.fallback, 0, lowest)
+    }
 }
 
 // a record's field (name: Type), or an interface's function (fn name(...) -> Type)
@@ -262,6 +266,9 @@ fn Writer.field(var self, a: Ast, d: Decl, i: Int) {
     if d.isInterface {
         self.interfaceFn(a, f)
         return
+    }
+    if f.isPub {
+        self.put("pub ")
     }
     self.put(f.name + ": ")
     self.typeExpr(a, f.ty)

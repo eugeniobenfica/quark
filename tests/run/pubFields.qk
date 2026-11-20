@@ -1,0 +1,11 @@
+// pub on a field of an opaque type: read and changed outside its file; the others stay its file's own.
+use lib.wallet
+
+fn main() {
+    var w = wallet("ana")
+    w.add(5)
+    print(w.owner, w.coinsOf())
+    w.owner = "bia"
+    w.add(2)
+    print(w.owner, w.coinsOf())
+}

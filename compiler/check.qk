@@ -86,6 +86,7 @@ pub type Checker {
     byName: [Text: [Int]] = [:]
     methods: Set<Text> = []
     changers: Set<Text> = []
+    selfMarker: Int = -1 // what Self is in an interface's functions: the type that fits it (fitsMember puts it in)
 }
 
 // A checked program, and the errors said (with those said before: errors).
@@ -100,11 +101,83 @@ pub fn checkProgram(p: Program, errors: Errors, needMain: Bool, allowed: Text?) 
             k.builtins[name] = i
         }
     }
+    k.addDefaults()
     for d in k.p.decls {
         k.named(d)
     }
     let ok = k.run(needMain)
     Checked(k.p, k.errors, ok)
+}
+
+// An interface's functions with a body are its defaults: a type (not generic) that has each of its other functions
+// and not this one gets it, as if it were written fn Type.name(self, ...) = body in the interface's file (Self there
+// is the type, as in any of its functions). It is the type's own from then on: called on it, or through the interface.
+fn Checker.addDefaults(var self) {
+    var made = false
+    let decls = self.p.decls
+    var fns: Set<Text> = [] // Type.name of every function a type has
+    for d in decls {
+        let x = self.p.ast.decls[d]
+        if x.kind == DeclKind.Fn and x.name.contains(".") {
+            fns.add(x.name)
+        }
+    }
+    for w in decls {
+        let iface = self.p.ast.decls[w]
+        if iface.kind != DeclKind.Type or not iface.isInterface {
+            continue
+        }
+        let members = iface.params.map(f => self.p.ast.params[f]).toArray()
+        if not members.any(m => m.fallback >= 0) {
+            continue
+        }
+        for t in decls {
+            let ty = self.p.ast.decls[t]
+            if not ty.kind is Type | Enum or ty.isInterface or len(ty.typeParams) > 0 or ty.isExtern or ty.fromPrelude {
+                continue
+            }
+            if not members.all(m => m.fallback >= 0 or fns.contains(ty.name + "." + m.name)) {
+                continue // not one that fits it
+            }
+            for m in members {
+                if m.fallback < 0 or fns.contains(ty.name + "." + m.name) {
+                    continue
+                }
+                // fn loud(times: Int) -> Text = ... as fn Dog.loud(self, times: Int) -> Text = ...
+                let head = memberText(self.p.ast, m with { fallback: -1 })
+                let open = head.indexOf("(") ?? 0
+                let hasParams = not head[open + 1..].startsWith(")")
+                let start = if head.startsWith("effect ") { "pub effect fn " } else { "pub fn " }
+                let text = start
+                    + ty.name
+                    + "."
+                    + m.name
+                    + "(self"
+                    + (if hasParams { ", " } else { "" })
+                    + head[open + 1..]
+                    + " = "
+                    + exprText(self.p.ast, m.fallback, 0)
+                    + "\n"
+                let before = len(self.p.ast.decls)
+                let closing = self.p.ast.closingComment
+                let parsed = parseInto(self.p.ast, Source("{iface.name}.{m.name} (its default, for {ty.name})", text))
+                self.p.ast = parsed.ast
+                self.p.ast.closingComment = closing
+                for e in parsed.errors {
+                    self.errors.add(Source("", ""), iface.line, iface.col, e)
+                }
+                for at in before..len(self.p.ast.decls) {
+                    self.p.ast.decls[at].module = iface.module
+                    self.p.ast.decls[at].fromDefault = true // the language's making: not in the program's graph
+                    self.p.ast.decls[at].index = len(self.p.decls)
+                    self.p.decls.push(at)
+                    fns.add(self.p.ast.decls[at].name)
+                    made = true
+                }
+            }
+        }
+    }
+    let _ = made
 }
 
 // d among the program's declarations, findable by its name
@@ -965,6 +1038,13 @@ fn Checker.resolveNamed(var self, te: Int, name: Text, args: [Int], line: Int, c
         return tyTask
     }
     if name == "Self" and len(args) == 0 {
+        if self.c.typing >= 0 and self.p.ast.decls[self.c.typing].isInterface {
+            // fn compare(other: Self) -> Int: the type that fits the interface
+            if self.selfMarker < 0 {
+                self.selfMarker = self.p.addType(Type(.Error, typeVar: "Self"))
+            }
+            return self.selfMarker
+        }
         // fn Vec2.plus(self, b: Self) -> Self: the receiver's type
         let f = self.selfOf()
         if f >= 0 {
@@ -1406,7 +1486,11 @@ fn Checker.isInterface(self, t: Int) -> Bool {
 }
 
 // does m, a type's function, fit the interface's function of type ft?
-fn Checker.fitsMember(var self, m: Int, ft: Int, at: Int) -> Bool {
+// the type a member's function's value or result is, Self (in an interface) being have
+fn Checker.asFor(self, t: Int, have: Int) -> Int =
+    if t >= 0 and t == self.selfMarker { have } else { t }
+
+fn Checker.fitsMember(var self, m: Int, ft: Int, at: Int, have: Int) -> Bool {
     if m < 0 {
         return false
     }
@@ -1419,11 +1503,11 @@ fn Checker.fitsMember(var self, m: Int, ft: Int, at: Int) -> Bool {
         return false
     }
     for (i, p) in f.params.enumerate() {
-        if self.paramType(mp[i + 1]) != p {
+        if self.paramType(mp[i + 1]) != self.asFor(p, have) {
             return false
         }
     }
-    self.fnReturnType(m, at) == f.elem
+    self.fnReturnType(m, at) == self.asFor(f.elem, have)
 }
 
 // fn talk<T: Speaker>: does this type have each of the interface's functions, of its type? Said where it is called.
@@ -1432,7 +1516,7 @@ fn Checker.fitsInterface(var self, have: Int, w: Int, at: Int, fnName: Text, par
         let ft = self.paramType(f)
         let fname = self.paramName(f)
         let m = self.typeFunction(have, fname)
-        if not self.fitsMember(m, ft, at) {
+        if not self.fitsMember(m, ft, at, have) {
             let hn = self.tname(have)
             let sig = memberText(self.p.ast, self.p.ast.params[f])
             self.sayAt(
@@ -1450,11 +1534,22 @@ fn Checker.toInterface(var self, slot: Int, have: Int, want: Int) -> Bool {
     let hn = self.tname(have)
     let wn = self.tname(want)
     for f in self.p.ast.decls[w].params {
+        let ft = self.paramType(f)
+        if self.selfMarker >= 0
+            and (self.p.types[ft].elem == self.selfMarker or self.p.types[ft].params.contains(self.selfMarker)) {
+            self.sayAt(
+                slot,
+                "{wn}'s functions take or give Self (the type that fits it): it is a bound (T: {wn}), not a value",
+            )
+            return false
+        }
+    }
+    for f in self.p.ast.decls[w].params {
         // each field: the type's own function, of the same type
         let ft = self.paramType(f)
         let fname = self.paramName(f)
         let m = self.typeFunction(have, fname)
-        if not self.fitsMember(m, ft, slot) {
+        if not self.fitsMember(m, ft, slot, have) {
             self.sayAt(slot, "{hn} cannot be a {wn}: it needs fn {hn}.{fname}(self, ...) of the type {self.tname(ft)}")
             return false
         }
@@ -7044,6 +7139,28 @@ fn Checker.checkName(var self, e: Int, name: Text) -> Int {
     tyError
 }
 
+// How ? passes an Err of `from` on where the function's Err holds `to`: the case of to's enum that holds a `from`
+// and nothing else (it is the only one: enum AppError { Parse(e: ParseError), Io(why: Text) }), -2 when to is a Text
+// (the error said as text, as print says it), -1 none, -3 more than one case could.
+fn Checker.errorConversion(self, from: Int, to: Int) -> Int {
+    if to == tyText {
+        return -2
+    }
+    if self.kindOf(to) != Kind.Enum or self.p.types[to].decl < 0 {
+        return -1
+    }
+    var found = -1
+    for (k, fields) in self.p.ast.decls[self.p.types[to].decl].caseFields.enumerate() {
+        if len(fields) == 1 and self.same(self.paramType(fields[0]), from) {
+            if found >= 0 {
+                return -3 // two cases could hold it: which one is the program's to say (mapErr)
+            }
+            found = k
+        }
+    }
+    found
+}
+
 fn Checker.checkTry(var self, e: Int, value: Int) -> Int {
     if self.c.deferDepth > 0 {
         self.sayAt(e, "a defer's block cannot leave its function: no ? in it")
@@ -7084,12 +7201,24 @@ fn Checker.checkTry(var self, e: Int, value: Int) -> Int {
             } else if not self.isErr(want) and self.p.isResult(t) and not self.p.isResult(want) {
                 self.typeError(e, "? passes an Err on, so the function must give a result (T!), not %s", want, -1)
             } else if not self.isErr(want) and self.p.isResult(t) and self.p.errorOf(t) != self.p.errorOf(want) {
-                self.typeError(
-                    e,
-                    "? passes an Err of %s on, but the function's Err holds %s: take it apart with match",
-                    self.p.errorOf(t),
-                    self.p.errorOf(want),
-                )
+                let conversion = self.errorConversion(self.p.errorOf(t), self.p.errorOf(want))
+                if conversion == -3 {
+                    self.typeError(
+                        e,
+                        "? passes an Err of %s on, and two cases of %s hold one: say which with mapErr",
+                        self.p.errorOf(t),
+                        self.p.errorOf(want),
+                    )
+                } else if conversion == -1 {
+                    self.typeError(
+                        e,
+                        "? passes an Err of %s on, but the function's Err holds %s: give its enum a case that holds one (Parse(e: ParseError)), or convert it with mapErr",
+                        self.p.errorOf(t),
+                        self.p.errorOf(want),
+                    )
+                } else {
+                    self.p.ast.exprs[e].caseIndex = conversion
+                }
             }
         }
     }
@@ -7200,8 +7329,9 @@ fn Checker.checkField(var self, e: Int, target: Int, name: Text) -> Int {
     let tk = self.kindOf(t)
     if tk == Kind.Record {
         let d = self.declOf(t)
-        if not self.accessLayout(d, e) {
-            return tyError
+        let open = self.p.ast.decls[d].params.any(prm => self.p.ast.params[prm].isPub and self.paramName(prm) == name)
+        if not open and not self.accessLayout(d, e) {
+            return tyError // (a pub field of an opaque type is read and changed anywhere)
         }
         let fields = self.p.ast.decls[d].params
         for (f, prm) in fields.enumerate() {
@@ -7976,6 +8106,14 @@ fn Checker.run(var self, needMain: Bool) -> Bool {
         }
         if x.kind == DeclKind.Const {
             continue
+        }
+        if x.kind == DeclKind.Type and not x.opaque {
+            for prm in x.params {
+                let q = self.p.ast.params[prm]
+                if q.isPub {
+                    self.say(q.line, q.col, "{x.name}'s fields are all public: pub goes on a field of an opaque type")
+                }
+            }
         }
         self.c.typing = d // fn first<T>(xs: [T]): T is its own
         self.c.view = false

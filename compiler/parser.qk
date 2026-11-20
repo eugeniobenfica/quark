@@ -363,7 +363,8 @@ fn Parser.parseTypeIn(var self) -> Int {
 }
 
 // An interface's function: fn speak(loud: Bool) -> Text, effect fn log(line: Text). A field of a function type,
-// its values' names kept for the text.
+// its values' names kept for the text; with = and a body, its default (fn loud() -> Text = self.speak().upper()): a
+// type that has the interface's other functions and not this one gets it (checked as its own fn Type.loud(self)).
 fn Parser.parseMember(var self) -> Param {
     let t = self.peek()
     let isEffect = self.accept(.Effect)
@@ -395,7 +396,12 @@ fn Parser.parseMember(var self) -> Param {
         -1
     }
     let ty = self.ast.typeExpr(.Fn(params, names, result, isEffect, false), t.line, t.col)
-    Param(self.text(name), ty, name.line, name.col)
+    let body = if self.acceptOp(.Assign) {
+        self.parseExpr() // its default
+    } else {
+        -1
+    }
+    Param(self.text(name), ty, name.line, name.col, body)
 }
 
 // ---- expressions ----------------------------------------------------------------------------------------------
@@ -2077,6 +2083,7 @@ fn Parser.members(var self, decl: Decl, record: Bool) -> Decl {
                 let f = self.parseMember()
                 d.params.push(self.ast.param(f))
             } else {
+                let fieldPub = self.accept(.Pub) // pub balance: Int, in an opaque type
                 let fname = self.expect(.Name, "for a field (a camelCase name)")
                 self.expect(.Colon, "after the field's name")
                 let ty = self.parseType()
@@ -2085,7 +2092,9 @@ fn Parser.members(var self, decl: Decl, record: Bool) -> Decl {
                 } else {
                     -1
                 }
-                d.params.push(self.ast.param(Param(self.text(fname), ty, fname.line, fname.col, fallback)))
+                d.params.push(
+                    self.ast.param(Param(self.text(fname), ty, fname.line, fname.col, fallback, isPub: fieldPub)),
+                )
             }
         } else {
             d.cases.push(self.text(self.expect(.TypeName, "for a case (a PascalCase name)")))

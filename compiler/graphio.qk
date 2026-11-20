@@ -150,6 +150,7 @@ fn GWriter.params(var self, key: Text, list: [g.Param], always: Bool) {
 
 fn GWriter.field(var self, f: g.Field) {
     self.open("Field")
+    self.flag("pub", f.isPub)
     self.text("name", f.name)
     self.text("type", f.typeName)
     self.pin("default", f.default)
@@ -470,7 +471,12 @@ fn GReader.param(self, v: Int) -> g.Param =
     )
 
 fn GReader.field(self, v: Int) -> g.Field =
-    g.Field(name: self.str(v, "name"), typeName: self.str(v, "type"), default: self.pin(self.j.get(v, "default")))
+    g.Field(
+        name: self.str(v, "name"),
+        typeName: self.str(v, "type"),
+        default: self.pin(self.j.get(v, "default")),
+        isPub: self.flag(v, "pub"),
+    )
 
 fn GReader.binds(self, o: Int) -> [g.Bind] {
     var out: [g.Bind] = []

@@ -63,9 +63,9 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 
 - [x] constantes em padrões, `T?!`, `a..=b` decidido (não), `Char` decidido (um `Int`), só `defer`, efeitos na doc,
   `edition` lida
-- [ ] o `?` convertendo erros (`E1` em `E2`)
-- [ ] `Self` e implementações padrão em interfaces
-- [ ] `pub` por campo
+- [x] o `?` convertendo erros (`E1` no caso do enum que o guarda; em texto num `T!`)
+- [x] `Self` e implementações padrão em interfaces
+- [x] `pub` por campo (num tipo opaco)
 
 ## D. Backends e sistema
 

@@ -1,0 +1,14 @@
+// error: ? passes an Err of ParseError on, and two cases of AppError hold one: say which with mapErr
+enum ParseError { Empty }
+enum AppError { First(e: ParseError), Second(e: ParseError) }
+
+fn parse(t: Text) -> Int ! ParseError = Err(.Empty)
+
+fn age(t: Text) -> Int ! AppError {
+    let n = parse(t)?
+    n
+}
+
+fn main() {
+    print(age(""))
+}

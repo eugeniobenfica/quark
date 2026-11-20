@@ -192,6 +192,7 @@ pub type Param {
     isVar: Bool = false
     binding: Int = -1
     boxed: Bool = false
+    isPub: Bool = false // a field of an opaque type its module lets others read and change (pub balance: Int)
 }
 
 // ---- declarations -----------------------------------------------------------------------------------------------
@@ -264,6 +265,7 @@ pub type Decl {
     returnsEarly: Bool = false
     callsItself: Bool = false
     lifted: Bool = false
+    fromDefault: Bool = false // an interface's default, made a type's function (Checker.addDefaults)
     inferEffect: Bool = false
     folded: Int = -1
     foldedAgain: Bool = false

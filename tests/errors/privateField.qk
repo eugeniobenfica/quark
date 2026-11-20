@@ -1,0 +1,7 @@
+// error: Wallet is opaque outside its module: use its public functions
+use lib.wallet
+
+fn main() {
+    let w = wallet("ana")
+    print(w.coins)
+}

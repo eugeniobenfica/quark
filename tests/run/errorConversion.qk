@@ -1,0 +1,38 @@
+// ? passes an Err on as the function's own: into the one case of its enum that holds that error (Parse(e:
+// ParseError), Io(why: Text)), or as text into a plain T!.
+enum ParseError { Empty, NotANumber(text: Text) }
+enum AppError { Parse(e: ParseError), Io(why: Text), Limit(n: Int) }
+
+fn parseAge(t: Text) -> Int ! ParseError {
+    if t == "" {
+        return Err(.Empty)
+    }
+    t.parseInt() ?? return Err(.NotANumber(t))
+}
+
+fn load(path: Text) -> Text ! AppError {
+    if path == "" {
+        return Err(.Io("no path"))
+    }
+    let text = readFile(path)? // a Text Err: into Io
+    text
+}
+
+fn ageOf(t: Text) -> Int ! AppError {
+    let n = parseAge(t)? // a ParseError: into Parse
+    if n > 150 {
+        return Err(.Limit(n))
+    }
+    n
+}
+
+fn plain(t: Text) -> Int! {
+    let n = parseAge(t)? // as text
+    n + 1
+}
+
+fn main() {
+    print(ageOf("42"), ageOf(""), ageOf("x"), ageOf("200"))
+    print(load(""), load("no-such-file-here") is Err(Io(_)))
+    print(plain("41"), plain("y"))
+}

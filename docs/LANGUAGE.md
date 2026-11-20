@@ -505,6 +505,11 @@ with a NaN in `x` stops the program, and `m[x]` finds nothing.
 **Results whose error is a type.** `T ! E` holds a T or an E, as in `fn parseAge(t: Text) -> Int ! ParseError`,
 whose failures are `Err(.Empty)`. `?` passes an `Err` on when the function's own `Err` holds the same
 type; `match` takes it apart (`Err(e) => explain(e)`). `T!` is the result whose error is a `Text` message.
+`?` also passes on an `Err` of another type, in two cases: when the function's error is an enum with exactly one
+case that holds that type and nothing else, the error goes into it (with `enum AppError { Parse(e: ParseError),
+Io(why: Text) }`, `parseAge(t)?` in a `-> Int ! AppError` gives `Err(.Parse(e))`, and `readFile(path)?` gives
+`Err(.Io(why))`); and when the function gives a `T!`, the error goes as its text. When two cases could hold it,
+`mapErr` says which.
 `r.mapErr(e => ...)` turns one error into another: the same `Ok` value, or `Err` of what the (pure) lambda
 gives, so converting is written where it happens: `let text = readFile(path).mapErr(e => .Io(e))?`.
 `E` goes on the same line as `!`, with a space either side. Parentheses group a type: `(Int ! E)?` is an
@@ -790,6 +795,28 @@ let pets: [Speaker] = [Dog("rex"), Cat("tom")]
 print(pets.map(p => p.speak()))
 ```
 
+A function of an interface may have a body: its default. A type that has the interface's other functions and
+not this one gets it, as its own function (`fn Dog.loud(self, times: Int)` here: it is called on a `Dog` too), with
+`self` the value of that type; a type that has one of its own keeps it. `Self` in an interface's function is the
+type that fits it, which makes the interface a bound (`fn lowest<T: Ordered>(xs: [T])`), not a value: a value
+of `Ordered` would not know what `other` may be.
+
+<!-- given
+type Dog { name: Text }
+fn Dog.speak(self) -> Text = "woof"
+type Card { value: Int }
+fn Card.before(self, other: Card) -> Bool = self.value < other.value
+-->
+```quark
+interface Loud { fn speak() -> Text, fn loud(times: Int) -> Text = self.speak().upper() * times }
+
+interface Ordered { fn before(other: Self) -> Bool }
+
+fn earliest<T: Ordered>(a: T, b: T) -> T = if b.before(a) { b } else { a }
+
+print(Dog("rex").loud(2), earliest(Card(3), Card(1)))
+```
+
 An interface value is two words, however many functions the interface lists: the address of its value's
 copy, and its type's table of the interface's functions (one table for each type and interface, in the
 program's data). Making one copies the value once; a call loads its function from the table and calls it
@@ -801,7 +828,10 @@ A record may hold functions as data too (`type Button { label: Text, onPress: (I
 is a record, built with its fields, never an interface.
 
 `pub opaque type Account { balance: Int }` exports the type while keeping construction, field access,
-updates and destructuring within its module. Export functions or methods to expose operations on it.
+updates and destructuring within its module. Export functions or methods to expose operations on it. A field
+marked `pub` (`pub opaque type Account { pub owner: Text, balance: Int }`) is read and changed anywhere; the
+others, construction and destructuring stay the module's. In a type that is not opaque every field is public
+already, and `pub` on one is an error.
 
 A generic function calls what it needs on its T (`fn talk<T>(x: T) -> Text = x.speak()`); each
 instance is checked with its own type, and a type without the function is an error that names it:

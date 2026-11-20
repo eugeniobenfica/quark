@@ -1,0 +1,3 @@
+Ok(42) Err(AppError.Parse(e: ParseError.Empty)) Err(AppError.Parse(e: ParseError.NotANumber(text: x))) Err(AppError.Limit(n: 200))
+Err(AppError.Io(why: no path)) true
+Ok(42) Err(NotANumber(text: y))

@@ -99,7 +99,7 @@ pub type Param {
     default: Pin = Pin()
 }
 
-pub type Field { name: Text = "", typeName: Text = "", default: Pin = Pin() }
+pub type Field { name: Text = "", typeName: Text = "", default: Pin = Pin(), isPub: Bool = false }
 pub type Case { name: Text = "", fields: [Field] = [] }
 
 // a match's arm: its pattern (with alternatives), the names it binds, a guard, its value or block

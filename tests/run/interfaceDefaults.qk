@@ -1,0 +1,46 @@
+// Interfaces: a function with a body is a default (a type that has the others gets it, as its own function,
+// unless it has one of its own); Self in a function's type is the type that fits, which makes it a bound.
+interface Speaker {
+    fn speak() -> Text
+    fn loud(times: Int) -> Text = self.speak().upper() * times
+    fn intro() -> Text = "I say {self.speak()}"
+}
+
+interface Ordered { fn rank() -> Int, fn before(other: Self) -> Bool }
+type Dog { name: Text }
+
+fn Dog.speak(self) -> Text = "woof"
+
+type Robot { id: Int }
+
+fn Robot.speak(self) -> Text = "beep {self.id}"
+
+fn Robot.loud(self, times: Int) -> Text = "BEEP" // its own: the default is not used
+
+type Card { value: Int }
+
+fn Card.rank(self) -> Int = self.value
+
+fn Card.before(self, other: Card) -> Bool = self.value < other.value
+
+fn lowest<T: Ordered>(xs: [T]) -> T? {
+    var best: T? = None
+    for x in xs {
+        if best is Some(b) {
+            if x.before(b) {
+                best = Some(x)
+            }
+        } else {
+            best = Some(x)
+        }
+    }
+    best
+}
+
+fn talk(s: Speaker) -> Text = s.intro() + " / " + s.loud(2)
+
+fn main() {
+    print(talk(Dog("rex")), talk(Robot(7)))
+    print(Dog("a").loud(3), Robot(1).intro())
+    print(lowest([Card(5), Card(2), Card(9)]))
+}

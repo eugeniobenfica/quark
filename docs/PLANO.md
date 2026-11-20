@@ -476,6 +476,23 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 > - **Edições**: feito. `edition` no `quark.toml` é lido; outra edição que não a do compilador é um erro claro.
 > - **Ficam para depois** (maiores, e somam sem quebrar): conversão automática de erros no `?`, `Self` e
 >   implementações padrão em interfaces, `pub` por campo.
+>
+> **Feitos em 20/11/2026**, os três, somando sem quebrar nada:
+> - **O `?` convertendo erros.** Quando o erro da função é um enum com exatamente um caso que guarda o tipo do erro
+>   e nada mais, o `?` o põe nesse caso (`enum AppError { Parse(e: ParseError), Io(why: Text) }`: o padrão do
+>   `#[from]` do Rust, sem anotação); quando a função dá um `T!`, o erro vai como texto. Dois casos possíveis são
+>   um erro que manda dizer qual com `mapErr`. Um traço como `From` foi pesado e deixado: a conversão por caso é a
+>   forma canônica que já se escreve com enums, e não pede uma segunda maneira.
+> - **Implementações padrão e `Self` em interfaces.** Uma função de interface com corpo é o padrão: um tipo que
+>   tem as outras e não esta ganha `fn Tipo.nome(self, ...)` com esse corpo, escrito como texto e lido como do
+>   programa (no arquivo da interface), então é checado e chamado como qualquer outra função do tipo. `Self` no tipo
+>   de uma função é o tipo que serve: `fitsMember` o troca; uma interface com `Self` é uma restrição
+>   (`T: Ordered`), não um valor, como no Rust.
+> - **`pub` por campo**, dentro do tipo opaco que já existia: o campo `pub` é lido e mudado em qualquer lugar; os
+>   outros, a construção e a desestruturação ficam do módulo. Num tipo que não é opaco todo campo já é público, e
+>   `pub` num é um erro (uma forma só). No grafo, `Field.isPub` (`"pub"` no JSON).
+> - Testes: `errorConversion`, `interfaceDefaults`, `pubFields`, e os erros `errorTwoCases`, `errorNoCase`,
+>   `selfInterfaceValue`, `privateField`, `pubFieldNotOpaque`.
 
 Cada item é uma decisão que o 1.0 torna cara de mudar.
 

@@ -1,0 +1,11 @@
+// error: Ordered's functions take or give Self (the type that fits it): it is a bound (T: Ordered), not a value
+interface Ordered { fn before(other: Self) -> Bool }
+type Card { value: Int }
+
+fn Card.before(self, other: Card) -> Bool = self.value < other.value
+
+fn show(o: Ordered) -> Text = "an ordered one"
+
+fn main() {
+    print(show(Card(1)))
+}

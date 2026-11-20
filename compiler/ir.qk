@@ -136,7 +136,7 @@ pub const runtimeNames = [
     "makeDir", "removePath", "runProcess", "arrayAppend", "sort", "cText", "textOfC", "printPointer", "parallelFold",
     "joinInt", "openFile", "readChunk", "writeChunk", "seekFile", "closeFile", "listen", "connect", "accept",
     "readSocket", "writeSocket", "closeSocket", "go", "runTasks", "channel", "send", "receive", "closeChannel",
-    "localOffset", "shortText",
+    "localOffset",
 ]
 
 // the runtime's functions that make nothing in the arena: a loop's turn that calls only these (and pushes onto vars
@@ -146,7 +146,7 @@ const runtimeMakesNothing = [
     "asin", "acos", "atan", "atan2", "exp", "log", "pow", "fuelOut", "printHandle", "textCompare", "fail", "exit",
     "printTo", "startsWith", "endsWith", "find", "time", "mapGet", "mapRemove", "mapLen", "mapUsed", "mapEntry",
     "loopCheck", "textCut", "random", "randomInt", "seedRandom", "codePointCount", "remember", "valueEqual",
-    "printBytes", "shortText",
+    "printBytes",
 ]
 
 // by the runtime function's number (a name above that the runtime does not have stops the compiler's build)

@@ -13,7 +13,7 @@ fn less(kind: Int, v: Int, i: Int, j: Int) -> Bool {
         let y = floatAt(v, j)
         return x < y or y != y and x == x
     }
-    textCompare(textBytesAt(v + 16 * i), textLengthAt(v + 16 * i), textBytesAt(v + 16 * j), textLengthAt(v + 16 * j)) < 0
+    textCompare(word(v, 2 * i), word(v, 2 * i + 1), word(v, 2 * j), word(v, 2 * j + 1)) < 0
 }
 
 fn swap(kind: Int, v: Int, i: Int, j: Int) {

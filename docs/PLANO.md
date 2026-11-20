@@ -246,29 +246,24 @@ coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 >   - opcionais sem etiqueta (`Text?` num slot a menos).
 > - Nenhum dos três foi começado.
 
-> **Textos curtos dentro do valor: desenho (20/11/2026).**
-> - **Medição.** 79% dos textos feitos em `json` e 52% em `strings` têm até 15 bytes.
-> - **Codificação.** Um `Text` continua dois slots. Na forma curta, o bit de cima do segundo slot diz "dentro", o resto dele é o comprimento, e o primeiro slot guarda os bytes (até 8). Guardado na memória, os bytes ficam no endereço do próprio valor. O comprimento é sempre `slot1 & ~bit`.
-> - **As duas formas valem para o mesmo texto.** Não há forma canônica, porque o runtime passa seus literais ao C pelo endereço (`textAt`) e um `Text` vira `Bytes` sem cópia.
->   - Igualdade e hash são sempre pelos bytes, com atalho quando os dois são curtos.
->   - Os produtores passam a fazer a forma curta um a um, e as fatias continuam vistas, sem cópia.
-> - **Chamadas ao runtime e ao C.** O lowering entrega a forma longa, copiando os bytes de um texto curto para a área da função. As exceções são as funções que guardam o texto (a chave de `mapSet`, `send`), que o recebem como é.
-> - **O runtime aprende as duas formas onde lê um texto que está na memória**: as chaves e os valores de um mapa, os elementos de um array de textos, a cópia do coletor, a ordenação, `join`, os argumentos de processos e as mensagens de canais.
-> - **Feito (20/11/2026): etapas 1 a 3.**
->   - O runtime lê as duas formas. As funções que recebem texto o decodificam ao entrar, e as que devolvem vistas dele (`split`, `words`, `lines`) copiam um curto antes.
->   - O lowering trata as duas formas:
->     - o comprimento é mascarado;
->     - a igualdade compara os primeiros slots quando os dois textos são curtos;
->     - a fatia de um curto sai curta, com os bytes deslocados;
->     - `Text`→`Bytes` e os laços sobre bytes recebem uma cópia longa, feita antes da marca do laço.
->   - `QUARK_SHORT_TEXTS=1` faz curtos os literais e as fatias de até 8 bytes, menos no runtime, que passa literais ao C pelo endereço. A suíte inteira passa com ele e roda assim no CI (Checks).
->   - Achado no caminho: `for c in f().codePoints()` lia memória já coletada, como `words` antes. A saída esperada de `tests/run/loopSourceMade` tinha guardado o valor errado (157408805 em vez de 610500).
-> - **Etapas**, cada uma com a suíte também com o interruptor ligado:
->   1. Os leitores do runtime.
->   2. Os leitores do lowering e a fronteira das chamadas.
->   3. O interruptor que faz os produtores criarem a forma curta. A suíte inteira tem de passar com ele.
->   4. Os produtores a sério e a medição em `json` e `strings`.
->   5. O contrato da API C (`include/quark.h` promete `.p` e `.i`): converter na fronteira.
+> **Textos curtos dentro do valor: feitos, medidos e desfeitos (20/11/2026).** Implementei em quatro etapas:
+> - um texto de até 8 bytes guardado no próprio valor, marcado no bit de cima do comprimento;
+> - as duas formas valendo para o mesmo texto;
+> - a suíte inteira passando com eles ligados.
+>
+> Os benchmarks pioraram contra o código sem eles: json de 435 para 476 ms, words de 393 para 458 ms, strings de 348 para 380 ms. O custo das duas formas espalha-se pelos caminhos quentes:
+> - o hash das chaves de mapa deixou de ser inlinado (10% de words);
+> - cada função de texto do runtime decodifica o que recebe.
+>
+> O que a técnica poupa quase não existe aqui:
+> - Swift e C++ a usam porque cada texto lhes custa um `malloc`/`free` e, no Swift, contagem de referências.
+> - Em Quark alocar é avançar um ponteiro na arena, e fatias e palavras já são vistas de graça.
+> - Em `strings`, nenhum dos textos curtos cabe em 8 bytes: todos têm de 9 a 15.
+>
+> Rust e Go também deixam a técnica fora da string padrão. Decisão: uma forma só. Ficaram as correções achadas no caminho:
+> - `for c in f().codePoints()` lia memória já coletada; sua fonte agora é feita antes da marca do laço;
+> - `tests/run/loopSourceMade` tinha guardado o valor errado;
+> - `tests/run/textMix`, com textos e `Bytes` misturados.
 
 ### B7. Memória: copiar menos na coleta de laço
 

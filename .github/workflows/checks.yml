@@ -13,7 +13,7 @@ on:
 
 jobs:
   checks:
-    name: Differential, fuzz, short texts, canonical
+    name: Differential, fuzz, canonical
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -28,8 +28,6 @@ jobs:
         run: build/quark.exe run tools/difftest.qk -- build/quark.exe $COUNT 1
       - name: Fuzzing
         run: build/quark.exe run tools/fuzz.qk -- build/quark.exe $((COUNT * 2)) 1
-      - name: The suite with short texts (literals and slices of up to 8 bytes made short)
-        run: QUARK_SHORT_TEXTS=1 bash tests/run.sh build/quark.exe
       - name: The compiler in canonical form
         run: |
           bad=0

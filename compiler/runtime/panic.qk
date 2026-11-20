@@ -78,9 +78,7 @@ fn escapeOrEnd(say: Bool) {
 pub extern effect fn rtStop() as "qkrtStop" = escapeOrEnd(true)
 
 // x? in main, a failed assert: "path:line: message"
-pub extern effect fn rtFail(pGiven: Int64, nGiven: Int64, line: Int64) as "qk_fail" {
-    let p = shortBytes(pGiven, nGiven, 0)
-    let n = textLength(nGiven)
+pub extern effect fn rtFail(p: Int64, n: Int64, line: Int64) as "qk_fail" {
     let _ = at(line).bytes(p, if n < 400 { n } else { 400 })
     appendTrace(line >> 32)
     escapeOrEnd(true)

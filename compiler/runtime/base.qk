@@ -116,38 +116,6 @@ pub fn zeroBytes(to: Int, n: Int) {
 }
 
 // the same n bytes at a and b: eight at a time (the last eight overlapping), C's memcmp only for long runs
-// ---- a text's two slots: the address of its bytes and its length; or, a short one (up to 8 bytes), its bytes
-// themselves in the first slot (the ones past its length 0) and its length with the top bit set in the second. Both
-// forms may hold the same text: what is equal is the bytes (docs/PLANO.md, B6) ----
-pub fn textLength(n1: Int) -> Int = n1 & ~intMin
-
-// the address of the bytes of the text whose two slots are in memory at at (a short one's: at itself)
-pub fn textBytesAt(at: Int) -> Int = if word(at, 1) < 0 { at } else { word(at, 0) }
-
-pub fn textLengthAt(at: Int) -> Int = word(at, 1) & ~intMin
-
-// the address of a text's bytes given its two slots: a short one's put in the thread's word k (0 to 2) of ctxShort
-pub fn shortBytes(p: Int, n1: Int, k: Int) -> Int {
-    if n1 >= 0 {
-        return p
-    }
-    let at = ctx() + 8 * (ctxShort + k)
-    setWord(at, 0, p)
-    at
-}
-
-// the same text: two given by their slots
-pub fn sameText(a0: Int, a1: Int, b0: Int, b1: Int) -> Bool {
-    let n = a1 & ~intMin
-    if n != b1 & ~intMin {
-        return false
-    }
-    if a1 < 0 and b1 < 0 {
-        return a0 == b0
-    }
-    sameBytes(shortBytes(a0, a1, 0), shortBytes(b0, b1, 1), n)
-}
-
 pub fn sameBytes(a: Int, b: Int, n: Int) -> Bool {
     if n >= 64 {
         return memcmp(a, b, n) == 0
@@ -297,8 +265,7 @@ pub const ctxGlobals = 15
 pub const ctxScratch = 16 // 128 bytes: an Int's digits, a Float's text, a Float's bits
 pub const ctxPanicText = 32 // 512 bytes: 64 words
 pub const ctxFloatWork = 96 // floatText's room for its big integers (made at the thread's first Float written)
-pub const ctxShort = 97 // three words: a short text's bytes put where an address can point at them (shortBytes)
-pub const ctxWords = 100
+pub const ctxWords = 97
 pub const panicTextSize = 512
 
 // The running thread's context: in the context register (machine.context), which every way in from C makes 0; then

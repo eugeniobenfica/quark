@@ -1,0 +1,40 @@
+// Texts made by literals, joins, interpolation and slices, used together: equal by their bytes as map keys, sorted,
+// joined, sliced, gone over by code point and word, read as numbers; Bytes joined and then pushed onto.
+fn main() {
+    let text = "alpha beta gamma beta alpha delta, epsilon"
+    let words = text.words()
+    var counts: [Text: Int] = [:]
+    for w in words {
+        counts[w] = (counts[w] ?? 0) + 1
+    }
+    print(counts["beta"] ?? 0, counts["alpha"] ?? 0, counts["delta,"] ?? 0, len(counts))
+    let a = "beta"
+    let b = text[6..10]
+    print(a == b, a == words[1], b == words[3], "{a}|{b}|", len(a), len(b))
+    let sorted = ["pear", "fig", "banana", "apple", text[0..5], "kiwifruit"].sorted()
+    print(sorted, sorted.join("+"))
+    let s = "héllo"
+    print(s[1..3], len(s), s.codePoints().toArray(), s.upper(), s.bytes())
+    for w in "ab cd".words() {
+        print("[{w}]", w.codePoints().toArray())
+    }
+    print("12".parseInt() ?? 0, "2.5".parseFloat() ?? 0.0, "x" + "y", "abc".startsWith("ab"), "abc".indexOf("c") ?? -1)
+    let parts = "a,b,,c".split(",")
+    print(parts, parts.map(p => len(p)).toArray(), "a,b".replace(",", ";"))
+    var m: [Text: Text] = ["k": "v", "longer key here": "value"]
+    m[text[0..1]] = "first"
+    print(m["a"] ?? "-", m["k"] ?? "-", m["longer key here"] ?? "-", len(m))
+    let short = "12345678"
+    let nine = "123456789"
+    print(short[2..5], nine[2..5], short == nine[0..8], short[0..0] == "", short.lines())
+    var small: Bytes = "ab".bytes() + "c".bytes()
+    small.push(100)
+    print(small, len(small))
+    var grown = ""
+    for i in 0..12 {
+        grown += "{i % 10}"
+    }
+    var keys: [Text: Int] = ["0123": 1]
+    keys["01" + "23"] = 2
+    print(grown, len(grown), keys["0123"] ?? 0, len(keys), "ab" + "cd" == "abcd")
+}

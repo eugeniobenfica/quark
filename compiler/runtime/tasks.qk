@@ -456,9 +456,7 @@ pub extern effect fn rtChannel() -> Int64 as "qk_channel" {
 }
 
 // send(channel, text): the text at the end of its queue (a copy of its own: it goes from one task to another)
-pub extern effect fn rtSend(n: Int64, pGiven: Int64, lenGiven: Int64, line: Int64) as "qk_send" {
-    let p = shortBytes(pGiven, lenGiven, 0)
-    let len = textLength(lenGiven)
+pub extern effect fn rtSend(n: Int64, p: Int64, len: Int64, line: Int64) as "qk_send" {
     var c = channelAt(n, line)
     if word(c, chClosed) != 0 {
         panicNow(panicClosedChannel, line, n, 0)

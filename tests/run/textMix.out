@@ -1,0 +1,12 @@
+2 2 1 5
+true true true beta|beta| 4 4
+[alpha, apple, banana, fig, kiwifruit, pear] alpha+apple+banana+fig+kiwifruit+pear
+é 6 [104, 233, 108, 108, 111] HÉLLO Bytes[0x68, 0xc3, 0xa9, 0x6c, 0x6c, 0x6f]
+[ab] [97, 98]
+[cd] [99, 100]
+12 2.5 xy true 2
+[a, b, , c] [1, 1, 0, 1] a;b
+first v value 3
+345 345 true true [12345678]
+Bytes[0x61, 0x62, 0x63, 0x64] 4
+012345678901 12 2 1 true

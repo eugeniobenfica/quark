@@ -91,11 +91,7 @@ pub extern effect fn rtPrintBool(v: Int64) as "qk_printBool" {
     if v != 0 { outText("true") } else { outText("false") }
 }
 
-pub extern effect fn rtPrintText(pGiven: Int64, nGiven: Int64) as "qk_printText" {
-    let p = shortBytes(pGiven, nGiven, 0)
-    let n = textLength(nGiven)
-    outWrite(p, n)
-}
+pub extern effect fn rtPrintText(p: Int64, n: Int64) as "qk_printText" = outWrite(p, n)
 
 pub extern effect fn rtPrintSep() as "qk_printSep" = outText(" ")
 
@@ -107,9 +103,7 @@ pub extern effect fn rtPrintTo(stream: Int64) as "qk_printTo" {
     gSet(gOutFd, if stream == 2 { 2 } else { 1 })
 }
 
-pub extern effect fn rtPrintHandle(nameGiven: Int64, nGiven: Int64, v: Int64) as "qk_printHandle" {
-    let name = shortBytes(nameGiven, nGiven, 0)
-    let n = textLength(nGiven)
+pub extern effect fn rtPrintHandle(name: Int64, n: Int64, v: Int64) as "qk_printHandle" {
     outWrite(name, n)
     outText("#")
     rtPrintInt(v)

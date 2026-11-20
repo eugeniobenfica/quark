@@ -170,18 +170,13 @@ const panicTextCut = 10
 const panicByte = 18
 
 // a var self of more slots than this takes it by address
-const selfInRegisters = 4
-
 // A record of more than byRefFrom slots, given to a function that does not change it (self, or any parameter), goes by
 // address: the place it is in when it is in one, else a copy in the caller's area. A var self kept in memory never
 // comes into registers for a loop when it is larger than selfRegistersMost (
 // SELF_REGISTERS_MOST).
 const byRefFrom = 8
-const selfRegistersMost = 16
 
 // inlining's budget
-const inlineBody = 120
-const inlineCostMax = 400
 const inlineBudget = 4000
 
 // ---- what lowering keeps ----
@@ -333,13 +328,10 @@ pub type Lower {
     inl: Int = 0
     inlines: [InlineCall] = []
     externIndex: [Int] = []
-    inlineCost: [Int] = []
-    sizeMemo: [Int] = []
     inlined: Int = 0
     areaAt: Int = -1
     areaSlots: Int = 0
     areaReg: Int = 0
-    selfMemo: [Int] = []
     asValue: [Bool] = []
     selfHome: Int = -1
     helpers: [Helper] = []
@@ -631,11 +623,6 @@ fn Lower.setRets(var self, k: Int, rets: [Int]) {
         self.touch(r)
     }
 }
-
-fn Lower.selfByAddress(var self, d: Int) -> Bool =
-    not self.opts.debug
-        and self.own.changesSelf(d)
-        and self.slots(self.bt(self.pbind(self.dl(d).params[0]))) > selfInRegisters
 
 fn Lower.bigRecord(var self, t: Int) -> Bool {
     if t < 0 or self.tk(t) != Kind.Record {
@@ -4133,133 +4120,6 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
     []
 }
 
-// How big a function's body is, in nodes (C's exprSize: the arguments as written).
-fn Lower.exprSize(self, e: Int) -> Int {
-    if e < 0 {
-        return 0
-    }
-    var n = 1 + self.exprSize(self.aOf(e)) + self.exprSize(self.bOf(e))
-    let x = self.p.ast.exprs[e]
-    match x.node {
-        Lambda(_, body) => {
-            n += self.exprSize(body)
-        }
-        If(_, then, other) => {
-            n += self.exprSize(other) + self.blockSize(then)
-        }
-        BlockExpr(block, _) => {
-            n += self.blockSize(block)
-        }
-        _ => {}
-    }
-    for a in self.writtenArgs(e) {
-        n += self.exprSize(a)
-    }
-    for a in self.armsOf(e) {
-        n += self.exprSize(self.p.ast.arms[a].body)
-    }
-    n
-}
-
-fn Lower.stmtParts(self, s: Int) -> (Int, Int, Int, Int) = match self.p.ast.stmts[s].node {
-    Let(_, _, _, value, _, _) => (value, -1, -1, -1)
-    Assign(target, _, value) => (value, target, -1, -1)
-    ExprStmt(value) => (value, -1, -1, -1)
-    For(_, _, iter, body) => (-1, -1, iter, body)
-    While(cond, body) => (cond, -1, -1, body)
-    Return(value) => (value, -1, -1, -1)
-    Defer(body) => (-1, -1, -1, body)
-    _ => (-1, -1, -1, -1)
-}
-
-fn Lower.blockSize(self, b: Int) -> Int {
-    if b < 0 {
-        return 0
-    }
-    var n = 0
-    for s in self.p.ast.blocks[b].stmts {
-        let (value, target, iter, body) = self.stmtParts(s)
-        n += 1 + self.exprSize(value) + self.exprSize(target) + self.exprSize(iter) + self.blockSize(body)
-    }
-    n
-}
-
-fn Lower.bodySize(var self, d: Int) -> Int {
-    let i = self.dl(d).index
-    if i < 0 {
-        return self.exprSize(self.dl(d).body)
-    }
-    if self.sizeMemo[i] < 0 {
-        let n = self.exprSize(self.dl(d).body)
-        self.sizeMemo[i] = n
-    }
-    self.sizeMemo[i]
-}
-
-fn Lower.exprCost(var self, e: Int) -> Int {
-    if e < 0 {
-        return 0
-    }
-    var n = 1 + self.exprCost(self.aOf(e)) + self.exprCost(self.bOf(e))
-    let x = self.p.ast.exprs[e]
-    match x.node {
-        Lambda(_, body) => {
-            n += self.exprCost(body)
-        }
-        If(_, then, other) => {
-            n += self.exprCost(other) + self.blockCost(then)
-        }
-        BlockExpr(block, _) => {
-            n += self.blockCost(block)
-        }
-        _ => {}
-    }
-    for a in self.writtenArgs(e) {
-        n += self.exprCost(a)
-    }
-    for a in self.armsOf(e) {
-        n += self.exprCost(self.p.ast.arms[a].body)
-    }
-    let d = x.decl
-    if d >= 0
-        and self.dl(d).kind == DeclKind.Fn
-        and not self.isCFunction(d)
-        and self.dl(d).body >= 0
-        and x.node is Call(_, _, _, _, _, _) | Binary(_, _, _) | Unary(_, _) {
-        let c = self.inlineCostOf(d)
-        if self.dl(d).inlineOnly or self.bodySize(d) <= inlineBody and c <= inlineCostMax {
-            n += c
-        }
-    }
-    n
-}
-
-fn Lower.blockCost(var self, b: Int) -> Int {
-    if b < 0 {
-        return 0
-    }
-    var n = 0
-    for s in self.p.ast.blocks[b].stmts {
-        let (value, target, iter, body) = self.stmtParts(s)
-        n += 1 + self.exprCost(value) + self.exprCost(target) + self.exprCost(iter) + self.blockCost(body)
-    }
-    n
-}
-
-fn Lower.inlineCostOf(var self, d: Int) -> Int {
-    let i = self.dl(d).index
-    let c = self.inlineCost[i]
-    if c < 0 {
-        return 1
-    }
-    if c == 0 {
-        self.inlineCost[i] = -1
-        let n = self.exprCost(self.dl(d).body)
-        self.inlineCost[i] = min(n, 1 << 20)
-    }
-    self.inlineCost[i]
-}
-
 // ---- C: its types' layout, values across the boundary, calls both ways ----
 fn Lower.isCStruct(self, t: Int) -> Bool =
     t >= 0 and self.tk(t) == Kind.Record and self.tdecl(t) >= 0 and self.dl(self.tdecl(t)).cStruct
@@ -5115,61 +4975,6 @@ fn Lower.callDecl(var self, d: Int, given: [[Int]], line: Int) -> [Int] {
     r
 }
 
-fn Lower.inlinedSmall(var self, g: Int) -> Bool =
-    self.dl(g).inlineOnly or self.bodySize(g) <= inlineBody and self.inlineCostOf(g) <= inlineCostMax
-
-fn Lower.wantsPlace(var self, g: Int) -> Bool {
-    if not self.selfByAddress(g) {
-        return false
-    }
-    not self.inlinedSmall(g) or self.keepsSelfInMemory(g)
-}
-
-fn Lower.keepsSelfInMemory(var self, d: Int) -> Bool {
-    let i = self.dl(d).index
-    if self.selfMemo[i] == 3 {
-        return true
-    }
-    if self.selfMemo[i] == 0 {
-        self.selfMemo[i] = 3
-        let x = self.dl(d)
-        if x.body >= 0 {
-            let selfBinding = self.pbind(x.params[0])
-            for e in self.own.visitExpr(x.body, []) {
-                if e < 0 {
-                    continue
-                }
-                let b = self.own.selfCallOn(e)
-                if b >= 0 and b == selfBinding and self.wantsPlace(self.p.ast.exprs[e].decl) {
-                    self.selfMemo[i] = 2
-                }
-            }
-        }
-        if self.selfMemo[i] == 3 {
-            self.selfMemo[i] = 1
-        }
-    }
-    self.selfMemo[i] == 2
-}
-
-fn Lower.selfInRegs(var self, d: Int) -> Bool {
-    if not self.selfByAddress(d)
-        or self.keepsSelfInMemory(d)
-        or self.slots(self.bt(self.pbind(self.dl(d).params[0]))) > selfRegistersMost {
-        return false
-    }
-    let body = self.dl(d).body
-    if body < 0 {
-        return false
-    }
-    for e in self.own.visitExpr(body, []) {
-        if e < 0 and self.p.ast.stmts[-1 - e].node is For(_, _, _, _) | While(_, _) {
-            return true
-        }
-    }
-    false
-}
-
 // A read of a var kept in memory (a large var self, by address), or of its fields: read when its value is used, after
 // what is worked out next to it (f(self, self.add(t)): self as the call left it, as a var in registers is).
 fn Lower.addressRead(self, e: Int) -> Bool {
@@ -5366,13 +5171,13 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
         and not inside
         and depth < 8
         and d != self.current
-        and self.bodySize(d) <= inlineBody
+        and self.own.bodySize(d) <= inlineBody
     if small and not dx.inlineOnly {
-        let cost = self.inlineCostOf(d)
+        let cost = self.own.inlineCostOf(d)
         small = cost <= inlineCostMax and self.inlined + cost <= inlineBudget
     }
     if small or dx.inlineOnly and depth < 32 {
-        self.inlined += self.bodySize(d)
+        self.inlined += self.own.bodySize(d)
         var saved: [([Int], Bool, Int, Bool)] = []
         for (i, prm) in dx.params.enumerate() {
             let b = self.pbind(prm)
@@ -5386,7 +5191,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
                 self.atAddress[b] = false
             }
         }
-        let inPlace = changes and selfAt >= 0 and not self.selfInRegs(d)
+        let inPlace = changes and selfAt >= 0 and not self.own.selfInRegs(d)
         if changes and selfAt >= 0 and not inPlace {
             let rv = self.readPlace(selfPlace, self.ty(values[0]))
             args[0] = rv // a loop over its fields: registers
@@ -5455,7 +5260,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
             args[i] = self.refOf(args[i])
         }
     }
-    let byAddress = changes and self.selfByAddress(d)
+    let byAddress = changes and self.own.selfByAddress(d)
     var area = -1
     if byAddress and selfAt < 0 {
         area = self.areaTake(len(args[0]))
@@ -6837,7 +6642,7 @@ fn Lower.emitReturn(var self, given: [Int]) {
     let x = self.dl(d)
     var v = given
     let selfB = if len(x.params) > 0 { self.pbind(x.params[0]) } else { -1 }
-    let extra = if self.own.changesSelf(d) and not self.selfByAddress(d) {
+    let extra = if self.own.changesSelf(d) and not self.own.selfByAddress(d) {
         self.slots(self.bt(selfB))
     } else {
         0
@@ -7494,7 +7299,7 @@ fn Lower.lowerFn(var self, d: Int, index: Int) {
     self.depth = 0
     self.inlined = 0
     self.selfHome = -1
-    let byAddress = self.selfByAddress(d)
+    let byAddress = self.own.selfByAddress(d)
     var params: [Int] = []
     for (i, prm) in x.params.enumerate() {
         let b = self.pbind(prm)
@@ -7506,7 +7311,7 @@ fn Lower.lowerFn(var self, d: Int, index: Int) {
             let r = self.newReg('I')
             self.addrReg[b] = r
             params.push(r)
-            if self.selfInRegs(d) {
+            if self.own.selfInRegs(d) {
                 self.selfHome = r
                 self.atAddress[b] = false
                 let v = self.loadSlots(r, self.bt(b))
@@ -7682,9 +7487,9 @@ pub fn Lowered.lowerFrom(var self, p: Program, opts: LowerOptions) {
     l.addrReg = [-1] * nb
     l.selfInPlace = [false] * nb
     l.fnIndex = [0] * n
-    l.inlineCost = [0] * n
-    l.sizeMemo = [-1] * n
-    l.selfMemo = [0] * n
+    l.own.inlineCost = [0] * n
+    l.own.sizeMemo = [-1] * n
+    l.own.selfMemo = [0] * n
     l.asValue = [false] * n
     l.externIndex = [-1] * n
     l.out.fuel = opts.fuel
@@ -7809,7 +7614,7 @@ fn Lower.markInPlace(var self) {
                 continue
             }
             let b = self.own.selfCallOn(e)
-            if b >= 0 and not self.p.bindings[b].isParam and self.wantsPlace(self.p.ast.exprs[e].decl) {
+            if b >= 0 and not self.p.bindings[b].isParam and self.own.wantsPlace(self.p.ast.exprs[e].decl) {
                 self.selfInPlace[b] = true
             }
             // a function kept as a value (f in xs.map(f), an interface's table): called with slots

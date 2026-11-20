@@ -19,6 +19,9 @@ pub type Ownership {
     ownedResults: [Bool] = [] // by declaration: a function whose result is always all its own (decideResults)
     returns: [[Int]] = [] // by declaration: the values its returns give back (noted by decideAliases' walk)
     walking: Int = -1 // the declaration decideAliases goes through
+    sizeMemo: [Int] = [] // by declaration index: its body's size (bodySize), -1 not known yet
+    inlineCost: [Int] = [] // by declaration index: what putting it in line costs (inlineCostOf), 0 not known yet
+    selfMemo: [Int] = [] // by declaration index: keepsSelfInMemory's answer (0 not known, 3 being worked out)
 }
 
 // ---- the tree, as these questions read it ----
@@ -1374,4 +1377,200 @@ fn Ownership.blockValueOwned(self, b: Int) -> Bool {
         ExprStmt(v) => self.ownedValue(v)
         _ => true
     }
+}
+
+// ---- calls: what is put in line, and a var self by address ----
+// A function's body is put in line where it is called when it is small (bodySize nodes, inlineCostOf with what it puts
+// in line itself); a var self of more slots than selfInRegisters goes by address, and comes into registers for a loop
+// when it is no larger than selfRegistersMost. The lowering asks; the answers depend on the tree alone.
+pub const selfInRegisters = 4
+pub const selfRegistersMost = 16
+pub const inlineBody = 120
+pub const inlineCostMax = 400
+
+pub fn Ownership.selfByAddress(var self, d: Int) -> Bool =
+    not self.debug
+        and self.changesSelf(d)
+        and self.p.slots(self.p.bindings[self.pbind(self.dl(d).params[0])].ty) > selfInRegisters
+
+// How big a function's body is, in nodes (C's exprSize: the arguments as written).
+pub fn Ownership.exprSize(self, e: Int) -> Int {
+    if e < 0 {
+        return 0
+    }
+    var n = 1 + self.exprSize(self.aOf(e)) + self.exprSize(self.bOf(e))
+    let x = self.p.ast.exprs[e]
+    match x.node {
+        Lambda(_, body) => {
+            n += self.exprSize(body)
+        }
+        If(_, then, other) => {
+            n += self.exprSize(other) + self.blockSize(then)
+        }
+        BlockExpr(block, _) => {
+            n += self.blockSize(block)
+        }
+        _ => {}
+    }
+    for a in self.writtenArgs(e) {
+        n += self.exprSize(a)
+    }
+    for a in self.armsOf(e) {
+        n += self.exprSize(self.p.ast.arms[a].body)
+    }
+    n
+}
+
+pub fn Ownership.stmtParts(self, s: Int) -> (Int, Int, Int, Int) = match self.p.ast.stmts[s].node {
+    Let(_, _, _, value, _, _) => (value, -1, -1, -1)
+    Assign(target, _, value) => (value, target, -1, -1)
+    ExprStmt(value) => (value, -1, -1, -1)
+    For(_, _, iter, body) => (-1, -1, iter, body)
+    While(cond, body) => (cond, -1, -1, body)
+    Return(value) => (value, -1, -1, -1)
+    Defer(body) => (-1, -1, -1, body)
+    _ => (-1, -1, -1, -1)
+}
+
+pub fn Ownership.blockSize(self, b: Int) -> Int {
+    if b < 0 {
+        return 0
+    }
+    var n = 0
+    for s in self.p.ast.blocks[b].stmts {
+        let (value, target, iter, body) = self.stmtParts(s)
+        n += 1 + self.exprSize(value) + self.exprSize(target) + self.exprSize(iter) + self.blockSize(body)
+    }
+    n
+}
+
+pub fn Ownership.bodySize(var self, d: Int) -> Int {
+    let i = self.dl(d).index
+    if i < 0 {
+        return self.exprSize(self.dl(d).body)
+    }
+    if self.sizeMemo[i] < 0 {
+        let n = self.exprSize(self.dl(d).body)
+        self.sizeMemo[i] = n
+    }
+    self.sizeMemo[i]
+}
+
+pub fn Ownership.exprCost(var self, e: Int) -> Int {
+    if e < 0 {
+        return 0
+    }
+    var n = 1 + self.exprCost(self.aOf(e)) + self.exprCost(self.bOf(e))
+    let x = self.p.ast.exprs[e]
+    match x.node {
+        Lambda(_, body) => {
+            n += self.exprCost(body)
+        }
+        If(_, then, other) => {
+            n += self.exprCost(other) + self.blockCost(then)
+        }
+        BlockExpr(block, _) => {
+            n += self.blockCost(block)
+        }
+        _ => {}
+    }
+    for a in self.writtenArgs(e) {
+        n += self.exprCost(a)
+    }
+    for a in self.armsOf(e) {
+        n += self.exprCost(self.p.ast.arms[a].body)
+    }
+    let d = x.decl
+    if d >= 0
+        and self.dl(d).kind == DeclKind.Fn
+        and not (self.dl(d).isExtern and self.dl(d).body < 0)
+        and self.dl(d).body >= 0
+        and x.node is Call(_, _, _, _, _, _) | Binary(_, _, _) | Unary(_, _) {
+        let c = self.inlineCostOf(d)
+        if self.dl(d).inlineOnly or self.bodySize(d) <= inlineBody and c <= inlineCostMax {
+            n += c
+        }
+    }
+    n
+}
+
+pub fn Ownership.blockCost(var self, b: Int) -> Int {
+    if b < 0 {
+        return 0
+    }
+    var n = 0
+    for s in self.p.ast.blocks[b].stmts {
+        let (value, target, iter, body) = self.stmtParts(s)
+        n += 1 + self.exprCost(value) + self.exprCost(target) + self.exprCost(iter) + self.blockCost(body)
+    }
+    n
+}
+
+pub fn Ownership.inlineCostOf(var self, d: Int) -> Int {
+    let i = self.dl(d).index
+    let c = self.inlineCost[i]
+    if c < 0 {
+        return 1
+    }
+    if c == 0 {
+        self.inlineCost[i] = -1
+        let n = self.exprCost(self.dl(d).body)
+        self.inlineCost[i] = min(n, 1 << 20)
+    }
+    self.inlineCost[i]
+}
+
+pub fn Ownership.inlinedSmall(var self, g: Int) -> Bool =
+    self.dl(g).inlineOnly or self.bodySize(g) <= inlineBody and self.inlineCostOf(g) <= inlineCostMax
+
+pub fn Ownership.wantsPlace(var self, g: Int) -> Bool {
+    if not self.selfByAddress(g) {
+        return false
+    }
+    not self.inlinedSmall(g) or self.keepsSelfInMemory(g)
+}
+
+pub fn Ownership.keepsSelfInMemory(var self, d: Int) -> Bool {
+    let i = self.dl(d).index
+    if self.selfMemo[i] == 3 {
+        return true
+    }
+    if self.selfMemo[i] == 0 {
+        self.selfMemo[i] = 3
+        let x = self.dl(d)
+        if x.body >= 0 {
+            let selfBinding = self.pbind(x.params[0])
+            for e in self.visitExpr(x.body, []) {
+                if e < 0 {
+                    continue
+                }
+                let b = self.selfCallOn(e)
+                if b >= 0 and b == selfBinding and self.wantsPlace(self.p.ast.exprs[e].decl) {
+                    self.selfMemo[i] = 2
+                }
+            }
+        }
+        if self.selfMemo[i] == 3 {
+            self.selfMemo[i] = 1
+        }
+    }
+    self.selfMemo[i] == 2
+}
+
+pub fn Ownership.selfInRegs(var self, d: Int) -> Bool {
+    if not self.selfByAddress(d)
+        or self.keepsSelfInMemory(d)
+        or self.p.slots(self.p.bindings[self.pbind(self.dl(d).params[0])].ty) > selfRegistersMost {
+        return false
+    }
+    let body = self.dl(d).body
+    if body < 0 {
+        return false
+    }
+    for e in self.visitExpr(body, []) {
+        if e < 0 and self.p.ast.stmts[-1 - e].node is For(_, _, _, _) | While(_, _) {
+            return true
+        }
+    }
+    false
 }

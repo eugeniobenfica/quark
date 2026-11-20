@@ -3850,7 +3850,9 @@ fn Checker.instantiate(var self, d: Int, bound: [Int], lambdas: [Int], takesFn: 
 
 // A call to a template: its types from the values given, its lambdas checked where they are written; then the
 // instance for those types (made once), or for those lambdas (made for this call, and always inlined).
-fn Checker.checkTemplateCall(var self, e: Int, d: Int) -> Int {
+// hint: the written type the call's value goes into (let c: Channel<Int> = channel()), -1 none: it tells the types
+// the values do not
+fn Checker.checkTemplateCall(var self, e: Int, d: Int, hint: Int) -> Int {
     if self.p.ast.decls[d].state == 0 {
         // checked loosely first: which of its functions it keeps
         self.enter(Ctx())
@@ -4020,9 +4022,15 @@ fn Checker.checkTemplateCall(var self, e: Int, d: Int) -> Int {
     if loose {
         return tyError
     }
+    if hint >= 0 and bound.contains(-1) and self.p.ast.decls[d].ret >= 0 {
+        bound = self.unify(d, self.p.ast.decls[d].ret, hint, bound)
+    }
     for (i, t) in bound.enumerate() {
         if t < 0 {
-            self.sayAt(e, "{dname}: what {typeParams[i]} is cannot be told from the values given")
+            self.sayAt(
+                e,
+                "{dname}: what {typeParams[i]} is cannot be told from the values given: write the type where the value goes, let x: Type = {dname}(...)",
+            )
             return tyError
         }
     }
@@ -4826,7 +4834,7 @@ fn Checker.checkCall(var self, e: Int) -> Int {
     if d >= 0 {
         let x = self.p.ast.decls[d]
         if x.kind == DeclKind.Fn and x.isTemplate and (ownFn or self.lookup(name) < 0) {
-            return self.checkTemplateCall(e, d)
+            return self.checkTemplateCall(e, d, hint)
         }
         if x.kind == DeclKind.Fn and x.isTest {
             self.sayAt(e, "a test is run by quark test, not called")
@@ -6690,7 +6698,7 @@ fn Checker.checkBinary(var self, e: Int) -> Int {
             let call = self.newExpr(.Call(self.declName(d), "", [left, right], ["", ""], false, false), line, col)
             self.p.ast.exprs[left].typed = true
             self.p.ast.exprs[right].typed = true
-            let r = self.checkTemplateCall(call, d)
+            let r = self.checkTemplateCall(call, d, -1)
             if self.isErr(r) {
                 return r
             }

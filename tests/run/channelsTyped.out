@@ -1,0 +1,13 @@
+true
+score 2.5
+work 7 seven [x]
+done
+Some(1.25)
+4244450
+11 10
+Some([1, 2]) Some([3]) 2
+Some(42)
+9.0
+Some(()) None
+Some(None) Some(Some(5))
+Some(Err(bad))

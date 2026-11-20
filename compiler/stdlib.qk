@@ -127,19 +127,20 @@ pub effect fn go(f: effect () -> Unit) = runtime("tasks", "go", f)
 // every background task, run until all are done
 pub effect fn runTasks() = runtimeLine("tasks", "runTasks")
 
-// texts from task to task, in the order they were sent
-pub type Channel { id: Int }
+// values from task to task, in the order they were sent: each a copy of its own (it goes from one task's memory
+// to another's). Its T is told where it goes: let results: Channel<Int> = channel()
+pub type Channel<T> { id: Int }
 
-pub effect fn channel() -> Channel = runtime("tasks", "channel")
+pub effect fn channel<T>() -> Channel<T> = runtime("tasks", "channel")
 
-// the text at the end of the channel's queue (it never waits)
-pub effect fn send(channel: Channel, text: Text) = runtimeLine("tasks", "send", channel, text)
+// the value at the end of the channel's queue (it never waits)
+pub effect fn send<T>(channel: Channel<T>, value: T) = runtimeLine("tasks", "send", channel, value)
 
-// the first text sent and not yet received (it waits for one); None once the channel is closed and empty
-pub effect fn receive(channel: Channel) -> Text? = runtimeLine("tasks", "receive", channel)
+// the first value sent and not yet received (it waits for one); None once the channel is closed and empty
+pub effect fn receive<T>(channel: Channel<T>) -> T? = runtimeLine("tasks", "receive", channel)
 
-// no more texts go in: receive gives those left, then None
-pub effect fn closeChannel(channel: Channel) = runtimeLine("tasks", "closeChannel", channel)
+// no more values go in: receive gives those left, then None
+pub effect fn closeChannel<T>(channel: Channel<T>) = runtimeLine("tasks", "closeChannel", channel)
 
 // ---- the clock, and chance ----
 // seconds, for timing: only differences mean something
@@ -3873,7 +3874,11 @@ pub const gBackgroundCap = 26
 pub const gChannels = 27 // channel()'s queues, by number
 pub const gChannelCount = 28
 pub const gChannelCap = 29
-pub const gWords = 30
+pub const gChannelArena = 30 // where the values in the channels' queues are, apart from any task's memory (or 0)
+pub const gChannelQueued = 31 // values in all the queues: none, and the arena is emptied
+pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
+pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
+pub const gWords = 34
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -7001,7 +7006,8 @@ const cDataLen = 23
 const cToData = 24 // ... and this program's, where the copy's description goes
 const cSides = 25 // for each young range (as cYoung is sorted), its side table or 0 (movedSlot)
 const cLastRange = 26 // the young range youngAt found last (the next address is most often in it too), or 0
-const copierWords = 27
+const cFresh = 27 // the copies made as the arena's own allocations (copierFresh)
+const copierWords = 28
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -7304,6 +7310,10 @@ fn survive(c: Int, bytes0: Int) -> Int {
     if bytes == 0 {
         bytes = 16
     }
+    if word(c, cFresh) != 0 {
+        setWord(c, cTotal, word(c, cTotal) + bytes)
+        return alloc(bytes, 1)
+    }
     if bytes >= largeFrom {
         // a large block of its own, made now: the next collection keeps it in place
         setWord(c, cMade, word(c, cMade) + bytes)
@@ -7431,7 +7441,14 @@ fn movedSlot(c: Int, from: Int, n: Int, kind: Int) -> Slot {
         return s
     }
     if word(c, cMovedCount) * 2 >= word(c, cMovedCap) {
-        let cap = if word(c, cMovedCap) != 0 { word(c, cMovedCap) * 2 } else { 1024 }
+        // a channel's copier (one value at a time) starts small: forgetting clears all of it
+        let cap = if word(c, cMovedCap) != 0 {
+            word(c, cMovedCap) * 2
+        } else if word(c, cFresh) != 0 {
+            16
+        } else {
+            1024
+        }
         let grown = calloc(cap, 32)
         let old = word(c, cMoved)
         for i in 0..word(c, cMovedCap) {
@@ -7870,6 +7887,38 @@ pub fn copierDone(c: Int) {
     let to = word(c, cA)
     setWord(to, aAllocated, word(to, aAllocated) + word(c, cMade))
     freeCopier(c)
+}
+
+// A copier of values, with all they point to, into the arena the running code allocates in, made as its own
+// allocations are (in its blocks, after its marks: young to its loops): a value received from another task's
+// memory. c: one used before (copierFreshDone), kept for what it worked out about the types; 0, a new one. Then
+// copyValue for each value, and copierFreshDone.
+pub fn copierFresh(c0: Int) -> Int {
+    let a = arena()
+    setWord(a, aClock, word(a, aClock) + 1)
+    if c0 != 0 {
+        setWord(c0, cA, a)
+        setWord(c0, cTime, word(a, aClock))
+        return c0
+    }
+    let c = copierNew(a, word(a, aClock))
+    setWord(c, cAll, 1)
+    setWord(c, cFresh, 1)
+    c
+}
+
+// what was copied forgotten (the next copies share nothing with these): the copier ready for copierFresh again
+pub fn copierFreshDone(c: Int) {
+    if word(c, cMovedCap) > 64 {
+        // grown by a large value: small again for the next ones
+        free(word(c, cMoved))
+        setWord(c, cMoved, 0)
+        setWord(c, cMovedCap, 0)
+        setWord(c, cMovedCount, 0)
+    }
+    copierForget(c)
+    setWord(c, cRoomCount, 0)
+    setWord(c, cTotal, 0)
 }
 
 // a task's own copy of what its function captured (env: [description][slots]), in the task's arena
@@ -10315,12 +10364,71 @@ pub fn waitSocket(fd: Int, write: Bool) {
     setWord(ctxGet(ctxTask), tWaitFd, 0)
 }
 
-// a channel: [closed][count][capacity][head][items: (malloc'd bytes, length) each]
+// A channel: [closed][count][capacity][head][slots][description][items: a value's slots each]. The values in the
+// queues are copies, in an arena of the channels' own (gChannelArena): they go from one task's memory to another's.
+// It is emptied when every queue is, and made again from what they hold when it grows to twice what that was.
 const chClosed = 0
 const chCount = 1
 const chCap = 2
 const chHead = 3
-const chItems = 4
+const chSlots = 4 // the values' slots
+const chDesc = 5 // an array of their type's description (lower.qk's Desc), 0 when they hold no memory
+const chItems = 6
+const channelArenaLeast = 1048576 // made again only past this
+
+// the place of the queue's i-th value (from its head)
+fn channelItem(c: Int, i: Int) -> Int =
+    c + 8 * (chItems + word(c, chSlots) * ((word(c, chHead) + i) % word(c, chCap)))
+
+// the channels' arena a made the one the running code allocates in: the one it was, to put back
+fn inChannelArena(a: Int) -> Int {
+    let was = ctxGet(ctxArena)
+    setWord(ctx(), ctxArena, a)
+    was
+}
+
+// the channels' copier, into the arena the running code allocates in
+fn channelCopier() -> Int {
+    let c = copierFresh(gGet(gChannelCopier))
+    gSet(gChannelCopier, c)
+    c
+}
+
+// the value of slots at the place, its memory copied into the channels' arena (as it is now)
+fn channelKeep(slotsAt: Int, desc: Int) {
+    var a = gGet(gChannelArena)
+    if a == 0 {
+        a = arenaNew()
+        gSet(gChannelArena, a)
+    }
+    let was = inChannelArena(a)
+    let c = channelCopier()
+    copyValue(c, slotsAt, desc)
+    copierFreshDone(c)
+    setWord(ctx(), ctxArena, was)
+}
+
+// the channels' arena made again from the values queued (what was received goes)
+fn channelArenaRemade() {
+    let old = gGet(gChannelArena)
+    let a = arenaNew()
+    let was = inChannelArena(a)
+    let c = channelCopier()
+    let chans = gGet(gChannels)
+    for n in 0..gGet(gChannelCount) {
+        let ch = word(chans, n)
+        if word(ch, chDesc) != 0 {
+            for i in 0..word(ch, chCount) {
+                copyValue(c, channelItem(ch, i), word(ch, chDesc))
+            }
+        }
+    }
+    copierFreshDone(c)
+    setWord(ctx(), ctxArena, was)
+    arenaFree(old)
+    gSet(gChannelArena, a)
+    gSet(gChannelKept, word(a, aAllocated))
+}
 
 fn channelAt(n: Int, line: Int) -> Int {
     if n < 0 or n >= gGet(gChannelCount) {
@@ -10469,8 +10577,9 @@ pub extern effect fn rtRunTasks(line: Int64) as "qk_runTasks" {
     while backgroundRound(line) {}
 }
 
-// channel(): a new channel of texts, its number
-pub extern effect fn rtChannel() -> Int64 as "qk_channel" {
+// channel(): a new channel of values of slots slots each (desc: an array of their type's description, 0 when they
+// hold no memory), its number
+pub extern effect fn rtChannel(desc: Int64, slots: Int64) -> Int64 as "qk_channel" {
     let g = globals()
     if word(g, gChannelCount) == word(g, gChannelCap) {
         let cap = if word(g, gChannelCap) != 0 { word(g, gChannelCap) * 2 } else { 8 }
@@ -10478,42 +10587,50 @@ pub extern effect fn rtChannel() -> Int64 as "qk_channel" {
         setWord(g, gChannelCap, cap)
     }
     let c = calloc(chItems, 8)
+    setWord(c, chSlots, slots)
+    setWord(c, chDesc, desc)
     let n = word(g, gChannelCount)
     setWord(word(g, gChannels), n, c)
     setWord(g, gChannelCount, n + 1)
     n
 }
 
-// send(channel, text): the text at the end of its queue (a copy of its own: it goes from one task to another)
-pub extern effect fn rtSend(n: Int64, p: Int64, len: Int64, line: Int64) as "qk_send" {
+// send(channel, value): the value (its slots at p) at the end of the queue, a copy of its own
+pub extern effect fn rtSend(n: Int64, p: Int64, line: Int64) as "qk_send" {
     var c = channelAt(n, line)
     if word(c, chClosed) != 0 {
         panicNow(panicClosedChannel, line, n, 0)
     }
+    let slots = word(c, chSlots)
     if word(c, chCount) == word(c, chCap) {
-        // grown, its items from the head on put back at the start
+        // grown, its values from the head on put back at the start
         let cap = if word(c, chCap) != 0 { word(c, chCap) * 2 } else { 8 }
-        let grown = calloc(chItems + 2 * cap, 8)
+        let grown = calloc(chItems + slots * cap, 8)
+        copyBytes(grown, c, 8 * chItems)
         for i in 0..word(c, chCount) {
-            let from = c + 8 * (chItems + 2 * ((word(c, chHead) + i) % word(c, chCap)))
-            copyBytes(grown + 8 * (chItems + 2 * i), from, 16)
+            copyBytes(grown + 8 * (chItems + slots * i), channelItem(c, i), 8 * slots)
         }
-        setWord(grown, chCount, word(c, chCount))
+        setWord(grown, chHead, 0)
         setWord(grown, chCap, cap)
         free(c)
         setWord(gGet(gChannels), n, grown)
         c = grown
     }
-    let copy = malloc(if len > 0 { len } else { 1 })
-    copyBytes(copy, p, len)
-    let at = c + 8 * (chItems + 2 * ((word(c, chHead) + word(c, chCount)) % word(c, chCap)))
-    setWord(at, 0, copy)
-    setWord(at, 1, len)
+    let at = channelItem(c, word(c, chCount))
+    copyBytes(at, p, 8 * slots)
     setWord(c, chCount, word(c, chCount) + 1)
+    gSet(gChannelQueued, gGet(gChannelQueued) + 1)
+    if word(c, chDesc) != 0 {
+        channelKeep(at, word(c, chDesc))
+        let made = word(gGet(gChannelArena), aAllocated)
+        if made > channelArenaLeast and made > 2 * gGet(gChannelKept) {
+            channelArenaRemade()
+        }
+    }
 }
 
-// receive(channel) -> Text?: the first text sent and not yet received; None once it is closed and empty. Waits:
-// in a task, its turn back until a text comes; outside one, the background tasks run until one does.
+// receive(channel) -> T?: the first value sent and not yet received; None once it is closed and empty. Waits: in a
+// task, its turn back until a value comes; outside one, the background tasks run until one does.
 pub extern effect fn rtReceive(n: Int64, line: Int64) -> Int64 as "qk_receive" {
     let _ = channelAt(n, line)
     while not channelReady(n) {
@@ -10527,21 +10644,31 @@ pub extern effect fn rtReceive(n: Int64, line: Int64) -> Int64 as "qk_receive" {
         }
     }
     let c = word(gGet(gChannels), n)
+    let slots = word(c, chSlots)
+    let p = alloc(1 + slots, 8) // the optional: [Some or None][the value's slots]
     if word(c, chCount) == 0 {
-        return optional(false, 0, 0) // closed, and every text received
+        return p // closed, and every value received
     }
-    let at = c + 8 * (chItems + 2 * word(c, chHead))
-    let copy = word(at, 0)
-    let len = word(at, 1)
+    setWord(p, 0, 1)
+    copyBytes(p + 8, channelItem(c, 0), 8 * slots)
     setWord(c, chHead, (word(c, chHead) + 1) % word(c, chCap))
     setWord(c, chCount, word(c, chCount) - 1)
-    let p = allocRaw(len + 1, 1)
-    copyBytes(p, copy, len)
-    free(copy)
-    optional(true, p, len)
+    if word(c, chDesc) != 0 {
+        let k = channelCopier() // into this task's memory
+        copyValue(k, p + 8, word(c, chDesc))
+        copierFreshDone(k)
+    }
+    gSet(gChannelQueued, gGet(gChannelQueued) - 1)
+    if gGet(gChannelQueued) == 0 and gGet(gChannelArena) != 0 {
+        let was = inChannelArena(gGet(gChannelArena))
+        arenaReset()
+        setWord(ctx(), ctxArena, was)
+        gSet(gChannelKept, 0)
+    }
+    p
 }
 
-// closeChannel(channel): no more texts go in; receive gives those left, then None
+// closeChannel(channel): no more values go in; receive gives those left, then None
 pub extern effect fn rtCloseChannel(n: Int64, line: Int64) as "qk_closeChannel" {
     setWord(channelAt(n, line), chClosed, 1)
 }

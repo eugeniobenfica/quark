@@ -98,7 +98,8 @@ const cDataLen = 23
 const cToData = 24 // ... and this program's, where the copy's description goes
 const cSides = 25 // for each young range (as cYoung is sorted), its side table or 0 (movedSlot)
 const cLastRange = 26 // the young range youngAt found last (the next address is most often in it too), or 0
-const copierWords = 27
+const cFresh = 27 // the copies made as the arena's own allocations (copierFresh)
+const copierWords = 28
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -401,6 +402,10 @@ fn survive(c: Int, bytes0: Int) -> Int {
     if bytes == 0 {
         bytes = 16
     }
+    if word(c, cFresh) != 0 {
+        setWord(c, cTotal, word(c, cTotal) + bytes)
+        return alloc(bytes, 1)
+    }
     if bytes >= largeFrom {
         // a large block of its own, made now: the next collection keeps it in place
         setWord(c, cMade, word(c, cMade) + bytes)
@@ -528,7 +533,14 @@ fn movedSlot(c: Int, from: Int, n: Int, kind: Int) -> Slot {
         return s
     }
     if word(c, cMovedCount) * 2 >= word(c, cMovedCap) {
-        let cap = if word(c, cMovedCap) != 0 { word(c, cMovedCap) * 2 } else { 1024 }
+        // a channel's copier (one value at a time) starts small: forgetting clears all of it
+        let cap = if word(c, cMovedCap) != 0 {
+            word(c, cMovedCap) * 2
+        } else if word(c, cFresh) != 0 {
+            16
+        } else {
+            1024
+        }
         let grown = calloc(cap, 32)
         let old = word(c, cMoved)
         for i in 0..word(c, cMovedCap) {
@@ -967,6 +979,38 @@ pub fn copierDone(c: Int) {
     let to = word(c, cA)
     setWord(to, aAllocated, word(to, aAllocated) + word(c, cMade))
     freeCopier(c)
+}
+
+// A copier of values, with all they point to, into the arena the running code allocates in, made as its own
+// allocations are (in its blocks, after its marks: young to its loops): a value received from another task's
+// memory. c: one used before (copierFreshDone), kept for what it worked out about the types; 0, a new one. Then
+// copyValue for each value, and copierFreshDone.
+pub fn copierFresh(c0: Int) -> Int {
+    let a = arena()
+    setWord(a, aClock, word(a, aClock) + 1)
+    if c0 != 0 {
+        setWord(c0, cA, a)
+        setWord(c0, cTime, word(a, aClock))
+        return c0
+    }
+    let c = copierNew(a, word(a, aClock))
+    setWord(c, cAll, 1)
+    setWord(c, cFresh, 1)
+    c
+}
+
+// what was copied forgotten (the next copies share nothing with these): the copier ready for copierFresh again
+pub fn copierFreshDone(c: Int) {
+    if word(c, cMovedCap) > 64 {
+        // grown by a large value: small again for the next ones
+        free(word(c, cMoved))
+        setWord(c, cMoved, 0)
+        setWord(c, cMovedCap, 0)
+        setWord(c, cMovedCount, 0)
+    }
+    copierForget(c)
+    setWord(c, cRoomCount, 0)
+    setWord(c, cTotal, 0)
 }
 
 // a task's own copy of what its function captured (env: [description][slots]), in the task's arena

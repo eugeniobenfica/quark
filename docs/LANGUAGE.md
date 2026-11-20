@@ -1168,25 +1168,32 @@ arena of its own (see [Memory](#memory)), so tasks that are alive keep no one's 
 ### Tasks in the background, and channels
 
 `go(f)` makes a task of `f` that is no one's to step: the background runs it. `runTasks()` runs every background
-task until all are done (those they `go` too), and a `receive` outside a task runs them until a text comes. What
+task until all are done (those they `go` too), and a `receive` outside a task runs them until a value comes. What
 a task waits for gives its turn back: `sleep`, a `receive` on an empty channel, and a socket's read, write or
 accept that would wait. When every task waits, the program waits on the system (the sockets' readiness, the
 soonest sleep's end), so a thousand idle connections cost no processor time.
 
-A `Channel` carries texts from task to task, in the order they were sent (each is copied: a task's memory is its
-own). `send` never waits; `receive` waits for a text, and gives `None` once the channel is closed and every text in
+A `Channel<T>` carries values of `T` from task to task, in the order they were sent: numbers, texts, records,
+enums, arrays, maps, functions, other channels. Each is copied, with all it holds: a task's memory is its own.
+`send` never waits; `receive` waits for a value, and gives `None` once the channel is closed and every value in
 it received. A receive that could never get one (every task waits on a channel, and none is left to send) stops
-the program: a deadlock.
+the program: a deadlock. `channel()` takes no values, so its `T` is written where it goes.
 
 ```quark
-let results = channel()
+type Done { worker: Int, steps: [Text] }
+
+let results: Channel<Done> = channel()
 for id in 0..4 {
-    go(() => send(results, "worker {id} done"))
+    go(() => send(results, Done(id, ["read", "sum"])))
 }
 for _ in 0..4 {
-    print(receive(results) ?? "?") // runs the workers until one sends
+    let done = receive(results)? // runs the workers until one sends
+    print("worker {done.worker}: {done.steps}")
 }
 ```
+
+A channel's values wait in memory of the channels' own until they are received: emptied when every channel is,
+and made again from what is waiting when it has grown to twice that.
 
 A server runs each connection in a task of its own (`std.net`, `std.http`): each waits only on its own socket,
 and the others go on meanwhile.
@@ -1205,8 +1212,7 @@ go(() => {
 runTasks()
 ```
 
-Texts are what channels carry: a value of another type goes as its text (`toJson`, `"{n}"`). A panic in a
-background task stops the program with its message. Everything runs on one thread: `parallelMap` and
+A panic in a background task stops the program with its message. Everything runs on one thread: `parallelMap` and
 `parallelFold` are for the processor's other cores.
 
 ## Threads: parallelMap and parallelFold
@@ -1340,7 +1346,7 @@ when it ends.
 | Tuples | `(a, b)`, `t.0`, `let (q, r) = divmod(7, 2)`, as a map's key |
 | Random | `random()` (a Float in [0, 1)), `randomInt(lo, hi)` (hi not included), `seedRandom(n)`: effects, group `random` |
 | Tasks | `spawn(f)`, `step(task)`, `joinTask(task)`, `yield()`, `sleep(seconds)`: effects, group `tasks` |
-| Background, channels | `go(f)` (f as a task the background runs), `runTasks()` (every such task, to its end), `channel()` (→ `Channel`), `send(ch, text)`, `receive(ch)` (→ `Text?`: `None` once closed and empty), `closeChannel(ch)`: effects, group `tasks` ([below](#tasks-in-the-background-and-channels)) |
+| Background, channels | `go(f)` (f as a task the background runs), `runTasks()` (every such task, to its end), `channel()` (→ `Channel<T>`, its `T` written where it goes), `send(ch, value)`, `receive(ch)` (→ `T?`: `None` once closed and empty), `closeChannel(ch)`: effects, group `tasks` ([below](#tasks-in-the-background-and-channels)) |
 | Files a part at a time | `openFile(path, mode)` (→ `File!`; `"r"`, `"w"`, `"a"`, `"r+"`, `"w+"`, bytes as they are), `readChunk(file, most)` (→ `Bytes!`: none at the end), `writeChunk(file, bytes)` (→ `Unit!`), `seekFile(file, at, from)` (→ `Int!`, the place now; `from` 0 the start (left out), 1 where it is, 2 the end), `closeFile(file)`: effects, group `files` |
 | Sockets (TCP) | `listen(host, port)` (→ `Socket!`; host `"0.0.0.0"` every address), `accept(listener)` (→ `Socket!`), `connect(host, port)` (→ `Socket!`), `readSocket(socket, most)` (→ `Bytes!`: none when the other end closed it), `writeSocket(socket, bytes)` (→ `Unit!`, every byte), `closeSocket(socket)`: effects, group `net`; a read, write or accept waits only the task that makes it |
 | Local time | `localOffset(seconds)` (→ `Int`: the system's time zone's offset from UTC at that moment, in seconds east), group `clock` |

@@ -1,0 +1,108 @@
+// Channels of any type: records, tuples with arrays, enums, Floats, functions, maps, channels, interfaces, Unit,
+// optionals and results; each value a copy of its own. Many values queued and received: the channels' memory made
+// again from what is queued, and emptied when every queue is.
+type Job { id: Int, name: Text, tags: [Text] }
+enum Msg { Work(job: Job), Score(value: Float), Done }
+
+fn workers() {
+    let jobs: Channel<Job> = channel()
+    let results: Channel<(Int, [Int])> = channel()
+    for w in 0..3 {
+        go(() => {
+            while receive(jobs) is Some(j) {
+                var xs: [Int] = []
+                for t in j.tags {
+                    xs.push(len(t) * w)
+                }
+                send(results, (j.id, xs))
+            }
+        })
+    }
+    for i in 0..10 {
+        send(jobs, Job(i, "job {i}", ["a" * i, "bb", "{i}"]))
+    }
+    closeChannel(jobs)
+    var total = 0
+    for _ in 0..10 {
+        let (id, xs) = receive(results) ?? (-1, [])
+        total += id + xs.sum()
+    }
+    print(total >= 45)
+    let msgs: Channel<Msg> = channel()
+    send(msgs, .Score(2.5))
+    send(msgs, .Work(Job(7, "seven", ["x"])))
+    send(msgs, .Done)
+    closeChannel(msgs)
+    while receive(msgs) is Some(m) {
+        match m {
+            Work(j) => print("work {j.id} {j.name} {j.tags}")
+            Score(f) => print("score {f}")
+            Done => print("done")
+        }
+    }
+    let floats: Channel<Float> = channel()
+    send(floats, 1.25)
+    print(receive(floats))
+    // many values, received at once, then more: the channels' memory made again and emptied
+    let texts: Channel<Text> = channel()
+    var made = 0
+    for round in 0..5 {
+        for i in 0..20000 {
+            send(texts, "a fairly long text, number {i} of round {round}")
+        }
+        for _ in 0..19990 {
+            made += len(receive(texts) ?? "")
+        }
+    }
+    for _ in 0..50 {
+        made += len(receive(texts) ?? "")
+    }
+    print(made)
+}
+
+interface Shape { fn area() -> Float }
+type Square { side: Float }
+
+fn Square.area(self) -> Float = self.side * self.side
+
+fn kinds() {
+    let fs: Channel<(Int) -> Int> = channel()
+    let k = 10
+    send(fs, x => x + k)
+    send(fs, x => x * 2)
+    let f = receive(fs) ?? (x => x)
+    let g = receive(fs) ?? (x => x)
+    print(f(1), g(5))
+    let maps: Channel<[Text: [Int]]> = channel()
+    send(maps, ["a": [1, 2], "b": [3]])
+    let m = receive(maps) ?? [:]
+    print(m["a"], m["b"], len(m))
+    let replies: Channel<Channel<Int>> = channel()
+    let inner: Channel<Int> = channel()
+    send(replies, inner)
+    go(() => {
+        if receive(replies) is Some(r) {
+            send(r, 42)
+        }
+    })
+    print(receive(inner))
+    let shapes: Channel<Shape> = channel()
+    send(shapes, Square(3.0))
+    print((receive(shapes) ?? Square(0.0)).area())
+    let units: Channel<Unit> = channel()
+    send(units, ())
+    closeChannel(units)
+    print(receive(units), receive(units))
+    let opts: Channel<Int?> = channel()
+    send(opts, None)
+    send(opts, Some(5))
+    print(receive(opts), receive(opts))
+    let res: Channel<Int!> = channel()
+    send(res, Err("bad"))
+    print(receive(res))
+}
+
+fn main() {
+    workers()
+    kinds()
+}

@@ -121,19 +121,20 @@ pub effect fn go(f: effect () -> Unit) = runtime("tasks", "go", f)
 // every background task, run until all are done
 pub effect fn runTasks() = runtimeLine("tasks", "runTasks")
 
-// texts from task to task, in the order they were sent
-pub type Channel { id: Int }
+// values from task to task, in the order they were sent: each a copy of its own (it goes from one task's memory
+// to another's). Its T is told where it goes: let results: Channel<Int> = channel()
+pub type Channel<T> { id: Int }
 
-pub effect fn channel() -> Channel = runtime("tasks", "channel")
+pub effect fn channel<T>() -> Channel<T> = runtime("tasks", "channel")
 
-// the text at the end of the channel's queue (it never waits)
-pub effect fn send(channel: Channel, text: Text) = runtimeLine("tasks", "send", channel, text)
+// the value at the end of the channel's queue (it never waits)
+pub effect fn send<T>(channel: Channel<T>, value: T) = runtimeLine("tasks", "send", channel, value)
 
-// the first text sent and not yet received (it waits for one); None once the channel is closed and empty
-pub effect fn receive(channel: Channel) -> Text? = runtimeLine("tasks", "receive", channel)
+// the first value sent and not yet received (it waits for one); None once the channel is closed and empty
+pub effect fn receive<T>(channel: Channel<T>) -> T? = runtimeLine("tasks", "receive", channel)
 
-// no more texts go in: receive gives those left, then None
-pub effect fn closeChannel(channel: Channel) = runtimeLine("tasks", "closeChannel", channel)
+// no more values go in: receive gives those left, then None
+pub effect fn closeChannel<T>(channel: Channel<T>) = runtimeLine("tasks", "closeChannel", channel)
 
 // ---- the clock, and chance ----
 // seconds, for timing: only differences mean something

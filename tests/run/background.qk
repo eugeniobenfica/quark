@@ -1,6 +1,6 @@
 // Tasks in the background (go, runTasks) and channels: workers that send what they make, a receive that runs the
-// tasks until a text comes, sleeps that let the others go on, a channel closed when its last text is sent.
-fn worker(id: Int, results: Channel) {
+// tasks until a value comes, sleeps that let the others go on, a channel closed when its last text is sent.
+fn worker(id: Int, results: Channel<Text>) {
     for k in 0..3 {
         send(results, "{id}:{k}")
         yield()
@@ -8,7 +8,7 @@ fn worker(id: Int, results: Channel) {
 }
 
 fn main() {
-    let results = channel()
+    let results: Channel<Text> = channel()
     for id in 0..4 {
         go(() => worker(id, results))
     }
@@ -18,28 +18,27 @@ fn main() {
     }
     print(got.sorted())
     // a pipeline: numbers through a channel, squared in another task, summed here
-    let numbers = channel()
-    let squares = channel()
+    let numbers: Channel<Int> = channel()
+    let squares: Channel<Int> = channel()
     go(() => {
         for i in 1..11 {
-            send(numbers, "{i}")
+            send(numbers, i)
         }
         closeChannel(numbers)
     })
     go(() => {
-        while receive(numbers) is Some(t) {
-            let n = t.parseInt() ?? 0
-            send(squares, "{n * n}")
+        while receive(numbers) is Some(n) {
+            send(squares, n * n)
         }
         closeChannel(squares)
     })
     var total = 0
-    while receive(squares) is Some(t) {
-        total += t.parseInt() ?? 0
+    while receive(squares) is Some(n) {
+        total += n
     }
     print(total)
     // sleeps: the one that sleeps less says first
-    let order = channel()
+    let order: Channel<Text> = channel()
     go(() => {
         sleep(0.06)
         send(order, "slow")

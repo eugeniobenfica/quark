@@ -326,7 +326,11 @@ pub const gBackgroundCap = 26
 pub const gChannels = 27 // channel()'s queues, by number
 pub const gChannelCount = 28
 pub const gChannelCap = 29
-pub const gWords = 30
+pub const gChannelArena = 30 // where the values in the channels' queues are, apart from any task's memory (or 0)
+pub const gChannelQueued = 31 // values in all the queues: none, and the arena is emptied
+pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
+pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
+pub const gWords = 34
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 

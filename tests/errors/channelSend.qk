@@ -1,0 +1,5 @@
+// error: expected Int, found Text
+fn main() {
+    let c: Channel<Int> = channel()
+    send(c, "one")
+}

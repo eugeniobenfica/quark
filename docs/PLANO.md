@@ -296,7 +296,18 @@ simplifica `graph.qk`/`collab.qk` (4.000 linhas) e deixa programas Quark manipul
 
 ### B9. Concorrência: do protótipo ao modelo
 
-- **`Channel<T>` tipado** (o runtime já copia qualquer valor entre arenas).
+- **`Channel<T>` tipado** (o runtime já copia qualquer valor entre arenas). **Feito:** `channel`, `send`,
+  `receive` e `closeChannel` são genéricos no prelúdio; o `T` vem de onde o valor vai
+  (`let c: Channel<Int> = channel()`): a dica de tipo agora diz os tipos que os valores de qualquer chamada genérica
+  não dizem. O canal guarda o tamanho e a descrição do seu `T`; `send` passa o endereço dos slots. Os valores na fila
+  ficam numa arena dos canais (o remetente pode acabar antes), copiados para ela ao enviar e para a memória de quem
+  recebe ao receber (`copierFresh`: as cópias como alocações comuns da arena, jovens para os laços). A arena dos
+  canais esvazia quando todas as filas esvaziam, e é refeita a partir do que está na fila quando dobra (memória
+  limitada: 2 milhões de envios com 100 na fila, 24 MB de pico). Um copiador só para os canais, mantido entre
+  valores: com um novo a cada valor, e a tabela de cópias de 32 KB zerada a cada um, 2 milhões de pares
+  envio/recebimento de textos levavam 1.265 ms; mantido e com a tabela pequena, 185 ms (os canais só de texto, com
+  `malloc`: 139 ms). Testes: `channelsTyped` (registros, tuplas, enums, `Float`, funções, mapas, canais de canais,
+  interfaces, `Unit`, opcionais, resultados).
 - **Tudo o que espera é cooperativo:** `connect`, resolução de nomes, `runProcess`, leitura do teclado.
 - **Cancelamento e prazos:** `timeout(seconds, f)`, fechar um canal acorda quem espera.
 - **Concorrência estruturada:** um escopo que só termina quando as tarefas que abriu terminam, e propaga o pânico

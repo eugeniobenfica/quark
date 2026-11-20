@@ -46,7 +46,7 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [ ] o que `records` precisa: saber ao alocar o que vai viver (uma região escolhida entre funções)
 - [ ] B8 o grafo sem JSON por dentro
 - [ ] B9 concorrência
-  - [ ] `Channel<T>` tipado (hoje os canais levam só textos)
+  - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [ ] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado)
   - [ ] cancelamento e prazos
   - [ ] concorrência estruturada

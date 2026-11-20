@@ -1,0 +1,5 @@
+// error: channel: what T is cannot be told from the values given: write the type where the value goes
+fn main() {
+    let c = channel()
+    send(c, 1)
+}

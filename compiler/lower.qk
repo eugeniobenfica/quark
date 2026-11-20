@@ -2975,6 +2975,19 @@ fn Lower.lowerRuntimeCall(var self, e: Int, a: [Int], t: Int, line: Int) -> [Int
     for x in a[2..] {
         args += self.lowerExpr(x)
     }
+    if name == "channel" {
+        // a channel of T's: what its values are, for the copies it keeps
+        let elem = self.p.ast.decls[self.p.types[t].decl].typeArgs[0]
+        let desc = if self.own.holdsMemory(elem) {
+            self.descAddress(self.p.arrayType(elem))
+        } else {
+            self.iconst(0)
+        }
+        args = [desc, self.iconst(self.slots(elem))]
+    } else if name == "send" {
+        // the value whole, by the address of its slots (a T of any size)
+        args = [args[0], self.spill(args[1..], line)]
+    }
     let withLine = match self.p.ast.exprs[e].node {
         Call(called, _, _, _, _, _) => called == "runtimeLine"
         _ => false

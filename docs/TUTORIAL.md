@@ -152,7 +152,7 @@ The standard library is `std.*`: `json`, `files`, `net`, `http`, `time`, `regex`
 ## 8. Tasks: many things at once
 
 ```quark
-fn worker(id: Int, out: Channel) {
+fn worker(id: Int, out: Channel<Text>) {
     for step in 0..2 {
         send(out, "worker {id}, step {step}")
         sleep(0.01)
@@ -160,7 +160,7 @@ fn worker(id: Int, out: Channel) {
 }
 
 fn main() {
-    let out = channel()
+    let out: Channel<Text> = channel()
     for id in 0..3 {
         go(() => worker(id, out))
     }
@@ -173,7 +173,8 @@ fn main() {
 ```
 
 `go(f)` starts a task; tasks take turns on one thread, and one that waits (a `sleep`, a `receive`, a socket)
-lets the others run. A `Channel` carries texts between them. For the processor's other cores,
+lets the others run. A `Channel<T>` carries values of `T` between them (`T` written where the
+channel goes: `let out: Channel<Text> = channel()`). For the processor's other cores,
 `xs.parallelMap(f)` shares the work out to threads.
 
 ## 9. A server

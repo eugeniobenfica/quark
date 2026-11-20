@@ -25,7 +25,7 @@ fn main() {
             go(() => shout(s))
         }
     })
-    let answers = channel()
+    let answers: Channel<Text> = channel()
     for name in ["ana", "bia", "caio"] {
         go(() => {
             var c = conn(connect("127.0.0.1", 47911) ?? panic("connect"))
@@ -51,7 +51,7 @@ fn main() {
             go(() => handleConnection(s, route))
         }
     })
-    let out = channel()
+    let out: Channel<Text> = channel()
     for path in ["/hello?name=Ana%20Lu", "/hello", "/x"] {
         go(() => {
             send(out, match get("http://127.0.0.1:47912{path}") {

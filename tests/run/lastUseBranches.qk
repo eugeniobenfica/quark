@@ -1,0 +1,24 @@
+// A var's last use in branches: each branch of an if, an else if and a match hands the row over (no copy), and
+// what each list holds is its own.
+fn main() {
+    var evens: [[Int]] = []
+    var odds: [[Int]] = []
+    var small: [[Int]] = []
+    for i in 0..300000 {
+        var row = [i, i + 1, i + 2, i + 3]
+        row.push(len(evens))
+        if i % 3 == 0 {
+            evens.push(row)
+        } else if i % 3 == 1 {
+            odds.push(row)
+        } else {
+            match i % 2 {
+                0 => small.push(row)
+                _ => odds.push(row)
+            }
+        }
+    }
+    print(len(evens), len(odds), len(small), evens[5], odds[7], small[2])
+    evens[5].push(99)
+    print(evens[5], evens[6], odds[7])
+}

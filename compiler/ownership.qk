@@ -1205,24 +1205,77 @@ pub fn Ownership.decideTakes(var self) {
                 or not self.tk(self.p.bindings[bnd].ty) is Array | Map {
                 continue
             }
-            // the statements after it that mention it: the last one's mention, if it is its only one
-            var last = Uses(bnd)
-            var ok = true
-            for j in i + 1..len(stmts) {
-                var u = Uses(bnd)
-                u.stmt(self, stmts[j], false)
-                if u.count == 0 {
-                    continue
-                }
-                let later = self.p.ast.stmts[stmts[j]]
-                if later.node is Defer(_) or later.binding >= 0 and self.p.bindings[later.binding].lazy {
-                    ok = false
-                    break
-                }
-                last = u
+            self.takeLast(stmts[i + 1..], bnd)
+        }
+    }
+}
+
+// The last statement of stmts that mentions the var bnd: its mention taken when it is its only one there (not under
+// a loop or a lambda); when that statement is an if or a match, each branch decided the same way, a block of its own
+// (the condition, the subject and the guards are read before any branch). Nothing when a defer or a lazy let
+// mentions it after.
+fn Ownership.takeLast(var self, stmts: [Int], bnd: Int) {
+    var last = Uses(bnd)
+    var lastStmt = -1
+    for s in stmts {
+        var u = Uses(bnd)
+        u.stmt(self, s, false)
+        if u.count == 0 {
+            continue
+        }
+        let later = self.p.ast.stmts[s]
+        if later.node is Defer(_) or later.binding >= 0 and self.p.bindings[later.binding].lazy {
+            return
+        }
+        last = u
+        lastStmt = s
+    }
+    if lastStmt < 0 {
+        return
+    }
+    if last.count == 1 and not last.guarded and last.at >= 0 {
+        self.takes[last.at] = true
+        return
+    }
+    if self.p.ast.stmts[lastStmt].node is ExprStmt(value) {
+        self.takeInBranches(value, bnd)
+    }
+}
+
+// an if's or a match's branches, each with its last mention of bnd taken (takeLast)
+fn Ownership.takeInBranches(var self, e: Int, bnd: Int) {
+    if e < 0 {
+        return
+    }
+    match self.p.ast.exprs[e].node {
+        If(_, then, otherwise) => {
+            self.takeLast(self.p.ast.blocks[then].stmts, bnd)
+            self.takeInBranch(otherwise, bnd)
+        }
+        Match(_, arms, _) => {
+            for a in arms {
+                self.takeInBranch(self.p.ast.arms[a].body, bnd)
             }
-            if ok and last.count == 1 and not last.guarded and last.at >= 0 {
-                self.takes[last.at] = true
+        }
+        _ => {}
+    }
+}
+
+// a branch: a block, an else if, or one expression (a match arm's)
+fn Ownership.takeInBranch(var self, e: Int, bnd: Int) {
+    if e < 0 {
+        return
+    }
+    match self.p.ast.exprs[e].node {
+        BlockExpr(block, _) => self.takeLast(self.p.ast.blocks[block].stmts, bnd)
+        If(_, _, _) => self.takeInBranches(e, bnd)
+        _ => {
+            var u = Uses(bnd)
+            u.expr(self, e, false)
+            if u.count == 1 and not u.guarded and u.at >= 0 {
+                self.takes[u.at] = true
+            } else if u.count > 1 {
+                self.takeInBranches(e, bnd)
             }
         }
     }

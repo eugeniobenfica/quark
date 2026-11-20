@@ -7096,7 +7096,13 @@ const gPromoted = 1
 const gLive = 2
 const gBlock = 3
 const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
-const genWords = 5
+const gWait = 5 // how many times what the last full one kept minor ones keep before the next is full (fullWait)
+const genWords = 6
+
+// A full collection copies everything since the mark again: worth it when there is garbage among what minor ones
+// kept. One that kept nearly all it looked at (data that grows) makes the next wait twice as long, up to fullWaitMost;
+// one that found much garbage brings the wait back down. With a memory limit, the wait stays 1.
+const fullWaitMost = 8
 
 pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
     let a = arena()
@@ -7115,6 +7121,7 @@ pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
     setWord(f, frameTime, word(a, aClock))
     setWord(gen, gLast, word(a, aClock))
     setWord(gen, gArena, a)
+    setWord(gen, gWait, 1)
     setMark(a, cur, word(cur, bUsed))
     f
 }
@@ -7693,11 +7700,22 @@ fn copyMapInto(c: Int, slot: Int) {
     }
 }
 
+// a text or an array of plain values this small is copied where it is met, without the table of what was copied
+const smallCopy = 64
+
 fn copyText(c: Int, slots: Int) {
     let n = word(slots, 1)
     let p = word(slots, 0)
     if n <= 0 or p == 0 or not isYoung(c, p) and not isYoung(c, p + n - 1) {
         // from before the mark: it stays
+        return
+    }
+    if n + 8 <= smallCopy and largeAt(c, p) == 0 {
+        // a short one: copied where it is met (as a small array is)
+        let q = survive(c, n + 8)
+        setWord(q, 0, n)
+        copyBytes(q + 8, p, n)
+        setWord(slots, 0, q + 8)
         return
     }
     let large = largeAt(c, p)
@@ -7730,6 +7748,14 @@ fn copyArray(c: Int, slots: Int, elem: Int) {
     }
     let from = word(slots, 0)
     if not isYoung(c, from) {
+        return
+    }
+    if word(elem, sCount) == 0 and n * each <= smallCopy {
+        // a small one of plain values: copied where it is met, without the table of what was copied (two holders of
+        // it get a copy each, of a few words; values have no identity)
+        let q = survive(c, n * each)
+        copyBytes(q, from, n * each)
+        setWord(slots, 0, q)
         return
     }
     let to = movedSlot(c, from, n, 'A')
@@ -7919,7 +7945,8 @@ fn lookAgain(c: Int, r: Int, since: Int) {
 pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     let a = arena()
     let gen = word(f, frameGen)
-    let full = word(gen, gPromoted) >= max(word(gen, gLive), limited(a, nurseryMost))
+    let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), limited(a, nurseryMost))
+    let looked = word(gen, gLive) + word(gen, gPromoted) // what a full one looks through: its last, and what came since
     // young: made at this time or later (a full collection: since the mark)
     let since = if full { word(f, frameTime) } else { word(gen, gLast) }
     setWord(a, aClock, word(a, aClock) + 1)
@@ -7990,6 +8017,15 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         growingAdd(a, word(r, 0), word(r, 1))
     }
     if full {
+        // kept nearly all it looked at: the next waits longer; found much garbage: sooner
+        let wait = word(gen, gWait)
+        if word(a, aLimit) != 0 {
+            setWord(gen, gWait, 1)
+        } else if word(c, cTotal) * 10 >= looked * 9 {
+            setWord(gen, gWait, min(wait * 2, fullWaitMost))
+        } else if word(c, cTotal) * 2 < looked {
+            setWord(gen, gWait, max(wait / 2, 1))
+        }
         setWord(gen, gLive, word(c, cTotal))
         setWord(gen, gPromoted, 0)
     } else {

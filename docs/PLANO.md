@@ -343,6 +343,24 @@ coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 
 Meta: `records` de 2,2× para menos de 1,5× o C.
 
+> **Rodada de 20/11/2026: de 1,95× para cerca de 1,6× o C.** Medido por partes (cada executável num núcleo, prioridade
+> alta): sem coleta nenhuma, `records` leva 76 ms (1,18× o C); só com as menores, 116 ms; com as completas também,
+> 151 ms. As cópias do coletor são quase toda a diferença.
+> - **Coletas completas que esperam o que precisam.** Uma completa copia de novo tudo desde a marca; quando ela
+>   guarda quase tudo o que olhou (dados que crescem), a próxima espera o dobro, até 8 vezes o que ficou vivo; quando
+>   acha muito lixo, a espera volta a cair. Com limite de memória (`--memory`), fica em 1. `records` −10%.
+> - **Valores pequenos copiados onde são achados.** Um array de valores simples ou um texto de até 64 bytes é
+>   copiado sem a tabela do que já foi copiado (dois donos ganham uma cópia cada, de poucas palavras: valores não têm
+>   identidade). Cada cópia fazia três buscas nas faixas jovens, a tabela de compartilhamento e a de salas. A fase de
+>   construção de `records` foi de 51 para 34 ms.
+> - Juntos: `records` 136,6 → 111,6 ms (−18%), `json` −3%, `sorting` −3%, os outros iguais.
+> - **De passagem:** o literal de um lado de `xs + [x]` é da área da função (a junção copia os dois lados).
+> - **Não alcançado: menos de 1,5×.** Falta a pré-promoção por chamada: o que `build()` faz vai para `fns`, fora do
+>   laço, e é copiado uma vez pelas coletas menores do laço de `main` (cerca de 20 ms). Ela pede uma região "guardada"
+>   na arena que a alocação no código use como um bloco comum, e que os laços de dentro da chamada marquem e coletem
+>   sem confundi-la com os blocos da arena. As formas limitadas que pesei arriscam memória sem limite, quando a função
+>   chamada tem um laço longo próprio. Fica como próximo passo, com esse desenho.
+
 ### B8. O grafo sem JSON por dentro
 
 O código do grafo monta e lê JSON e converte para QGN na borda. Trabalhar sobre os valores de `std.graph`

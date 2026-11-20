@@ -46,7 +46,9 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [-] promoção no lugar: `records` 15% mais rápido, mas superlinear no Linux (memória guardada): desfeita
   - [-] reutilização no lugar (`xs = xs + [x]` crescendo onde está): mais lenta que um array novo pequeno
   - [-] barreira de escrita filtrada no código: as chamadas fazem trabalho real, sem ganho
-  - [ ] o que `records` precisa: saber ao alocar o que vai viver (uma região escolhida entre funções)
+  - [x] coletas completas que esperam conforme o lixo que acham; valores pequenos copiados sem a tabela: `records`
+    de 1,95× para 1,6× o C
+  - [ ] pré-promoção por chamada (o que `build()` faz vai para fora do laço): uma região guardada na arena
 - [ ] B8 o grafo sem JSON por dentro
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)

@@ -1675,8 +1675,8 @@ pub fn Ownership.mapsInPlace(self, target: Int, value: Int) -> Bool {
 }
 
 // ---- escape analysis: values that never leave the function ----
-// An array literal of a few elements that hold no memory, held by a let that is only read by index (not sliced), by
-// len, or gone through by a for, never leaves the function: no call is given it, no lambda captures it, it is never
+// An array literal that is a side of an array's + (the join copies it), or one of a few elements that hold no memory
+// held by a let that is only read by index (not sliced), by len, or gone through by a for, never leaves the function: no call is given it, no lambda captures it, it is never
 // returned, stored or held by another name. Its memory is the function's area (made once a call, used again by each
 // turn of a loop: the let's value of the turn before is gone), not the arena: a loop that makes one a turn makes
 // nothing for its collector.
@@ -1691,6 +1691,16 @@ pub fn Ownership.decideEscapes(var self) {
     for x in self.p.bindings {
         if x.capturedFrom >= 0 {
             captured.add(x.capturedFrom)
+        }
+    }
+    // a side of xs + [x]: the join copies both into a new array, the literal is read once and gone
+    for x in self.p.ast.exprs {
+        if x.node is Binary(op, l, r) and op == .Plus and x.ty >= 0 and self.tk(x.ty) == Kind.Array {
+            for side in [l, r] {
+                if self.p.ast.exprs[side].node is ArrayLit(items) and len(items) > 0 and len(items) <= localMost {
+                    self.local.add(side)
+                }
+            }
         }
     }
     for b in 0..len(self.p.ast.blocks) {

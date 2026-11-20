@@ -167,7 +167,11 @@ preciso, numa versão mínima.
 >   - `keywords[word]` refazia o mapa de palavras-chave (~30 inserções) a cada nome lido, e a leitura e checagem foi de 541 para 442 ms. Um mapa constante ainda é refeito onde é usado: falta a linguagem fazê-lo uma vez.
 >   - A eliminação de subexpressões comuns criava um mapa novo a cada rótulo, salto ou chamada. Agora é uma tabela por função, com o número do trecho na chave: otimizar foi de 3.652 para 3.413 ms no `--release`.
 > - **Medido e não mantido.** Um cache da última sala na arena, para `text += ...`: não mudou nada. Cada pedaço custa ~8 ns, que são a chamada ao runtime e não a busca da sala. O próximo passo seria juntar os pedaços de uma interpolação numa só chamada.
-> - **Records (2,0× de C).** O coletor gasta 29% copiando o array novo de `ins.args + [x]`, que sobrevive por ir para uma estrutura velha. O caminho é reutilizar no lugar: o array antigo morre na mesma atribuição e poderia crescer onde está.
+> - **Records (2,0× de C): medido em partes, sem ganho a manter.**
+>   - **Onde está o tempo.** Build leva 47 ms. Nele, o coletor copia uma vez cada um dos ~1 milhão de arrays pequenos que sobrevivem, enquanto C só faz `malloc`. O rewrite leva 70 ms, em 19 milhões de visitas a ~3,7 ns cada. Depois da primeira volta o rewrite não aloca: cada `args` cresce uma vez só, porque `op` muda.
+>   - **Crescer no lugar (`ins.args + [x]` sobre o array do elemento que morre na atribuição).** Implementado com regras conservadoras, piorou 2,3× num teste de crescimento repetido (20 → 46 ms). As salas dos arrays ficam numa tabela de tamanho fixo (1.024 baldes), feita para poucos vars que crescem. Com milhares de elementos, ela despeja entradas, e cada crescimento aloca o dobro. Para valer, a sala precisaria morar no próprio array (um cabeçalho de capacidade), o que muda o layout de todos os arrays. Revertido.
+>   - **A checagem de fim de turno com o limiar pré-calculado.** Uma leitura por volta em vez de cinco, e nenhum ganho medido: as palavras da arena estão no cache L1. Revertido.
+>   - **O que falta é de desenho.** É preciso não copiar o que sobrevive com certeza (alocar direto no espaço velho quando o valor vai para uma estrutura velha) e ter arrays com cabeçalho de capacidade.
 
 > **Próximos passos:**
 > - As decisões que ainda dependem do estado da emissão: o self por endereço, a área da função e a coleta por turno de laço, que lê o IR emitido.

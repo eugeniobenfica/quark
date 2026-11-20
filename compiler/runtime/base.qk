@@ -331,7 +331,9 @@ pub const gChannelQueued = 31 // values in all the queues: none, and the arena i
 pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
 pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
-pub const gWords = 35
+pub const gTaskSpares = 35 // the stacks and arenas of tasks that ended, kept for new ones: (stack, arena) pairs
+pub const gTaskSpareCount = 36
+pub const gWords = 37
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 

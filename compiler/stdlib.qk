@@ -3901,7 +3901,9 @@ pub const gChannelQueued = 31 // values in all the queues: none, and the arena i
 pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
 pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
-pub const gWords = 35
+pub const gTaskSpares = 35 // the stacks and arenas of tasks that ended, kept for new ones: (stack, arena) pairs
+pub const gTaskSpareCount = 36
+pub const gWords = 37
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -10306,13 +10308,28 @@ fn taskStart() -> Int {
     0
 }
 
+// A task that ends leaves its stack and its arena (emptied) for the next ones, up to taskSpares of them: a stack
+// is 8 MB, which a system may map and zero again each time (macOS: milliseconds a task).
+const taskSpares = 16
+const taskSpareMost = 1048576 // the most memory an arena kept for a new task holds
+
 pub fn taskNew(l: Int, f: Int, args: Int, argCount: Int) -> Int {
     if argCount > 16 {
         return 0
     }
     let t = calloc(taskWords, 8)
-    let stack = malloc(taskStack)
-    let a = arenaLike()
+    var stack = 0
+    var a = 0
+    let spares = gGet(gTaskSpareCount)
+    if spares > 0 {
+        let at = gGet(gTaskSpares) + 16 * (spares - 1)
+        stack = word(at, 0)
+        a = word(at, 1)
+        gSet(gTaskSpareCount, spares - 1)
+    } else {
+        stack = malloc(taskStack)
+        a = arenaLike()
+    }
     if t == 0 or stack == 0 or a == 0 {
         free(t)
         free(stack)
@@ -10370,9 +10387,25 @@ pub fn taskFree(t: Int) {
     if t == 0 {
         return
     }
-    free(word(t, tStack))
     free(word(t, tError))
-    arenaFree(word(t, tArena))
+    let spares = gGet(gTaskSpareCount)
+    if spares < taskSpares and word(word(t, tArena), aReserved) <= taskSpareMost {
+        // kept: the arena emptied, as a new one is (one that grew large is let go of: its memory with it)
+        if gGet(gTaskSpares) == 0 {
+            gSet(gTaskSpares, malloc(16 * taskSpares))
+        }
+        let was = ctxGet(ctxArena)
+        setWord(ctx(), ctxArena, word(t, tArena))
+        arenaReset()
+        setWord(ctx(), ctxArena, was)
+        let at = gGet(gTaskSpares) + 16 * spares
+        setWord(at, 0, word(t, tStack))
+        setWord(at, 1, word(t, tArena))
+        gSet(gTaskSpareCount, spares + 1)
+    } else {
+        free(word(t, tStack))
+        arenaFree(word(t, tArena))
+    }
     free(t)
 }
 

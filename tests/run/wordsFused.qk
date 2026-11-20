@@ -1,0 +1,35 @@
+// A text's words handed to what goes over them as each is found (no array made): for, countBy, map; spaces,
+// tabs and line ends between them, at the ends, none at all; break and continue.
+fn show(t: Text) {
+    var got: [Text] = []
+    for w in t.words() {
+        got.push(w)
+    }
+    let made = t.words()
+    let counted = t.words().countBy(w => w)
+    print(got == made, len(got), got, len(counted))
+}
+
+fn main() {
+    show("")
+    show("   ")
+    show("one")
+    show("  lead and trail  ")
+    show("a\tb\nc\r\nd  e")
+    show("ção  é\x01x  日本 語")
+    show("x")
+    show(" x")
+    show("x ")
+    var n = 0
+    for w in "skip these words but stop here please".words() {
+        if w == "these" {
+            continue
+        }
+        if w == "here" {
+            break
+        }
+        n += len(w)
+    }
+    print(n)
+    print("a b a c a".words().map(w => w.upper()).toArray())
+}

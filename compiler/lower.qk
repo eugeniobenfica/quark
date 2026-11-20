@@ -938,6 +938,31 @@ fn Lower.allocInline(var self, bytes0: Int, count: Int, line: Int) -> Int {
     r
 }
 
+// 1 when byte c is a space between words (' ', a tab, a new line, a carriage return), else 0: a byte above ' ' (most
+// of them) by one test
+fn Lower.spaceTest(var self, c: Int) -> Int {
+    let r = self.newReg('I')
+    let z = self.iconst(0)
+    self.mov(r, z)
+    let no = self.label()
+    let k32 = self.iconst(32)
+    let above = self.cmp(condGt, c, k32)
+    self.jnz(above, no)
+    let sp = self.cmp(condEq, c, k32)
+    let k9 = self.iconst(9)
+    let tab = self.cmp(condEq, c, k9)
+    let k10 = self.iconst(10)
+    let nl = self.cmp(condEq, c, k10)
+    let k13 = self.iconst(13)
+    let cr = self.cmp(condEq, c, k13)
+    let a = self.op2(.Or, sp, tab, 'I')
+    let b = self.op2(.Or, nl, cr, 'I')
+    let any = self.op2(.Or, a, b, 'I')
+    self.mov(r, any)
+    self.place(no)
+    r
+}
+
 fn Lower.loadByte(var self, base: Int, index: Int) -> Int {
     let r = self.newReg('I')
     self.emit(.Load, r, base, index, imm: 1, c: 0, cond: 1)
@@ -1531,6 +1556,57 @@ fn Lower.forEachInner(var self, from: Int, sink: Sink) {
     let top = self.label()
     let next = self.label()
     let done = self.label()
+    if isCall and x.builtin == bWords {
+        // a text's words, each handed on as it is found: no array of them made (runtime/text.qk's splitText: a space
+        // is ' ', a tab, a new line or a carriage return; a word, the bytes between)
+        let tv = self.lowerExpr(self.arg(src, 0))
+        let t = self.copyVal(tv)
+        let at = self.newReg('I')
+        let start = self.newReg('I')
+        let index = self.newReg('I')
+        let z = self.iconst(0)
+        self.mov(at, z)
+        let z2 = self.iconst(0)
+        self.mov(index, z2)
+        let skip = self.label()
+        let scan = self.label()
+        let ended = self.label()
+        self.depth += 1
+        self.jmp(skip)
+        // at a word's first byte
+        self.place(top)
+        self.fuel(x.line)
+        self.mov(start, at)
+        self.place(scan)
+        let one = self.iconst(1)
+        self.emit(.Add, at, at, one)
+        let inText = self.cmp(condLt, at, t[1])
+        self.jz(inText, ended)
+        let c = self.loadByte(t[0], at)
+        self.jz(self.spaceTest(c), scan)
+        self.place(ended)
+        let wordAt = self.op2(.Add, t[0], start, 'I')
+        let wordLen = self.op2(.Sub, at, start, 'I')
+        let saved = self.loopFrame(done, next)
+        self.sink(sink, [wordAt, wordLen], index)
+        self.loopBreak = saved.0
+        self.loopContinue = saved.1
+        self.place(next)
+        let one2 = self.iconst(1)
+        self.emit(.Add, index, index, one2)
+        // the spaces before the next word
+        self.place(skip)
+        let more = self.cmp(condLt, at, t[1])
+        self.jz(more, done)
+        let c2 = self.loadByte(t[0], at)
+        self.jz(self.spaceTest(c2), top)
+        let one3 = self.iconst(1)
+        self.emit(.Add, at, at, one3)
+        self.jmp(skip)
+        self.depth -= 1
+        self.place(done)
+        return
+    }
     if isCall and x.builtin == bCodePoints {
         let tv = self.lowerExpr(self.arg(src, 0))
         let t = self.copyVal(tv)

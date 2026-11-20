@@ -343,7 +343,8 @@ pub fn jobBegins(job: Int) {
     }
 }
 
-fn waitsOnThread(t: Int) -> Bool = word(t, tWaitThread) != 0 and word(word(t, tWaitThread), jobDone) == 0
+fn waitsOnThread(t: Int) -> Bool =
+    word(t, tWaitThread) != 0 and word(word(t, tWaitThread), jobDone) == 0
 
 // A channel: [closed][count][capacity][head][slots][description][items: a value's slots each]. The values in the
 // queues are copies, in an arena of the channels' own (gChannelArena): they go from one task's memory to another's.

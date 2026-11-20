@@ -5419,7 +5419,11 @@ fn readLineJob(j: Int) -> Int {
 
 fn runProcessJob(j: Int) -> Int {
     jobBegins(j)
-    setWord(j, jobArgs + 4, osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)))
+    setWord(
+        j,
+        jobArgs + 4,
+        osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)),
+    )
     setWord(j, jobDone, 1)
     0
 }
@@ -5842,7 +5846,6 @@ extern effect fn osRecv(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "q
 extern effect fn osSend(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosSend" // bytes, -1 would wait, -2
 extern effect fn osCloseSocket(s: Int64) as "qkosCloseSocket"
 extern effect fn osLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" // seconds east of UTC, then
-
 extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 
 // the job of a connect or a listen (tasks.qk offThread): host, port, why, then the socket made
@@ -5867,7 +5870,11 @@ fn socketOn(listen: Bool, host: Int, port: Int, why: Int) -> Int {
     setWord(j, jobArgs, host)
     setWord(j, jobArgs + 1, port)
     setWord(j, jobArgs + 2, why)
-    let f = if listen { jobAddress(x => listenJob(x)) } else { jobAddress(x => connectJob(x)) }
+    let f = if listen {
+        jobAddress(x => listenJob(x))
+    } else {
+        jobAddress(x => connectJob(x))
+    }
     if not offThread(f, j) {
         let _ = if listen { listenJob(j) } else { connectJob(j) }
     }
@@ -10518,7 +10525,8 @@ pub fn jobBegins(job: Int) {
     }
 }
 
-fn waitsOnThread(t: Int) -> Bool = word(t, tWaitThread) != 0 and word(word(t, tWaitThread), jobDone) == 0
+fn waitsOnThread(t: Int) -> Bool =
+    word(t, tWaitThread) != 0 and word(word(t, tWaitThread), jobDone) == 0
 
 // A channel: [closed][count][capacity][head][slots][description][items: a value's slots each]. The values in the
 // queues are copies, in an arena of the channels' own (gChannelArena): they go from one task's memory to another's.

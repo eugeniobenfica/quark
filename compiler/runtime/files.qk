@@ -134,7 +134,11 @@ fn readLineJob(j: Int) -> Int {
 
 fn runProcessJob(j: Int) -> Int {
     jobBegins(j)
-    setWord(j, jobArgs + 4, osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)))
+    setWord(
+        j,
+        jobArgs + 4,
+        osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)),
+    )
     setWord(j, jobDone, 1)
     0
 }

@@ -26,7 +26,7 @@ extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as 
 // ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
 // ---- each runtime function's address, by its number: its Quark function, which the
 // program calls the Quark way ----
-const runtimeCount = 122 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+const runtimeCount = 123 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
 
 fn runtimeTable() -> Int {
     let t = calloc(runtimeCount, 8)

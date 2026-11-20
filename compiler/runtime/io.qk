@@ -30,7 +30,11 @@ fn failed(what: Text, why: Int) -> Int = errResult(message().text(what).text(": 
 // ---- files ----
 // openFile(path, mode) -> File!: "r" read, "w" written from nothing, "a" added to, "r+" read and written (bytes, as
 // they are: no line endings changed)
-pub extern effect fn rtOpenFile(path: Int64, pathLen: Int64, mode: Int64, modeLen: Int64) -> Int64 as "qk_openFile" {
+pub extern effect fn rtOpenFile(pathGiven: Int64, pathLenGiven: Int64, modeGiven: Int64, modeLenGiven: Int64) -> Int64 as "qk_openFile" {
+    let path = shortBytes(pathGiven, pathLenGiven, 0)
+    let pathLen = textLength(pathLenGiven)
+    let mode = shortBytes(modeGiven, modeLenGiven, 1)
+    let modeLen = textLength(modeLenGiven)
     let name = cString(path, pathLen)
     let m = if modeLen == 1 and byte(mode, 0) == 'r' {
         "rb\0"
@@ -100,7 +104,9 @@ fn why() -> Int {
 }
 
 // listen(host, port) -> Socket!
-pub extern effect fn rtListen(host: Int64, hostLen: Int64, port: Int64) -> Int64 as "qk_listen" {
+pub extern effect fn rtListen(hostGiven: Int64, hostLenGiven: Int64, port: Int64) -> Int64 as "qk_listen" {
+    let host = shortBytes(hostGiven, hostLenGiven, 0)
+    let hostLen = textLength(hostLenGiven)
     let w = why()
     let s = osListen(cString(host, hostLen), port, w)
     if s < 0 {
@@ -110,7 +116,9 @@ pub extern effect fn rtListen(host: Int64, hostLen: Int64, port: Int64) -> Int64
 }
 
 // connect(host, port) -> Socket!
-pub extern effect fn rtConnect(host: Int64, hostLen: Int64, port: Int64) -> Int64 as "qk_connect" {
+pub extern effect fn rtConnect(hostGiven: Int64, hostLenGiven: Int64, port: Int64) -> Int64 as "qk_connect" {
+    let host = shortBytes(hostGiven, hostLenGiven, 0)
+    let hostLen = textLength(hostLenGiven)
     let w = why()
     let name = cString(host, hostLen)
     let s = osConnect(name, port, w)

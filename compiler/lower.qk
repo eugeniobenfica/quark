@@ -25,6 +25,7 @@ pub type LowerOptions {
     sysv: Bool = false
     debug: Bool = false
     debugKeys: [Int: Text] = [:]
+    shortTexts: Bool = false // literals and slices of up to 8 bytes made short texts (QUARK_SHORT_TEXTS=1)
 }
 
 // the IR, the program's data (texts, constant arrays, interface tables), and where inlined code came from
@@ -82,6 +83,7 @@ const rtReplace = 45
 const rtRepeat = 46
 const rtJoin = 47
 const rtFind = 48
+const rtShortText = 122
 const rtTextFixed = 49
 const rtPad = 50
 const rtEnv = 51
@@ -1567,7 +1569,7 @@ fn Lower.forEachInner(var self, from: Int, sink: Sink) {
             self.preText = -1
         } else {
             let tv = self.lowerExpr(self.arg(src, 0))
-            t = self.copyVal(tv)
+            t = self.longText(self.copyVal(tv), x.line)
         }
         let at = self.newReg('I')
         let start = self.newReg('I')
@@ -1616,8 +1618,14 @@ fn Lower.forEachInner(var self, from: Int, sink: Sink) {
         return
     }
     if isCall and x.builtin == bCodePoints {
-        let tv = self.lowerExpr(self.arg(src, 0))
-        let t = self.copyVal(tv)
+        var t: [Int] = []
+        if self.preText == src {
+            t = self.preTextVal
+            self.preText = -1
+        } else {
+            let tv = self.lowerExpr(self.arg(src, 0))
+            t = self.longText(self.copyVal(tv), x.line)
+        }
         let at = self.newReg('I')
         let index = self.newReg('I')
         let n = self.newReg('I')
@@ -1906,7 +1914,49 @@ fn Lower.caseValue(var self, t: Int, k: Int, fields: [[Int]]?) -> [Int] {
 }
 
 // ---- text ----
+// ---- short texts (docs/PLANO.md, B6): a text's two slots, or a short one's bytes (up to 8, the rest 0) in the first
+// and its length with the top bit set in the second ----
+// a text's length from its second slot
+fn Lower.textLen(var self, n1: Int) -> Int {
+    let mask = self.iconst(maxInt)
+    self.op2(.And, n1, mask, 'I')
+}
+
+// a text whose bytes are in memory (a short one copied into a new text): for code that reads its bytes or keeps views
+// of them
+fn Lower.longText(var self, t: [Int], line: Int) -> [Int] {
+    let out = [self.newReg('I'), self.newReg('I')]
+    self.mov(out[0], t[0])
+    self.mov(out[1], t[1])
+    let done = self.label()
+    let z = self.iconst(0)
+    let short = self.cmp(condLt, t[1], z)
+    self.jz(short, done)
+    let empty = self.iconst(0)
+    let p = self.rtcall(rtTextJoin, [t[0], t[1], empty, empty], 'I', line) // a copy of it
+    let long = self.unpackText(p)
+    self.mov(out[0], long[0])
+    self.mov(out[1], long[1])
+    self.place(done)
+    out
+}
+
+// a text of up to 8 bytes as a short one, its bytes read from p (the switch's test of short texts: shortTexts)
+fn Lower.shortOf(var self, p: Int, n: Int, line: Int) -> [Int] {
+    let bytes = self.rtcall(rtShortText, [p, n], 'I', line)
+    let flag = self.iconst(minInt)
+    [bytes, self.op2(.Or, n, flag, 'I')]
+}
+
 fn Lower.literalText(var self, s: Text) -> [Int] {
+    if self.opts.shortTexts and not self.opts.runtime and len(s) <= 8 {
+        // a short text: its bytes in the first slot
+        var bytes = 0
+        for (i, c) in s.bytes().enumerate() {
+            bytes = bytes | c << (8 * i)
+        }
+        return [self.iconst(bytes), self.iconst(minInt | len(s))]
+    }
     let d = self.dataText(s)
     let a = self.dataAddress(d)
     let n = self.iconst(len(s))
@@ -3460,7 +3510,11 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
             return [self.rtcall(rtCodePointCount, tv[..2], 'I', line)]
         }
         let sk = self.tk(sx.ty)
-        if sk is Text | Bytes {
+        if sk == Kind.Text {
+            let n1 = self.lowerExpr(src)[1]
+            return [self.textLen(n1)]
+        }
+        if sk == Kind.Bytes {
             return [self.lowerExpr(src)[1]]
         }
         if sk == Kind.Map {
@@ -3647,7 +3701,8 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
         return []
     }
     if b == bBytes {
-        return self.lowerExpr(a[0])
+        let tv = self.lowerExpr(a[0])
+        return self.longText(self.copyVal(tv), line)
     }
     if b == bChar {
         let v = self.lowerExpr(a[0])[0]
@@ -5180,12 +5235,25 @@ fn Lower.equalVals(var self, a: [Int], b: [Int], t: Int, line: Int) -> Int {
     }
     let k = self.tk(t)
     if k is Text | Bytes {
-        // lengths first: the bytes only when they are as long
+        // lengths first: the bytes only when they are as long (two short texts: their first slots)
         let all = self.newReg('I')
-        let sameLen = self.cmp(condEq, a[1], b[1])
+        let la = if k == Kind.Text { self.textLen(a[1]) } else { a[1] }
+        let lb = if k == Kind.Text { self.textLen(b[1]) } else { b[1] }
+        let sameLen = self.cmp(condEq, la, lb)
         self.mov(all, sameLen)
         let done = self.label()
         self.jz(all, done)
+        if k == Kind.Text {
+            let notBoth = self.label()
+            let both = self.op2(.And, a[1], b[1], 'I')
+            let z0 = self.iconst(0)
+            let short = self.cmp(condLt, both, z0)
+            self.jz(short, notBoth)
+            let same = self.cmp(condEq, a[0], b[0])
+            self.mov(all, same)
+            self.jmp(done)
+            self.place(notBoth)
+        }
         let z = self.iconst(0)
         let r = self.rtcall(rtTextCompare, [a[0], a[1], b[0], b[1]], 'I', line)
         let eq = self.cmp(condEq, r, z)
@@ -6002,6 +6070,62 @@ fn Lower.lowerTry(var self, e: Int, value: Int) -> [Int] {
     whole[at..at + self.slots(self.ty(e))]
 }
 
+// t[lo..hi] of a text: a view of its bytes, or of a short one's a short one (its bytes moved down); with shortTexts,
+// a view of up to 8 bytes made a short one too
+fn Lower.textSlice(var self, e: Int, src0: [Int], lo: Int, hi: Int, line: Int) -> [Int] {
+    let src = self.copyVal(src0)
+    let n = self.textLen(src[1])
+    let low = if lo >= 0 { self.lowerExpr(lo)[0] } else { self.iconst(0) }
+    let high = if hi >= 0 { self.lowerExpr(hi)[0] } else { n }
+    let one = self.iconst(1)
+    let n1 = self.op2(.Add, n, one, 'I')
+    self.bounds(high, n1, panicSliceEnd, line)
+    let one2 = self.iconst(1)
+    let h1 = self.op2(.Add, high, one2, 'I')
+    self.bounds(low, h1, panicSliceStart, line)
+    let one3 = self.iconst(1)
+    let cut = self.rtcall(rtTextCut, [src[0], src[1], low, high], 'I', line)
+    self.bounds(cut, one3, panicTextCut, line)
+    let len2 = self.op2(.Sub, high, low, 'I')
+    let out = [self.newReg('I'), self.newReg('I')]
+    let done = self.label()
+    let long = self.label()
+    let z = self.iconst(0)
+    let short = self.cmp(condLt, src[1], z)
+    self.jz(short, long)
+    // a short one's: its bytes from low, the ones past len2 cleared
+    let k8 = self.iconst(8)
+    let shift = self.op2(.Mul, low, k8, 'I')
+    let moved = self.op2(.Sar, src[0], shift, 'I')
+    let k4 = self.iconst(4)
+    let half = self.op2(.Mul, len2, k4, 'I')
+    let unit = self.iconst(1)
+    let up = self.op2(.Shl, unit, half, 'I')
+    let up2 = self.op2(.Shl, up, half, 'I')
+    let unit2 = self.iconst(1)
+    let mask = self.op2(.Sub, up2, unit2, 'I')
+    let bytes = self.op2(.And, moved, mask, 'I')
+    self.mov(out[0], bytes)
+    let flag = self.iconst(minInt)
+    let n2 = self.op2(.Or, len2, flag, 'I')
+    self.mov(out[1], n2)
+    self.jmp(done)
+    self.place(long)
+    let at = self.op2(.Add, src[0], low, 'I')
+    self.mov(out[0], at)
+    self.mov(out[1], len2)
+    if self.opts.shortTexts and not self.opts.runtime {
+        let k9 = self.iconst(9)
+        let fits = self.cmp(condLt, len2, k9)
+        self.jz(fits, done)
+        let made = self.shortOf(at, len2, line)
+        self.mov(out[0], made[0])
+        self.mov(out[1], made[1])
+    }
+    self.place(done)
+    out
+}
+
 fn Lower.lowerIndex(var self, e: Int, target: Int, index: Int) -> [Int] {
     let line = self.lineOf(e)
     if self.isCPlace(e) {
@@ -6010,6 +6134,9 @@ fn Lower.lowerIndex(var self, e: Int, target: Int, index: Int) -> [Int] {
     let tt = self.ty(target)
     if self.p.ast.exprs[index].node is Range(lo, hi) {
         let src = self.lowerExpr(target)
+        if self.tk(tt) == Kind.Text {
+            return self.textSlice(e, src, lo, hi, line)
+        }
         let n = src[1]
         let low = if lo >= 0 { self.lowerExpr(lo)[0] } else { self.iconst(0) }
         let high = if hi >= 0 { self.lowerExpr(hi)[0] } else { n }
@@ -6397,12 +6524,12 @@ fn Lower.preLowerSource(var self, iter: Int) {
         }
     }
     let bx = self.p.ast.exprs[base]
-    if bx.node is Call(_, _, _, _, _, _) and bx.builtin == bWords {
-        // its words are found as the loop goes, in the text: made before the mark, so that no collection of the
-        // loop's turns takes it back
+    if bx.node is Call(_, _, _, _, _, _) and (bx.builtin == bWords or bx.builtin == bCodePoints) {
+        // its words (code points) are found as the loop goes, in the text: made before the mark, so that no
+        // collection of the loop's turns takes it back (a short one copied out there too)
         let tv = self.lowerExpr(self.arg(base, 0))
         self.preText = base
-        self.preTextVal = self.copyVal(tv)
+        self.preTextVal = self.longText(self.copyVal(tv), bx.line)
         return
     }
     if bx.node is Range(lo, hi) {

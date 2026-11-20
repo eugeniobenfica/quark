@@ -3,6 +3,14 @@
 use base
 use arena
 
+// the address of a text's bytes given its two slots, where they may be kept: a short one's copied into a new text
+pub fn longBytes(p: Int, n1: Int) -> Int {
+    if n1 >= 0 {
+        return p
+    }
+    makeText(shortBytes(p, n1, 2), n1 & ~intMin) + 8
+}
+
 pub fn makeText(p: Int, n: Int) -> Int {
     let t = allocRaw(n + 8, 1)
     setWord(arena(), aLastText, t)
@@ -136,8 +144,22 @@ pub fn textJoin(x: Int, xn: Int, y: Int, yn: Int) -> Int {
     p
 }
 
-pub extern effect fn rtTextJoin(x: Int64, xn: Int64, y: Int64, yn: Int64) -> Int64 as "qk_textJoin" =
+// a short text's first slot: n (up to 8) bytes from p, the rest 0
+pub extern effect fn rtShortText(p: Int64, n: Int64) -> Int64 as "qk_shortText" {
+    var v = 0
+    for i in 0..n {
+        v = v | byte(p, i) << (8 * i)
+    }
+    v
+}
+
+pub extern effect fn rtTextJoin(xGiven: Int64, xnGiven: Int64, yGiven: Int64, ynGiven: Int64) -> Int64 as "qk_textJoin" {
+    let x = shortBytes(xGiven, xnGiven, 0)
+    let xn = textLength(xnGiven)
+    let y = shortBytes(yGiven, ynGiven, 1)
+    let yn = textLength(ynGiven)
     textJoin(x, xn, y, yn)
+}
 
 pub fn textCompare(x: Int, xn: Int, y: Int, yn: Int) -> Int {
     let c = compareBytes(x, y, if xn < yn { xn } else { yn })
@@ -153,8 +175,13 @@ pub fn textCompare(x: Int, xn: Int, y: Int, yn: Int) -> Int {
     }
 }
 
-pub extern effect fn rtTextCompare(x: Int64, xn: Int64, y: Int64, yn: Int64) -> Int64 as "qk_textCompare" =
+pub extern effect fn rtTextCompare(xGiven: Int64, xnGiven: Int64, yGiven: Int64, ynGiven: Int64) -> Int64 as "qk_textCompare" {
+    let x = shortBytes(xGiven, xnGiven, 0)
+    let xn = textLength(xnGiven)
+    let y = shortBytes(yGiven, ynGiven, 1)
+    let yn = textLength(ynGiven)
     textCompare(x, xn, y, yn)
+}
 
 pub extern effect fn rtTextOfInt(v: Int64) -> Int64 as "qk_textOfInt" {
     let b = bufAt(ctx() + 8 * ctxScratch, 32).int(v) // (the digits in the context's scratch: nothing made for them)
@@ -162,7 +189,9 @@ pub extern effect fn rtTextOfInt(v: Int64) -> Int64 as "qk_textOfInt" {
 }
 
 // x + the digits of v: written from the context's scratch onto x (in place when x has room)
-pub extern effect fn rtJoinInt(x: Int64, xn: Int64, v: Int64) -> Int64 as "qk_joinInt" {
+pub extern effect fn rtJoinInt(xGiven: Int64, xnGiven: Int64, v: Int64) -> Int64 as "qk_joinInt" {
+    let x = shortBytes(xGiven, xnGiven, 0)
+    let xn = textLength(xnGiven)
     let b = bufAt(ctx() + 8 * ctxScratch, 32).int(v)
     textJoin(x, xn, b.p, b.n)
 }
@@ -240,12 +269,23 @@ pub fn splitText(t: Int, n: Int, sep: Int, sn: Int) -> Int {
     p
 }
 
-pub extern effect fn rtSplit(t: Int64, n: Int64, sep: Int64, sn: Int64) -> Int64 as "qk_split" =
+pub extern effect fn rtSplit(tGiven: Int64, nGiven: Int64, sepGiven: Int64, snGiven: Int64) -> Int64 as "qk_split" {
+    let t = longBytes(tGiven, nGiven)
+    let n = textLength(nGiven)
+    let sep = shortBytes(sepGiven, snGiven, 1)
+    let sn = textLength(snGiven)
     splitText(t, n, sep, sn)
+}
 
-pub extern effect fn rtWords(t: Int64, n: Int64) -> Int64 as "qk_words" = splitText(t, n, 0, 0)
+pub extern effect fn rtWords(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_words" {
+    let t = longBytes(tGiven, nGiven)
+    let n = textLength(nGiven)
+    splitText(t, n, 0, 0)
+}
 
-pub extern effect fn rtLines(t: Int64, n0: Int64) -> Int64 as "qk_lines" {
+pub extern effect fn rtLines(tGiven: Int64, n0Given: Int64) -> Int64 as "qk_lines" {
+    let t = longBytes(tGiven, n0Given)
+    let n0 = textLength(n0Given)
     var n = n0
     if n != 0 and byte(t, n - 1) == '\n' {
         n -= 1
@@ -264,7 +304,9 @@ pub extern effect fn rtLines(t: Int64, n0: Int64) -> Int64 as "qk_lines" {
     p
 }
 
-pub extern effect fn rtTrim(t: Int64, n: Int64) -> Int64 as "qk_trim" {
+pub extern effect fn rtTrim(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_trim" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     var a = 0
     var b = n
     while a < b and isSpace(byte(t, a)) {
@@ -276,7 +318,9 @@ pub extern effect fn rtTrim(t: Int64, n: Int64) -> Int64 as "qk_trim" {
     makeText(t + a, b - a)
 }
 
-pub extern effect fn rtCodePointCount(t: Int64, n: Int64) -> Int64 as "qk_codePointCount" {
+pub extern effect fn rtCodePointCount(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_codePointCount" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     var count = 0
     for i in 0..n {
         if i == 0 or byte(t, i) & 192 != 128 {
@@ -287,7 +331,9 @@ pub extern effect fn rtCodePointCount(t: Int64, n: Int64) -> Int64 as "qk_codePo
 }
 
 // t[lo..hi]: 0 when both ends are between characters, else 1 + the byte that cuts one
-pub extern effect fn rtTextCut(t: Int64, n: Int64, lo: Int64, hi: Int64) -> Int64 as "qk_textCut" {
+pub extern effect fn rtTextCut(tGiven: Int64, nGiven: Int64, lo: Int64, hi: Int64) -> Int64 as "qk_textCut" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     if lo > 0 and lo < n and byte(t, lo) & 192 == 128 {
         return lo + 1
     }
@@ -297,18 +343,46 @@ pub extern effect fn rtTextCut(t: Int64, n: Int64, lo: Int64, hi: Int64) -> Int6
     0
 }
 
-pub extern effect fn rtStartsWith(t: Int64, n: Int64, s: Int64, sn: Int64) -> Int64 as "qk_startsWith" =
+pub extern effect fn rtStartsWith(tGiven: Int64, nGiven: Int64, sGiven: Int64, snGiven: Int64) -> Int64 as "qk_startsWith" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    let s = shortBytes(sGiven, snGiven, 1)
+    let sn = textLength(snGiven)
     if sn <= n and sameBytes(t, s, sn) { 1 } else { 0 }
+}
 
-pub extern effect fn rtEndsWith(t: Int64, n: Int64, s: Int64, sn: Int64) -> Int64 as "qk_endsWith" =
+pub extern effect fn rtEndsWith(tGiven: Int64, nGiven: Int64, sGiven: Int64, snGiven: Int64) -> Int64 as "qk_endsWith" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    let s = shortBytes(sGiven, snGiven, 1)
+    let sn = textLength(snGiven)
     if sn <= n and sameBytes(t + n - sn, s, sn) { 1 } else { 0 }
+}
 
 pub fn find(t: Int, n: Int, part: Int, pn: Int) -> Int = findBytes(t, 0, n, part, pn)
 
-pub extern effect fn rtFind(t: Int64, n: Int64, part: Int64, pn: Int64) -> Int64 as "qk_find" =
+pub extern effect fn rtFind(tGiven: Int64, nGiven: Int64, partGiven: Int64, pnGiven: Int64) -> Int64 as "qk_find" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    let part = shortBytes(partGiven, pnGiven, 1)
+    let pn = textLength(pnGiven)
     find(t, n, part, pn)
+}
 
-pub extern effect fn rtReplace(t: Int64, n: Int64, old: Int64, on: Int64, by: Int64, wn: Int64) -> Int64 as "qk_replace" {
+pub extern effect fn rtReplace(
+    tGiven: Int64,
+    nGiven: Int64,
+    oldGiven: Int64,
+    onGiven: Int64,
+    byGiven: Int64,
+    wnGiven: Int64,
+) -> Int64 as "qk_replace" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    let old = shortBytes(oldGiven, onGiven, 1)
+    let on = textLength(onGiven)
+    let by = shortBytes(byGiven, wnGiven, 2)
+    let wn = textLength(wnGiven)
     if on == 0 {
         return makeText(t, n)
     }
@@ -343,7 +417,9 @@ pub extern effect fn rtReplace(t: Int64, n: Int64, old: Int64, on: Int64, by: In
     p
 }
 
-pub extern effect fn rtRepeat(t: Int64, n: Int64, times: Int64) -> Int64 as "qk_repeat" {
+pub extern effect fn rtRepeat(tGiven: Int64, nGiven: Int64, times: Int64) -> Int64 as "qk_repeat" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     if times <= 0 or n == 0 {
         return makeText(0, 0)
     }
@@ -356,7 +432,9 @@ pub extern effect fn rtRepeat(t: Int64, n: Int64, times: Int64) -> Int64 as "qk_
 }
 
 // join(texts, separator): an array of (bytes, length) pairs
-pub extern effect fn rtJoin(items: Int64, count: Int64, sep: Int64, sn: Int64) -> Int64 as "qk_join" {
+pub extern effect fn rtJoin(items: Int64, count: Int64, sepGiven: Int64, snGiven: Int64) -> Int64 as "qk_join" {
+    let sep = shortBytes(sepGiven, snGiven, 0)
+    let sn = textLength(snGiven)
     var total = 0
     for i in 0..count {
         total += textLengthAt(items + 16 * i) + (if i != 0 { sn } else { 0 })
@@ -390,7 +468,9 @@ pub extern effect fn rtTextFixed(v: Float64, decimals: Int64) -> Int64 as "qk_te
 }
 
 // "{x:8}": at least so wide, with spaces in front
-pub extern effect fn rtPad(t: Int64, n: Int64, width: Int64) -> Int64 as "qk_pad" {
+pub extern effect fn rtPad(tGiven: Int64, nGiven: Int64, width: Int64) -> Int64 as "qk_pad" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     var chars = 0
     for i in 0..n {
         if byte(t, i) & 192 != 128 {
@@ -685,9 +765,17 @@ fn textCase(t: Int, n: Int, upper: Bool) -> Int {
     p
 }
 
-pub extern effect fn rtUpper(t: Int64, n: Int64) -> Int64 as "qk_upper" = textCase(t, n, true)
+pub extern effect fn rtUpper(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_upper" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    textCase(t, n, true)
+}
 
-pub extern effect fn rtLower(t: Int64, n: Int64) -> Int64 as "qk_lower" = textCase(t, n, false)
+pub extern effect fn rtLower(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_lower" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    textCase(t, n, false)
+}
 
 // char(n): the code point's character; a panic for what is not one
 pub extern effect fn rtChar(cp: Int64, line: Int64) -> Int64 as "qk_char" {
@@ -720,7 +808,11 @@ pub extern effect fn rtBytesPush(p: Int64, n: Int64, b: Int64) -> Int64 as "qk_b
 
 // ---- C: texts across the boundary ----
 // a Text for C: its bytes and a zero, in the arena
-pub extern effect fn rtCText(p: Int64, n: Int64) -> Int64 as "qk_cText" = cString(p, n)
+pub extern effect fn rtCText(pGiven: Int64, nGiven: Int64) -> Int64 as "qk_cText" {
+    let p = shortBytes(pGiven, nGiven, 0)
+    let n = textLength(nGiven)
+    cString(p, n)
+}
 
 // bytes C gives as a Text (n < 0: up to their zero; 0: an empty text), copied: the address of its two slots
 pub extern effect fn rtTextOfC(p: Int64, n0: Int64) -> Int64 as "qk_textOfC" {
@@ -763,7 +855,9 @@ fn numberCopy(t: Int, n: Int) -> Int {
 fn wholeNumber(s: Int, n: Int, end: Int) -> Bool =
     n != 0 and end == s + n and not isSpace(byte(s, 0)) and strlen(s) == n
 
-pub extern effect fn rtParseInt(t: Int64, n: Int64) -> Int64 as "qk_parseInt" {
+pub extern effect fn rtParseInt(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_parseInt" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     let s = numberCopy(t, n)
     let endAt = alloc(1, 8)
     setWord(endAt, 0, s)
@@ -780,7 +874,9 @@ pub extern effect fn rtParseInt(t: Int64, n: Int64) -> Int64 as "qk_parseInt" {
     okResult(v, 0)
 }
 
-pub extern effect fn rtParseFloat(t: Int64, n: Int64) -> Int64 as "qk_parseFloat" {
+pub extern effect fn rtParseFloat(tGiven: Int64, nGiven: Int64) -> Int64 as "qk_parseFloat" {
+    let t = shortBytes(tGiven, nGiven, 0)
+    let n = textLength(nGiven)
     let out = alloc(1, 8)
     if not textFloat(t, n, out) {
         return notANumber("not a number", t, n)

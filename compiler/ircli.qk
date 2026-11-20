@@ -133,6 +133,7 @@ pub fn irCommand(given: [Text]) -> Int {
             sysv: sysv,
             debug: debug,
             debugKeys: if debug { lineKeys(checkedProgram.program) } else { [:] },
+            shortTexts: env("QUARK_SHORT_TEXTS") == Some("1"),
         ),
     )
     var prog = low.program

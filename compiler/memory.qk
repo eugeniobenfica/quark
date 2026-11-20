@@ -171,6 +171,7 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
             sysv: sysv,
             debug: debug,
             debugKeys: keys,
+            shortTexts: env("QUARK_SHORT_TEXTS") == Some("1"),
         ),
     )
     let lanes = if arm {

@@ -254,6 +254,15 @@ coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 >   - Os produtores passam a fazer a forma curta um a um, e as fatias continuam vistas, sem cópia.
 > - **Chamadas ao runtime e ao C.** O lowering entrega a forma longa, copiando os bytes de um texto curto para a área da função. As exceções são as funções que guardam o texto (a chave de `mapSet`, `send`), que o recebem como é.
 > - **O runtime aprende as duas formas onde lê um texto que está na memória**: as chaves e os valores de um mapa, os elementos de um array de textos, a cópia do coletor, a ordenação, `join`, os argumentos de processos e as mensagens de canais.
+> - **Feito (20/11/2026): etapas 1 a 3.**
+>   - O runtime lê as duas formas. As funções que recebem texto o decodificam ao entrar, e as que devolvem vistas dele (`split`, `words`, `lines`) copiam um curto antes.
+>   - O lowering trata as duas formas:
+>     - o comprimento é mascarado;
+>     - a igualdade compara os primeiros slots quando os dois textos são curtos;
+>     - a fatia de um curto sai curta, com os bytes deslocados;
+>     - `Text`→`Bytes` e os laços sobre bytes recebem uma cópia longa, feita antes da marca do laço.
+>   - `QUARK_SHORT_TEXTS=1` faz curtos os literais e as fatias de até 8 bytes, menos no runtime, que passa literais ao C pelo endereço. A suíte inteira passa com ele e roda assim no CI (Checks).
+>   - Achado no caminho: `for c in f().codePoints()` lia memória já coletada, como `words` antes. A saída esperada de `tests/run/loopSourceMade` tinha guardado o valor errado (157408805 em vez de 610500).
 > - **Etapas**, cada uma com a suíte também com o interruptor ligado:
 >   1. Os leitores do runtime.
 >   2. Os leitores do lowering e a fronteira das chamadas.

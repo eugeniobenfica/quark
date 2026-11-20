@@ -94,7 +94,9 @@ fn top(d: Int) -> Int = if word(d, dFrameCount) > 0 {
     0
 }
 
-pub extern effect fn rtDebugEnter(name: Int64, n: Int64) as "qk_debugEnter" {
+pub extern effect fn rtDebugEnter(nameGiven: Int64, nGiven: Int64) as "qk_debugEnter" {
+    let name = shortBytes(nameGiven, nGiven, 0)
+    let n = textLength(nGiven)
     let d = state()
     if d == 0 {
         return
@@ -132,7 +134,20 @@ pub extern effect fn debugUnwind() as "qkDebugUnwind" {
     }
 }
 
-pub extern effect fn rtDebugValue(name: Int64, nn: Int64, key: Int64, kn: Int64, text: Int64, tn: Int64) as "qk_debugValue" {
+pub extern effect fn rtDebugValue(
+    nameGiven: Int64,
+    nnGiven: Int64,
+    keyGiven: Int64,
+    knGiven: Int64,
+    textGiven: Int64,
+    tnGiven: Int64,
+) as "qk_debugValue" {
+    let name = shortBytes(nameGiven, nnGiven, 0)
+    let nn = textLength(nnGiven)
+    let key = shortBytes(keyGiven, knGiven, 1)
+    let kn = textLength(knGiven)
+    let text = shortBytes(textGiven, tnGiven, 2)
+    let tn = textLength(tnGiven)
     let d = state()
     if d == 0 {
         return

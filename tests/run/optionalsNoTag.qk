@@ -1,0 +1,74 @@
+// Optionals of a text, bytes or an array have no case slot (None is a length of -1): built, matched, compared, in
+// records, arrays, maps and channels, from the runtime (receive), and kept through the loops' collections (copied by
+// their type's description).
+type Item { name: Text, note: Text? }
+
+fn noteOf(it: Item) -> Text? = it.note
+
+fn firstWord(t: Text) -> Text? {
+    let ws = t.words()
+    if len(ws) == 0 {
+        return None
+    }
+    Some(ws[0])
+}
+
+fn need(t: Text?) -> Text? {
+    let v = t?
+    Some(v + "!")
+}
+
+fn main() {
+    let a = Item("a", Some("hi"))
+    let b = Item("b", None)
+    let empty: Text? = Some("")
+    print(a, b, empty, a.note ?? "-", b.note ?? "-")
+    print(noteOf(a) == Some("hi"), noteOf(b) == None, empty == None, empty == Some(""))
+    match b.note {
+        Some(n) => print("some", n)
+        None => print("none")
+    }
+    if a.note is Some(n) {
+        print("is", n, len(n))
+    }
+    print(firstWord("  hello world"), firstWord("   "))
+    print(need(Some("x")), need(None))
+    let xs = ["p", "q", "r"]
+    print(xs.first(), xs.last(), xs.get(1), xs.get(9), xs.first(x => x == "q"), xs.first(x => x == "z"))
+    let none: [Text] = []
+    print(none.first(), none.last())
+    var m: [Text: Text] = ["k": "v"]
+    print(m["k"], m["z"])
+    var opts: [Text?] = [Some("1"), None, Some("")]
+    opts.push(None)
+    print(opts, opts.filter(o => o != None).toArray())
+    let nothing: [Int] = []
+    let arrs: [[Int]?] = [Some([1, 2]), None, Some(nothing)]
+    print(arrs, arrs[0] ?? [], arrs[1] ?? [9])
+    let ch: Channel<Text?> = channel()
+    send(ch, None)
+    send(ch, Some("s"))
+    print(receive(ch), receive(ch))
+    var counts: [Text?: Int] = [:]
+    counts[None] = 1
+    counts[Some("x")] = 2
+    print(counts[None], counts[Some("x")], counts[Some("")])
+    // records with optionals that live through many collections of a loop
+    var kept: [Item] = []
+    var lists: [[Int]?] = []
+    for i in 0..200000 {
+        let note = if i % 4 == 0 { Some("note {i}") } else { None }
+        let item = Item("item {i}", note)
+        if i % 1000 == 0 {
+            kept.push(item)
+            lists.push(if i % 2000 == 0 { Some([i, i + 1]) } else { None })
+        }
+    }
+    var withNotes = 0
+    for it in kept {
+        if it.note is Some(n) {
+            withNotes += len(n)
+        }
+    }
+    print(len(kept), withNotes, kept[4], kept[5], lists[2], lists[3])
+}

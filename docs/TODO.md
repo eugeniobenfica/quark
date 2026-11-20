@@ -35,10 +35,10 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 - [x] B5 o runtime inlinável
   - [x] alocação de tamanho conhecido no próprio código
   - [x] push, busca em mapa (chave simples no código, de texto numa função do programa), interpolação numa chamada
-- [-] B6 representação dos valores
+- [x] B6 representação dos valores
   - [-] textos curtos dentro do valor: feitos em quatro etapas, medidos mais lentos (json +9%, words +16%), desfeitos
-  - [-] opcionais sem etiqueta: um slot a menos, nenhum trabalho poupado em laços; não vale a mudança
-  - [-] mapas em Swiss table: a tabela de índices com etiqueta já faz quase tudo o que ela faria
+  - [x] opcionais sem etiqueta (`Text?`, `Bytes?`, `[T]?`: `None` é o comprimento −1): `counting` −12%, `json` −2,5%
+  - [-] mapas em Swiss table: feita e medida; faltas 2× mais rápidas, acertos 18% mais lentos: desfeita
 - [~] B7 copiar menos na coleta de laço
   - [x] a tabela de salas cresce quando perde salas demais (50.000 elementos com push: de 1.160 para 210 ms)
   - [x] um registro das salas: uma coleta olha só as feitas depois da sua marca

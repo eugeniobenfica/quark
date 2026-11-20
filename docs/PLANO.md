@@ -299,6 +299,26 @@ coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 > - `tests/run/loopSourceMade` tinha guardado o valor errado;
 > - `tests/run/textMix`, com textos e `Bytes` misturados.
 
+> **Concluído em 20/11/2026.** Medido com cada executável num núcleo só e prioridade alta, alternando (a máquina
+> estava carregada; assim a variação cai para ±5%).
+> - **Opcionais sem etiqueta: feitos e mantidos.** `Text?`, `Bytes?` e `[T]?` não têm o slot do caso: são os dois
+>   slots do valor, e `None` é o comprimento −1, que nenhum valor tem. Medido antes: registros com um `Text?`
+>   eram 18% mais lentos que os mesmos registros sem a etiqueta. Com a mudança, 7% mais rápidos nesse teste; nos
+>   benchmarks, `counting` −12%, `json` −2,5%, `records` −2%, os outros iguais.
+>   - O layout está num lugar só (`Program.nicheDecl`, `caseLayout`). O lowering lê e escreve o caso por
+>     `tagOf`, `optNone`, `optSome` e `optionAt` (um opcional que o runtime deixou na memória, `[caso][valor]`).
+>   - A descrição do tipo é a do valor (`T`, `A...`): o coletor, a igualdade e o hash já tratam `(0, −1)` como
+>     nada. Esquecer isso fazia o coletor ler o ponteiro como caso, e só aparecia quando um registro com `Text?`
+>     era copiado (o `quark run` de um `extern` com biblioteca).
+>   - Fora, de propósito: os textos de C (`CText?`), que já têm a forma da fronteira com C.
+>   - Teste: `optionalsNoTag` (registros, arrays, mapas, canais, `receive`, `?`, `??`, `match`, e coletas de laço).
+> - **Swiss table: feita, medida e desfeita.** Bytes de controle (7 bits do hash) e índices de 32 bits na mesma
+>   alocação, oito bytes por vez (SWAR: o runtime não tem SIMD). Faltas ficaram 2× mais rápidas (14,4 → 7,6 ns),
+>   mas acertos 18% mais lentos (13,6 → 16,0 ns): a tabela atual vai do índice, que já traz a etiqueta e a entrada,
+>   direto à entrada; a Swiss passa pelo grupo, pela conta dos bits e por um índice à parte. Programas buscam
+>   sobretudo chaves que existem (`countBy`, chaves de JSON). Fica a tabela atual.
+> - **Textos curtos:** ficam fora, pelas medições acima.
+
 ### B7. Memória: copiar menos na coleta de laço
 
 - **Pré-promoção:** o que é guardado num container de fora do laço é alocado direto na região de fora.

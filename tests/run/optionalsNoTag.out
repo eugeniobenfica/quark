@@ -1,0 +1,14 @@
+Item(name: a, note: Some(hi)) Item(name: b, note: None) Some() hi -
+true true false true
+none
+is hi 2
+Some(hello) None
+Some(x!) None
+Some(p) Some(r) Some(q) None Some(q) None
+None None
+Some(v) None
+[Some(1), None, Some(), None] [Some(1), Some()]
+[Some([1, 2]), None, Some([])] [1, 2] [9]
+Some(None) Some(Some(s))
+Some(1) Some(2) None
+200 2087 Item(name: item 4000, note: Some(note 4000)) Item(name: item 5000, note: Some(note 5000)) Some([2000, 2001]) None

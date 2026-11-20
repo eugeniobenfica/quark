@@ -256,6 +256,7 @@ type Search {
     builtin: Int = 0
     line: Int = 0
     keyType: Int = -1
+    option: Int = -1 // first, find: the optional it gives
 }
 
 // What a loop does with each element (C's Sink and its context).
@@ -1544,6 +1545,9 @@ fn Lower.zeroOf(var self, t: Int) -> [Int] {
         }
         self.mov(r, z)
     }
+    if self.niche(t) {
+        self.optNone(v, t) // an optional's zero is None
+    }
     v
 }
 
@@ -1915,7 +1919,7 @@ fn Lower.sharedBoxes(var self, t: Int, slots: Int) -> Int {
 fn Lower.boxVal(var self, v: [Int], t: Int, line: Int) -> [Int] {
     let out = self.newReg('I')
     let done = self.label()
-    if t >= 0 and self.tk(t) == Kind.Enum and self.hasData(t) {
+    if t >= 0 and self.tk(t) == Kind.Enum and self.hasData(t) and not self.niche(t) {
         let d = self.tdecl(t)
         var table = -1
         for k in 0..len(self.dl(d).cases) {
@@ -1965,11 +1969,74 @@ fn Lower.setField(var self, prm: Int, slots: [Int], v: [Int], line: Int) {
     }
 }
 
+// ---- optionals of a text, bytes or an array: no case slot (types.qk's nicheOption) ----
+fn Lower.niche(self, t: Int) -> Bool = self.p.nicheOption(t)
+
+// the case of a value of enum t: slot 0; for an optional without one, 1 (Some) when its length is a value's
+fn Lower.tagOf(var self, v: [Int], t: Int) -> Int {
+    if self.niche(t) {
+        let none = self.iconst(-1)
+        return self.cmp(condNe, v[1], none)
+    }
+    v[0]
+}
+
+// the case of a value of the enum declared d
+fn Lower.tagIn(var self, v: [Int], d: Int) -> Int {
+    if self.p.nicheDecl(d) {
+        let none = self.iconst(-1)
+        return self.cmp(condNe, v[1], none)
+    }
+    v[0]
+}
+
+// r (an optional of type t) made None
+fn Lower.optNone(var self, r: [Int], t: Int) {
+    let z = self.iconst(0)
+    self.mov(r[0], z)
+    if self.niche(t) {
+        let none = self.iconst(-1)
+        self.mov(r[1], none)
+    }
+}
+
+// r (an optional of type t) made Some(v)
+fn Lower.optSome(var self, r: [Int], t: Int, v: [Int]) {
+    if self.niche(t) {
+        self.movVal(r[..len(v)], v)
+        return
+    }
+    let one = self.iconst(1)
+    self.mov(r[0], one)
+    self.movVal(r[1..1 + len(v)], v)
+}
+
+// an optional of type t the runtime left at p: [Some or None][the value's slots]
+fn Lower.optionAt(var self, p: Int, t: Int) -> [Int] {
+    if not self.niche(t) {
+        return self.loadSlots(p, t)
+    }
+    let r = self.valOf(t)
+    self.optNone(r, t)
+    let none = self.label()
+    let tag = self.loadMem('I', p, -1, 1, 0, mem64)
+    self.jz(tag, none)
+    let a = self.loadMem('I', p, -1, 1, 8, mem64)
+    let b = self.loadMem('I', p, -1, 1, 16, mem64)
+    self.movVal(r, [a, b])
+    self.place(none)
+    r
+}
+
 // Case k of enum t, with its data (one value per field, or none).
 fn Lower.caseValue(var self, t: Int, k: Int, fields: [[Int]]?) -> [Int] {
     let v = self.valOf(t)
     let kk = self.iconst(k)
     self.mov(v[0], kk)
+    if self.niche(t) and k == 0 {
+        let none = self.iconst(-1)
+        self.mov(v[1], none)
+    }
     let d = self.tdecl(t)
     if fields is Some(fs) {
         let cf = self.caseFields(d, k)
@@ -2132,7 +2199,7 @@ fn Lower.dumpFields(var self, v: [Int], d: Int, k: Int, fields: [Int]) {
 fn Lower.dumpCase(var self, v: [Int], d: Int, k: Int, t: Int) {
     let skip = self.label()
     let kk = self.iconst(k)
-    let same = self.cmp(condEq, v[0], kk)
+    let same = self.cmp(condEq, self.tagIn(v, d), kk)
     self.jz(same, skip)
     let at = self.caseOffset(d, k)
     self.dumpVal(v[at..at + self.slots(t)], t)
@@ -2183,7 +2250,7 @@ fn Lower.dumpVal(var self, v: [Int], t: Int) {
         Enum => {
             let d = self.tdecl(t)
             let x = self.dl(d)
-            self.dumpInt(v[0])
+            self.dumpInt(self.tagOf(v, t))
             if x.resultOf >= 0 {
                 self.dumpCase(v, d, 0, x.errorOf)
                 self.dumpCase(v, d, 1, x.resultOf)
@@ -2301,7 +2368,7 @@ fn Lower.printValInline(var self, v: [Int], t: Int) {
             if x.optionOf >= 0 {
                 let some = self.label()
                 let done = self.label()
-                self.jnz(v[0], some)
+                self.jnz(self.tagOf(v, t), some)
                 self.printLiteral("None")
                 self.jmp(done)
                 self.place(some)
@@ -2719,9 +2786,7 @@ fn Lower.searchSink(var self, s: Search, elem: [Int], index: Int) {
             let t = self.lowerExpr(self.lambdaBody(s.lambda))[0]
             self.jz(t, self.loopContinue)
         }
-        let one = self.iconst(1)
-        self.mov(s.result[0], one)
-        self.movVal(s.result[1..], elem)
+        self.optSome(s.result, s.option, elem)
         if s.builtin == bFirst {
             self.jmp(self.loopBreak)
         }
@@ -3070,15 +3135,11 @@ fn Lower.mapGet(var self, m: [Int], k: [Int], key: Int, option: Int, line: Int) 
     let ka = self.keyArgs(k, key)
     let p = self.mapLookup(m[0], ka, key, line)
     let r = self.valOf(option)
-    let z = self.iconst(0)
-    let found = self.cmp(condNe, p, z)
-    self.mov(r[0], found)
+    self.optNone(r, option)
     let none = self.label()
-    self.jz(r[0], none)
-    for i in 1..len(r) {
-        let z2 = self.iconst(0)
-        self.emit(.Load, r[i], p, z2, imm: 8, c: 8 * (i - 1))
-    }
+    self.jz(p, none)
+    let v = self.loadSlots(p, self.p.fallibleValue(option))
+    self.optSome(r, option, v)
     self.place(none)
     r
 }
@@ -3319,7 +3380,7 @@ fn Lower.lowerRuntimeCall(var self, e: Int, a: [Int], t: Int, line: Int) -> [Int
         // the value whole, by the address of its slots (a T of any size)
         args = [args[0], self.spill(args[1..], line)]
     } else if name == "receive" {
-        args.push(self.iconst(self.slots(t))) // the T? it gives: its slots
+        args.push(self.iconst(1 + self.slots(self.p.fallibleValue(t)))) // the T? it leaves: its case, then T's slots
     }
     let withLine = match self.p.ast.exprs[e].node {
         Call(called, _, _, _, _, _) => called == "runtimeLine"
@@ -3341,6 +3402,9 @@ fn Lower.lowerRuntimeCall(var self, e: Int, a: [Int], t: Int, line: Int) -> [Int
     }
     if self.slots(t) == 1 and not (k == Kind.Enum and self.hasData(t)) {
         return [self.rtcall(id, args, 'I', at)]
+    }
+    if self.niche(t) {
+        return self.optionAt(self.rtcall(id, args, 'I', at), t) // [Some or None][the value]: without its case slot
     }
     self.slotsCall(id, args, t, at)
 }
@@ -3542,15 +3606,15 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
         if b == bLast and len(a) == 1 {
             let arr = self.lowerExpr(src)
             let r = self.valOf(t)
+            self.optNone(r, t)
             let z = self.iconst(0)
             let some = self.cmp(condGt, arr[1], z)
-            self.mov(r[0], some)
             let none = self.label()
-            self.jz(r[0], none)
+            self.jz(some, none)
             let one = self.iconst(1)
             let at = self.op2(.Sub, arr[1], one, 'I')
             let last = self.loadElem(arr, at, elem)
-            self.movVal(r[1..], last)
+            self.optSome(r, t, last)
             self.place(none)
             return r
         }
@@ -3563,8 +3627,8 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
         } else if b is 59 | 60 {
             let r = self.valOf(t)
             s.result = r
-            let z = self.iconst(0)
-            self.mov(r[0], z)
+            s.option = t
+            self.optNone(r, t)
         } else {
             let r = self.valOf(elem)
             s.result = r
@@ -3908,6 +3972,9 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
             }
             self.mov(reg, zz)
         }
+        if self.niche(t) {
+            self.optNone(r, t)
+        }
         let none = self.label()
         let c1 = self.cmp(condLt, i, arr[1])
         self.jz(c1, none)
@@ -3915,9 +3982,7 @@ fn Lower.lowerBuiltin(var self, e: Int) -> [Int] {
         let c2 = self.cmp(condLt, i, z)
         self.jnz(c2, none)
         let v = self.loadElem(arr, i, self.dl(self.tdecl(t)).optionOf)
-        let one = self.iconst(1)
-        self.mov(r[0], one)
-        self.movVal(r[1..1 + len(v)], v)
+        self.optSome(r, t, v)
         self.place(none)
         return r
     }
@@ -4453,7 +4518,17 @@ fn Lower.nullable(var self, t: Int, p: Int, line: Int) -> [Int] {
     let z = self.iconst(0)
     r[0] = self.cmp(condNe, p, z)
     let inner = self.p.fallibleValue(t)
-    if self.tk(inner) == Kind.Text {
+    if self.tk(inner) == Kind.Text and self.niche(plain) {
+        // (no case slot: None's length is -1)
+        let out = self.valOf(plain)
+        self.optNone(out, plain)
+        let none = self.label()
+        self.jz(p, none)
+        let text = self.textOfC(p, -1, line)
+        self.movVal(out, text)
+        self.place(none)
+        return out
+    } else if self.tk(inner) == Kind.Text {
         let text = self.textOfC(p, -1, line)
         r[1] = text[0]
         r[2] = text[1]
@@ -4468,8 +4543,12 @@ fn Lower.nullableToC(var self, t: Int, v: [Int], line: Int) -> Int {
     let z = self.iconst(0)
     self.mov(r, z)
     let none = self.label()
-    self.jz(v[0], none)
-    let x = if self.tk(self.p.fallibleValue(t)) == Kind.Text {
+    let plain = self.p.plainType(t)
+    let niche = self.niche(plain)
+    self.jz(if niche { self.tagOf(v, plain) } else { v[0] }, none)
+    let x = if niche {
+        self.cTextOf(v[0..2], line)
+    } else if self.tk(self.p.fallibleValue(t)) == Kind.Text {
         self.cTextOf(v[1..3], line)
     } else {
         v[1]
@@ -5369,7 +5448,8 @@ fn Lower.equalVals(var self, a: [Int], b: [Int], t: Int, line: Int) -> Int {
     if k == Kind.Enum and self.hasData(t) {
         let d = self.tdecl(t)
         let all = self.newReg('I')
-        let same = self.cmp(condEq, a[0], b[0])
+        let ta = self.tagOf(a, t)
+        let same = self.cmp(condEq, ta, self.tagOf(b, t))
         self.mov(all, same)
         let done = self.label()
         self.jz(all, done)
@@ -5380,7 +5460,7 @@ fn Lower.equalVals(var self, a: [Int], b: [Int], t: Int, line: Int) -> Int {
             }
             let skip = self.label()
             let kc = self.iconst(kk)
-            let isK = self.cmp(condEq, a[0], kc)
+            let isK = self.cmp(condEq, ta, kc)
             self.jz(isK, skip)
             for (f, prm) in cf.enumerate() {
                 let ft = self.ptype(prm)
@@ -5507,7 +5587,7 @@ fn Lower.lowerBinary(var self, e: Int) -> [Int] {
         let r = self.valOf(x.ty)
         let none = self.label()
         let done = self.label()
-        self.jz(opt[0], none)
+        self.jz(self.tagOf(opt, self.ty(l)), none)
         if x.ty == self.ty(l) {
             self.movVal(r, opt)
         } else {
@@ -5703,7 +5783,7 @@ fn Lower.matchPattern(var self, arm: Int, v: [Int], t: Int, fail: Int, checkCase
     let record = self.tk(t) == Kind.Record
     if not record and checkCase and len(self.dl(d).cases) > 1 {
         let kc = self.iconst(a.caseIndex)
-        let c = self.cmp(condEq, v[0], kc)
+        let c = self.cmp(condEq, self.tagOf(v, t), kc)
         self.jz(c, fail)
     }
     for f in 0..len(a.binds) {
@@ -6191,7 +6271,7 @@ fn Lower.lowerTry(var self, e: Int, value: Int) -> [Int] {
     let d = self.tdecl(self.ty(value))
     let x = self.dl(d)
     let ok = self.label()
-    self.jnz(whole[0], ok)
+    self.jnz(self.tagOf(whole, self.ty(value)), ok)
     let f = if len(self.inlining) > 0 {
         self.inlining[len(self.inlining) - 1].d
     } else {
@@ -6453,6 +6533,11 @@ fn Desc.typeIn(var self, l: Lower, t: Int, given: [(Int, Int)]) {
                 return
             }
             let d = l.tdecl(t)
+            if l.p.nicheDecl(d) {
+                // no case slot: its value's description (None, a length of -1, is no value's: nothing to copy)
+                self.typeIn(l, l.dl(d).optionOf, open)
+                return
+            }
             if len(open) < 64 {
                 open.push((t, len(self.out)))
             }

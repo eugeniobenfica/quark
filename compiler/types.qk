@@ -581,7 +581,26 @@ pub fn Program.slotKinds(self, t: Int) -> Text {
 // starts: where each case's data begins; kinds: every slot's ('I' where no case has a Float).
 pub type CaseLayout { starts: [Int] = [], kinds: Text = "I" }
 
+// An optional of a text, bytes or an array has no case slot: its value's two slots, and None a length of -1, which no
+// value has (0, -1). Some's data starts at 0. (Not a C text's: the boundary with C has its own form.)
+pub fn Program.nicheOption(self, t: Int) -> Bool {
+    if t < 0 {
+        return false
+    }
+    let ty = self.types[t]
+    ty.kind == Kind.Enum and ty.decl >= 0 and self.nicheDecl(ty.decl)
+}
+
+// the same, by the optional's declaration (an instance of Option<T>)
+pub fn Program.nicheDecl(self, d: Int) -> Bool {
+    let inner = self.ast.decls[d].optionOf
+    inner >= 0 and self.types[inner].kind is Text | Bytes | Array and self.types[inner].c == 0
+}
+
 pub fn Program.caseLayout(self, d: Int) -> CaseLayout {
+    if self.nicheDecl(d) {
+        return CaseLayout([0, 0], "II")
+    }
     let cf = self.ast.decls[d].caseFields
     var each: [Bytes] = []
     for fields in cf {

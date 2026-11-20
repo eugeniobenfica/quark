@@ -1627,3 +1627,48 @@ pub fn Ownership.selfInRegs(var self, d: Int) -> Bool {
     }
     false
 }
+
+// ---- reuse in place ----
+// xs = xs.map(f) on a var: each value written where its element was, as xs[i] = f(xs[i]) would (a var's buffer is
+// its own: a let that borrowed it copies when the var changes). Only when f is a lambda that does not read xs (it
+// would see the elements already written), xs is no lambda's (a capture), the elements stay of their type, and they
+// hold no memory (a young value in an old array would need the loop collector's barrier).
+pub fn Ownership.mapsInPlace(self, target: Int, value: Int) -> Bool {
+    let b = self.p.ast.exprs[target].binding
+    if self.debug or b < 0 or self.p.bindings[b].lazy or value < 0 {
+        return false
+    }
+    var v = value // (made an array where it goes: the loop map gives, through an implicit toArray)
+    while self.p.ast.exprs[v].implicit
+        and self.p.ast.exprs[v].builtin == bToArray
+        and self.p.ast.exprs[v].node is Call(_, _, _, _, _, _) {
+        v = self.argsOf(v)[0]
+    }
+    let x = self.p.ast.exprs[v]
+    if not x.node is Call(_, _, _, _, _, _) or x.builtin != bMap {
+        return false
+    }
+    let args = self.argsOf(v)
+    if len(args) != 2 {
+        return false
+    }
+    let source = self.p.ast.exprs[args[0]]
+    if not source.node is Name(_) or source.binding != b or not self.p.ast.exprs[args[1]].node is Lambda(_, _) {
+        return false
+    }
+    let t = self.p.bindings[b].ty
+    if self.tk(t) != Kind.Array
+        or self.ty(value) != t
+        or self.elemOf(x.ty) != self.elemOf(t)
+        or self.holdsMemory(self.elemOf(t)) {
+        return false
+    }
+    for y in self.p.bindings {
+        if y.capturedFrom == b {
+            return false
+        }
+    }
+    var u = Uses(b)
+    u.expr(self, args[1], false)
+    u.count == 0
+}

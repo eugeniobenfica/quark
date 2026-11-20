@@ -277,6 +277,7 @@ enum Sink {
     ForBody(stmt: Int, memory: Int)
     PrintElem(elem: Int)
     DumpElem(elem: Int)
+    InPlace(ptr: Int, bytes: Int)
 }
 
 // What a loop over a map's entries does with each one (C's EntryFn and its context).
@@ -1421,6 +1422,7 @@ fn Lower.sink(var self, sk: Sink, elem: [Int], index: Int) {
             }
             self.place(done)
         }
+        InPlace(ptr, bytes) => self.storeSlots(ptr, index, bytes, 0, elem)
         MapThrough(lambda, inner) => {
             self.bindLambda(lambda, [elem, [index]])
             let v = self.lowerExpr(self.lambdaBody(lambda))
@@ -6978,6 +6980,13 @@ fn Lower.lowerAssign(var self, s: Int) {
         let fresh = self.copyVal(joined)
         let p = self.changePlace(target)
         self.writePlace(p, fresh)
+        return
+    }
+    if opNum == 0 and tx.node is Name(_) and self.own.mapsInPlace(target, value) and not self.atAddress[tx.binding] {
+        // xs = xs.map(f): each value written where its element was (the var's buffer is its own, as for xs[i] = v)
+        let arr = self.regsOf(tx.binding)[..2]
+        let bytes = self.slots(self.elemOf(tx.ty)) * 8
+        self.forEach(value, .InPlace(arr[0], bytes))
         return
     }
     if opNum == 0 and tx.node is Name(_) {

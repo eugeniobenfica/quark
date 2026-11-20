@@ -62,6 +62,7 @@ const growingFirstBits = 10 // 1024 buckets to start with
 const growingWays = 4
 const growingMostBits = 14 // at most 16384 buckets: a loop's collection looks through all of them
 const blockSize = 16777216
+const blockFirst = 65536 // an arena's first block (a new block: as large as all before it, up to blockSize)
 
 pub fn arena() -> Int = ctxGet(ctxArena)
 
@@ -250,7 +251,9 @@ fn allocSlow(count: Int, bytesEach: Int) -> Int {
         cur = next // blocks after the current one are empty and zeroed
     }
     if cur == 0 or word(cur, bUsed) + bytes > word(cur, bSize) {
-        var size = if bytes > blockSize { bytes } else { blockSize }
+        // as large as all the arena reserved so far: from 64 KB (a task's arena, often small) up to 16 MB
+        let step = min(max(word(a, aReserved), blockFirst), blockSize)
+        var size = if bytes > step { bytes } else { step }
         let limit = word(a, aLimit)
         if limit != 0 and word(a, aReserved) + size > limit {
             if word(a, aReserved) + bytes > limit {

@@ -331,6 +331,10 @@ simplifica `graph.qk`/`collab.qk` (4.000 linhas) e deixa programas Quark manipul
   de escolher o template, porque desde `Channel<T>` os built-ins genéricos (`send`, `receive`) escapavam da
   conferência na chamada; as chamadas do próprio prelúdio não são conferidas, e um built-in com corpo em bloco
   (`withTimeout`) tem o grupo do primeiro built-in que chama.
+  No macOS, 2.000 `withTimeout` levavam 3 a 6,5 s (58 ms no Windows): medido por partes na CI, o custo era a
+  primeira alocação de cada tarefa, um bloco de 16 MB com `calloc`, que o macOS zera inteiro ao reaproveitar a
+  região recém-liberada. Agora o bloco novo de uma arena é do tamanho de tudo o que ela já reservou, de 64 KB a
+  16 MB: tarefas duas vezes mais rápidas no Windows também, e os benchmarks iguais.
 - **Concorrência estruturada:** um escopo que só termina quando as tarefas que abriu terminam, e propaga o pânico
   com a origem (`go` solto fica para servidores).
 - **Decisão a tomar e escrever:** uma thread por agendador (hoje) ou um agendador por núcleo com roubo de trabalho.

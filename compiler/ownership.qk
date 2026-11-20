@@ -16,6 +16,9 @@ pub type Ownership {
     aliasDeep: [Bool] = [] // by binding: its value may share containers with a deep var (decideAliases)
     borrowed: [Int] = [] // by statement: a let that copies its value (0), borrows it (1) or takes it (2) (decideAliases)
     takes: [Bool] = [] // by expression: a var's name at its last use, its value handed over, not copied (decideTakes)
+    ownedResults: [Bool] = [] // by declaration: a function whose result is always all its own (decideResults)
+    returns: [[Int]] = [] // by declaration: the values its returns give back (noted by decideAliases' walk)
+    walking: Int = -1 // the declaration decideAliases goes through
 }
 
 // ---- the tree, as these questions read it ----
@@ -665,7 +668,12 @@ pub fn Ownership.deepFresh(self, e: Int) -> Bool {
                 return self.isFresh(e) and self.tk(x.ty) == Kind.Array and not self.holdsContainers(self.elemOf(x.ty))
             }
             if not self.constructs(e) {
-                return false
+                // a function's call whose result is always its own
+                return x.callee < 0
+                    and x.binding < 0
+                    and x.decl >= 0
+                    and x.decl < len(self.ownedResults)
+                    and self.ownedResults[x.decl]
             }
             x.ordered.all(o => self.deepFresh(o))
         }
@@ -1017,9 +1025,12 @@ pub fn Ownership.appended(self, s: Int) -> Int {
 pub fn Ownership.decideAliases(var self) {
     self.aliasDeep = [false] * len(self.p.bindings)
     self.borrowed = [0] * len(self.p.ast.stmts)
+    let none: [Int] = []
+    self.returns = [none] * len(self.p.ast.decls)
     for d in self.p.decls {
         let x = self.p.ast.decls[d]
         if x.body >= 0 and not x.isTemplate {
+            self.walking = d
             self.aliasExpr(x.body)
         }
     }
@@ -1146,7 +1157,12 @@ fn Ownership.aliasBlock(var self, b: Int) {
                 self.aliasExpr(cond)
                 self.aliasBlock(body)
             }
-            Return(value) => self.aliasExpr(value)
+            Return(value) => {
+                self.aliasExpr(value)
+                if value >= 0 and self.walking >= 0 {
+                    self.returns[self.walking].push(value)
+                }
+            }
             Defer(body) => self.aliasBlock(body)
             _ => {}
         }
@@ -1286,5 +1302,76 @@ pub fn Uses.stmt(var self, l: Ownership, s: Int, loop: Bool) {
         Return(value) => self.expr(l, value, loop)
         Defer(body) => self.block(l, body, true)
         _ => {}
+    }
+}
+
+// ---- results that are all their own ----
+// A function's result is all its own (nothing in it shared with a var, a parameter or a constant) when every value it
+// gives back is: a new one (deepFresh), a var of its own changed inside (a deep var: every value put in it was copied
+// all through), the result of a call of such a function, or an if's, a match's or a block's whose every branch is.
+// A call of it needs no deep copy where its value is kept all through. Worked out for every function together,
+// from "all of them are" down to what holds (a function that calls itself keeps its answer when nothing else says no).
+pub fn Ownership.decideResults(var self) {
+    let n = len(self.p.ast.decls)
+    self.ownedResults = [false] * n
+    var candidates: [Int] = []
+    for d in self.p.decls {
+        let x = self.p.ast.decls[d]
+        if x.kind == DeclKind.Fn and x.body >= 0 and not x.isExtern and not x.isTemplate {
+            self.ownedResults[d] = true
+            candidates.push(d)
+        }
+    }
+    var changed = true
+    while changed {
+        changed = false
+        for d in candidates {
+            if self.ownedResults[d] and not self.resultOwned(d) {
+                self.ownedResults[d] = false
+                changed = true
+            }
+        }
+    }
+}
+
+// (its returns' values noted by decideAliases, which goes through every function first)
+fn Ownership.resultOwned(self, d: Int) -> Bool =
+    self.ownedValue(self.p.ast.decls[d].body) and self.returns[d].all(v => self.ownedValue(v))
+
+// is the value of e all its own
+fn Ownership.ownedValue(self, e: Int) -> Bool {
+    if e < 0 or self.deepFresh(e) {
+        return true
+    }
+    let x = self.p.ast.exprs[e]
+    match x.node {
+        Name(_) => {
+            let b = x.binding
+            b >= 0
+                and self.p.bindings[b].mutable
+                and self.p.bindings[b].deep
+                and not self.p.bindings[b].isParam
+                and self.p.bindings[b].capturedFrom < 0
+                and not self.p.bindings[b].lazy
+        }
+        BlockExpr(block, _) => self.blockValueOwned(block)
+        If(_, then, otherwise) => self.blockValueOwned(then) and self.ownedValue(otherwise)
+        Match(_, arms, _) => arms.all(a => self.ownedValue(self.p.ast.arms[a].body))
+        _ => false
+    }
+}
+
+// a block's value (its last statement's, when that is an expression) all its own; a block that gives none, yes
+fn Ownership.blockValueOwned(self, b: Int) -> Bool {
+    if b < 0 {
+        return true
+    }
+    let stmts = self.p.ast.blocks[b].stmts
+    if len(stmts) == 0 {
+        return true
+    }
+    match self.p.ast.stmts[stmts[len(stmts) - 1]].node {
+        ExprStmt(v) => self.ownedValue(v)
+        _ => true
     }
 }

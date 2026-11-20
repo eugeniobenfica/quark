@@ -1,0 +1,28 @@
+// A constant array of texts gone over as it is, read from the program's data (no array made for it): for, map,
+// filter, countBy, enumerate, break and continue; and as a value, given to a function and kept.
+const names = ["ann", "bob", "cy", "dee", "bob"]
+const primes = [2, 3, 5, 7, 11]
+
+fn joined(xs: [Text]) -> Text = xs.join("+")
+
+fn main() {
+    var all: [Text] = []
+    for n in names {
+        all.push(n)
+    }
+    print(all, len(names), names[3])
+    print(names.map(n => n.upper()).toArray(), names.filter(n => len(n) == 3).toArray())
+    print(names.countBy(n => n)["bob"] ?? 0)
+    for (i, n) in names.enumerate() {
+        if n == "bob" {
+            continue
+        }
+        if i == 3 {
+            break
+        }
+        print(i, n)
+    }
+    var kept = names
+    kept.push("eve")
+    print(joined(names), len(kept), primes.sum())
+}

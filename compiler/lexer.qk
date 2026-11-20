@@ -23,6 +23,7 @@ type Lexer {
     tokenOnLine: Bool = false
     blank: Bool = false
     out: Lexed = Lexed()
+    keywordOf: [Text: Tok] = keywords // the map made once for the file (a constant's map is made where it is used)
 }
 
 pub fn lex(text: Text) -> Lexed {
@@ -262,7 +263,7 @@ fn Lexer.name(var self, start: Int) {
         )
     }
     let word = self.text[start..self.p]
-    let kind = keywords[word] ?? (if b[start] is 'A'..='Z' { Tok.TypeName } else { Tok.Name })
+    let kind = self.keywordOf[word] ?? (if b[start] is 'A'..='Z' { Tok.TypeName } else { Tok.Name })
     self.add(kind, start, n)
 }
 

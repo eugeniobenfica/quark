@@ -1,0 +1,6 @@
+[ann, bob, cy, dee, bob] 5 dee
+[ANN, BOB, CY, DEE, BOB] [ann, bob, dee, bob]
+2
+0 ann
+2 cy
+ann+bob+cy+dee+bob 6 28

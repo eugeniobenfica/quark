@@ -154,6 +154,21 @@ preciso, numa versão mínima.
 >   - `split` e `lines` foram medidos fundidos do mesmo jeito e ficaram mais lentos: `lines` 22 → 37 ms, `split` 102 → 111 ms. O runtime acha o separador oito bytes por vez, e um laço byte a byte no IR perde. Ficam como estão, e `tests/run/textPieces` fixa o que eles dão.
 > - O `pipeline` deixou de acusar diferença no checksum. Era o mesmo Float escrito de dois jeitos, e `tools/bench.sh` agora compara os números por valor.
 
+> **Mais uma rodada (20/11/2026):**
+> - **Arrays constantes de texto, percorridos sem array.** `for`, `map`, `countBy` etc. leem a tabela nos dados, como o índice já fazia. Num laço de teste, 46 → 36 ms e nenhuma alocação.
+> - **Resultado já possuído (`decideResults`).** Uma função cujo valor devolvido é sempre todo seu não paga cópia funda onde a chamada é guardada. Conta como todo seu:
+>   - algo novo;
+>   - um var fundo seu;
+>   - a chamada de outra função assim;
+>   - um `if`, `match` ou bloco em que todos os ramos são assim.
+>
+>   O cálculo é um ponto fixo otimista. Os `return` de cada função são anotados pela passada de aliasing, que já percorre tudo, então o custo é perto de zero.
+> - **Tempo de compilação.** O compilador compilando a si mesmo ficou cerca de 5% mais rápido no total, já pagando as passadas novas:
+>   - `keywords[word]` refazia o mapa de palavras-chave (~30 inserções) a cada nome lido, e a leitura e checagem foi de 541 para 442 ms. Um mapa constante ainda é refeito onde é usado: falta a linguagem fazê-lo uma vez.
+>   - A eliminação de subexpressões comuns criava um mapa novo a cada rótulo, salto ou chamada. Agora é uma tabela por função, com o número do trecho na chave: otimizar foi de 3.652 para 3.413 ms no `--release`.
+> - **Medido e não mantido.** Um cache da última sala na arena, para `text += ...`: não mudou nada. Cada pedaço custa ~8 ns, que são a chamada ao runtime e não a busca da sala. O próximo passo seria juntar os pedaços de uma interpolação numa só chamada.
+> - **Records (2,0× de C).** O coletor gasta 29% copiando o array novo de `ins.args + [x]`, que sobrevive por ir para uma estrutura velha. O caminho é reutilizar no lugar: o array antigo morre na mesma atribuição e poderia crescer onde está.
+
 > **Próximos passos:**
 > - As decisões que ainda dependem do estado da emissão: o self por endereço, a área da função e a coleta por turno de laço, que lê o IR emitido.
 > - O último uso estendido a campos (`self.items` no fim) e a ramos de `match` e `if`.

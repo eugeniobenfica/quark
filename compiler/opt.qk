@@ -150,8 +150,10 @@ fn IrFn.remainderFromQuotient(var self) {
 }
 
 // ---- common subexpressions ----
-// a pure computation seen: an operand is a register's number and version, or a constant's value
+// a pure computation seen in a straight run (run: which one): an operand is a register's number and version, or a
+// constant's value
 type Seen {
+    run: Int
     op: Int
     cond: Int
     kind: Int
@@ -222,7 +224,8 @@ pub fn IrFn.commonSubexpressions(var self) {
             }
         }
     }
-    var table: [Seen: Int] = [:]
+    var table: [Seen: Int] = [:] // one table for the function: what an earlier run saw has another run's number
+    var run = 0
     for k in 0..len(self.code) {
         if self.code[k].op == .Nop {
             continue
@@ -277,7 +280,7 @@ pub fn IrFn.commonSubexpressions(var self) {
         }
         let now = self.code[k].op
         if now is Label | Jmp | Jz | Jnz | Call | RtCall | HostCall | Ret {
-            table = [:] // a new straight run
+            run += 1 // a new straight run
         }
         let ca = self.code[k].a
         let cb = self.code[k].b
@@ -288,6 +291,7 @@ pub fn IrFn.commonSubexpressions(var self) {
             and defs[dst] == 1
         if candidate {
             var s = Seen(
+                run,
                 now.index(),
                 self.code[k].cond,
                 self.kinds[dst],

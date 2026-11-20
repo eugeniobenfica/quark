@@ -1723,6 +1723,38 @@ fn Lower.forEachInner(var self, from: Int, sink: Sink) {
         self.place(done)
         return
     }
+    if x.node is Name(_) and x.binding < 0 and x.decl >= 0 and self.constTexts(x.decl) >= 0 {
+        // a constant array of texts: each read from its table in the data, no array made for it
+        let table = self.dataAddress(self.constTextAt[x.decl] ?? 0)
+        let count = self.iconst(self.constTextCount(x.decl))
+        let k = self.newReg('I')
+        let z = self.iconst(0)
+        self.mov(k, z)
+        let test = self.label()
+        self.depth += 1
+        self.jmp(test)
+        self.place(top)
+        self.fuel(x.line)
+        let off = self.newReg('I')
+        self.emit(.Load, off, table, k, imm: 16, c: 0)
+        let size = self.newReg('I')
+        self.emit(.Load, size, table, k, imm: 16, c: 8)
+        let data = self.dataAddress(0)
+        let at = self.op2(.Add, data, off, 'I')
+        let saved = self.loopFrame(done, next)
+        self.sink(sink, [at, size], k)
+        self.loopBreak = saved.0
+        self.loopContinue = saved.1
+        self.place(next)
+        let one = self.iconst(1)
+        self.emit(.Add, k, k, one)
+        self.place(test)
+        let more = self.cmp(condLt, k, count)
+        self.jnz(more, top)
+        self.depth -= 1
+        self.place(done)
+        return
+    }
     // an array
     var arr: [Int] = []
     if self.preArray == src {
@@ -6383,7 +6415,9 @@ fn Lower.preLowerSource(var self, iter: Int) {
         self.preB = pb
         self.mov(pa, a)
         self.mov(pb, b)
-    } else if self.tk(bx.ty) is Array | Map | Bytes {
+    } else if self.tk(bx.ty) is Array | Map | Bytes
+        and not (bx.node is Name(_) and bx.binding < 0 and bx.decl >= 0 and self.constTexts(bx.decl) >= 0) {
+        // (a constant array of texts is read from the data as the loop goes: nothing made)
         let v = self.lowerExpr(base)
         var arr = self.copyVal(v)
         if self.tk(bx.ty) == Kind.Map and self.snapshot >= 0 and self.own.rootBinding(base) == self.snapshot {
@@ -7245,6 +7279,7 @@ pub fn Lowered.lowerFrom(var self, p: Program, opts: LowerOptions) {
     l.out.runtime = runtimeTable()
     l.own.decideAliases()
     l.own.decideTakes()
+    l.own.decideResults()
     l.markInPlace()
     var count = 0
     var main = -1

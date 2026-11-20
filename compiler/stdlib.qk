@@ -2944,7 +2944,7 @@ pub fn localNow() -> DateTime = local(unixTime())
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "504378378-2259995"
+pub const compilerSources = "544220711-2274195"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -12870,7 +12870,7 @@ pub extern effect fn wasiSleep(ms: Int64) as "qkosSleep" {
     free(n)
 }
 
-pub extern effect fn wasiLocalOffset(t: Int64) -> Int64 as "qkosLocalOffset" = t - t // UTC
+pub extern effect fn wasiLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" = toInt(seconds - seconds) // UTC
 
 pub extern effect fn wasiProcessors() -> Int64 as "qkosProcessors" = 1
 
@@ -13193,6 +13193,9 @@ pub extern effect fn wasiCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int
 
 // ---- the start: the arguments, the state; and the end: what print kept written, the status ----
 pub extern effect fn wasiBegin() as "qkWasiBegin" {
+    for i in 0..8 {
+        setWord(wasiCell(), i, 0) // its words zero (a literal's bytes until now)
+    }
     let sizes = calloc(2, 8)
     let _ = argsSizesGet(sizes, sizes + 8)
     let count = word(sizes, 0) & 4294967295
@@ -13958,9 +13961,12 @@ pub extern fn wasiPow(x: Float64, y: Float64) -> Float64 as "pow" {
     }
     if name == "windows" {
         return r"""
-// The runtime's system calls on Windows: kernel32 and the C runtime (ucrt), each behind a symbol of the runtime's own
-// (qkos*, C's calls; linux.qk gives the same ones), and the executable's entry, wmain. Names are UTF-8 in the runtime
-// and UTF-16 here: Windows' wide functions take any name, its ANSI ones only the code page's.
+// The runtime's system calls on Windows: kernel32 alone (and ntdll's memcpy, memset, memcmp, strlen), each behind a
+// symbol of the runtime's own (qkos*, C's calls; linux.qk gives the same ones), and the executable's entry, wmain.
+// What the C library gives elsewhere is made here over kernel32: the heap (malloc...: the process's heap), files (a
+// FILE* is a word of ours over a handle), the environment, the time and its zone, the command line's arguments. Names
+// are UTF-8 in the runtime and UTF-16 here: Windows' wide functions take any name, its ANSI ones only the code
+// page's.
 use base
 use start
 use host
@@ -14051,10 +14057,27 @@ extern effect fn formatMessageA(
 ) -> UInt32 as "FormatMessageA"
 
 extern effect fn getCommandLineW() -> Int64 as "GetCommandLineW"
-extern effect fn commandLineToArgvW(line: Int64, count: Int64) -> Int64 as "CommandLineToArgvW"
-extern effect fn wfopen(name: Int64, mode: Int64) -> Int64 as "_wfopen"
-extern effect fn wgetenv(name: Int64) -> Int64 as "_wgetenv"
-extern effect fn errnoAt() -> Int64 as "_errno"
+extern effect fn getProcessHeap() -> Int64 as "GetProcessHeap"
+extern effect fn heapAlloc(h: Int64, flags: UInt32, n: UInt64) -> Int64 as "HeapAlloc"
+extern effect fn heapReAlloc(h: Int64, flags: UInt32, p: Int64, n: UInt64) -> Int64 as "HeapReAlloc"
+extern effect fn heapFree(h: Int64, flags: UInt32, p: Int64) -> Int32 as "HeapFree"
+extern effect fn getEnvironmentVariableW(name: Int64, buf: Int64, n: UInt32) -> UInt32 as "GetEnvironmentVariableW"
+extern effect fn setFilePointerEx(h: Int64, at: Int64, now: Int64, how: UInt32) -> Int32 as "SetFilePointerEx"
+extern effect fn getSystemTimeAsFileTime(at: Int64) as "GetSystemTimeAsFileTime"
+extern effect fn fileTimeToSystemTime(ft: Int64, st: Int64) -> Int32 as "FileTimeToSystemTime"
+extern effect fn systemTimeToTzSpecificLocalTime(zone: Int64, utc: Int64, local: Int64) -> Int32 as "SystemTimeToTzSpecificLocalTime"
+extern effect fn systemTimeToFileTime(st: Int64, ft: Int64) -> Int32 as "SystemTimeToFileTime"
+
+extern effect fn createFileW(
+    name: Int64,
+    access: UInt32,
+    share: UInt32,
+    security: Int64,
+    how: UInt32,
+    flags: UInt32,
+    template: Int64,
+) -> Int64 as "CreateFileW"
+
 extern fn fnAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 
 const utf8 = 65001
@@ -14135,9 +14158,10 @@ pub extern effect fn osWriteImpl(fd: Int64, p: Int64, n: Int64) as "qkosWrite" {
     writeAll(h, p + from, n - from)
 }
 
-pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = int32At(errnoAt(), 0)
+// errno: C's numbers (POSIX's), in the runtime's cell (one for the process: it is read right after it is set)
+pub extern effect fn osErrnoImpl() -> Int64 as "qkosErrno" = word(cell(), 2)
 
-pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setInt32(errnoAt(), 0, e)
+pub extern effect fn osSetErrnoImpl(e: Int64) as "qkosSetErrno" = setWord(cell(), 2, e)
 
 pub extern effect fn osNowImpl() -> Float64 as "qkosNow" {
     let q = calloc(2, 8)
@@ -14159,21 +14183,222 @@ pub extern effect fn osTimeImpl() -> Float64 as "qkosTime" {
 pub extern effect fn osSleepImpl(ms: Int64) as "qkosSleep" = winSleep(ms)
 
 // ---- files and folders ----
+// GetLastError's numbers as errno's: ENOENT, EACCES, EEXIST, ENOTEMPTY, EINVAL, else EIO
+fn errnoOf(e: Int) -> Int = if e == 2 or e == 3 or e == 15 or e == 161 {
+    2
+} else if e == 5 or e == 32 or e == 33 {
+    13
+} else if e == 80 or e == 183 {
+    17
+} else if e == 145 {
+    41
+} else if e == 87 or e == 123 {
+    22
+} else {
+    5
+}
+
+// a FILE* here: the handle, an error seen, the end seen; "rb", "wb", "ab", "r+b", "w+b" as C opens them
 pub extern effect fn osOpenImpl(path: Int64, mode: Int64) -> Int64 as "qkosOpen" {
+    let m = byte(mode, 0)
+    let plus = byte(mode, 1) == '+' or byte(mode, 2) == '+'
+    let read = 2147483648
+    let write = 1073741824
+    let access = if m == 'r' {
+        read | (if plus { write } else { 0 })
+    } else if m == 'w' {
+        write | (if plus { read } else { 0 })
+    } else {
+        4 | 1048576 | (if plus {
+            read // FILE_APPEND_DATA | SYNCHRONIZE
+        } else {
+            0
+        })
+    }
+    let how = if m == 'r' {
+        3 // OPEN_EXISTING, CREATE_ALWAYS, OPEN_ALWAYS
+    } else if m == 'w' {
+        2
+    } else {
+        4
+    }
     let w = wide(path)
-    let m = wide(mode)
-    let f = wfopen(w, m)
+    let h = createFileW(w, access, 7, 0, how, 128, 0)
     free(w)
-    free(m)
+    if h == -1 {
+        setErrno(errnoOf(getLastError()))
+        return 0
+    }
+    let f = calloc(3, 8)
+    setWord(f, 0, h)
     f
+}
+
+pub extern effect fn winFread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64 as "fread" {
+    let total = size * n
+    let got = calloc(1, 8)
+    var at = 0
+    while at < total {
+        let chunk = if total - at > 1073741824 { 1073741824 } else { total - at }
+        if winReadFile(word(f, 0), p + at, chunk, got, 0) == 0 {
+            setWord(f, 1, 1)
+            break
+        }
+        let k = int32At(got, 0)
+        if k == 0 {
+            setWord(f, 2, 1)
+            break
+        }
+        at += k
+    }
+    free(got)
+    if size > 0 { at / size } else { 0 }
+}
+
+pub extern effect fn winFwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64 as "fwrite" {
+    let total = size * n
+    let done = calloc(1, 8)
+    var at = 0
+    while at < total {
+        let chunk = if total - at > 1073741824 { 1073741824 } else { total - at }
+        if winWriteFile(word(f, 0), p + at, chunk, done, 0) == 0 or int32At(done, 0) == 0 {
+            setWord(f, 1, 1)
+            break
+        }
+        at += int32At(done, 0)
+    }
+    free(done)
+    if size > 0 { at / size } else { 0 }
+}
+
+pub extern effect fn winFclose(f: Int64) -> Int32 as "fclose" {
+    let ok = closeHandle(word(f, 0))
+    free(f)
+    if ok != 0 { 0 } else { -1 }
+}
+
+pub extern effect fn winFerror(f: Int64) -> Int32 as "ferror" = word(f, 1)
+
+pub extern effect fn winFflush(f: Int64) -> Int32 as "fflush" = f - f // (nothing kept: every write is the system's)
+
+pub extern effect fn winFseek(f: Int64, offset: Int32, whence: Int32) -> Int32 as "fseek" = if setFilePointerEx(
+    word(f, 0),
+    offset,
+    0,
+    whence,
+) != 0 {
+    0
+} else {
+    -1
 }
 
 pub extern effect fn osEnvImpl(name: Int64) -> Int64 as "qkosEnv" {
     let w = wide(name)
-    let v = wgetenv(w)
+    let n = getEnvironmentVariableW(w, 0, 0)
+    if n == 0 {
+        free(w)
+        return 0
+    }
+    let v = calloc(n + 1, 2)
+    let _ = getEnvironmentVariableW(w, v, n + 1)
     free(w)
-    if v == 0 { 0 } else { utf8Of(v) }
+    let s = utf8Of(v)
+    free(v)
+    s
 }
+
+// ---- the C library's functions the runtime calls, over kernel32 ----
+pub extern effect fn winMalloc(size: UInt64) -> Int64 as "malloc" =
+    heapAlloc(getProcessHeap(), 0, if size > 0 { size } else { 1 })
+
+pub extern effect fn winCalloc(count: UInt64, size: UInt64) -> Int64 as "calloc" {
+    let n = count * size
+    heapAlloc(getProcessHeap(), 8, if n > 0 {
+        n // HEAP_ZERO_MEMORY
+    } else {
+        1
+    })
+}
+
+pub extern effect fn winRealloc(p: Int64, size: UInt64) -> Int64 as "realloc" = if p == 0 {
+    winMalloc(size)
+} else {
+    heapReAlloc(getProcessHeap(), 0, p, if size > 0 { size } else { 1 })
+}
+
+pub extern effect fn winFree(p: Int64) as "free" {
+    if p != 0 {
+        let _ = heapFree(getProcessHeap(), 0, p)
+    }
+}
+
+pub extern effect fn winExit(code: Int32) as "exit" = exitProcess(code)
+
+pub extern fn winFloor(x: Float64) -> Float64 as "floor" = floor(x)
+
+pub extern fn winFabs(x: Float64) -> Float64 as "fabs" = if x < 0.0 { -x } else { x }
+
+// seconds since 1970 (C's time)
+pub extern effect fn winTime(t: Int64) -> Int64 as "time" {
+    let q = calloc(1, 8)
+    getSystemTimeAsFileTime(q)
+    let s = (word(q, 0) - 116444736000000000) / 10000000
+    free(q)
+    if t != 0 {
+        setWord(t, 0, s)
+    }
+    s
+}
+
+pub extern effect fn winStrtoll(s: Int64, end: Int64, base: Int32) -> Int64 as "strtoll" {
+    var i = 0
+    while byte(s, i) == ' ' or byte(s, i) == '\t' {
+        i += 1
+    }
+    var negative = false
+    if byte(s, i) == '-' or byte(s, i) == '+' {
+        negative = byte(s, i) == '-'
+        i += 1
+    }
+    var v = 0
+    while true {
+        let c = byte(s, i)
+        let d = if c >= '0' and c <= '9' {
+            c - '0'
+        } else if c >= 'a' and c <= 'z' {
+            c - 'a' + 10
+        } else if c >= 'A' and c <= 'Z' {
+            c - 'A' + 10
+        } else {
+            99
+        }
+        if d >= base {
+            break
+        }
+        v = v *% base +% d
+        i += 1
+    }
+    if end != 0 {
+        setWord(end, 0, s + i)
+    }
+    if negative { 0 -% v } else { v }
+}
+
+// errno's numbers said as C's strerror says them
+pub extern effect fn winStrerror(code: Int32) -> Int64 as "strerror" = textAt(match code {
+    2 => "No such file or directory\0"
+    5 => "Input/output error\0"
+    9 => "Bad file descriptor\0"
+    12 => "Not enough space\0"
+    13 => "Permission denied\0"
+    17 => "File exists\0"
+    20 => "Not a directory\0"
+    21 => "Is a directory\0"
+    22 => "Invalid argument\0"
+    28 => "No space left on device\0"
+    41 => "Directory not empty\0"
+    _ => "Unknown error\0"
+})
 
 pub extern effect fn osPathKindImpl(path: Int64) -> Int64 as "qkosPathKind" {
     let w = wide(path)
@@ -14188,7 +14413,7 @@ pub extern effect fn osPathKindImpl(path: Int64) -> Int64 as "qkosPathKind" {
     }
 }
 
-fn setErrno(code: Int) = setInt32(errnoAt(), 0, code)
+fn setErrno(code: Int) = setWord(cell(), 2, code)
 
 pub extern effect fn osMakeDirImpl(path: Int64) -> Int64 as "qkosMakeDir" {
     let w = wide(path)
@@ -14245,7 +14470,7 @@ pub extern effect fn osListDirImpl(path: Int64) -> Int64 as "qkosListDir" {
     free(w)
     if h == -1 {
         free(fd)
-        setInt32(errnoAt(), 0, 2)
+        setErrno(2)
         return 0
     }
     var cap = 1024
@@ -14627,6 +14852,8 @@ pub extern effect fn osThreadJoinImpl(h: Int64) as "qkosThreadJoin" {
 // ---- the executable's entry: the arguments as Windows has them (UTF-16), made UTF-8 ----
 pub extern effect fn wmain(argc: Int32, argv: Int64) -> Int32 as "wmain" {
     setWord(cell(), 1, tlsAlloc())
+    setWord(cell(), 2, 0) // errno
+    setWord(cell(), 3, 0) // Winsock, not loaded yet (the cell is a literal's bytes until its words are set)
     let _ = setConsoleOutputCP(utf8)
     let args = calloc(argc + 1, 8)
     for i in 0..argc {
@@ -14644,14 +14871,115 @@ extern effect fn exitProcess(code: UInt32) as "ExitProcess"
 
 pub extern effect fn winEntry() -> Int32 as "qkWinEntry" {
     let count = calloc(1, 8)
-    let argv = commandLineToArgvW(getCommandLineW(), count)
+    let argv = argvOf(getCommandLineW(), count)
     exitProcess(wmain(int32At(count, 0), argv))
     0
+}
+
+// The command line's arguments as Windows' C programs read them (CommandLineToArgvW's rules): the program's name up to
+// a space, or within quotes; then arguments between spaces, where quotes group, 2n backslashes and a quote are n
+// backslashes and the quote's meaning, 2n + 1 of them n and a quote, other backslashes themselves, and "" inside quotes
+// a quote. Each argument UTF-16 and zero-ended, malloc'd; their count in count.
+fn argvOf(line: Int, count: Int) -> Int {
+    var n = 0
+    while unitAt(line, n) != 0 {
+        n += 1
+    }
+    var argv = calloc(n / 2 + 2, 8)
+    var argc = 0
+    let buf = calloc(n + 1, 2)
+    var i = 0
+    // the program's name
+    var k = 0
+    if unitAt(line, 0) == '"' {
+        i = 1
+        while unitAt(line, i) != 0 and unitAt(line, i) != '"' {
+            Pointer<UInt16>(buf)[k] = unitAt(line, i)
+            k += 1
+            i += 1
+        }
+        if unitAt(line, i) == '"' {
+            i += 1
+        }
+    } else {
+        while unitAt(line, i) != 0 and unitAt(line, i) != ' ' and unitAt(line, i) != '\t' {
+            Pointer<UInt16>(buf)[k] = unitAt(line, i)
+            k += 1
+            i += 1
+        }
+    }
+    setWord(argv, argc, wideCopy(buf, k))
+    argc += 1
+    while true {
+        while unitAt(line, i) == ' ' or unitAt(line, i) == '\t' {
+            i += 1
+        }
+        if unitAt(line, i) == 0 {
+            break
+        }
+        k = 0
+        var quoted = false
+        while unitAt(line, i) != 0 and (quoted or unitAt(line, i) != ' ' and unitAt(line, i) != '\t') {
+            if unitAt(line, i) == '\\' {
+                var slashes = 0
+                while unitAt(line, i) == '\\' {
+                    slashes += 1
+                    i += 1
+                }
+                if unitAt(line, i) == '"' {
+                    for _ in 0..slashes / 2 {
+                        Pointer<UInt16>(buf)[k] = '\\'
+                        k += 1
+                    }
+                    if slashes % 2 == 1 {
+                        Pointer<UInt16>(buf)[k] = '"'
+                        k += 1
+                        i += 1
+                    }
+                } else {
+                    for _ in 0..slashes {
+                        Pointer<UInt16>(buf)[k] = '\\'
+                        k += 1
+                    }
+                }
+            } else if unitAt(line, i) == '"' {
+                if quoted and unitAt(line, i + 1) == '"' {
+                    Pointer<UInt16>(buf)[k] = '"'
+                    k += 1
+                    i += 2
+                } else {
+                    quoted = not quoted
+                    i += 1
+                }
+            } else {
+                Pointer<UInt16>(buf)[k] = unitAt(line, i)
+                k += 1
+                i += 1
+            }
+        }
+        setWord(argv, argc, wideCopy(buf, k))
+        argc += 1
+    }
+    free(buf)
+    setInt32(count, 0, argc)
+    argv
+}
+
+// the i-th UTF-16 unit at w (no closure: this runs before the runtime has its context)
+fn unitAt(w: Int, i: Int) -> Int = Pointer<UInt16>(w)[i]
+
+// k UTF-16 units of buf, zero-ended, malloc'd
+fn wideCopy(buf: Int, k: Int) -> Int {
+    let w = calloc(k + 1, 2)
+    copyBytes(w, buf, 2 * k)
+    w
 }
 
 // ---- a program run from memory (quarkimg run): the runtime mapped by the caller, the arguments UTF-8 already ----
 pub extern effect fn memoryMain(argc: Int64, argv: Int64, payload: Int64, trailer: Int64) -> Int64 as "qkMemoryMain" {
     setWord(cell(), 1, tlsAlloc())
+    setWord(cell(), 2, 0) // errno
+    setWord(cell(), 3, 0) // Winsock, not loaded yet (the cell is a literal's bytes until its words are set)
     let _ = setConsoleOutputCP(utf8)
     qkStartMemory(argc, argv, payload, trailer)
 }
@@ -14659,6 +14987,8 @@ pub extern effect fn memoryMain(argc: Int64, argv: Int64, payload: Int64, traile
 // ---- the command line's own runs (host.qk, compiler/memory.qk): this thread made ready for the runtime ----
 pub extern effect fn hostInit() as "qkosHostInit" {
     setWord(cell(), 1, tlsAlloc())
+    setWord(cell(), 2, 0) // errno
+    setWord(cell(), 3, 0) // Winsock, not loaded yet (the cell is a literal's bytes until its words are set)
     let _ = setConsoleOutputCP(utf8)
 }
 
@@ -14754,25 +15084,130 @@ pub extern effect fn osProfileStopImpl(p: Int64) as "qkosProfileStop" {
 }
 
 // ---- sockets (ws2_32: Winsock), seeking, the local time ----
-extern effect fn wsaStartup(version: UInt16, data: Int64) -> Int32 as "WSAStartup"
-extern effect fn wsaGetLastError() -> Int32 as "WSAGetLastError"
-extern effect fn wsaPoll(items: Int64, count: UInt32, ms: Int32) -> Int32 as "WSAPoll"
-extern effect fn wsSocket(family: Int32, kind: Int32, protocol: Int32) -> Int64 as "socket"
-extern effect fn wsBind(s: Int64, addr: Int64, n: Int32) -> Int32 as "bind"
-extern effect fn wsListen(s: Int64, backlog: Int32) -> Int32 as "listen"
-extern effect fn wsAccept(s: Int64, addr: Int64, n: Int64) -> Int64 as "accept"
-extern effect fn wsConnect(s: Int64, addr: Int64, n: Int32) -> Int32 as "connect"
-extern effect fn wsRecv(s: Int64, p: Int64, n: Int32, flags: Int32) -> Int32 as "recv"
-extern effect fn wsSend(s: Int64, p: Int64, n: Int32, flags: Int32) -> Int32 as "send"
-extern effect fn wsClose(s: Int64) -> Int32 as "closesocket"
-extern effect fn wsIoctl(s: Int64, command: Int32, arg: Int64) -> Int32 as "ioctlsocket"
-extern effect fn wsSetOption(s: Int64, level: Int32, name: Int32, value: Int64, n: Int32) -> Int32 as "setsockopt"
-extern effect fn wsGetAddrInfo(host: Int64, service: Int64, hints: Int64, out: Int64) -> Int32 as "getaddrinfo"
-extern effect fn wsFreeAddrInfo(info: Int64) as "freeaddrinfo"
-extern effect fn fseeki64(f: Int64, at: Int64, from: Int32) -> Int32 as "_fseeki64"
-extern effect fn ftelli64(f: Int64) -> Int64 as "_ftelli64"
-extern effect fn localtime64s(tm: Int64, t: Int64) -> Int32 as "_localtime64_s"
-extern effect fn mkgmtime64(tm: Int64) -> Int64 as "_mkgmtime64"
+// Winsock, loaded the first time a socket is used (programs without sockets depend on kernel32 alone): each function
+// found by its name in ws2_32.dll, then called through its address
+fn winsock() -> Int {
+    let have = word(cell(), 3)
+    if have != 0 {
+        return have
+    }
+    let w = wide(textAt("ws2_32.dll\0"))
+    let m = loadLibraryW(w)
+    free(w)
+    setWord(cell(), 3, m)
+    m
+}
+
+extern effect fn findWsaStartup(m: Int64, name: Int64) -> (extern (UInt16, Int64) -> Int32)? as "GetProcAddress"
+
+fn wsaStartup(version: Int, data: Int) -> Int = match findWsaStartup(winsock(), textAt("WSAStartup\0")) {
+    Some(f) => f(version, data)
+    None => -1
+}
+
+extern effect fn findWsaGetLastError(m: Int64, name: Int64) -> (extern () -> Int32)? as "GetProcAddress"
+
+fn wsaGetLastError() -> Int = match findWsaGetLastError(winsock(), textAt("WSAGetLastError\0")) {
+    Some(f) => f()
+    None => -1
+}
+
+extern effect fn findWsaPoll(m: Int64, name: Int64) -> (extern (Int64, UInt32, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsaPoll(items: Int, count: Int, ms: Int) -> Int = match findWsaPoll(winsock(), textAt("WSAPoll\0")) {
+    Some(f) => f(items, count, ms)
+    None => -1
+}
+
+extern effect fn findWsSocket(m: Int64, name: Int64) -> (extern (Int32, Int32, Int32) -> Int64)? as "GetProcAddress"
+
+fn wsSocket(family: Int, kind: Int, protocol: Int) -> Int = match findWsSocket(winsock(), textAt("socket\0")) {
+    Some(f) => f(family, kind, protocol)
+    None => -1
+}
+
+extern effect fn findWsBind(m: Int64, name: Int64) -> (extern (Int64, Int64, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsBind(s: Int, addr: Int, n: Int) -> Int = match findWsBind(winsock(), textAt("bind\0")) {
+    Some(f) => f(s, addr, n)
+    None => -1
+}
+
+extern effect fn findWsListen(m: Int64, name: Int64) -> (extern (Int64, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsListen(s: Int, backlog: Int) -> Int = match findWsListen(winsock(), textAt("listen\0")) {
+    Some(f) => f(s, backlog)
+    None => -1
+}
+
+extern effect fn findWsAccept(m: Int64, name: Int64) -> (extern (Int64, Int64, Int64) -> Int64)? as "GetProcAddress"
+
+fn wsAccept(s: Int, addr: Int, n: Int) -> Int = match findWsAccept(winsock(), textAt("accept\0")) {
+    Some(f) => f(s, addr, n)
+    None => -1
+}
+
+extern effect fn findWsConnect(m: Int64, name: Int64) -> (extern (Int64, Int64, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsConnect(s: Int, addr: Int, n: Int) -> Int = match findWsConnect(winsock(), textAt("connect\0")) {
+    Some(f) => f(s, addr, n)
+    None => -1
+}
+
+extern effect fn findWsRecv(m: Int64, name: Int64) -> (extern (Int64, Int64, Int32, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsRecv(s: Int, p: Int, n: Int, flags: Int) -> Int = match findWsRecv(winsock(), textAt("recv\0")) {
+    Some(f) => f(s, p, n, flags)
+    None => -1
+}
+
+extern effect fn findWsSend(m: Int64, name: Int64) -> (extern (Int64, Int64, Int32, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsSend(s: Int, p: Int, n: Int, flags: Int) -> Int = match findWsSend(winsock(), textAt("send\0")) {
+    Some(f) => f(s, p, n, flags)
+    None => -1
+}
+
+extern effect fn findWsClose(m: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "GetProcAddress"
+
+fn wsClose(s: Int) -> Int = match findWsClose(winsock(), textAt("closesocket\0")) {
+    Some(f) => f(s)
+    None => -1
+}
+
+extern effect fn findWsIoctl(m: Int64, name: Int64) -> (extern (Int64, Int32, Int64) -> Int32)? as "GetProcAddress"
+
+fn wsIoctl(s: Int, command: Int, arg: Int) -> Int = match findWsIoctl(winsock(), textAt("ioctlsocket\0")) {
+    Some(f) => f(s, command, arg)
+    None => -1
+}
+
+extern effect fn findWsSetOption(m: Int64, name: Int64) -> (extern (Int64, Int32, Int32, Int64, Int32) -> Int32)? as "GetProcAddress"
+
+fn wsSetOption(s: Int, level: Int, name: Int, value: Int, n: Int) -> Int = match findWsSetOption(
+    winsock(),
+    textAt("setsockopt\0"),
+) {
+    Some(f) => f(s, level, name, value, n)
+    None => -1
+}
+
+extern effect fn findWsGetAddrInfo(m: Int64, name: Int64) -> (extern (Int64, Int64, Int64, Int64) -> Int32)? as "GetProcAddress"
+
+fn wsGetAddrInfo(host: Int, service: Int, hints: Int, out: Int) -> Int = match findWsGetAddrInfo(
+    winsock(),
+    textAt("getaddrinfo\0"),
+) {
+    Some(f) => f(host, service, hints, out)
+    None => -1
+}
+
+extern effect fn findWsFreeAddrInfo(m: Int64, name: Int64) -> (extern (Int64) -> Unit)? as "GetProcAddress"
+
+fn wsFreeAddrInfo(info: Int) = match findWsFreeAddrInfo(winsock(), textAt("freeaddrinfo\0")) {
+    Some(f) => f(info)
+    None => {}
+}
 
 const wouldBlock = 10035 // WSAEWOULDBLOCK
 const fionbio = -2147195266 // FIONBIO: 0x8004667E as an Int32
@@ -14957,18 +15392,28 @@ pub extern effect fn osPollImpl(items: Int64, count: Int64, ms: Int64) -> Int64 
 }
 
 pub extern effect fn osSeekImpl(f: Int64, at: Int64, from: Int64) -> Int64 as "qkosSeek" {
-    if fseeki64(f, at, from) != 0 {
+    let now = calloc(1, 8)
+    let ok = setFilePointerEx(word(f, 0), at, now, from)
+    let place = word(now, 0)
+    free(now)
+    if ok == 0 {
+        setErrno(errnoOf(getLastError()))
         return -1
     }
-    ftelli64(f)
+    place
 }
 
 pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalOffset" {
-    let t = calloc(10, 8) // the moment, then a struct tm
-    setWord(t, 0, toInt(cFloor(seconds)))
+    // the moment as a FILETIME (100 ns since 1601), as the wall clock of the zone then (summer time as it was), back
+    let t = calloc(8, 8) // the FILETIME, a SYSTEMTIME, the local one, the local FILETIME
+    let ft = (toInt(floor(seconds)) + 11644473600) * 10000000
+    setWord(t, 0, ft)
     var offset = 0
-    if localtime64s(t + 8, t) == 0 {
-        offset = mkgmtime64(t + 8) - word(t, 0) // the local wall clock read as UTC, less the moment
+    if ft >= 0
+        and fileTimeToSystemTime(t, t + 8) != 0
+        and systemTimeToTzSpecificLocalTime(0, t + 8, t + 24) != 0
+        and systemTimeToFileTime(t + 24, t + 40) != 0 {
+        offset = (word(t, 5) - ft) / 10000000
     }
     free(t)
     offset

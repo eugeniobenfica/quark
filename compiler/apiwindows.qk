@@ -10,6 +10,8 @@ extern effect fn tlsAlloc() -> UInt32 as "TlsAlloc"
 // the thread's context made findable (the runtime's TLS slot); the system: 0, Windows
 pub extern effect fn libraryStart() -> Int64 as "qkosLibraryStart" {
     setWord(cell(), 1, tlsAlloc())
+    setWord(cell(), 2, 0) // errno
+    setWord(cell(), 3, 0) // Winsock, not loaded yet (the cell is a literal's bytes until its words are set)
     0
 }
 

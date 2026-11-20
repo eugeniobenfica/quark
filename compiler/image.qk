@@ -1348,6 +1348,9 @@ pub fn dllOf(name: Text) -> Text {
     if name is "WSAStartup" | "WSAGetLastError" | "WSAPoll" | "socket" | "bind" | "listen" | "accept" | "connect" | "recv" | "send" | "closesocket" | "ioctlsocket" | "setsockopt" | "getaddrinfo" | "freeaddrinfo" {
         return "ws2_32.dll" // sockets (Winsock)
     }
+    if name is "memcpy" | "memmove" | "memset" | "memcmp" | "strlen" {
+        return "ntdll.dll" // the system's own (the runtime needs no C runtime)
+    }
     let c = name.bytes()[0]
     if c >= 'A' and c <= 'Z' { "kernel32.dll" } else { "ucrtbase.dll" }
 }

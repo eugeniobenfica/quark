@@ -326,7 +326,7 @@ pub extern effect fn wasiSleep(ms: Int64) as "qkosSleep" {
     free(n)
 }
 
-pub extern effect fn wasiLocalOffset(t: Int64) -> Int64 as "qkosLocalOffset" = t - t // UTC
+pub extern effect fn wasiLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" = toInt(seconds - seconds) // UTC
 
 pub extern effect fn wasiProcessors() -> Int64 as "qkosProcessors" = 1
 
@@ -649,6 +649,9 @@ pub extern effect fn wasiCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int
 
 // ---- the start: the arguments, the state; and the end: what print kept written, the status ----
 pub extern effect fn wasiBegin() as "qkWasiBegin" {
+    for i in 0..8 {
+        setWord(wasiCell(), i, 0) // its words zero (a literal's bytes until now)
+    }
     let sizes = calloc(2, 8)
     let _ = argsSizesGet(sizes, sizes + 8)
     let count = word(sizes, 0) & 4294967295

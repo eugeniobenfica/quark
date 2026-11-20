@@ -9,13 +9,13 @@ fn main() {
     let start = monotonicTime()
     let out: Channel<Text> = channel()
     let n = scope(s => {
-        s.start(() => send(out, fetch("a", 0.05)))
-        s.start(() => send(out, fetch("b", 0.03)))
+        s.start(() => send(out, fetch("a", 0.2)))
+        s.start(() => send(out, fetch("b", 0.12)))
         s.start(() => {
             // nested: its own scope inside a task
             let inner = scope(t => {
-                t.start(() => send(out, fetch("c1", 0.01)))
-                t.start(() => send(out, fetch("c2", 0.02)))
+                t.start(() => send(out, fetch("c1", 0.04)))
+                t.start(() => send(out, fetch("c2", 0.08)))
                 2
             })
             send(out, "inner gave {inner}")
@@ -28,7 +28,7 @@ fn main() {
         got.push(t)
     }
     print(n, got.sorted())
-    print(monotonicTime() - start < 0.09)
+    print(monotonicTime() - start < 0.35) // at once: 0.2 s; one after another, 0.44 s
     // a task of the scope starts another in it: the scope waits for both
     let chain: Channel<Int> = channel()
     let total = scope(s => {

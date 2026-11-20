@@ -1,5 +1,6 @@
 /* Quark — the embedding API: any C program (an application, an editor, a server, a tool) compiles Quark, calls it, gives it host
- * functions, and turns programs into node graphs and back. Link build/libquark.a; nothing else is needed.
+ * functions, and turns programs into node graphs and back. Link build/libquark.a and the system's libraries
+ * (Windows: -lm -lwinmm -lws2_32; Linux, macOS: -lm -lpthread -ldl); nothing else is needed.
  *
  *   QkVm* vm = qkVmNew();
  *   qkVmPrelude(vm, "extern type Item\n"
@@ -19,8 +20,8 @@
  *
  * Host functions (extern fn) are plain C functions: each slot is one argument (int64_t, or double for Float
  * slots); one result slot is returned as int64_t or double, several as a struct of slots returned by value
- * (Windows x64 passes it through a hidden pointer, System V in registers or through that pointer; Quark
- * follows the platform's convention).
+ * (Windows x64 passes it through a hidden pointer; System V and ARM64 in registers or through that pointer;
+ * Quark follows the platform's convention).
  *
  * One call at a time per process (the budget and the panic exit are shared). Each machine has its own
  * memory: what a call allocates (arrays and texts it returns) stays valid until that machine's next call. */
@@ -36,6 +37,8 @@ extern "C" {
 #endif
 
 #define QUARK_VERSION 1 /* the language and this API; grows only by additions */
+/* The version of the library linked: a host checks it against QUARK_VERSION (a newer library is fine). */
+int qkVersion(void);
 
 typedef struct QkVm QkVm;         /* host functions, settings, the last errors */
 typedef struct QkModule QkModule; /* a compiled program, ready to call */

@@ -2,15 +2,17 @@
 // compiler written in Quark into one object whose addresses the linker gives (quark object --linked), then written
 // as an archive a C host links (gcc host.c libquark.a): no C compiler and no ar make it.
 //   quark build compiler/libquark.qk -o build/libq/libquark.exe
-//   libquark [--target x86_64-windows | x86_64-linux | arm64-linux] [-o libquark.a] [--object libquark.o]
+//   libquark [--target x86_64-windows | x86_64-linux | arm64-linux | x86_64-macos | arm64-macos] [-o libquark.a]
+//            [--object libquark.o]
 // The object exports include/quark.h's functions and variables (qkAbi, qkModuleReader); the executables' entries the
-// runtime has (wmain, main, qkWinEntry...) are left out, so the host's own main is the one.
+// runtime has (wmain, main, qkWinEntry...) are left out, so the host's own main is the one. macOS's archive is BSD's
+// (its index __.SYMDEF, the names with C's _), the others' System V's.
 use imagecli
 use image
 use ir
 
 // the runtime's entries for executables and quarkimg run: not a library's
-const hidden = ["wmain", "main", "qkWinEntry", "qkMemoryMain", "qkStart", "qkStartMemory"]
+const hidden = ["wmain", "main", "qkWinEntry", "qkMacMain", "qkMemoryMain", "qkStart", "qkStartMemory"]
 
 // C's variables: each one's name, and the text in the data that is its place (compiler/api.qk's cells)
 const variables = [
@@ -35,7 +37,7 @@ fn find(b: Bytes, part: Bytes) -> Int {
 
 fn usage() -> Int {
     printErr(
-        "usage: libquark [--target x86_64-windows | x86_64-linux | arm64-linux] [-o libquark.a] [--object libquark.o] [--map FILE]",
+        "usage: libquark [--target x86_64-windows | x86_64-linux | arm64-linux | x86_64-macos | arm64-macos] [-o libquark.a] [--object libquark.o] [--map FILE]",
     )
     2
 }
@@ -64,11 +66,14 @@ fn main() -> Int {
         i += 2
     }
     let windows = target == "x86_64-windows"
-    if not target is "x86_64-windows" | "x86_64-linux" | "arm64-linux" {
+    let macos = target.endsWith("-macos")
+    if not target is "x86_64-windows" | "x86_64-linux" | "arm64-linux" | "x86_64-macos" | "arm64-macos" {
         return usage()
     }
     let root = if windows {
         "compiler/apiwindows.qk"
+    } else if macos {
+        "compiler/apimacos.qk"
     } else {
         "compiler/apilinux.qk"
     }
@@ -101,7 +106,7 @@ fn main() -> Int {
             printErr("libquark: {root} has no place for {name}")
             return 1
         }
-        // C's value at the start: 0 (qkAbi on Linux: 1, System V)
+        // C's value at the start: 0 (qkAbi on Linux and macOS: 1, System V)
         let first = if name == "qkAbi" and not windows { 1 } else { 0 }
         o.data = o.data[..at] + [first, 0, 0, 0, 0, 0, 0, 0] + o.data[at + 8..]
         o.dataExports.push(name)
@@ -116,7 +121,8 @@ fn main() -> Int {
         printErr("libquark: cannot write {objectPath}")
         return 1
     }
-    let lib = archive([Member("libquark.o", obj, o.exports + o.dataExports + [symbol])])
+    let members = [Member("libquark.o", obj, o.exports + o.dataExports + [symbol])]
+    let lib = if macos { bsdArchive(members) } else { archive(members) }
     if writeBytes(out, lib) is Err(_) {
         printErr("libquark: cannot write {out}")
         return 1

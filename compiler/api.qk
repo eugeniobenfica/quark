@@ -32,7 +32,7 @@ use collab
 use catalog
 
 extern effect fn fflush(f: Int64) -> Int32
-extern effect fn osLibraryStart() -> Int64 as "qkosLibraryStart" // the thread's context made findable; the system (0 Windows, 1 Linux)
+extern effect fn osLibraryStart() -> Int64 as "qkosLibraryStart" // the thread's context made findable; the system (0 Windows, 1 Linux, 2 macOS)
 extern fn fnAddress(f: extern () -> Int64) -> Int64 as "qkTextAddress"
 extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" // a C function, or 0 and why
 
@@ -454,14 +454,21 @@ fn compileNow(vm: Int, name: Int, text: Int, n: Int) -> Int {
     }
     let p = checked.program
     let arm = libraryArm()
-    let sysv = system() == 1 or Pointer<Int32>(abiCell())[0] == 1
+    let sysv = system() != 0 or Pointer<Int32>(abiCell())[0] == 1
     let arch = if arm { Arch.Arm64 } else { Arch.X64 }
     let low = lowerProgram(p, LowerOptions(fuel: word(vm, vFuel) > 0, arch: arch, sysv: sysv))
     var ir = low.program
     let cpu = machine.cpu()
     let avx = not arm and word(vm, vNoAvx) == 0 and cpu & 1 != 0
     let lanes = if not arm and avx and cpu & 2 != 0 { 4 } else { 2 }
-    ir.target = Target(arch: arch, sysv: sysv, avx: avx, lanes: lanes, sse42: not arm and cpu & 4 != 0)
+    ir.target = Target(
+        arch: arch,
+        sysv: sysv,
+        avx: avx,
+        lanes: lanes,
+        sse42: not arm and cpu & 4 != 0,
+        apple: system() == 2,
+    )
     ir.optimize(word(vm, vRelease) != 0)
     let mc = if arm { genArm64(ir) } else { genX64(ir) }
     let hosts = hostsFor(vm, path, p, ir)
@@ -822,6 +829,9 @@ pub extern effect fn qkModuleStatic(vm: Int64, p: Int64) -> Int64 as "qkModuleSt
 
 // ---- text and graphs ----
 pub extern effect fn qkFree(p: Int64) as "qkFree" = free(p)
+
+// include/quark.h's QUARK_VERSION this library is
+pub extern fn qkVersion() -> Int32 as "qkVersion" = 1
 
 fn formatTextNow(vm: Int, text: Int, n: Int) -> Int {
     enter(vm)

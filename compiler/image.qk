@@ -556,7 +556,9 @@ fn elf(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
 // ---- Mach-O (macOS, iOS: ARM64 and x86-64) ----
 // __TEXT,__text then __DATA,__data. The code's loads of the table are relocated against a local symbol at the data's
 // start: ARM64 an ADDEND before each PAGE21 (adrp) and PAGEOFF12 (ldr), x86-64 a SIGNED (rip + disp32) with the
-// offset in place. The data's pointers are UNSIGNED, by section, with the address in place.
+// offset in place. The data's pointers are UNSIGNED, by section, with the address in place; linked (libquark), the
+// table's entries are UNSIGNED against the symbols the linker finds (undefined, after the defined ones). Each
+// section is one piece (no subsections by symbol): the code's calls between functions have no relocations.
 fn machoReloc(symbol: Int, pcrel: Bool, length: Int, external: Bool, kind: Int) -> Int =
     symbol | (if pcrel { 1 } else { 0 }) << 24 | length << 25 | (if external { 1 } else { 0 }) << 27 | kind << 28
 
@@ -586,11 +588,17 @@ fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
     }
     let code = written(mc.code, codePuts)
     var dataPuts: [Put] = []
+    let defined = 2 + len(o.exports) + len(o.dataExports)
     for r in o.relocs {
-        // the address in place: the section's own plus the offset
-        dataPuts.push(Put(r.at, if r.toText { r.addend } else { dataAddr + r.addend }, 8))
         rdata.u32(r.at)
-        rdata.u32(machoReloc(if r.toText { 1 } else { 2 }, false, 3, false, 0))
+        if r.external >= 0 {
+            dataPuts.push(Put(r.at, r.addend, 8))
+            rdata.u32(machoReloc(defined + r.external, false, 3, true, 0))
+        } else {
+            // the address in place: the section's own plus the offset
+            dataPuts.push(Put(r.at, if r.toText { r.addend } else { dataAddr + r.addend }, 8))
+            rdata.u32(machoReloc(if r.toText { 1 } else { 2 }, false, 3, false, 0))
+        }
     }
     let data = written(o.data, dataPuts)
     str.u8(0)
@@ -599,12 +607,12 @@ fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
     let globalName = str.len()
     str.cText("_" + symbol)
     var exportName: [Int] = []
-    for e in o.exports {
+    for e in o.exports + o.dataExports + o.externals {
         exportName.push(str.len())
         str.cText("_" + e)
     }
     str.align(8)
-    let symbols = 2 + len(o.exports)
+    let symbols = defined + len(o.externals)
     let sizeofcmds = 72 + 2 * 80 + 24 + 24 + 80
     let textOff = alignUp(32 + sizeofcmds, 16)
     let dataOff = textOff + dataAddr
@@ -620,7 +628,7 @@ fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
     out.u32(1) // an object
     out.u32(4)
     out.u32(sizeofcmds)
-    out.u32(0x2000) // subsections via symbols
+    out.u32(0)
     out.u32(0)
     // LC_SEGMENT_64, its two sections
     out.u32(0x19)
@@ -670,15 +678,15 @@ fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
     out.u32(symbols)
     out.u32(strOff)
     out.u32(str.len())
-    // LC_DYSYMTAB: one local, the defined externals
+    // LC_DYSYMTAB: one local, the defined externals, the undefined ones
     out.u32(0xB)
     out.u32(80)
     out.u32(0)
     out.u32(1)
     out.u32(1)
-    out.u32(symbols - 1)
-    out.u32(symbols)
-    out.u32(0)
+    out.u32(defined - 1)
+    out.u32(defined)
+    out.u32(len(o.externals))
     out.zeros(48)
     out.padTo(textOff)
     out.add(code)
@@ -687,7 +695,8 @@ fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
     out.padTo(relText)
     out.add(rtext.b)
     out.add(rdata.b)
-    // the symbols: the data's start (local), the program (external), the functions C calls (in __text)
+    // the symbols: the data's start (local), the program (external), the functions C calls (in __text), C's
+    // variables (in __data), the ones the linker finds (undefined)
     out.u32(localName)
     out.u8(0x0E)
     out.u8(2)
@@ -698,24 +707,38 @@ fn macho(mc: MachineCode, o: Layout, symbol: Text, arm: Bool) -> Bytes {
     out.u8(2)
     out.u16(0)
     out.u64(dataAddr)
+    let fns = len(o.exports)
+    let vars = fns + len(o.dataExports)
     for (k, e) in exportName.enumerate() {
         out.u32(e)
-        out.u8(0x0F)
-        out.u8(1)
+        out.u8(if k < vars { 0x0F } else { 0x01 })
+        out.u8(if k < fns {
+            1
+        } else if k < vars {
+            2
+        } else {
+            0
+        })
         out.u16(0)
-        out.u64(o.exportAt[k])
+        out.u64(if k < fns {
+            o.exportAt[k]
+        } else if k < vars {
+            dataAddr + o.dataExportAt[k - fns]
+        } else {
+            0
+        })
     }
     out.add(str.b)
     out.b
 }
 
-// quark object's file for the program: None for a target with no object format yet (Windows on ARM; Mach-O linked)
+// quark object's file for the program: None for a target with no object format yet (Windows on ARM)
 pub fn objectFile(mc: MachineCode, p: IrProgram, info: ImageInfo, symbol: Text) -> Bytes? =
     objectOf(mc, layout(mc, p, info), info, symbol, p.target.arch == .Arm64)
 
 // the object of a layout (libquark's writer changes its exports first)
 pub fn objectOf(mc: MachineCode, o: Layout, info: ImageInfo, symbol: Text, arm: Bool) -> Bytes? = match info.os {
-    Macos => if info.linked { None } else { macho(mc, o, symbol, arm) }
+    Macos => macho(mc, o, symbol, arm)
     Windows => if arm { None } else { coff(mc, o, symbol) }
     Linux => elf(mc, o, symbol, arm)
 }
@@ -774,6 +797,58 @@ pub fn archive(members: [Member]) -> Bytes {
         }
     }
     out
+}
+
+// The archive macOS's linker reads (BSD): its index first, __.SYMDEF (each symbol's name, its member's place), each
+// member's name after its header (#1/n), as long as puts the member's bytes 8-aligned in the file.
+fn bsdMember(at: Int, name: Text, bytes: Bytes) -> Bytes {
+    var n = name.bytes()
+    n.push(0)
+    while (at + 60 + len(n)) % 8 != 0 {
+        n.push(0)
+    }
+    var body = n + bytes
+    while (60 + len(body)) % 8 != 0 {
+        body.push(0) // in the member's size: the next header 8-aligned too
+    }
+    arHeader("#1/{len(n)}", len(body)) + body
+}
+
+pub fn bsdArchive(members: [Member]) -> Bytes {
+    var names: Bytes = []
+    var strs: [Int] = []
+    var count = 0
+    for m in members {
+        for s in m.symbols {
+            strs.push(len(names))
+            names += ("_" + s).bytes()
+            names.push(0)
+            count += 1
+        }
+    }
+    while len(names) % 8 != 0 {
+        names.push(0)
+    }
+    // the index's size first: the members' places follow it
+    let indexLen = len(bsdMember(8, "__.SYMDEF", [0] * (8 + 8 * count + len(names))))
+    var index = Buf()
+    index.u32(8 * count)
+    var at = 8 + indexLen
+    var k = 0
+    var placed: Bytes = []
+    for m in members {
+        for _ in m.symbols {
+            index.u32(strs[k])
+            index.u32(at)
+            k += 1
+        }
+        let b = bsdMember(at, m.name, m.bytes)
+        placed += b
+        at += len(b)
+    }
+    index.u32(len(names))
+    index.add(names)
+    "!<arch>".bytes() + [10] + bsdMember(8, "__.SYMDEF", index.b) + placed
 }
 
 // ---- the program a built executable carries: its payload and trailer ----

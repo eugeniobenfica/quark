@@ -331,8 +331,7 @@ sq(n) + 1
 ' | "$Q" repl 2>&1 | grep -qF "50"; then ok; else bad "quark repl"; fi
 # the profiler: where the time goes, by function
 if "$Q" run bench/mandelbrot.qk --profile 2>&1 | grep -qE "samples|no samples"; then ok; else bad "--profile"; fi
-# an object file, compiled ahead of time and linked into a C host (needs a C compiler: $CC or gcc, and libquark: none
-# on macOS yet)
+# an object file, compiled ahead of time and linked into a C host (needs a C compiler: $CC or gcc, and libquark)
 CCX=${CC:-gcc}
 if [ ! -f "$(dirname "$Q")/libquark.a" ]; then CCX=no-libquark; fi
 case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) CLIBS="-lm -lwinmm -lws2_32" ;; *) CLIBS="-lm -lpthread -ldl" ;; esac

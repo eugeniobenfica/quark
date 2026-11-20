@@ -7,7 +7,6 @@
 #   ./build.sh --check    then the fixed point: build/quark.exe builds compiler/ once more (build/stage3), and the two
 #                         must be the same bytes
 # With a C compiler (CC, default gcc) it also links the C hosts the tests run: build/host.exe, build/sysv-hosts.exe.
-# macOS: no libquark yet (compiler/libquark.qk writes Windows' and Linux's), so no C hosts either.
 set -e
 cd "$(dirname "$0")"
 B=${QK_OUT:-build}
@@ -59,7 +58,6 @@ if $check; then
         exit 1
     fi
 fi
-[ "$(uname -s)" = Darwin ] && exit 0
 # libquark, written in Quark and compiled by the compiler just made (no C compiler, no ar)
 start=$SECONDS
 QUARK=$B/quark.exe bash tools/libquark.sh "$B/libquark.a"

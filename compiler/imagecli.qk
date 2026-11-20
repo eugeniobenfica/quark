@@ -61,15 +61,6 @@ pub fn compileSource(path: Text, target: Text, os: Os, object: Bool, linked: Boo
     } else {
         2
     }
-    prog.target = Target(
-        arch: arch,
-        sysv: sysv,
-        objectMode: object,
-        avx: avx,
-        lanes: lanes,
-        sse42: cpu & 4 != 0 and target == "",
-    )
-    prog.optimize(release)
     let targetOs = if target == "" {
         os
     } else if target.endsWith("windows") {
@@ -79,6 +70,16 @@ pub fn compileSource(path: Text, target: Text, os: Os, object: Bool, linked: Boo
     } else {
         Os.Macos
     }
+    prog.target = Target(
+        arch: arch,
+        sysv: sysv,
+        objectMode: object,
+        avx: avx,
+        lanes: lanes,
+        sse42: cpu & 4 != 0 and target == "",
+        apple: targetOs == .Macos,
+    )
+    prog.optimize(release)
     Dump(prog, ImageInfo(targetOs, linked, if avx { 1 } else { 0 }, low.data, runtimeNames))
 }
 

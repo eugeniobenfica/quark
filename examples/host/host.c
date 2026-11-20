@@ -118,6 +118,10 @@ int main(int argc, char** argv) {
     const char* preludePath = argc > 1 ? argv[1] : "examples/host/app.qk";
     const char* scriptPath = argc > 2 ? argv[2] : "examples/host/item.qk";
     size_t len;
+    if (qkVersion() != QUARK_VERSION) { /* the library linked is the one this header describes */
+        fprintf(stderr, "libquark %d, quark.h %d\n", qkVersion(), QUARK_VERSION);
+        return 1;
+    }
 
     QkVm* vm = qkVmNew();
     char* prelude = readFile(preludePath, &len);

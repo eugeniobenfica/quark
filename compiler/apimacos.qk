@@ -1,0 +1,49 @@
+// libquark on macOS (Apple silicon, x86-64): the embedding API (compiler/api.qk) on the runtime written in Quark, its
+// system calls runtime/macos.qk's. tools/libquark.sh compiles it into one object (qkMacMain, qkMemoryMain left out).
+use std.machine as machine
+use api
+use runtime.base
+use runtime.macos
+
+extern effect fn pthreadKeyCreate(key: Int64, destructor: Int64) -> Int32 as "pthread_key_create"
+
+// the thread's context made findable (the runtime's key); the system: 2, macOS
+pub extern effect fn libraryStart() -> Int64 as "qkosLibraryStart" {
+    let _ = pthreadKeyCreate(cell() + 8, 0)
+    setWord(cell(), 1, word(cell() + 8, 0)) // the key (a pthread_key_t is an unsigned long), its own word
+    2
+}
+
+extern effect fn pthreadAttrInit(a: Int64) -> Int32 as "pthread_attr_init"
+extern effect fn pthreadAttrSetStackSize(a: Int64, n: UInt64) -> Int32 as "pthread_attr_setstacksize"
+extern effect fn pthreadAttrDestroy(a: Int64) -> Int32 as "pthread_attr_destroy"
+extern effect fn pthreadCreate(t: Int64, a: Int64, f: Int64, arg: Int64) -> Int32 as "pthread_create"
+extern effect fn pthreadJoin(t: Int64, result: Int64) -> Int32 as "pthread_join"
+extern fn threadAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+// a thread's start: the context first (Quark code may allocate as it starts), then f(arg); t: f, arg, context
+fn threadMain(t: Int) -> Int {
+    setCtx(word(t, 2))
+    machine.call(Pointer<UInt8>(word(t, 0)), word(t, 1), 0, 0, 0)
+}
+
+// f(arg) on a thread whose stack is 256 MB, with this thread's context, waited for: where the compiler runs
+pub extern effect fn libraryRun(f: Int64, arg: Int64, ctx: Int64) as "qkosLibraryRun" {
+    let attr = calloc(1, 256)
+    let id = calloc(1, 8)
+    let t = calloc(3, 8)
+    setWord(t, 0, f)
+    setWord(t, 1, arg)
+    setWord(t, 2, ctx)
+    let _ = pthreadAttrInit(attr)
+    let _ = pthreadAttrSetStackSize(attr, 268435456)
+    if pthreadCreate(id, attr, threadAddress(x => threadMain(x)), t) == 0 {
+        let _ = pthreadJoin(word(id, 0), 0)
+    } else {
+        let _ = machine.call(Pointer<UInt8>(f), arg, 0, 0, 0) // no thread: here, as deep as this stack goes
+    }
+    let _ = pthreadAttrDestroy(attr)
+    free(attr)
+    free(id)
+    free(t)
+}

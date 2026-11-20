@@ -903,7 +903,7 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         rememberedGrow(a, word(a, aRememberedCap)) // the same size, without the holes
     }
     let growing = word(a, aGrowing)
-    for i in 0..growingSlots() {
+    for i in 0..growingSlots(a) {
         let p = word(growing, 2 * i)
         if p != 0 and goneAt(c, p) {
             setWord(growing, 2 * i, 0)

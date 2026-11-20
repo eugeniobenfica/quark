@@ -1,0 +1,25 @@
+// Thousands of arrays that push at once, each an element of another (more than the table of rooms holds at first: it
+// grows, and every array keeps its room), through the loop's collections; and texts made longer, many at once.
+type Group { id: Int, members: [Int], name: Text }
+
+fn main() {
+    var groups: [Group] = []
+    for i in 0..12_000 {
+        groups.push(Group(i, [], "g"))
+    }
+    for round in 0..40 {
+        for k in 0..len(groups) {
+            if (k + round) % 3 != 0 {
+                groups[k].members.push(k * round)
+                groups[k].name += "{round % 10}"
+            }
+        }
+    }
+    var total = 0
+    var letters = 0
+    for g in groups {
+        total += len(g.members) + g.members[len(g.members) - 1]
+        letters += len(g.name)
+    }
+    print(total, letters, groups[7].members[..5], groups[11_999].name[..12])
+}

@@ -12,7 +12,7 @@ pub const aExtras = 2 // survivors: what loops copied out, outside the blocks
 pub const aClock = 3
 pub const aAllocated = 4 // bytes handed out, ever
 pub const aGrowing = 5 // the rooms: growingEntries (address, bytes) pairs
-pub const aGrowingNext = 6
+pub const aGrowingBits = 6 // the table's buckets: 2^bits
 pub const aGrowingUsed = 7
 pub const aLastText = 8 // the last text made: s + t appends in place while it is the top
 pub const aReserved = 9
@@ -26,7 +26,7 @@ pub const aRememberedCount = 16
 pub const aLarge = 17 // the large blocks, the latest first
 pub const aSpare = 18 // large blocks given back, kept for one of the same size (a few: memory touched already)
 pub const aSpareCount = 19
-pub const aUnused20 = 20 // (free)
+pub const aGrowingEvicted = 20 // rooms a full bucket gave its place away to make, since the table was made
 pub const aUnused21 = 21 // (free)
 pub const aSide = 22 // the loop collections' side table (loops.qk sideSlot), kept from one to the next
 pub const aSideBytes = 23
@@ -55,7 +55,7 @@ pub const bigMarked = 3
 pub const bigData = 4
 pub const largeFrom = 65536
 const largeSpare = 4
-const growingBuckets = 1024
+const growingFirstBits = 10 // 1024 buckets to start with
 const growingWays = 4
 const blockSize = 16777216
 
@@ -64,7 +64,8 @@ pub fn arena() -> Int = ctxGet(ctxArena)
 pub fn arenaNew() -> Int {
     let a = calloc(1, 8 * arenaWords)
     if a != 0 {
-        setWord(a, aGrowing, calloc(growingBuckets * growingWays, 16))
+        setWord(a, aGrowing, calloc(1 << growingFirstBits * growingWays, 16))
+        setWord(a, aGrowingBits, growingFirstBits)
     }
     a
 }
@@ -298,7 +299,7 @@ pub fn arenaReset() {
     let _ = freeLarge(a, intMin, -1 - intMin)
     freeSpare(a)
     if word(a, aGrowingUsed) != 0 {
-        zeroBytes(word(a, aGrowing), growingBuckets * growingWays * 16)
+        zeroBytes(word(a, aGrowing), growingSlots(a) * 16)
     }
     setWord(a, aGrowingUsed, 0)
     rememberedFree(a)
@@ -310,11 +311,14 @@ pub fn arenaReset() {
 pub extern effect fn qkArenaReset() as "qkArenaReset" = arenaReset()
 
 // ---- room to grow: arrays that push, long texts made by s + t, by address (four to a bucket) ----
+// A full bucket gives the smallest room's place away (a room lost costs a copy of what it holds). When that has
+// happened as many times as there are buckets, the program grows more things at once than the table holds (thousands
+// of elements that push): it doubles, and keeps them all.
 fn growingBucket(a: Int, p: Int) -> Int {
     var h = shr(p, 4)
     h ^= shr(h, 17)
     h *%= -7046029254386353131
-    word(a, aGrowing) + shr(h, 54) * growingWays * 16 // the top 10 bits: one of 1024 buckets
+    word(a, aGrowing) + shr(h, 64 - word(a, aGrowingBits)) * growingWays * 16 // the top bits: the bucket
 }
 
 // the room known at p (bytes), or 0
@@ -346,7 +350,14 @@ pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
         }
     }
     if at < 0 {
-        // a full bucket: the smallest room gives its place (a lost room costs a copy of what it holds)
+        let evicted = word(a, aGrowingEvicted) + 1
+        setWord(a, aGrowingEvicted, evicted)
+        if evicted > 1 << word(a, aGrowingBits) and word(a, aGrowingBits) < 24 {
+            growingDouble(a)
+            growingAdd(a, p, capBytes)
+            return
+        }
+        // a full bucket: the smallest room gives its place
         at = 0
         for i in 1..growingWays {
             if word(b, 2 * i + 1) < word(b, 2 * at + 1) {
@@ -359,8 +370,24 @@ pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
     setWord(a, aGrowingUsed, word(a, aGrowingUsed) + 1)
 }
 
-// clears the rooms of what is in [lo, hi) for which young says so (loops.qk)
-pub fn growingSlots() -> Int = growingBuckets * growingWays
+// twice the buckets, the rooms put in again
+fn growingDouble(a: Int) {
+    let old = word(a, aGrowing)
+    let oldSlots = growingSlots(a)
+    setWord(a, aGrowingBits, word(a, aGrowingBits) + 1)
+    setWord(a, aGrowing, calloc(growingSlots(a), 16))
+    setWord(a, aGrowingEvicted, 0)
+    for i in 0..oldSlots {
+        let p = word(old, 2 * i)
+        if p != 0 {
+            growingAdd(a, p, word(old, 2 * i + 1))
+        }
+    }
+    free(old)
+}
+
+// the table's slots, for the loops' collections to look through (loops.qk)
+pub fn growingSlots(a: Int) -> Int = 1 << word(a, aGrowingBits) * growingWays
 
 // ---- the runtime's functions the code calls ----
 pub extern effect fn rtAlloc(count: Int64, bytesEach: Int64) -> Int64 as "qk_alloc" =

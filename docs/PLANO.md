@@ -272,6 +272,13 @@ coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 - **Reutilização no lugar:** atualizar campo ou elemento de um valor único nunca aloca.
 - **Barreira de escrita filtrada no código gerado** (`remember` ainda custa 5 a 7% em `json`).
 
+> **Feito em 20/11/2026: promoção no lugar.** A pré-promoção por lugar não alcança o caso de `records`: os objetos são feitos dentro de `build()` e só depois vão para a estrutura de fora. O que alcança é a forma dinâmica. Quando a última coleta menor real guardou ao menos 60% do que as voltas fizeram, a próxima não copia: deixa os blocos onde estão e adianta o início do que é jovem e a marca da arena, de modo que a barreira os vê velhos.
+> - Uma coleta em cada cinco copia, para medir de novo.
+> - A coleta completa continua copiando tudo o que vive desde a marca, e o lixo promovido vai embora nela.
+> - Resultados: `records` de 117 para 100 ms (de 2,0× para 1,7× do C), `trees` −4%, o resto igual.
+> - No teste de laços aninhados os dois tamanhos ficaram mais rápidos (o pequeno −35%, o grande −8%). A razão entre eles subiu para ~6,5×, e o limite do teste foi para 8×; quadrático seria 16×.
+> - Medido e não mantido: contar no total "guardado desde a última completa" só a parte estimada como viva. Atrasa a completa, e o tamanho grande ficou mais lento.
+
 > **Medido em 20/11/2026: não vale.** O primeiro teste do `remember` foi posto no código: nenhum loop com marca, ou um container feito depois dela.
 > - Nada mudou em `json` (440 → 450 ms), e `strings` ficou 2% pior pelo código maior em cada escrita.
 > - As chamadas de `json` não saem cedo: são containers velhos mudados, e o custo está em anotá-los.

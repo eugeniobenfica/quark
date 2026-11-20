@@ -905,17 +905,7 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         setWord(a, aRememberedCount, kept)
         rememberedGrow(a, word(a, aRememberedCap)) // the same size, without the holes
     }
-    let growing = word(a, aGrowing)
-    var rooms = 0
-    for i in 0..growingSlots(a) {
-        let p = word(growing, 2 * i)
-        if p != 0 and goneAt(c, p) {
-            setWord(growing, 2 * i, 0)
-        } else if p != 0 {
-            rooms += 1
-        }
-    }
-    growingFit(a, rooms)
+    growingCollected(a, c, since)
     var gone = freeExtras(a, since - 1, word(c, cTime)) // inner loops' survivors (and, when full, this loop's)
     gone += freeLarge(a, since, word(c, cTime)) // (those made now hold what was copied)
     gone += word(mark, bUsed) - used
@@ -996,4 +986,43 @@ pub fn copyIntoArena(to: Int, env: Int) -> Int {
     copyPending(c)
     freeCopier(c)
     word(cell, 0)
+}
+
+// after a collection that took back what was made since since: the rooms of what went forgotten. The log's end (what
+// was added since then) is all that can be gone; the rooms there that stay stay in the log (a full collection of a
+// loop around this one may yet take them). A log too long: the whole table looked through.
+fn growingCollected(a: Int, c: Int, since: Int) {
+    let count = word(a, aGrowingLogCount)
+    if count < 0 {
+        let growing = word(a, aGrowing)
+        for i in 0..growingSlots(a) {
+            let p = word(growing, 2 * i)
+            if p != 0 and goneAt(c, p) {
+                growingForget(a, p)
+            }
+        }
+        setWord(a, aGrowingLogCount, 0)
+    } else {
+        let log = word(a, aGrowingLog)
+        var first = count
+        while first > 0 and word(log + 16 * (first - 1), 1) >= since {
+            first -= 1
+        }
+        var kept = first
+        for i in first..count {
+            let p = word(log + 16 * i, 0)
+            if growingRoom(a, p) == 0 {
+                continue // forgotten already (it moved)
+            }
+            if goneAt(c, p) {
+                growingForget(a, p)
+                continue
+            }
+            setWord(log + 16 * kept, 0, p)
+            setWord(log + 16 * kept + 8, 0, word(log + 16 * i, 1))
+            kept += 1
+        }
+        setWord(a, aGrowingLogCount, kept)
+    }
+    growingFit(a, word(a, aGrowingUsed))
 }

@@ -13,7 +13,7 @@ pub const aClock = 3
 pub const aAllocated = 4 // bytes handed out, ever
 pub const aGrowing = 5 // the rooms: growingEntries (address, bytes) pairs
 pub const aGrowingBits = 6 // the table's buckets: 2^bits
-pub const aGrowingUsed = 7
+pub const aGrowingUsed = 7 // the rooms the table holds
 pub const aLastText = 8 // the last text made: s + t appends in place while it is the top
 pub const aReserved = 9
 pub const aLimit = 10
@@ -31,7 +31,10 @@ pub const aUnused21 = 21 // (free)
 pub const aSide = 22 // the loop collections' side table (loops.qk sideSlot), kept from one to the next
 pub const aSideBytes = 23
 pub const aSideEpoch = 24 // the collection its entries are of (1 to 15): an entry of another is empty
-pub const arenaWords = 25
+pub const aGrowingLog = 25 // the rooms added, in order, with the clock then: (address, time) pairs
+pub const aGrowingLogCount = 26 // how many (-1: more than the log holds: a collection looks through the table)
+pub const aGrowingLogCap = 27
+pub const arenaWords = 28
 
 // a block's words, then its bytes (16-aligned)
 pub const bNext = 0
@@ -197,6 +200,7 @@ pub fn arenaFree(a: Int) {
     freeSpare(a)
     rememberedFree(a)
     free(word(a, aGrowing))
+    free(word(a, aGrowingLog))
     free(word(a, aSide))
     free(a)
 }
@@ -303,6 +307,7 @@ pub fn arenaReset() {
         zeroBytes(word(a, aGrowing), growingSlots(a) * 16)
     }
     setWord(a, aGrowingUsed, 0)
+    setWord(a, aGrowingLogCount, 0)
     rememberedFree(a)
     setWord(a, aMarked, 0)
     setWord(a, aMarkBlock, 0)
@@ -338,11 +343,46 @@ pub fn growingForget(a: Int, p: Int) {
     for i in 0..growingWays {
         if word(b, 2 * i) == p {
             setWord(b, 2 * i, 0)
+            setWord(a, aGrowingUsed, word(a, aGrowingUsed) - 1)
         }
     }
 }
 
+// a room added: noted in the log with the clock, for the loops' collections (only what is younger than their mark
+// can be gone: they look at the log's end instead of the whole table)
+fn growingNote(a: Int, p: Int) {
+    let count = word(a, aGrowingLogCount)
+    if count < 0 {
+        return
+    }
+    if count == word(a, aGrowingLogCap) {
+        if count >= growingLogMost {
+            setWord(a, aGrowingLogCount, -1)
+            return
+        }
+        let cap = if count == 0 { 1024 } else { 2 * count }
+        let log = malloc(cap * 16)
+        if word(a, aGrowingLog) != 0 {
+            copyBytes(log, word(a, aGrowingLog), count * 16)
+            free(word(a, aGrowingLog))
+        }
+        setWord(a, aGrowingLog, log)
+        setWord(a, aGrowingLogCap, cap)
+    }
+    let at = word(a, aGrowingLog) + 16 * count
+    setWord(at, 0, p)
+    setWord(at, 1, word(a, aClock))
+    setWord(a, aGrowingLogCount, count + 1)
+}
+
+const growingLogMost = 1048576
+
 pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
+    growingNote(a, p)
+    growingPut(a, p, capBytes)
+}
+
+fn growingPut(a: Int, p: Int, capBytes: Int) {
     let b = growingBucket(a, p)
     var at = -1
     for i in 0..growingWays {
@@ -353,9 +393,9 @@ pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
     if at < 0 {
         let evicted = word(a, aGrowingEvicted) + 1
         setWord(a, aGrowingEvicted, evicted)
-        if evicted > 1 << word(a, aGrowingBits) and word(a, aGrowingBits) < 24 {
+        if evicted > 1 << word(a, aGrowingBits) and word(a, aGrowingBits) < growingMostBits {
             growingDouble(a)
-            growingAdd(a, p, capBytes)
+            growingPut(a, p, capBytes)
             return
         }
         // a full bucket: the smallest room gives its place
@@ -366,9 +406,11 @@ pub fn growingAdd(a: Int, p: Int, capBytes: Int) {
             }
         }
     }
+    if word(b, 2 * at) == 0 {
+        setWord(a, aGrowingUsed, word(a, aGrowingUsed) + 1)
+    }
     setWord(b, 2 * at, p)
     setWord(b, 2 * at + 1, capBytes)
-    setWord(a, aGrowingUsed, word(a, aGrowingUsed) + 1)
 }
 
 // twice the buckets, the rooms put in again
@@ -392,10 +434,11 @@ fn growingResize(a: Int, bits: Int) {
     setWord(a, aGrowingBits, bits)
     setWord(a, aGrowing, calloc(growingSlots(a), 16))
     setWord(a, aGrowingEvicted, 0)
+    setWord(a, aGrowingUsed, 0)
     for i in 0..oldSlots {
         let p = word(old, 2 * i)
         if p != 0 {
-            growingAdd(a, p, word(old, 2 * i + 1))
+            growingPut(a, p, word(old, 2 * i + 1))
         }
     }
     free(old)

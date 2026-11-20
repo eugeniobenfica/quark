@@ -43,6 +43,7 @@ pub extern effect fn rtPanic(code: Int64, line: Int64, a: Int64, b: Int64) as "q
         21 => at(line).text("every task waits on a channel, and none is left to send on it (a deadlock)")
         22 => at(line).text("send on channel ").int(a).text(", which was closed")
         23 => at(line).text("there is no channel ").int(a)
+        24 => at(line).text("a task started in a scope that ended (start it inside scope(...))")
         20 => at(line).text("a block of memory was ").text(if b == 1 { "held" } else { "let go of" }).text(
             " after it was given back at line ",
         ).int(a).text(" (QUARK_VALIDATE)")

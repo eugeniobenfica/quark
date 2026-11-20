@@ -2617,7 +2617,7 @@ fn builtinGroup(b: Int) -> Text = if b == bPrint or b == bPrintErr { "print" } e
 // `name` (ir.qk's runtimeNames) called with the values' slots, giving what the function around it says it gives
 // (runtimeLine: the line of the call that reached it goes last, for the runtime's messages). group: the capability
 // its callers need ("" none).
-fn Checker.checkRuntimeCall(var self, e: Int) -> Int {
+fn Checker.checkRuntimeCall(var self, e: Int, hint: Int) -> Int {
     let args = self.argsOf(e)
     let f = self.c.fnDecl
     var ok = len(args) >= 2
@@ -2635,7 +2635,13 @@ fn Checker.checkRuntimeCall(var self, e: Int) -> Int {
         self.checkExpr(a, true)
     }
     self.p.ast.exprs[e].builtin = bRuntime
+    // what it gives: the function's when it is its body; in a block, the written type it goes into
+    // (let s: Scope = runtime(...)), else nothing
     let ret = self.p.ast.decls[f].retType
+    let body = self.p.ast.decls[f].body
+    if body >= 0 and self.p.ast.exprs[body].node is BlockExpr(_, _) {
+        return if hint >= 0 { hint } else { tyVoid }
+    }
     if ret >= 0 { ret } else { tyVoid }
 }
 
@@ -4038,6 +4044,13 @@ fn Checker.checkTemplateCall(var self, e: Int, d: Int, hint: Int) -> Int {
             loose = true
         } else {
             bound = self.unify(d, fresult, r, bound)
+            if self.kindOf(r) == Kind.Void and fresult >= 0 and self.p.ast.types[fresult].node is Named(n, targs) {
+                // a lambda that gives nothing: its result type is Unit (scope(s => { for ... }))
+                let k = self.typeParamIndex(d, n)
+                if len(targs) == 0 and k >= 0 and bound[k] < 0 {
+                    bound[k] = r
+                }
+            }
         }
     }
     if loose {
@@ -4585,6 +4598,13 @@ fn Checker.placeTypeExpr(var self, te: Int, line: Int, col: Int) {
 }
 
 // ---- calls ---------------------------------------------------------------------------------------------------------
+// whether f(...) or a.f(...) calls a local value named f: in a.f(...) only a function value is (a local Float named
+// start leaves s.start(...) to the function start)
+fn Checker.localCalled(self, name: Text, method: Bool) -> Bool {
+    let b = self.lookup(name)
+    b >= 0 and (not method or self.kindOf(self.bindingType(b)) is Fn | CFn)
+}
+
 fn Checker.checkCall(var self, e: Int) -> Int {
     let hint = self.c.hint // the written type it goes into, for this call only (not its values)
     self.c.hint = -1
@@ -4857,19 +4877,19 @@ fn Checker.checkCall(var self, e: Int) -> Int {
         if x.kind == DeclKind.Fn
             and x.builtin
             and self.c.module != x.module
-            and (ownFn or self.lookup(name) < 0)
+            and (ownFn or not self.localCalled(name, method))
             and self.builtinGroupOf(d) != ""
             and not self.capable(e, x.name, self.builtinGroupOf(d)) {
             return tyError // what the program calls (the prelude's own calls are its)
         }
-        if x.kind == DeclKind.Fn and x.isTemplate and (ownFn or self.lookup(name) < 0) {
+        if x.kind == DeclKind.Fn and x.isTemplate and (ownFn or not self.localCalled(name, method)) {
             return self.checkTemplateCall(e, d, hint)
         }
         if x.kind == DeclKind.Fn and x.isTest {
             self.sayAt(e, "a test is run by quark test, not called")
             return tyError
         }
-        if x.kind == DeclKind.Fn and (ownFn or self.lookup(name) < 0) {
+        if x.kind == DeclKind.Fn and (ownFn or not self.localCalled(name, method)) {
             if self.isCFunction(d)
                 and not self.capable(e, if x.externSymbol != "" { x.externSymbol } else { x.name }, "") {
                 return tyError
@@ -4937,7 +4957,7 @@ fn Checker.checkCall(var self, e: Int) -> Int {
         }
     }
     if name is "runtime" | "runtimeLine" and self.c.fnDecl >= 0 and self.p.ast.decls[self.c.fnDecl].builtin {
-        return self.checkRuntimeCall(e)
+        return self.checkRuntimeCall(e, hint)
     }
     let b = self.builtinNamed(name)
     if b == bParallelMap {

@@ -1,0 +1,47 @@
+// Structured concurrency: scope(...) gives its body's value once every task it started has ended (running at once,
+// the others going on); scopes nest, inside tasks too; a scope's tasks may start more in it.
+fn fetch(name: Text, seconds: Float) -> Text {
+    sleep(seconds)
+    "{name} done"
+}
+
+fn main() {
+    let start = monotonicTime()
+    let out: Channel<Text> = channel()
+    let n = scope(s => {
+        s.start(() => send(out, fetch("a", 0.05)))
+        s.start(() => send(out, fetch("b", 0.03)))
+        s.start(() => {
+            // nested: its own scope inside a task
+            let inner = scope(t => {
+                t.start(() => send(out, fetch("c1", 0.01)))
+                t.start(() => send(out, fetch("c2", 0.02)))
+                2
+            })
+            send(out, "inner gave {inner}")
+        })
+        3
+    })
+    closeChannel(out)
+    var got: [Text] = []
+    while receive(out) is Some(t) {
+        got.push(t)
+    }
+    print(n, got.sorted())
+    print(monotonicTime() - start < 0.09)
+    // a task of the scope starts another in it: the scope waits for both
+    let chain: Channel<Int> = channel()
+    let total = scope(s => {
+        s.start(() => {
+            send(chain, 1)
+            let _ = s.start(() => send(chain, 2))
+        })
+        0
+    })
+    closeChannel(chain)
+    var sum = total
+    while receive(chain) is Some(k) {
+        sum += k
+    }
+    print(sum)
+}

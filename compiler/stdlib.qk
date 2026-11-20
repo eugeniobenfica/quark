@@ -150,6 +150,23 @@ pub effect fn closeChannel<T>(channel: Channel<T>) = runtimeLine("tasks", "close
 // not running); a call it waits for on a thread (runProcess, connect) ends first. Ended already: nothing.
 pub effect fn cancel(task: Task) = runtimeLine("tasks", "cancel", task)
 
+// A scope: the tasks started in it end before scope(...) gives its value
+pub type Scope { id: Int }
+
+// body(scope)'s value, once every task scope.start(f) made has ended (the others go on meanwhile): no task of it
+// outlives it. A task's panic stops the program, saying the line that started it.
+pub effect fn scope<T>(body: effect (Scope) -> T) -> T {
+    let s: Scope = runtime("tasks", "scopeOpen")
+    defer {
+        runtimeLine("tasks", "scopeClose", s)
+    }
+    body(s)
+}
+
+// f as a task of the scope, in the background: scope(...) waits for it
+pub effect fn start(scope: Scope, f: effect () -> Unit) -> Task =
+    runtimeLine("tasks", "scopeStart", scope, f)
+
 // f's value, when f ends within so many seconds; None when it does not (it is cancelled then). f runs as a task in
 // the background: what it waits for lets the others go on.
 pub effect fn withTimeout<T>(seconds: Float, f: effect () -> T) -> T? {
@@ -3903,7 +3920,10 @@ pub const gChannelCopier = 33 // the copier the channels' values go through (cop
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
 pub const gTaskSpares = 35 // the stacks and arenas of tasks that ended, kept for new ones: (stack, arena) pairs
 pub const gTaskSpareCount = 36
-pub const gWords = 37
+pub const gScopes = 37 // scope()'s: (open, tasks alive) pairs, by number
+pub const gScopeCount = 38
+pub const gScopeCap = 39
+pub const gWords = 40
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -4884,6 +4904,7 @@ pub const panicFreed = 20 // QUARK_VALIDATE=1: a block counted or let go of afte
 pub const panicDeadlock = 21 // every task waits on a channel, and nothing is left to send on one
 pub const panicClosedChannel = 22
 pub const panicNoChannel = 23
+pub const panicScopeClosed = 24 // scope.start after its scope(...) ended
 
 // ---- the runtime's one word of its own: the shared state's address ----
 // Quark has no global variables; the runtime keeps two words in its object's data (quark object --linked makes
@@ -9823,6 +9844,7 @@ pub extern effect fn rtPanic(code: Int64, line: Int64, a: Int64, b: Int64) as "q
         21 => at(line).text("every task waits on a channel, and none is left to send on it (a deadlock)")
         22 => at(line).text("send on channel ").int(a).text(", which was closed")
         23 => at(line).text("there is no channel ").int(a)
+        24 => at(line).text("a task started in a scope that ended (start it inside scope(...))")
         20 => at(line).text("a block of memory was ").text(if b == 1 { "held" } else { "let go of" }).text(
             " after it was given back at line ",
         ).int(a).text(" (QUARK_VALIDATE)")
@@ -10063,7 +10085,7 @@ extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as 
 // ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
 // ---- each runtime function's address, by its number: its Quark function, which the
 // program calls the Quark way ----
-const runtimeCount = 124 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+const runtimeCount = 127 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
 
 fn runtimeTable() -> Int {
     let t = calloc(runtimeCount, 8)
@@ -10250,7 +10272,10 @@ const tWaitWrite = 103 // ... to write to it, else to read
 const tWaitChannel = 104 // a channel it waits on (its number + 1), 0 none: stepped again when it has a message
 const tWaitThread = 105 // a system call it waits for, on a thread of its own (its job: offThread), 0 none
 const tCancelled = 106 // cancel(task) was called: it is let go of where it next gives its turn back
-const taskWords = 107
+const tScope = 107 // the scope it was started in (its number + 1), 0 none
+const tStartLine = 108 // ... the line that started it, for its panic's message
+const tWaitScope = 109 // a scope whose tasks it waits for (its number + 1), 0 none
+const taskWords = 110
 
 extern fn startAddress(f: extern () -> Int64) -> Int64 as "qkTextAddress"
 
@@ -10487,13 +10512,20 @@ pub extern effect fn rtStep(n: Int64, line: Int64) -> Int64 as "qk_step" {
     }
     let r = taskStep(t)
     if r < 0 {
-        // the task stopped: so does the one that stepped it, with its message
+        // the task stopped: so does the one that stepped it, with its message (and where a scope's task was started)
         copyBytes(panicText(), word(t, tError), panicTextSize)
+        if word(t, tStartLine) != 0 {
+            let n0 = strlen(panicText())
+            let _ = bufAt(panicText() + n0, panicTextSize - n0).text(" (in the task started at line ").int(
+                word(t, tStartLine),
+            ).text(")")
+        }
         taskFree(t)
         setWord(tasks, n, 0)
         stopNow()
     }
     if r == 0 {
+        taskEnds(t)
         taskFree(t)
         setWord(tasks, n, 0)
     }
@@ -10710,6 +10742,9 @@ fn ready(t: Int, now: Float) -> Bool {
     }
     if waitsOnThread(t) {
         return false
+    }
+    if word(t, tWaitScope) != 0 and scopeAlive(word(t, tWaitScope) - 1) > 0 {
+        return false // its scope's tasks are not all done
     }
     let wake = floatAt(t, tWakeAt)
     wake == 0.0 or wake <= now
@@ -10999,6 +11034,15 @@ fn running(t: Int) -> Bool {
     false
 }
 
+// the task t ends: its scope (if any) has one task less alive
+fn taskEnds(t: Int) {
+    let s = word(t, tScope)
+    if s != 0 {
+        let at = gGet(gScopes) + 16 * (s - 1)
+        setWord(at, 1, word(at, 1) - 1)
+    }
+}
+
 // the task n, cancelled, let go of (the call it waited for on a thread is done: its job too)
 fn cancelledEnds(n: Int, t: Int) {
     let job = word(t, tWaitThread)
@@ -11007,6 +11051,7 @@ fn cancelledEnds(n: Int, t: Int) {
         free(word(job, jobCtx))
         free(job)
     }
+    taskEnds(t)
     taskFree(t)
     setWord(gGet(gTasks), n, 0)
 }
@@ -11026,6 +11071,60 @@ pub extern effect fn rtCancel(n: Int64, line: Int64) as "qk_cancel" {
     setWord(t, tCancelled, 1)
     if not running(t) and not waitsOnThread(t) {
         cancelledEnds(n, t)
+    }
+}
+
+// ---- scopes: tasks that end before what started them goes on ----
+// scope(body) opens a scope, runs body(scope) and then waits for every task scope.start(f) made in it (those they
+// start in it too): no task of it outlives it. A task's panic stops the program, its message saying the line that
+// started the task.
+fn scopeAlive(s: Int) -> Int = word(gGet(gScopes) + 16 * s, 1)
+
+pub extern effect fn rtScopeOpen() -> Int64 as "qk_scopeOpen" {
+    let g = globals()
+    if word(g, gScopeCount) == word(g, gScopeCap) {
+        let cap = if word(g, gScopeCap) != 0 { word(g, gScopeCap) * 2 } else { 8 }
+        setWord(g, gScopes, realloc(word(g, gScopes), 16 * cap))
+        setWord(g, gScopeCap, cap)
+    }
+    let n = word(g, gScopeCount)
+    let at = word(g, gScopes) + 16 * n
+    setWord(at, 0, 1)
+    setWord(at, 1, 0)
+    setWord(g, gScopeCount, n + 1)
+    n
+}
+
+// scope.start(f): a task of f, in the background, the scope's
+pub extern effect fn rtScopeStart(s: Int64, f: Int64, env: Int64, line: Int64) -> Int64 as "qk_scopeStart" {
+    if s < 0 or s >= gGet(gScopeCount) or word(gGet(gScopes) + 16 * s, 0) == 0 {
+        panicNow(panicScopeClosed, line, s, 0)
+    }
+    let n = rtGo(f, env)
+    let t = word(gGet(gTasks), n)
+    setWord(t, tScope, s + 1)
+    setWord(t, tStartLine, line)
+    let at = gGet(gScopes) + 16 * s
+    setWord(at, 1, word(at, 1) + 1)
+    n
+}
+
+// the end of scope s's body: every task of it run to its end (in a task, its turn back meanwhile), then it closes
+pub extern effect fn rtScopeClose(s: Int64, line: Int64) as "qk_scopeClose" {
+    while scopeAlive(s) > 0 {
+        let t = ctxGet(ctxTask)
+        if t != 0 {
+            setWord(t, tWaitScope, s + 1)
+            rtYield()
+            setWord(ctxGet(ctxTask), tWaitScope, 0)
+        } else if not backgroundRound(line, 0.0) {
+            break
+        }
+    }
+    setWord(gGet(gScopes) + 16 * s, 0, 0)
+    // its place used again when it was the last one opened (scopes nest)
+    if s == gGet(gScopeCount) - 1 {
+        gSet(gScopeCount, s)
     }
 }
 """ + "\n"

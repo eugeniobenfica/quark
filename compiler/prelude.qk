@@ -144,6 +144,23 @@ pub effect fn closeChannel<T>(channel: Channel<T>) = runtimeLine("tasks", "close
 // not running); a call it waits for on a thread (runProcess, connect) ends first. Ended already: nothing.
 pub effect fn cancel(task: Task) = runtimeLine("tasks", "cancel", task)
 
+// A scope: the tasks started in it end before scope(...) gives its value
+pub type Scope { id: Int }
+
+// body(scope)'s value, once every task scope.start(f) made has ended (the others go on meanwhile): no task of it
+// outlives it. A task's panic stops the program, saying the line that started it.
+pub effect fn scope<T>(body: effect (Scope) -> T) -> T {
+    let s: Scope = runtime("tasks", "scopeOpen")
+    defer {
+        runtimeLine("tasks", "scopeClose", s)
+    }
+    body(s)
+}
+
+// f as a task of the scope, in the background: scope(...) waits for it
+pub effect fn start(scope: Scope, f: effect () -> Unit) -> Task =
+    runtimeLine("tasks", "scopeStart", scope, f)
+
 // f's value, when f ends within so many seconds; None when it does not (it is cancelled then). f runs as a task in
 // the background: what it waits for lets the others go on.
 pub effect fn withTimeout<T>(seconds: Float, f: effect () -> T) -> T? {

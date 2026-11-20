@@ -1,0 +1,10 @@
+// panic: index 3 is outside the array (its length is 1) (in the task started at line 5)
+fn main() {
+    scope(s => {
+        s.start(() => sleep(0.01))
+        s.start(() => {
+            let xs = [1]
+            print(xs[3])
+        })
+    })
+}

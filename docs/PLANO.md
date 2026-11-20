@@ -370,7 +370,14 @@ simplifica `graph.qk`/`collab.qk` (4.000 linhas) e deixa programas Quark manipul
   região recém-liberada. Agora o bloco novo de uma arena é do tamanho de tudo o que ela já reservou, de 64 KB a
   16 MB: tarefas duas vezes mais rápidas no Windows também, e os benchmarks iguais.
 - **Concorrência estruturada:** um escopo que só termina quando as tarefas que abriu terminam, e propaga o pânico
-  com a origem (`go` solto fica para servidores).
+  com a origem (`go` solto fica para servidores). **Feito:** `scope(s => ...)` roda o corpo e espera toda tarefa
+  que `s.start(f)` fez nele (e as que elas começam nele); dá o valor do corpo. Uma tarefa que pare o programa diz
+  a linha que a começou (`... (in the task started at line 5)`). Escopos aninham, dentro de tarefas também; quem
+  espera um escopo numa tarefa devolve a vez até as dele acabarem. `start` depois do fim do escopo para o
+  programa. De passagem, três correções da linguagem: `s.start(...)` com um local `start` que não é função chama
+  a função (antes, "is a value"); `runtime(...)` num corpo em bloco do prelúdio tem o tipo escrito onde vai, ou
+  nenhum; e as linhas de um lambda dado a um built-in são as do programa (antes, a da chamada do built-in).
+  Testes: `scopes`, e os pânicos `scopeTask` e `scopeEnded`.
 - **Decisão a tomar e escrever:** uma thread por agendador (hoje) ou um agendador por núcleo com roubo de trabalho.
   Recomendo ficar em uma thread no 1.0 e oferecer `serve(..., workers: n)` como processos ou threads isoladas que
   compartilham o socket: mantém o modelo "tarefas não compartilham memória" e escala em núcleos.

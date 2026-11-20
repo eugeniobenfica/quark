@@ -181,7 +181,9 @@ const inlineBudget = 4000
 
 // ---- what lowering keeps ----
 // a function being inlined: where its returns jump, where they leave their value
-type Frame { d: Int, end: Int, result: [Int] }
+// a call put in line: the function, where it ends, its result; outerCaller the callerLine of the code that called it
+// (a lambda it was given is that code's, its runtime's lines that code's own)
+type Frame { d: Int, end: Int, result: [Int], outerCaller: Int = 0 }
 
 // a defer of a block being lowered: its block, the function it belongs to (inlined ones too), the loops it is in
 type DeferAt { body: Int, inlineDepth: Int, loopLevel: Int }
@@ -5048,7 +5050,13 @@ fn Lower.lowerCall(var self, e: Int) -> [Int] {
             vals.push(self.copyVal(v))
         }
         self.bindLambda(lam, vals)
+        // the lambda is the code that called the function it was given to: its lines its own
+        let was = self.callerLine
+        if len(self.inlining) > 0 {
+            self.callerLine = self.inlining[len(self.inlining) - 1].outerCaller
+        }
         let v = self.lowerExpr(self.lambdaBody(lam))
+        self.callerLine = was
         return self.copyVal(v)
     }
     self.callOperator(e)
@@ -5224,7 +5232,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
         }
         let end = self.label()
         let result = self.valOf(dx.retType)
-        self.inlining.push(Frame(d, end, result))
+        self.inlining.push(Frame(d, end, result, outerCaller: savedCaller))
         let savedBreak = self.userBreak
         let savedContinue = self.userContinue
         let v = if self.isBlockExpr(dx.body) {

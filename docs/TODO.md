@@ -48,11 +48,11 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [-] barreira de escrita filtrada no código: as chamadas fazem trabalho real, sem ganho
   - [ ] o que `records` precisa: saber ao alocar o que vai viver (uma região escolhida entre funções)
 - [ ] B8 o grafo sem JSON por dentro
-- [ ] B9 concorrência
+- [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
   - [x] cancelamento e prazos (`cancel`, `withTimeout`, `receiveWithin`)
-  - [ ] concorrência estruturada
+  - [x] concorrência estruturada (`scope`, `s.start`)
 - [ ] B10 compilação incremental de ponta a ponta
 
 ## C. A linguagem

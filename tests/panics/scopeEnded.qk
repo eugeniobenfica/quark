@@ -1,0 +1,5 @@
+// panic: a task started in a scope that ended (start it inside scope(...))
+fn main() {
+    let kept = scope(s => s)
+    kept.start(() => print("late"))
+}

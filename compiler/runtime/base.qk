@@ -333,7 +333,10 @@ pub const gChannelCopier = 33 // the copier the channels' values go through (cop
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
 pub const gTaskSpares = 35 // the stacks and arenas of tasks that ended, kept for new ones: (stack, arena) pairs
 pub const gTaskSpareCount = 36
-pub const gWords = 37
+pub const gScopes = 37 // scope()'s: (open, tasks alive) pairs, by number
+pub const gScopeCount = 38
+pub const gScopeCap = 39
+pub const gWords = 40
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -1314,6 +1317,7 @@ pub const panicFreed = 20 // QUARK_VALIDATE=1: a block counted or let go of afte
 pub const panicDeadlock = 21 // every task waits on a channel, and nothing is left to send on one
 pub const panicClosedChannel = 22
 pub const panicNoChannel = 23
+pub const panicScopeClosed = 24 // scope.start after its scope(...) ended
 
 // ---- the runtime's one word of its own: the shared state's address ----
 // Quark has no global variables; the runtime keeps two words in its object's data (quark object --linked makes

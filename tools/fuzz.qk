@@ -1,7 +1,9 @@
 // Fuzzing the front end: the programs of the tests, changed at random (lines dropped, doubled or swapped, a piece cut,
 // bytes put in), given to quark check, quark fmt and the graph's round trip. Whatever the input, the compiler must
 // answer (exit 0, 1 or 2: never a crash), quark fmt must be stable (its text formatted again is the same), and a
-// program that checks must come back from its graph as quark fmt writes it. A case that fails is kept, with its seed.
+// program that checks must come back from its graph as quark fmt writes it. Every fourth case is a C header changed
+// the same way (with C's pieces), given to quark bind: it must answer too, and what it writes is Quark in its
+// canonical form. A case that fails is kept, with its seed.
 //   quark run tools/fuzz.qk -- QUARK [COUNT] [FIRST_SEED]
 type Rng { s: Int }
 
@@ -40,8 +42,49 @@ const pieces = [
     " ",
 ]
 
+// C's pieces, for quark bind's headers
+const cPieces = [
+    "{", "}",
+    "(",
+    ")",
+    "[",
+    "]",
+    ";",
+    ",",
+    "*",
+    "&",
+    "=",
+    "#define X ",
+    "#define F(a, b) ((a) + (b))",
+    "typedef ",
+    "struct ",
+    "union ",
+    "enum ",
+    "const ",
+    "unsigned ",
+    "long ",
+    "void ",
+    "int ",
+    "char *",
+    "...",
+    "\\\n",
+    "/*",
+    "*/",
+    "//",
+    "\n",
+    " ",
+    "0x7f",
+    "1.5f",
+    "\"text\"",
+    "'c'",
+    "__attribute__((packed)) ",
+    "static inline ",
+]
+
 // one change of the text
-fn Rng.mutate(var self, text: Text) -> Text {
+fn Rng.mutate(var self, text: Text) -> Text = self.mutateWith(text, pieces)
+
+fn Rng.mutateWith(var self, text: Text, given: [Text]) -> Text {
     var lines = text.split("\n")
     if len(lines) == 0 {
         return text
@@ -73,7 +116,7 @@ fn Rng.mutate(var self, text: Text) -> Text {
             let l = lines[at]
             let b = l.bytes()
             let i = self.below(len(b) + 1)
-            lines[at] = (Text(b[..i]) ?? "") + pieces[self.below(len(pieces))] + (Text(b[i..]) ?? "")
+            lines[at] = (Text(b[..i]) ?? "") + given[self.below(len(given))] + (Text(b[i..]) ?? "")
         }
     }
     lines.join("\n")
@@ -82,6 +125,40 @@ fn Rng.mutate(var self, text: Text) -> Text {
 // the command run: its status and output; a status past 2 is a crash
 fn call(quark: Text, args: [Text]) -> Process {
     runProcess(quark, args) ?? Process(99, "", "could not start {quark}")
+}
+
+// a C header changed at random, given to quark bind: why it failed, or ""
+fn bindCase(quark: Text, seed: Int, dir: Text, headers: [Text]) -> Text! {
+    var g = Rng(seed *% 6364136223846793005 +% 1442695040888963407)
+    let name = headers[g.below(len(headers))]
+    var text = readFile(name)?
+    for _ in 0..g.below(3) + 1 {
+        text = g.mutateWith(text, cPieces)
+    }
+    let path = "{dir}/b{seed}.h"
+    writeFile(path, text)?
+    let out = "{dir}/b{seed}.qk"
+    let bound = call(quark, ["bind", path, "-o", out])
+    if bound.status > 2 {
+        return Ok("quark bind crashed ({bound.status}): {bound.err} ({path}, from {name})")
+    }
+    if bound.status == 0 and pathExists(out) {
+        let written = readFile(out)?
+        let formatted = call(quark, ["fmt", out])
+        if formatted.status != 0 {
+            return Ok("quark bind wrote what is not Quark: {formatted.err} ({path}, from {name})")
+        }
+        if formatted.out != written {
+            return Ok("quark bind wrote Quark not in its canonical form ({path}, from {name})")
+        }
+        let checked = call(quark, ["check", out])
+        if checked.status > 2 {
+            return Ok("quark check crashed on quark bind's output ({checked.status}) ({path})")
+        }
+        let _ = removePath(out)
+    }
+    let _ = removePath(path)
+    Ok("")
 }
 
 fn main() {
@@ -97,7 +174,20 @@ fn main() {
     let dir = (env("TEMP") ?? env("TMPDIR") ?? "/tmp") + "/quark-fuzz"
     let _ = makeDir(dir)
     var failed = 0
+    let headers = (listDir("tests/bind")?)
+        .filter(n => n.endsWith(".h"))
+        .sorted()
+        .map(n => "tests/bind/" + n)
+        .toArray() + ["include/quark.h"]
     for seed in first..first + count {
+        if seed % 4 == 0 {
+            let why = bindCase(quark, seed, dir, headers)?
+            if why != "" {
+                failed += 1
+                print("seed {seed}: {why}")
+            }
+            continue
+        }
         var g = Rng(seed *% 6364136223846793005 +% 1442695040888963407)
         let name = sources[g.below(len(sources))]
         var text = readFile("tests/run/" + name)?

@@ -731,23 +731,13 @@ fn readImage(b: Bytes) -> RuntimeImage? {
     RuntimeImage(l, textSize, dataAt, size, names, starts)
 }
 
-// what this compiler is: FNV-1a over its own executable, eight bytes at a time (0: unknown, then nothing is kept)
+// what this compiler is: its sources' checksum (compiler/embed.sh). Two compilers built
+// from the same sources make the same runtime (the bootstrap's fixed point): reading the executable to know it cost
+// 15 to 20 ms a run.
 fn compilerId(host: Host) -> Int {
-    if host.selfPath == "" {
-        return 0
-    }
-    let Ok(b) = readBytes(host.selfPath) else {
-        return 0
-    }
     var h = -3750763034362895579
-    var i = 0
-    while i + 8 <= len(b) {
-        h = (h ^ u64At(b, i)) *% 1099511628211
-        i += 8
-    }
-    while i < len(b) {
-        h = (h ^ b[i]) *% 1099511628211
-        i += 1
+    for ch in compilerSources.bytes() {
+        h = (h ^ ch) *% 1099511628211
     }
     if h == 0 { 1 } else { h }
 }

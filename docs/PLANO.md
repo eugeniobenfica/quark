@@ -446,6 +446,18 @@ Cache por módulo e por conteúdo para parse, checagem e MIR (o de otimização 
 função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuild do compilador abaixo de 0,5 s e
 `quark run` de um programa pequeno abaixo de 30 ms.
 
+> **20/11/2026: `quark run` de um hello de 38,5 para 20,6 ms** (medido com `Process.Start`, sem o Git Bash, que
+> sozinho põe 30 ms em cada processo). O tempo estava em saber se o runtime guardado no cache servia: o compilador lia
+> o próprio executável (16 MB) e o resumia a cada execução, 15 a 20 ms. Agora a identidade dele é a soma das suas
+> fontes (`compilerSources`, escrita por `compiler/embed.sh` com `cksum`): o runtime depende só delas, e dois
+> compiladores feitos das mesmas fontes fazem o mesmo (o ponto fixo do bootstrap). Do que resta, 15 ms são abrir o
+> executável; compilar o hello leva 2 ms.
+>
+> **O rebuild do compilador continua em ~2,6 s** (ler e checar 0,66 s, lowering 0,85 s, otimizar 0,6 s, código de
+> máquina 0,45 s). Mesmo com as 1.810 funções tiradas do cache de otimização, otimizar leva 0,6 s: cada acerto codifica
+> a função, a resume e decodifica o resultado. Chegar a 0,5 s pede guardar por módulo a leitura, a checagem e o
+> lowering, e a checagem hoje é do programa inteiro (genéricos instanciados entre módulos): um trabalho próprio.
+
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 
 > **Decidido e feito em 19/11/2026**, pela regra "uma forma canônica para cada coisa; inferência quando não custa

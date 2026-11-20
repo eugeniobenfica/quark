@@ -10,7 +10,7 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 - [x] A1 git: [github.com/eugeniobenfica/quark](https://github.com/eugeniobenfica/quark), público, MIT
 - [x] A2 release (0.9.2) e CI rodando a suíte inteira em Windows, Linux x86-64 e ARM64, macOS
 - [x] A3 teste diferencial (`tools/difftest.qk`; a cada mudança, 3000 programas toda noite)
-- [x] A4 fuzzing (`tools/fuzz.qk`); `quark bind` ainda sem fuzzing
+- [x] A4 fuzzing (`tools/fuzz.qk`), `quark bind` também (um caso em quatro: um cabeçalho C mudado ao acaso)
 - [x] A5 as tabelas do runtime conferidas entre si
 - [ ] A6 assinar o `quark.exe` no Windows: precisa de um certificado de assinatura de código (Azure Trusted Signing,
   OV/EV)
@@ -55,7 +55,9 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
   - [x] cancelamento e prazos (`cancel`, `withTimeout`, `receiveWithin`)
   - [x] concorrência estruturada (`scope`, `s.start`)
-- [ ] B10 compilação incremental de ponta a ponta
+- [~] B10 compilação incremental de ponta a ponta
+  - [x] `quark run` de um programa pequeno abaixo de 30 ms (38,5 → 20,6 ms)
+  - [ ] rebuild do compilador abaixo de 0,5 s (hoje ~2,6 s): leitura, checagem e lowering guardados por módulo
 
 ## C. A linguagem
 

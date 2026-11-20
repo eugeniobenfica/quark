@@ -239,6 +239,13 @@ Três mudanças de layout, que por mexerem no ABI interno devem vir juntas e ant
 **Por quê:** atacam o custo por elemento em todo programa de dados. **Risco:** cada uma toca runtime, lowering,
 coletor e descrições de tipo; exigem a suíte e o teste diferencial de A3.
 
+> **Medido em 20/11/2026, antes de começar.** A Swiss table rende pouco sobre a tabela que já existe: as entradas na ordem em que as chaves vieram, e um índice cujos slots trazem 32 bits do hash, de modo que uma sondagem que encontra outra chave segue sem ler a entrada dela.
+> - Em `words`, o tempo de `mapFind` está no hash e na comparação das chaves de texto, não em sondar.
+> - O ganho de B6 está nos dois outros itens. São mudanças de layout em todo o lowering e o coletor:
+>   - textos curtos dentro do valor (sem alocar as palavras de um texto);
+>   - opcionais sem etiqueta (`Text?` num slot a menos).
+> - Nenhum dos três foi começado.
+
 ### B7. Memória: copiar menos na coleta de laço
 
 - **Pré-promoção:** o que é guardado num container de fora do laço é alocado direto na região de fora.
@@ -328,6 +335,8 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 - **wasm32:** rodar a suíte num runtime wasm; `std` sem sistema bem delimitada.
 - **libquark no macOS** e a API C revisada uma última vez antes de congelar.
 - **Executáveis menores:** só o que o programa usa do runtime (hoje vai inteiro).
+
+> **Medido em 20/11/2026.** Um "hello" tem 842 KB, dos quais 838 KB são o runtime. A imagem do runtime é guardada em cache uma vez por sistema, e o programa vai junto, carregado pelo runtime ao começar. A tabela de funções do runtime é preenchida com todas elas. Para deixar de fora as não usadas, é preciso compilar o runtime por programa, com alcançabilidade a partir das chamadas do programa e uma tabela parcial, e guardar o cache pelo conjunto de funções usadas.
 
 ## 6. Fase E: biblioteca e ferramentas
 

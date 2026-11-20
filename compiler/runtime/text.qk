@@ -359,7 +359,7 @@ pub extern effect fn rtRepeat(t: Int64, n: Int64, times: Int64) -> Int64 as "qk_
 pub extern effect fn rtJoin(items: Int64, count: Int64, sep: Int64, sn: Int64) -> Int64 as "qk_join" {
     var total = 0
     for i in 0..count {
-        total += word(items, 2 * i + 1) + (if i != 0 { sn } else { 0 })
+        total += textLengthAt(items + 16 * i) + (if i != 0 { sn } else { 0 })
     }
     let p = allocRaw(total + 8, 1)
     setWord(p, 0, total)
@@ -369,8 +369,8 @@ pub extern effect fn rtJoin(items: Int64, count: Int64, sep: Int64, sn: Int64) -
             copyBytes(w, sep, sn)
             w += sn
         }
-        copyBytes(w, word(items, 2 * i), word(items, 2 * i + 1))
-        w += word(items, 2 * i + 1)
+        copyBytes(w, textBytesAt(items + 16 * i), textLengthAt(items + 16 * i))
+        w += textLengthAt(items + 16 * i)
     }
     p
 }

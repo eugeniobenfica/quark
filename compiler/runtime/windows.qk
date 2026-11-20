@@ -481,7 +481,7 @@ pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, ou
     }
     var line = Line(malloc(256), 0, 256).quoted(name, n)
     for i in 0..count {
-        line = line.add(' ').quoted(word(args, 2 * i), word(args, 2 * i + 1))
+        line = line.add(' ').quoted(textBytesAt(args + 16 * i), textLengthAt(args + 16 * i))
     }
     let wline = wideOf(line.p, line.n)
     free(line.p)

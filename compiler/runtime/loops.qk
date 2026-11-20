@@ -624,6 +624,9 @@ fn copyMapInto(c: Int, slot: Int) {
 }
 
 fn copyText(c: Int, slots: Int) {
+    if word(slots, 1) < 0 {
+        return // a short text: its bytes are in its slots
+    }
     let n = word(slots, 1)
     let p = word(slots, 0)
     if n <= 0 or p == 0 or not isYoung(c, p) and not isYoung(c, p + n - 1) {

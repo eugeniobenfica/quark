@@ -152,6 +152,21 @@ fn textHash(p: Int, n: Int) -> Int {
     mix(h ^ last)
 }
 
+// a text's hash given its two slots: a short one's the same as when its bytes are in memory
+fn textSlotsHash(p: Int, n1: Int) -> Int {
+    if n1 >= 0 {
+        return textHash(p, n1)
+    }
+    let n = n1 & ~intMin
+    var h = n *% -7046029254386353131 ^ 1469598103934665603
+    if n == 8 {
+        h = (h ^ p) *% -7046029254386353131
+        h = h ^ shr(h, 29)
+        return mix(h)
+    }
+    mix(h ^ p) // the bytes past n are 0, as textHash's last word has them
+}
+
 const tagBits = -4294967296 // a table slot's high 32 bits: the hash's
 const indexBits = 4294967295
 
@@ -275,8 +290,7 @@ pub fn valuesEqual(a0: Int, b0: Int, d0: Int, base0: Int) -> Bool {
         if k == 'F' {
             same = floatAt(a, 0) == floatAt(b, 0) // -0.0 == 0.0; NaN is equal to nothing
         } else if k == 'T' {
-            same = word(a, 1) == word(b, 1)
-                and (word(a, 0) == word(b, 0) or sameBytes(word(a, 0), word(b, 0), word(a, 1)))
+            same = sameText(word(a, 0), word(a, 1), word(b, 0), word(b, 1))
         } else if k == 'A' {
             if word(a, 1) != word(b, 1) {
                 same = false
@@ -376,7 +390,7 @@ pub fn valueHash(a0: Int, d0: Int, base0: Int) -> Hashed {
             }
             h = mix(h ^ bitsOf(x))
         } else if k == 'T' {
-            h = mix(h ^ textHash(word(a, 0), word(a, 1)))
+            h = mix(h ^ textSlotsHash(word(a, 0), word(a, 1)))
         } else if k == 'A' {
             h = mix(h ^ word(a, 1))
             let elem = d + 1
@@ -434,7 +448,7 @@ fn keyHash(m: Int, k0: Int, k1: Int) -> Hashed {
         return Hashed(mix(k0 *% -7046029254386353131 ^ (k1 +% 7146057691288625177)), false)
     }
     if kind == keyText {
-        return Hashed(textHash(k0, k1), false)
+        return Hashed(textSlotsHash(k0, k1), false)
     }
     if kind == keyAny {
         return valueHash(k0, word(m, mDesc) + 1, word(m, mDesc))
@@ -448,7 +462,7 @@ fn keyEqual(m: Int, e: Int, k0: Int, k1: Int) -> Bool {
         return word(e, 1) == k0 and word(e, 2) == k1
     }
     if kind == keyText {
-        return word(e, 2) == k1 and sameBytes(word(e, 1), k0, k1)
+        return sameText(word(e, 1), word(e, 2), k0, k1)
     }
     if kind == keyAny {
         return valuesEqual(e + 8, k0, word(m, mDesc) + 1, word(m, mDesc))

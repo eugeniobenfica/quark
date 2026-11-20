@@ -67,6 +67,7 @@ pub type Purpose {
     runtime: Bool = false
     needMain: Bool = false
     debug: Bool = false
+    used: [Bool] = [] // the runtime for one program: the functions of its table it calls (empty: all of them)
 }
 
 fn targetOs(host: Host, target: Text) -> Os = if target == "" {
@@ -171,8 +172,20 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
             sysv: sysv,
             debug: debug,
             debugKeys: keys,
+            runtimeUsed: purpose.used,
         ),
     )
+    if runtime and len(purpose.used) > 0 {
+        // only what the program reaches: from the executable's entry (Windows', Linux's, macOS's), its table's
+        // functions through fillRuntime
+        var roots: [Int] = []
+        for (i, f) in low.program.fns.enumerate() {
+            if f.exportName is Some(sym) and sym is "qkWinEntry" | "main" | "qkMacMain" {
+                roots.push(i)
+            }
+        }
+        low.program.keepReachable(roots)
+    }
     let lanes = if arm {
         2
     } else if avx and cpu & 2 != 0 {
@@ -431,7 +444,10 @@ pub fn compileFile(host: Host, path: Text, o: RunOptions, purpose: Purpose) -> C
 }
 
 // the runtime for this machine (or target's), from the texts the compiler keeps: compiled for objects, linked
-pub fn compileRuntime(host: Host, target: Text) -> Compiled? {
+pub fn compileRuntime(host: Host, target: Text) -> Compiled? = compileRuntimeFor(host, target, [])
+
+// the runtime, only what a program reaches of it (used: its table's functions the program calls; [] all)
+pub fn compileRuntimeFor(host: Host, target: Text, used: [Bool]) -> Compiled? {
     let os = targetOs(host, target)
     let name = match os {
         Windows => "windows"
@@ -446,7 +462,7 @@ pub fn compileRuntime(host: Host, target: Text) -> Compiled? {
         host,
         Source(embeddedRuntime + name + ".qk", text),
         RunOptions(),
-        Purpose(target: target, object: true, linked: true, runtime: true),
+        Purpose(target: target, object: true, linked: true, runtime: true, used: used),
         false,
     )
 }
@@ -1188,14 +1204,56 @@ pub fn buildExecutable(host: Host, target: Text, c: Compiled, o: RunOptions) -> 
         Linux => if libc == .Musl { "linux-musl" } else { "linux" }
         Macos => "macos"
     }) + (if arm { "-arm64" } else { "-x64" })
-    let file = "quark-exe-{runtimeKey(name, id)}.bin"
+    // the runtime's functions the program calls (its code's addresses of them): the executable holds those and what
+    // they reach, not the whole runtime; kept by that set
+    var used = [false] * len(runtimeNames)
+    let reached = c.prog.reached([c.prog.mainIndex]) // (the prelude's built-ins it does not call are not its)
+    // and those its machine code calls (a bounds check's panic, the fuel...): each address of one, in a function it
+    // reaches (the functions' code in order: fnAt)
+    var starts: [(Int, Int)] = []
+    for (k, at) in c.mc.fnAt.enumerate() {
+        starts.push((at, k))
+    }
+    starts = starts.sortedBy(p => p.0)
+    for r in c.mc.relocs {
+        if r.kind != relocRuntime or r.target < 0 or r.target >= len(used) {
+            continue
+        }
+        var lo = 0 // the last function starting at or before it
+        var hi = len(starts)
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if starts[mid].0 <= r.at {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        let owner = if lo > 0 { starts[lo - 1].1 } else { -1 }
+        if owner < 0 or owner >= len(reached) or reached[owner] {
+            used[r.target] = true // (outside any function: the trampolines')
+        }
+    }
+    for (k, f) in c.prog.fns.enumerate() {
+        if not reached[k] {
+            continue
+        }
+        for ins in f.code {
+            if ins.op == Op.RtCall and ins.imm >= 0 and ins.imm < len(used) {
+                used[ins.imm] = true
+            }
+        }
+    }
+    var set = Hash128()
+    set.add(used.map(u => if u { 49 } else { 48 }).toArray())
+    let file = "quark-exe-{runtimeKey(name, id)}-{set.text()[..16]}.bin"
     let cache = cachePath(file)
     var image: Bytes = []
     if keep and readBytes(cache) is Ok(b) and len(b) > 16 and b[len(b) - 8..] == "QKEXEIMG".bytes() {
         cacheUsed(file, len(b))
         image = b[..len(b) - 8] + program
     } else {
-        let Some(rt) = compileRuntime(host, target) else {
+        let Some(rt) = compileRuntimeFor(host, target, used) else {
             return 1
         }
         let info = ImageInfo(rt.os, true, rt.features, rt.data, runtimeNames)

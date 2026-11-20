@@ -75,7 +75,7 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 - [ ] informação de depuração DWARF e PDB
 - [ ] a suíte em wasm32
 - [ ] libquark no macOS, a API C revista antes de congelar
-- [ ] executáveis menores (o runtime vai inteiro: 838 dos 842 KB de um hello)
+- [x] executáveis menores: só o runtime que o programa alcança (hello 911 → 136 KB)
 
 ## E. Biblioteca e ferramentas
 

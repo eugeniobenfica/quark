@@ -307,6 +307,64 @@ pub type IrProgram {
     cSigs: [IrExtern] = [] // the C functions called through an address (HostCall with a: the address): their slots
 }
 
+// ---- a program's functions, only those it reaches ----
+// The functions reached from the roots (each a function's index): through calls (Call's imm), functions' addresses
+// (Const c 2), the interface tables, and C's calls of a symbol a function of the program gives (the runtime's own:
+// extern fn osPoll(...) as "qkosPoll"). Every other one becomes an empty one (a ret): the numbers stay, the code goes.
+pub fn IrProgram.keepReachable(var self, roots: [Int]) {
+    let reached = self.reached(roots)
+    for (i, f) in self.fns.enumerate() {
+        if not reached[i] {
+            self.fns[i] = IrFn(f.name, exportName: f.exportName, code: [IrIns(Op.Ret, dst: -1, a: -1, b: -1, c: -1)])
+        }
+    }
+}
+
+// which functions the roots reach (keepReachable)
+pub fn IrProgram.reached(self, roots: [Int]) -> [Bool] {
+    var bySymbol: [Text: Int] = [:]
+    for (i, f) in self.fns.enumerate() {
+        if f.exportName is Some(sym) {
+            bySymbol[sym] = i
+        }
+    }
+    var reached = [false] * len(self.fns)
+    var todo: [Int] = []
+    for r in roots {
+        if r >= 0 and r < len(self.fns) and not reached[r] {
+            reached[r] = true
+            todo.push(r)
+        }
+    }
+    for t in self.tables {
+        for f in t.fns {
+            if f >= 0 and f < len(self.fns) and not reached[f] {
+                reached[f] = true
+                todo.push(f)
+            }
+        }
+    }
+    while len(todo) > 0 {
+        let f = todo.pop() ?? 0
+        for ins in self.fns[f].code {
+            let callee = if ins.op == Op.Call and ins.a < 0 {
+                ins.imm
+            } else if ins.op == Op.Const and ins.c == 2 {
+                ins.imm
+            } else if ins.op == Op.HostCall and ins.a < 0 and ins.imm >= 0 and ins.imm < len(self.externs) {
+                bySymbol[self.externs[ins.imm].name] ?? -1
+            } else {
+                -1
+            }
+            if callee >= 0 and callee < len(self.fns) and not reached[callee] {
+                reached[callee] = true
+                todo.push(callee)
+            }
+        }
+    }
+    reached
+}
+
 // ---- machine code ----
 // Reloc.kind: what the 8-byte address at `at` is
 pub const relocRuntime = 0 // a runtime function (target: its id)

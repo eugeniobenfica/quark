@@ -25,6 +25,7 @@ pub type LowerOptions {
     sysv: Bool = false
     debug: Bool = false
     debugKeys: [Int: Text] = [:]
+    runtimeUsed: [Bool] = [] // the runtime for one program: the functions of its table it calls (empty: every one)
 }
 
 // the IR, the program's data (texts, constant arrays, interface tables), and where inlined code came from
@@ -4761,9 +4762,10 @@ fn Lower.hostCall(var self, line: Int, d: Int, args: [[Int]], cTypes: [Int]) -> 
             }
         }
         let z = self.iconst(0)
+        let used = self.opts.runtimeUsed
         for (i, name) in runtimeNames.enumerate() {
             let fr = self.newReg('I')
-            if bySymbol["qk_" + name] is Some(f) {
+            if bySymbol["qk_" + name] is Some(f) and (len(used) == 0 or used.get(i) == Some(true)) {
                 self.emit(.Const, fr, -1, -1, imm: f, c: 2)
             } else {
                 self.emit(.Const, fr, -1, -1, imm: 0)

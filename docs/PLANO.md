@@ -536,6 +536,12 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 
 > **Medido em 20/11/2026.** Um "hello" tem 842 KB, dos quais 838 KB são o runtime. A imagem do runtime é guardada em cache uma vez por sistema, e o programa vai junto, carregado pelo runtime ao começar. A tabela de funções do runtime é preenchida com todas elas. Para deixar de fora as não usadas, é preciso compilar o runtime por programa, com alcançabilidade a partir das chamadas do programa e uma tabela parcial, e guardar o cache pelo conjunto de funções usadas.
 
+> **Feito em 20/11/2026: executáveis menores.** `quark build` compila o runtime por programa, só com o que ele alcança.
+> - O conjunto de funções da tabela do runtime que o programa usa vem das chamadas das funções alcançadas a partir de `main`, mais as relocações dentro delas.
+> - O runtime é compilado com essa tabela parcial (`LowerOptions.runtimeUsed`). As funções que nenhuma raiz alcança viram um `ret` (`IrProgram.keepReachable`). As raízes são a entrada do sistema, as tabelas de interfaces, os endereços de função e as chamadas por nome a uma função exportada.
+> - O cache é guardado pelo hash do conjunto usado. Montar o runtime de um conjunto novo leva 0,24 s; com o cache, 33 ms.
+> - Tamanhos: hello 911 → 136 KB, json 979 → 639 KB, words 916 → 532 KB, background 918 → 367 KB.
+
 ## 6. Fase E: biblioteca e ferramentas
 
 > **Feito em 19/11/2026:** `std.csv`, `walkFiles` no `std.files`, `quark test --filter`, e o tutorial

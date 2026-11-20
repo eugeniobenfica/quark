@@ -49,7 +49,7 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [x] coletas completas que esperam conforme o lixo que acham; valores pequenos copiados sem a tabela: `records`
     de 1,95× para 1,6× o C
   - [ ] pré-promoção por chamada (o que `build()` faz vai para fora do laço): uma região guardada na arena
-- [ ] B8 o grafo sem JSON por dentro
+- [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)

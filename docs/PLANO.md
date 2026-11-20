@@ -366,6 +366,26 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 O código do grafo monta e lê JSON e converte para QGN na borda. Trabalhar sobre os valores de `std.graph`
 simplifica `graph.qk`/`collab.qk` (4.000 linhas) e deixa programas Quark manipularem grafos com tipos.
 
+> **Feito em 20/11/2026.**
+> - **O escritor faz os valores.** `graph.qk` monta `Graph`, `Decl`, `Node`, `Pin`... em vez de texto JSON
+>   concatenado; o leitor faz a árvore sintática a partir deles (`programOfGraph`). Nenhuma linha de JSON ficou em
+>   `graph.qk`: o JSON que ele tinha, próprio, foi para `collab.qk`, o único que ainda o usa.
+> - **As duas notações saem dos valores** (`compiler/graphio.qk`): um escritor só, com a sintaxe de cada uma, os
+>   campos de cada registro na sua ordem e os que têm o valor de quando são omitidos, omitidos; JSON lido para os
+>   valores (e QGN por ele). Um grafo dado em QGN ou JSON é dito de novo pelos valores, então as duas notações de um
+>   grafo sempre batem. O formato JSON documentado (as chaves `type`, `fn`, `else`...) não mudou.
+> - **O que os valores não diziam:** um `else {}` vazio e nenhum `else` eram o mesmo `Block()`. `Node.otherwise`
+>   passou a `Block?` (em `std.graph` também).
+> - **O compilador tem a sua cópia dos tipos** (`compiler/graphvalue.qk`): ele é compilado por um compilador anterior
+>   (na CI, a última release), cujo `std.graph` pode ser outro. O teste que compila o QGN de um grafo como constante de
+>   `std.graph` mantém os dois iguais.
+> - **`collab.qk` fica sobre a árvore genérica, de propósito.** O diff e o merge trocam os ids por chaves dentro da
+>   árvore, acham fios e blocos em qualquer campo e comparam nós pelo texto canônico: um algoritmo estrutural, que
+>   a forma genérica deixa curto. Com registros, cada caminhada viraria código campo a campo. A borda dele já são os
+>   textos dos grafos, lidos e escritos pelos mesmos valores.
+> - De passagem: o JSON da LSP e o do grafo eram duas implementações; o grafo passou a usar o de `json.qk` (o layout)
+>   e `floatG` foi para `format.qk`.
+
 ### B9. Concorrência: do protótipo ao modelo
 
 - **`Channel<T>` tipado** (o runtime já copia qualquer valor entre arenas). **Feito:** `channel`, `send`,

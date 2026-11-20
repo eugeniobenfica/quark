@@ -1,5 +1,7 @@
-// Programs as node graphs, and back. A graph is written in Quark's own notation (QGN, compiler/qgn.qk: a value of
-// std.graph's types) or JSON (--json); both say the data below, which is read and written here as JSON.
+// Programs as node graphs, and back. A graph is std.graph's values (compiler/graphvalue.qk): the writer below makes
+// them from a checked program, the reader makes a program's syntax tree from them. Its two notations, Quark's own
+// (QGN, what quark graph writes) and JSON (--json), are written and read in compiler/graphio.qk; here, as JSON says
+// it:
 //
 // Every expression that is not a plain value is a node; its inputs are wires from other nodes or values typed into
 // the pin. Every let, var, parameter and loop variable is a named node, and a use of the name is a wire from it.
@@ -17,8 +19,6 @@
 // {"stmts": [ids], "closing": "comment"}. A node's "key" (fn/name, for named nodes) is stable while the name is: an
 // editor keeps positions in a side file under it (--layout), with a "uid" that survives a move.
 //
-// JSON is read into one Json value: its values in an array, each naming its items by their index there (the same
-// arena holds several documents: quark merge reads three graphs into one and copies values between them).
 use token
 use ast
 use source
@@ -30,244 +30,12 @@ use check
 use qgn
 use graphio
 use graphvalue as g
-
-// ---- JSON --------------------------------------------------------------------------------------------------------
-pub enum JKind { Null, Bool, Num, Str, Arr, Obj }
-
-// a value: a number, a text, or an array's or an object's items (and an object's keys, one per item)
-pub type JNode {
-    kind: JKind
-    num: Float = 0.0
-    b: Bool = false
-    str: Text = ""
-    keys: [Text] = []
-    items: [Int] = []
-}
-
-pub type Json { nodes: [JNode] = [] }
-
-pub fn Json.add(var self, n: JNode) -> Int {
-    self.nodes.push(n)
-    len(self.nodes) - 1
-}
-
-pub fn Json.text(var self, s: Text) -> Int = self.add(JNode(.Str, str: s))
-
-pub fn Json.kind(self, v: Int) -> JKind = if v < 0 { JKind.Null } else { self.nodes[v].kind }
-
-pub fn Json.count(self, v: Int) -> Int = if v < 0 { 0 } else { len(self.nodes[v].items) }
-
-pub fn Json.item(self, v: Int, i: Int) -> Int = self.nodes[v].items[i]
-
-// an object's value for a key (the first), or -1
-pub fn Json.get(self, o: Int, key: Text) -> Int {
-    if o < 0 or self.nodes[o].kind != JKind.Obj {
-        return -1
-    }
-    let n = self.nodes[o]
-    for (i, k) in n.keys.enumerate() {
-        if k == key {
-            return n.items[i]
-        }
-    }
-    -1
-}
-
-pub fn Json.str(self, o: Int, key: Text) -> Text? {
-    let v = self.get(o, key)
-    if v >= 0 and self.nodes[v].kind == JKind.Str {
-        Some(self.nodes[v].str)
-    } else {
-        None
-    }
-}
-
-pub fn Json.isTrue(self, o: Int, key: Text) -> Bool {
-    let v = self.get(o, key)
-    v >= 0 and self.nodes[v].kind == JKind.Bool and self.nodes[v].b
-}
-
-pub fn Json.int(self, o: Int, key: Text, fallback: Int) -> Int {
-    let v = self.get(o, key)
-    if v >= 0 and self.nodes[v].kind == JKind.Num {
-        truncate(self.nodes[v].num)
-    } else {
-        fallback
-    }
-}
-
-pub fn Json.has(self, o: Int, key: Text) -> Bool = self.get(o, key) >= 0
-
-type JParser { b: Bytes, text: Text, p: Int = 0, failed: Bool = false, doc: Json }
-
-fn JParser.at(self) -> Int = if self.p < len(self.b) { self.b[self.p] } else { -1 }
-
-fn JParser.ws(var self) {
-    while self.p < len(self.b) and self.b[self.p] is ' ' | '\n' | '\r' | '\t' {
-        self.p += 1
-    }
-}
-
-fn hexValue(t: Text) -> Int {
-    var v = 0
-    for c in t.bytes() {
-        let d = match c {
-            '0'..='9' => c - '0'
-            'a'..='f' => c - 'a' + 10
-            'A'..='F' => c - 'A' + 10
-            _ => -1
-        }
-        if d < 0 {
-            return v
-        }
-        v = v *% 16 +% d // 64 bits: a hash
-    }
-    v
-}
-
-fn JParser.string(var self) -> Text {
-    self.p += 1 // the opening quote
-    var out = ""
-    var from = self.p
-    let n = len(self.b)
-    while self.p < n and self.b[self.p] != '"' {
-        if self.b[self.p] != '\\' or self.p + 1 >= n {
-            self.p += 1
-            continue
-        }
-        out += self.text[from..self.p]
-        let k = self.b[self.p + 1]
-        self.p += 2
-        if k == 'u' and self.p + 4 <= n {
-            var u = hexValue(self.text[self.p..self.p + 4])
-            self.p += 4
-            if u >= 0xd800 and u < 0xdc00 and self.p + 6 <= n and self.b[self.p] == '\\' and self.b[self.p + 1] == 'u' {
-                let low = hexValue(self.text[self.p + 2..self.p + 6])
-                if low >= 0xdc00 and low < 0xe000 {
-                    u = 0x10000 + (u - 0xd800) << 10 + (low - 0xdc00)
-                    self.p += 6
-                }
-            }
-            out += char(u)
-        } else {
-            out += match k {
-                'n' => "\n"
-                't' => "\t"
-                'r' => "\r"
-                'b' => char(8)
-                'f' => char(12)
-                _ => self.text[self.p - 1..self.p]
-            }
-        }
-        from = self.p
-    }
-    out += self.text[from..(if self.p < n { self.p } else { n })]
-    if self.p >= n {
-        self.failed = true
-    } else {
-        self.p += 1
-    }
-    out
-}
-
-fn JParser.word(self, w: Text) -> Bool {
-    let n = len(w)
-    self.p + n <= len(self.b) and self.text[self.p..self.p + n] == w
-}
-
-fn JParser.value(var self) -> Int {
-    self.ws()
-    let c = self.at()
-    if c < 0 {
-        self.failed = true
-        return self.doc.add(JNode(.Null))
-    }
-    if c == '{' or c == '[' {
-        let obj = c == '{'
-        let close = if obj { '}' } else { ']' }
-        self.p += 1
-        self.ws()
-        var keys: [Text] = []
-        var items: [Int] = []
-        if self.at() == close {
-            self.p += 1
-            return self.doc.add(JNode(if obj { JKind.Obj } else { JKind.Arr }))
-        }
-        while not self.failed {
-            var key = ""
-            if obj {
-                self.ws()
-                if self.at() != '"' {
-                    self.failed = true
-                    break
-                }
-                key = self.string()
-                self.ws()
-                if self.at() != ':' {
-                    self.failed = true
-                    break
-                }
-                self.p += 1
-            }
-            let item = self.value()
-            keys.push(key)
-            items.push(item)
-            self.ws()
-            if self.at() == ',' {
-                self.p += 1
-                continue
-            }
-            if self.at() == close {
-                self.p += 1
-                break
-            }
-            self.failed = true
-        }
-        return self.doc.add(
-            JNode(if obj { JKind.Obj } else { JKind.Arr }, keys: if obj { keys } else { [] }, items: items),
-        )
-    }
-    if c == '"' {
-        let s = self.string()
-        return self.doc.text(s)
-    }
-    if self.word("true") {
-        self.p += 4
-        return self.doc.add(JNode(.Bool, b: true))
-    }
-    if self.word("false") {
-        self.p += 5
-        return self.doc.add(JNode(.Bool))
-    }
-    if self.word("null") {
-        self.p += 4
-        return self.doc.add(JNode(.Null))
-    }
-    let start = self.p
-    var q = self.p
-    while q < len(self.b) and self.b[q] is '0'..='9' | '-' | '+' | '.' | 'e' | 'E' {
-        q += 1
-    }
-    let Ok(x) = self.text[start..q].parseFloat() else {
-        self.failed = true
-        return self.doc.add(JNode(.Num))
-    }
-    self.p = q
-    self.doc.add(JNode(.Num, num: x))
-}
-
-// JSON text read into the arena: its value, or -1 when it is not JSON
-pub fn Json.parse(var self, text: Text) -> Int {
-    var jp = JParser(text.bytes(), text, doc: self)
-    let v = jp.value()
-    self.nodes = jp.doc.nodes
-    if jp.failed { -1 } else { v }
-}
+use json
 
 // ---- writing a program's graph ----------------------------------------------------------------------------------
-// The writer: the program, each binding's node (wire), the layout; per declaration its nodes so far (written as they
-// are met), the next id, the function's name (keys start with it), how many lets, vars and fors name each name.
-// The writer: a declaration's nodes (std.graph's values) as they are made, inputs before the node that takes them.
+// The writer: the program, each binding's node (wire), the layout; per declaration its nodes so far (std.graph's
+// values, made as they are met: inputs before the node that takes them), the next id, the function's name (keys start
+// with it), how many lets, vars and fors name each name.
 type Out {
     p: Program
     wire: [Int]
@@ -321,15 +89,13 @@ fn Out.headed(self, n: g.Node, id: Int, kind: Text, key: Text, line: Int, hash: 
     var out = n with { id: id, kind: kind, key: key, hash: hash, line: if line > 0 { line } else { 0 } }
     let l = self.layout
     let entry = self.layoutEntry(key, hash)
-    if l.str(entry, "uid") is Some(uid) and uid != "" {
+    if l.text(l.get(entry, "uid")) is Some(uid) and uid != "" {
         out.uid = uid
     }
     let pos = if l.kind(entry) == JKind.Obj { l.get(entry, "pos") } else { entry }
-    if l.kind(pos) == JKind.Arr
-        and l.count(pos) == 2
-        and l.kind(l.item(pos, 0)) == JKind.Num
-        and l.kind(l.item(pos, 1)) == JKind.Num {
-        out.pos = [l.nodes[l.item(pos, 0)].num, l.nodes[l.item(pos, 1)].num]
+    let xy = l.items(pos)
+    if l.kind(pos) == JKind.Arr and len(xy) == 2 and l.kind(xy[0]) == JKind.Num and l.kind(xy[1]) == JKind.Num {
+        out.pos = [l.nodes[xy[0]].num, l.nodes[xy[1]].num]
     }
     out
 }
@@ -341,7 +107,7 @@ fn Out.layoutEntry(self, key: Text, hash: Text) -> Int {
     let l = self.layout
     let byKey = l.get(self.layoutRoot, key)
     let said = if l.kind(byKey) == JKind.Obj {
-        l.str(byKey, "hash") ?? ""
+        l.text(l.get(byKey, "hash")) ?? ""
     } else {
         ""
     }
@@ -1036,16 +802,14 @@ fn Out.declOf(var self, d: Decl) -> g.Decl {
 pub fn graphValueOf(p: Program, layoutText: Text) -> g.Graph {
     var layout = Json()
     var root = -1
-    if layoutText != "" {
-        root = layout.parse(layoutText)
-        if layout.kind(root) != JKind.Obj {
-            root = -1
-        }
+    if layoutText != "" and parseJson(layoutText) is Some(l) and l.kind(0) == JKind.Obj {
+        layout = l
+        root = 0
     }
     var byHash: [Text: Int] = [:]
     if root >= 0 {
         for v in layout.nodes[root].items {
-            if layout.kind(v) == JKind.Obj and layout.str(v, "hash") is Some(h) and h != "" {
+            if layout.kind(v) == JKind.Obj and layout.text(layout.get(v, "hash")) is Some(h) and h != "" {
                 byHash[h] = if byHash.contains(h) { -1 } else { v }
             }
         }

@@ -21,6 +21,239 @@ use format
 use graph
 use qgn
 
+// ---- JSON: the graphs side by side, as one tree ---------------------------------------------------------------------
+pub enum JKind { Null, Bool, Num, Str, Arr, Obj }
+
+// a value: a number, a text, or an array's or an object's items (and an object's keys, one per item)
+pub type JNode {
+    kind: JKind
+    num: Float = 0.0
+    b: Bool = false
+    str: Text = ""
+    keys: [Text] = []
+    items: [Int] = []
+}
+
+pub type Json { nodes: [JNode] = [] }
+
+pub fn Json.add(var self, n: JNode) -> Int {
+    self.nodes.push(n)
+    len(self.nodes) - 1
+}
+
+pub fn Json.text(var self, s: Text) -> Int = self.add(JNode(.Str, str: s))
+
+pub fn Json.kind(self, v: Int) -> JKind = if v < 0 { JKind.Null } else { self.nodes[v].kind }
+
+pub fn Json.count(self, v: Int) -> Int = if v < 0 { 0 } else { len(self.nodes[v].items) }
+
+pub fn Json.item(self, v: Int, i: Int) -> Int = self.nodes[v].items[i]
+
+// an object's value for a key (the first), or -1
+pub fn Json.get(self, o: Int, key: Text) -> Int {
+    if o < 0 or self.nodes[o].kind != JKind.Obj {
+        return -1
+    }
+    let n = self.nodes[o]
+    for (i, k) in n.keys.enumerate() {
+        if k == key {
+            return n.items[i]
+        }
+    }
+    -1
+}
+
+pub fn Json.str(self, o: Int, key: Text) -> Text? {
+    let v = self.get(o, key)
+    if v >= 0 and self.nodes[v].kind == JKind.Str {
+        Some(self.nodes[v].str)
+    } else {
+        None
+    }
+}
+
+pub fn Json.isTrue(self, o: Int, key: Text) -> Bool {
+    let v = self.get(o, key)
+    v >= 0 and self.nodes[v].kind == JKind.Bool and self.nodes[v].b
+}
+
+pub fn Json.int(self, o: Int, key: Text, fallback: Int) -> Int {
+    let v = self.get(o, key)
+    if v >= 0 and self.nodes[v].kind == JKind.Num {
+        truncate(self.nodes[v].num)
+    } else {
+        fallback
+    }
+}
+
+pub fn Json.has(self, o: Int, key: Text) -> Bool = self.get(o, key) >= 0
+
+type JParser { b: Bytes, text: Text, p: Int = 0, failed: Bool = false, doc: Json }
+
+fn JParser.at(self) -> Int = if self.p < len(self.b) { self.b[self.p] } else { -1 }
+
+fn JParser.ws(var self) {
+    while self.p < len(self.b) and self.b[self.p] is ' ' | '\n' | '\r' | '\t' {
+        self.p += 1
+    }
+}
+
+fn hexValue(t: Text) -> Int {
+    var v = 0
+    for c in t.bytes() {
+        let d = match c {
+            '0'..='9' => c - '0'
+            'a'..='f' => c - 'a' + 10
+            'A'..='F' => c - 'A' + 10
+            _ => -1
+        }
+        if d < 0 {
+            return v
+        }
+        v = v *% 16 +% d // 64 bits: a hash
+    }
+    v
+}
+
+fn JParser.string(var self) -> Text {
+    self.p += 1 // the opening quote
+    var out = ""
+    var from = self.p
+    let n = len(self.b)
+    while self.p < n and self.b[self.p] != '"' {
+        if self.b[self.p] != '\\' or self.p + 1 >= n {
+            self.p += 1
+            continue
+        }
+        out += self.text[from..self.p]
+        let k = self.b[self.p + 1]
+        self.p += 2
+        if k == 'u' and self.p + 4 <= n {
+            var u = hexValue(self.text[self.p..self.p + 4])
+            self.p += 4
+            if u >= 0xd800 and u < 0xdc00 and self.p + 6 <= n and self.b[self.p] == '\\' and self.b[self.p + 1] == 'u' {
+                let low = hexValue(self.text[self.p + 2..self.p + 6])
+                if low >= 0xdc00 and low < 0xe000 {
+                    u = 0x10000 + (u - 0xd800) << 10 + (low - 0xdc00)
+                    self.p += 6
+                }
+            }
+            out += char(u)
+        } else {
+            out += match k {
+                'n' => "\n"
+                't' => "\t"
+                'r' => "\r"
+                'b' => char(8)
+                'f' => char(12)
+                _ => self.text[self.p - 1..self.p]
+            }
+        }
+        from = self.p
+    }
+    out += self.text[from..(if self.p < n { self.p } else { n })]
+    if self.p >= n {
+        self.failed = true
+    } else {
+        self.p += 1
+    }
+    out
+}
+
+fn JParser.word(self, w: Text) -> Bool {
+    let n = len(w)
+    self.p + n <= len(self.b) and self.text[self.p..self.p + n] == w
+}
+
+fn JParser.value(var self) -> Int {
+    self.ws()
+    let c = self.at()
+    if c < 0 {
+        self.failed = true
+        return self.doc.add(JNode(.Null))
+    }
+    if c == '{' or c == '[' {
+        let obj = c == '{'
+        let close = if obj { '}' } else { ']' }
+        self.p += 1
+        self.ws()
+        var keys: [Text] = []
+        var items: [Int] = []
+        if self.at() == close {
+            self.p += 1
+            return self.doc.add(JNode(if obj { JKind.Obj } else { JKind.Arr }))
+        }
+        while not self.failed {
+            var key = ""
+            if obj {
+                self.ws()
+                if self.at() != '"' {
+                    self.failed = true
+                    break
+                }
+                key = self.string()
+                self.ws()
+                if self.at() != ':' {
+                    self.failed = true
+                    break
+                }
+                self.p += 1
+            }
+            let item = self.value()
+            keys.push(key)
+            items.push(item)
+            self.ws()
+            if self.at() == ',' {
+                self.p += 1
+                continue
+            }
+            if self.at() == close {
+                self.p += 1
+                break
+            }
+            self.failed = true
+        }
+        return self.doc.add(
+            JNode(if obj { JKind.Obj } else { JKind.Arr }, keys: if obj { keys } else { [] }, items: items),
+        )
+    }
+    if c == '"' {
+        let s = self.string()
+        return self.doc.text(s)
+    }
+    if self.word("true") {
+        self.p += 4
+        return self.doc.add(JNode(.Bool, b: true))
+    }
+    if self.word("false") {
+        self.p += 5
+        return self.doc.add(JNode(.Bool))
+    }
+    if self.word("null") {
+        self.p += 4
+        return self.doc.add(JNode(.Null))
+    }
+    let start = self.p
+    var q = self.p
+    while q < len(self.b) and self.b[q] is '0'..='9' | '-' | '+' | '.' | 'e' | 'E' {
+        q += 1
+    }
+    let Ok(x) = self.text[start..q].parseFloat() else {
+        self.failed = true
+        return self.doc.add(JNode(.Num))
+    }
+    self.p = q
+    self.doc.add(JNode(.Num, num: x))
+}
+
+// JSON text read into the arena: its value, or -1 when it is not JSON
+pub fn Json.parse(var self, text: Text) -> Int {
+    var jp = JParser(text.bytes(), text, doc: self)
+    let v = jp.value()
+    self.nodes = jp.doc.nodes
+    if jp.failed { -1 } else { v }
+}
+
 // ---- JSON as text ---------------------------------------------------------------------------------------------
 // JSON text: with sorted fields, to compare (an editor may write fields in its own order); without the blocks'
 // statement lists, to compare a node apart from what its blocks hold (they merge on their own).

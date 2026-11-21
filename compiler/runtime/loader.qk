@@ -29,6 +29,7 @@ pub const lEnterAt = 10
 pub const lEscapeAt = 11
 pub const lHosts = 12
 pub const lHostCount = 13
+pub const lShared = 15 // its source and relocations are another's (a copy's): not freed with it
 pub const loadedWords = 16
 const relocRuntime = 0
 const relocData = 1
@@ -76,6 +77,20 @@ pub fn load(
     enter: Int,
     escape: Int,
     hosts: Int,
+) -> Int = loadShared(code, codeLen, data, dataLen, relocs, relocCount, enter, escape, hosts, false)
+
+// shared: the code and data it is loaded from, and the relocations, stay the caller's (a copy of a loaded program)
+fn loadShared(
+    code: Int,
+    codeLen: Int,
+    data: Int,
+    dataLen: Int,
+    relocs: Int,
+    relocCount: Int,
+    enter: Int,
+    escape: Int,
+    hosts: Int,
+    shared: Bool,
 ) -> Int {
     let dataCopy = malloc(dataLen + 16)
     if dataCopy == 0 {
@@ -97,13 +112,19 @@ pub fn load(
     setWord(l, lCode, mem)
     setWord(l, lCodeLen, codeLen)
     setWord(l, lData, dataCopy)
-    let source = malloc(codeLen + dataLen + 16)
-    copyBytes(source, code, codeLen)
-    copyBytes(source + codeLen, data, dataLen)
-    setWord(l, lSource, source)
-    let rs = malloc(16 * relocCount + 16)
-    copyBytes(rs, relocs, 16 * relocCount)
-    setWord(l, lRelocs, rs)
+    if shared {
+        setWord(l, lSource, code)
+        setWord(l, lRelocs, relocs)
+        setWord(l, lShared, 1)
+    } else {
+        let source = malloc(codeLen + dataLen + 16)
+        copyBytes(source, code, codeLen)
+        copyBytes(source + codeLen, data, dataLen)
+        setWord(l, lSource, source)
+        let rs = malloc(16 * relocCount + 16)
+        copyBytes(rs, relocs, 16 * relocCount)
+        setWord(l, lRelocs, rs)
+    }
     setWord(l, lRelocCount, relocCount)
     setWord(l, lDataLen, dataLen)
     setWord(l, lEnterAt, enter)
@@ -129,7 +150,7 @@ pub fn load(
 // another thread's copy: the same code, its addresses this thread's
 pub fn loadAgain(l: Int) -> Int {
     let s = word(l, lSource)
-    load(
+    loadShared(
         s,
         word(l, lCodeLen),
         s + word(l, lCodeLen),
@@ -139,14 +160,17 @@ pub fn loadAgain(l: Int) -> Int {
         word(l, lEnterAt),
         word(l, lEscapeAt),
         word(l, lHosts),
+        true,
     )
 }
 
 pub fn unload(l: Int) {
     osUnmapCode(word(l, lCode), word(l, lCodeLen))
     free(word(l, lData))
-    free(word(l, lSource))
-    free(word(l, lRelocs))
+    if word(l, lShared) == 0 {
+        free(word(l, lSource))
+        free(word(l, lRelocs))
+    }
     free(word(l, lHosts))
     free(l)
 }

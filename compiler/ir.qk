@@ -407,17 +407,35 @@ pub type MachineCode {
 pub const threadsFrom = 20000
 
 // the parts of fns made apart: each its first function's number and its functions
-pub fn partsOf(fns: [IrFn]) -> [(Int, [IrFn])] {
+pub fn partsOf(fns: [(Int, IrFn)]) -> [[(Int, IrFn)]] {
     let n = len(fns)
     let count = 16
-    var out: [(Int, [IrFn])] = []
+    var out: [[(Int, IrFn)]] = []
     var from = 0
     while from < n {
         let to = min(n, from + (n + count - 1) / count)
-        out.push((from, fns[from..to]))
+        out.push(fns[from..to])
         from = to
     }
     out
+}
+
+// each function with its number
+pub fn numbered(fns: [IrFn]) -> [(Int, IrFn)] {
+    var out: [(Int, IrFn)] = []
+    for (i, f) in fns.enumerate() {
+        out.push((i, f))
+    }
+    out
+}
+
+// the instructions of functions
+pub fn instructionsOf(fns: [(Int, IrFn)]) -> Int {
+    var n = 0
+    for (_, f) in fns {
+        n += len(f.code)
+    }
+    n
 }
 
 pub fn IrProgram.instructions(self) -> Int = self.fns.map(f => len(f.code)).sum()

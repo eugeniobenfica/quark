@@ -62,8 +62,10 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
 - [-] B11 a memória de uma chamada devolvida na volta: feita (a suíte passa com toda volta coletando), medida e
   desfeita: o pico do compilador caiu só 5%. O pico é a soma das fases (o [PLANO.md](PLANO.md) tem a tabela)
-- [ ] B12 a compilação em fluxo: lotes de funções baixados, otimizados e feitos código, só o código guardado (o IR
-  inteiro, ~380 MB duas vezes, deixa de existir de uma vez; proposta no plano)
+- [x] B12 a compilação em fluxo: lotes de funções baixados, otimizados e feitos código nas threads, só o código
+  guardado; a carga e o check numa tarefa (o lixo deles vai com ela). Pico do rebuild do compilador 3,1 → 1,5 GB,
+  relógio +5%
+  - [ ] o tempo de volta: workers do `parallelMap` que vivem entre chamadas; um canal que entrega o valor sem copiá-lo
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
@@ -80,8 +82,8 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
     [PLANO.md](PLANO.md) diz o que falta decidir)
   - [x] arrays grandes crescem no lugar (reserva de endereços, páginas conforme crescem): sem cópia e sem bloco velho
     (50 milhões de Ints: 897 → 375 MB, 2× mais rápido)
-  - [-] devolver ao fim de uma fase o que ela fez e não guardou: a B11, medida e desfeita (−5% do pico). O pico é a
-    soma das fases (carga 0,4 GB, check 0,6, lowering 0,8, otimização 0,7, código 0,35): a B12 ataca isso
+  - [x] devolver ao fim de uma fase o que ela fez e não guardou: a B11 (a coleta na volta) foi medida e desfeita
+    (−5% do pico); a B12 resolveu de outro jeito (a carga e o check numa tarefa, o resto em lotes): 3,1 → 1,5 GB
   - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 
 ### C. A linguagem

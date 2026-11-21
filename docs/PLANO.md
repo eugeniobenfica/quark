@@ -697,7 +697,8 @@ resultado.
 
 ### B12. A compilação em fluxo
 
-> **Proposta de 21/11/2026; não começada.**
+> **Feita (21/11/2026).** O pico do rebuild do compilador caiu de 3,1 GB para ~1,5 GB, com +5% de tempo de relógio
+> (o resultado está no fim desta seção).
 
 **Hoje:** o lowering faz o IR de todas as funções, a otimização faz outra cópia de todas, e só então sai o código de
 máquina. O IR de 25 mil funções (~380 MB, duas vezes) e o lixo de cada fase ficam vivos até o fim.
@@ -714,6 +715,37 @@ otimizada e gerada sozinha (as tabelas só são lidas), e as chamadas entre fun�
 
 **Medição que decide:** o pico do compilador abaixo de 2 GB (o check e as constantes, ~1,2 GB, mais um lote), com o
 tempo do rebuild igual ou menor.
+
+**Resultado (21/11/2026):**
+- **Em lotes** (`compiler/memory.qk`, `Lower.streamX64` e `streamArm64`):
+  - `lowerBegin`, `lowerNext` (uma declaração por vez), `lowerRest` (a entrada, os auxiliares, as funções tardias).
+  - A cada ~2 milhões de instruções de IR, os workers otimizam (o tier rápido) e fazem o código de máquina do lote.
+  - Só o código volta. De cada função fica um resumo: o nome, o que a ligação lê, e as instruções que nomeiam outras
+    funções, as do runtime ou as de C (`Lower.summaryOf`).
+  - Uma função com um número de função tardia fica retida até `lowerRest`, que o preenche.
+  - Ficam no caminho inteiro: o `--release` (o cache e o tier que otimiza), o runtime (guarda só o que alcança) e o
+    wasm.
+- **A carga e o check numa tarefa** (`readAndCheck`, por um canal): a arena da tarefa vai embora quando ela termina,
+  e só o programa checado é copiado para fora. Era o maior pedaço do pico: ~1,1 GB feito, ~57 MB guardados.
+- **A cópia de um worker** (`loadAgain`) usa a fonte e as relocações do original, sem copiá-las.
+- **Medido** (`quark build compiler/main.qk`, mediana de 4):
+
+  | | pico | relógio |
+  |---|---|---|
+  | antes | 3,11 GB | 1,72 s |
+  | lotes de 1 milhão | 1,30 GB | 1,88 s |
+  | lotes de 2 milhões (o escolhido) | 1,49 GB | 1,82 s |
+  | um lote só | 1,61 GB | 1,85 s |
+
+  O pico ficou abaixo da meta. O tempo ficou ~5% acima: ~50 ms copiando o programa checado para fora da tarefa (o
+  canal copia duas vezes) e a recarga do programa em cada thread a cada lote.
+- **Medido e deixado de lado:**
+  - lotes pequenos (200 mil instruções): menos pico, mas cada lote recarrega o programa em 16 threads (+0,3 s);
+  - guardar a cópia de cada worker para a chamada seguinte: quebrou (uma cópia reaproveitada por outra thread acaba
+    em "too many calls deep"); a causa não foi achada.
+- **O que ainda daria o tempo de volta:**
+  - workers que vivem entre chamadas do `parallelMap`;
+  - receber de um canal adotando a memória do valor, em vez de copiá-lo.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

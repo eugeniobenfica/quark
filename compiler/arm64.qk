@@ -14,6 +14,7 @@
 // on the stack; a record comes back in x0-x1, in d0-d3 when it is all floats (four at most), or through the
 // address in x8.
 use ir
+use opt
 
 const x0 = 0
 const x1 = 1
@@ -95,19 +96,30 @@ type Arm64 {
 }
 
 // A big program's functions are made in parts on the processor's threads, then joined (as genX64 does).
-pub fn genArm64(p: IrProgram) -> MachineCode {
-    let target = p.target
-    let runtime = p.runtime
-    let externs = p.externs
-    let sigs = p.cSigs
-    let parts = if p.instructions() >= threadsFrom {
-        partsOf(p.fns).parallelMap(part => arm64Part(target, runtime, externs, sigs, part.0, part.1))
+pub fn genArm64(p: IrProgram) -> MachineCode =
+    genArm64Join(p.target, p.runtime, p.externs, p.cSigs, len(p.fns), genArm64Parts(p.target, p.runtime, p.externs, p.cSigs, numbered(p.fns), false))
+
+// the machine code of some functions (each with its number), in parts on the processor's threads when they are many
+// (quick: each optimized there first, the quick tier: compiler/memory.qk's batches); joined by genArm64Join
+pub fn genArm64Parts(
+    target: Target,
+    runtime: [RtSig],
+    externs: [IrExtern],
+    sigs: [IrExtern],
+    fns: [(Int, IrFn)],
+    quick: Bool,
+) -> [CodePart] =
+    if instructionsOf(fns) >= threadsFrom {
+        partsOf(fns).parallelMap(part => arm64Part(target, runtime, externs, sigs, part, quick))
     } else {
-        [arm64Part(target, runtime, externs, sigs, 0, p.fns)]
+        [arm64Part(target, runtime, externs, sigs, fns, quick)]
     }
-    var g = Arm64(p.target, p.runtime, p.externs)
-    g.sigs = p.cSigs
-    var fnAt: [Int] = []
+
+// the parts joined, in order: count functions in all
+pub fn genArm64Join(target: Target, runtime: [RtSig], externs: [IrExtern], sigs: [IrExtern], count: Int, parts: [CodePart]) -> MachineCode {
+    var g = Arm64(target, runtime, externs)
+    g.sigs = sigs
+    var fnAt = [0] * count
     for part in parts {
         g.align()
         let base = g.here()
@@ -120,7 +132,9 @@ pub fn genArm64(p: IrProgram) -> MachineCode {
             g.lines.push(if k % 2 == 0 { v + base } else { v })
         }
         g.frames += part.frames.map(x => x + base).toArray()
-        fnAt += part.fnAt.map(x => x + base).toArray()
+        for (k, at) in part.fnAt.enumerate() {
+            fnAt[part.numbers[k]] = at + base
+        }
     }
     let (enter, escape) = g.genTrampoline()
     for fx in g.callFixups {
@@ -137,7 +151,7 @@ pub fn genArm64(p: IrProgram) -> MachineCode {
 }
 
 // functions from number `from` on, made from offset 0: what genArm64 joins
-type CodePart {
+pub type CodePart {
     code: Bytes
     patches: [Patch]
     relocs: [Reloc]
@@ -146,6 +160,7 @@ type CodePart {
     lines: [Int]
     frames: [Int]
     fnAt: [Int]
+    numbers: [Int] // each function's number, as fnAt has them
 }
 
 fn arm64Part(
@@ -153,19 +168,27 @@ fn arm64Part(
     runtime: [RtSig],
     externs: [IrExtern],
     sigs: [IrExtern],
-    from: Int,
-    fns: [IrFn],
+    fns: [(Int, IrFn)],
+    quick: Bool,
 ) -> CodePart {
     var g = Arm64(target, runtime, externs)
     g.sigs = sigs
     var fnAt: [Int] = []
-    for (k, f) in fns.enumerate() {
+    var numbers: [Int] = []
+    for (k, f) in fns {
         g.align()
         fnAt.push(g.here())
-        g.fnIndex = from + k
-        g.genFn(f)
+        numbers.push(k)
+        g.fnIndex = k
+        if quick {
+            var q = f
+            q.quickOptimize()
+            g.genFn(q)
+        } else {
+            g.genFn(f)
+        }
     }
-    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt)
+    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt, numbers)
 }
 
 // -g: where ins's code starts, when its line is another than the last one's

@@ -113,30 +113,15 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         preludeSrc = Source(o.prelude, text)
     }
-    let loaded = loadProgram(src, preludeSrc)
-    if not loaded.ok {
-        if not quiet {
-            for e in loaded.errors.shown {
-                printErr(e)
-            }
-        }
+    // read and checked as a task: what those two work with (most of the memory they make, little of it kept) goes
+    // when the task ends, and only the checked program is copied out
+    let out: Channel<Program?> = channel()
+    let _ = go(() => send(out, readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)))
+    let Some(Some(program)) = receive(out) else {
         return None
     }
-    let checked = checkProgram(
-        loaded.program,
-        loaded.errors,
-        purpose.needMain,
-        if purpose.runtime { None } else { o.allowed },
-    )
-    if not quiet {
-        for e in checked.errors.shown {
-            printErr(e)
-        }
-    }
-    if not checked.ok {
-        return None
-    }
-    var checkedProgram = checked.program
+    closeChannel(out)
+    var checkedProgram = program
     if not purpose.runtime {
         let problems = checkedProgram.runConsts(host)
         if len(problems) > 0 {
@@ -169,21 +154,61 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     // for the debugger (compiler/debugrun.qk), each line's graph key names its values
     let debug = purpose.debug and not runtime
     let keys = if debug { lineKeys(checkedProgram) } else { [:] }
-    var low = Lowered(IrProgram(), [], []) // lowered, optimized and made code in place: the program is never copied
-    low.lowerFrom(
-        checkedProgram,
-        LowerOptions(
-            fuel: o.fuel > 0 and not runtime,
-            runtime: runtime,
-            linked: purpose.linked,
-            arch: arch,
-            sysv: sysv,
-            debug: debug,
-            debugKeys: keys,
-            coverage: o.coverage and not runtime,
-            runtimeUsed: purpose.used,
-        ),
+    let lowering = LowerOptions(
+        fuel: o.fuel > 0 and not runtime,
+        runtime: runtime,
+        linked: purpose.linked,
+        arch: arch,
+        sysv: sysv,
+        debug: debug,
+        debugKeys: keys,
+        coverage: o.coverage and not runtime,
+        runtimeUsed: purpose.used,
     )
+    let wasm = target.startsWith("wasm32")
+    let lanes = if wasm {
+        0 // (no vector loops: the wasm backend makes none)
+    } else if arm {
+        2
+    } else if avx and cpu & 2 != 0 {
+        4
+    } else {
+        2
+    }
+    let made = Target(
+        arch: arch,
+        sysv: sysv,
+        objectMode: purpose.object,
+        avx: avx,
+        lanes: lanes,
+        sse42: cpu & 4 != 0 and target == "",
+        apple: os == .Macos,
+        lines: o.debugInfo and not runtime,
+        checks: false,
+    )
+    if not runtime and not release and not wasm {
+        // in batches: each lowered, then optimized (the quick tier, which makes no vector loops) and made machine code
+        // on the threads while the next is lowered; only the code is kept, so the whole program's IR never is at once
+        var l = lowerBegin(checkedProgram, lowering)
+        let quick = made with { lanes: 0 }
+        let mc = match arch {
+            X64 => l.streamX64(quick)
+            Arm64 => l.streamArm64(quick)
+        }
+        var low = l.lowered()
+        low.program.target = quick
+        if o.timed {
+            let t4 = monotonicTime()
+            printErr(
+                "quark: parsed and checked in {fixed((t1 - t0) * 1000, 2)} ms, compiled in {fixed((t4 - t1) * 1000, 2)} ms ({len(mc.code)} bytes of machine code): lowered, optimized and made machine code in batches",
+            )
+        }
+        let prog = low.program // taken
+        low.program = IrProgram()
+        return Some(Compiled(prog, mc, low.data, low.inlines, testsOf(checkedProgram), if avx { 1 } else { 0 }, os, purpose.linked))
+    }
+    var low = Lowered(IrProgram(), [], []) // lowered, optimized and made code in place: the program is never copied
+    low.lowerFrom(checkedProgram, lowering)
     if runtime and len(purpose.used) > 0 {
         // only what the program reaches: from the executable's entry (Windows', Linux's, macOS's), its table's
         // functions through fillRuntime
@@ -195,27 +220,7 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         low.program.keepReachable(roots)
     }
-    let wasm = target.startsWith("wasm32")
-    let lanes = if wasm {
-        0 // (no vector loops: the wasm backend makes none)
-    } else if arm {
-        2
-    } else if avx and cpu & 2 != 0 {
-        4
-    } else {
-        2
-    }
-    low.program.target = Target(
-        arch: arch,
-        sysv: sysv,
-        objectMode: purpose.object,
-        avx: avx,
-        lanes: lanes,
-        sse42: cpu & 4 != 0 and target == "",
-        apple: os == .Macos,
-        lines: o.debugInfo and not runtime,
-        checks: false,
-    )
+    low.program.target = made
     let t2 = monotonicTime()
     // --release: each function's optimized code kept by content, in a pack for this program (QUARK_CACHE=off: none),
     // when the program is big enough for that to take less than optimizing it does (reading the compiler to know
@@ -250,17 +255,91 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
             "quark: parsed and checked in {fixed((t1 - t0) * 1000, 2)} ms, compiled in {fixed((t4 - t1) * 1000, 2)} ms ({len(mc.code)} bytes of machine code): lowered in {fixed((t2 - t1) * 1000, 2)}, optimized in {fixed((t3 - t2) * 1000, 2)}{hits}, made machine code in {fixed((t4 - t3) * 1000, 2)}",
         )
     }
+    let prog = low.program // taken
+    low.program = IrProgram()
+    Compiled(prog, mc, low.data, low.inlines, testsOf(checkedProgram), if avx { 1 } else { 0 }, os, purpose.linked)
+}
+
+// the program read and checked, its errors said (unless quiet); None when it has any
+fn readAndCheck(src: Source, preludeSrc: Source?, purpose: Purpose, allowed: Text?, quiet: Bool) -> Program? {
+    let loaded = loadProgram(src, preludeSrc)
+    if not loaded.ok {
+        if not quiet {
+            for e in loaded.errors.shown {
+                printErr(e)
+            }
+        }
+        return None
+    }
+    let checked = checkProgram(loaded.program, loaded.errors, purpose.needMain, if purpose.runtime { None } else { allowed })
+    if not quiet {
+        for e in checked.errors.shown {
+            printErr(e)
+        }
+    }
+    if not checked.ok {
+        return None
+    }
+    Some(checked.program)
+}
+
+// the program's tests: each one's function and name
+fn testsOf(p: Program) -> [(Text, Text)] {
     var tests: [(Text, Text)] = []
-    let p = checkedProgram
     for d in p.decls {
         let x = p.ast.decls[d]
         if x.kind == DeclKind.Fn and x.isTest {
             tests.push((x.name, x.testName))
         }
     }
-    let prog = low.program // taken
-    low.program = IrProgram()
-    Compiled(prog, mc, low.data, low.inlines, tests, if avx { 1 } else { 0 }, os, purpose.linked)
+    tests
+}
+
+// the program's functions, lowered in batches of about this many instructions (each batch's threads load the program
+// again: a few batches)
+const streamBatch = 2000000
+
+// lowered in batches, each one's machine code made on the threads (compileText)
+fn Lower.streamX64(var self, target: Target) -> MachineCode {
+    var parts = genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, [], true)
+    var batch: [(Int, IrFn)] = []
+    var made = 0
+    // (one loop for the whole program: its collections' pace is set once)
+    while not self.allLowered() {
+        if self.lowerNext() is Some(f) {
+            made += len(f.1.code)
+            batch.push(f)
+        }
+        if made >= streamBatch or self.allLowered() {
+            parts += genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, batch, true)
+            batch = []
+            made = 0
+        }
+    }
+    let rest = self.lowerRest()
+    parts += genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest, true)
+    genX64Join(target, self.out.runtime, self.out.externs, self.out.cSigs, len(self.fns), parts)
+}
+
+fn Lower.streamArm64(var self, target: Target) -> MachineCode {
+    var parts = genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, [], true)
+    var batch: [(Int, IrFn)] = []
+    var made = 0
+    // (one loop for the whole program: its collections' pace is set once)
+    while not self.allLowered() {
+        if self.lowerNext() is Some(f) {
+            made += len(f.1.code)
+            batch.push(f)
+        }
+        if made >= streamBatch or self.allLowered() {
+            parts += genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, batch, true)
+            batch = []
+            made = 0
+        }
+    }
+    let rest = self.lowerRest()
+    parts += genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest, true)
+    genArm64Join(target, self.out.runtime, self.out.externs, self.out.cSigs, len(self.fns), parts)
 }
 
 // quark build --target wasm32-wasi: the program and the runtime (runtime/wasi.qk) as one WebAssembly module

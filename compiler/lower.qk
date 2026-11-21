@@ -346,6 +346,13 @@ pub type Lower {
     asValue: [Bool] = []
     selfHome: Int = -1
     helpers: [Helper] = []
+    // lowering in batches (lowerBegin): the next of p.decls, main's way in and main's declaration, the functions held
+    // back until lowerRest, and whether each function is kept whole (lowerFrom) or summed up (summaryOf)
+    nextDecl: Int = 0
+    entryAt: Int = -1
+    mainDecl: Int = -1
+    held: [Int] = []
+    keepWhole: Bool = false
     helpersDone: Int = 0 // helpers given their function already (counted in outCount: a new one's index is after all)
     printing: [Int] = []
     growths: [Growth] = []
@@ -7665,6 +7672,18 @@ pub fn lowerProgram(p: Program, opts: LowerOptions) -> Lowered {
 
 // lowerProgram's work, into a var: its program is never copied (the caller optimizes it there)
 pub fn Lowered.lowerFrom(var self, p: Program, opts: LowerOptions) {
+    var l = lowerBegin(p, opts)
+    l.keepWhole = true
+    let _ = l.lowerSome(-1)
+    let _ = l.lowerRest()
+    self = l.lowered()
+}
+
+// ---- the program lowered in batches (compiler/memory.qk: each batch optimized and made machine code while the next
+// is lowered, so the whole program's IR never is at once) ----
+// lowerBegin, then lowerSome until it gives nothing more, then lowerRest; lowered() the program (each function's
+// summary: Lower.summaryOf, unless keepWhole).
+pub fn lowerBegin(p: Program, opts: LowerOptions) -> Lower {
     let n = len(p.decls)
     let nb = len(p.bindings)
     var l = Lower(p, Ownership(p, debug: opts.debug), opts: opts)
@@ -7706,90 +7725,182 @@ pub fn Lowered.lowerFrom(var self, p: Program, opts: LowerOptions) {
             main = d
         }
     }
-    let entryAt = if main >= 0 { count } else { -1 }
+    l.entryAt = if main >= 0 { count } else { -1 }
     l.outCount = if main >= 0 { count + 1 } else { count }
     l.fns = [IrFn("")] * l.outCount
-    main = -1
     l.out.mainIndex = -1
-    for (i, d) in p.decls.enumerate() {
-        let x = p.ast.decls[d]
-        if x.kind != DeclKind.Fn or l.isCFunction(d) or x.isTemplate or x.inlineOnly {
-            continue
+    l
+}
+
+// the next functions, until about `budget` instructions are made (-1: all of them): each with its number. One that
+// names a late function (made by lowerRest) is held back until then: its instruction is filled in there.
+pub fn Lower.lowerSome(var self, budget: Int) -> [(Int, IrFn)] {
+    var out: [(Int, IrFn)] = []
+    var made = 0
+    while not self.allLowered() and (budget < 0 or made < budget) {
+        if self.lowerNext() is Some(f) {
+            made += len(f.1.code)
+            out.push(f)
         }
+    }
+    out
+}
+
+// the next declaration lowered, when it is a function lowerSome gives (one held back, or another declaration: None)
+pub fn Lower.lowerNext(var self) -> (Int, IrFn)? {
+    let i = self.nextDecl
+    self.nextDecl += 1
+    let d = self.p.decls[i]
+    let x = self.dl(d) // (not self.p in a let: lowering changes parts of it, and the let would be a copy)
+    if x.kind != DeclKind.Fn or self.isCFunction(d) or x.isTemplate or x.inlineOnly {
+        return None
+    }
+    {
         let sym = if x.externSymbol != "" { x.externSymbol } else { x.name }
         let runtimeFn = x.isExtern and sym.startsWith("qk_") // the runtime's: called the Quark way, by that name
         if x.isExtern and not runtimeFn {
-            l.lateFor(0, d, x.cTypes, if x.isPub { Some(sym) } else { None })
+            self.lateFor(0, d, x.cTypes, if x.isPub { Some(sym) } else { None })
         }
-        let at = l.fnIndex[i]
-        l.lowerFn(d, at)
+        let at = self.fnIndex[i]
+        let patches = len(self.latePatches)
+        self.lowerFn(d, at)
         if runtimeFn and x.isPub {
-            l.cur.exportName = Some(sym)
+            self.cur.exportName = Some(sym)
         }
-        let done = l.cur // taken: l.cur gets a new function next
-        l.cur = IrFn("")
-        l.fns[at] = done
+        var done = self.cur // taken: self.cur gets a new function next
+        self.cur = IrFn("")
         if x.module == 0 and x.name == "main" {
-            l.out.mainIndex = at
-            main = d
+            self.out.mainIndex = at
+            self.mainDecl = d
         }
+        if len(self.latePatches) > patches and not self.keepWhole {
+            self.fns[at] = done // held: lowerRest fills in its late functions' numbers
+            self.held.push(at)
+            return None
+        }
+        self.fns[at] = self.summaryOf(done)
+        done.isConst = [false] * len(done.kinds)
+        done.constValue = [0] * len(done.kinds)
+        Some((at, done))
     }
-    if entryAt >= 0 and main >= 0 {
-        l.lowerEntry(main, entryAt)
-        let done = l.cur // taken: l.cur gets a new function next
-        l.cur = IrFn("")
-        l.fns[entryAt] = done
-        l.out.mainIndex = entryAt
+}
+
+pub fn Lower.allLowered(self) -> Bool = self.nextDecl >= len(self.p.decls)
+
+// what lowerSome leaves: the way in (main's caller), the helpers and the late functions, and the held functions
+pub fn Lower.lowerRest(var self) -> [(Int, IrFn)] {
+    var made: [Int] = []
+    if self.entryAt >= 0 and self.mainDecl >= 0 {
+        self.lowerEntry(self.mainDecl, self.entryAt)
+        let done = self.cur // taken: self.cur gets a new function next
+        self.cur = IrFn("")
+        self.fns[self.entryAt] = done
+        self.out.mainIndex = self.entryAt
+        made.push(self.entryAt)
     }
     var h = 0
-    while h < len(l.helpers) {
-        let slot = l.outCount
-        l.outCount += 1
-        l.helpersDone += 1
-        l.fns.push(IrFn(""))
-        l.lowerHelper(l.helpers[h], slot)
-        let done = l.cur // taken: l.cur gets a new function next
-        l.cur = IrFn("")
-        l.fns[slot] = done
+    while h < len(self.helpers) {
+        let slot = self.outCount
+        self.outCount += 1
+        self.helpersDone += 1
+        self.fns.push(IrFn(""))
+        self.lowerHelper(self.helpers[h], slot)
+        let done = self.cur // taken: self.cur gets a new function next
+        self.cur = IrFn("")
+        self.fns[slot] = done
+        made.push(slot)
         h += 1
     }
     var k = 0
-    while k < len(l.lates) {
-        let slot = l.outCount
-        l.lates[k].index = slot
-        l.outCount += 1
-        l.fns.push(IrFn(""))
-        l.fnId = slot
-        let late = l.lates[k]
+    while k < len(self.lates) {
+        let slot = self.outCount
+        self.lates[k].index = slot
+        self.outCount += 1
+        self.fns.push(IrFn(""))
+        self.fnId = slot
+        let late = self.lates[k]
         if late.kind != 0 {
-            l.lowerMachine(late)
+            self.lowerMachine(late)
         } else {
-            l.lowerCEntry(late)
+            self.lowerCEntry(late)
         }
-        let done = l.cur // taken: l.cur gets a new function next
-        l.cur = IrFn("")
-        l.fns[slot] = done
+        let done = self.cur // taken: self.cur gets a new function next
+        self.cur = IrFn("")
+        self.fns[slot] = done
+        made.push(slot)
         k += 1
     }
-    for lp in l.latePatches {
-        let target = l.lates[lp.late].index
-        l.fns[lp.fnId].code[lp.at].imm = target
+    for lp in self.latePatches {
+        let target = self.lates[lp.late].index
+        self.fns[lp.fnId].code[lp.at].imm = target
     }
-    for i in 0..len(l.fns) {
-        let nk = len(l.fns[i].kinds)
-        l.fns[i].isConst = [false] * nk
-        l.fns[i].constValue = [0] * nk
+    var out: [(Int, IrFn)] = []
+    for at in self.held + made {
+        var done = self.fns[at]
+        done.isConst = [false] * len(done.kinds)
+        done.constValue = [0] * len(done.kinds)
+        if self.keepWhole {
+            self.fns[at] = done
+        } else {
+            self.fns[at] = self.summaryOf(done)
+        }
+        out.push((at, done))
     }
-    let fns = l.fns // taken: no copy of the program
-    l.fns = []
-    l.out.fns = fns
-    l.out.dataLen = len(l.data)
-    l.out.files = l.p.modules.map(m => m.path).toArray()
-    let out = l.out // taken
-    l.out = IrProgram()
-    self.program = out
-    self.data = l.data
-    self.inlines = l.inlines
+    self.held = []
+    if self.keepWhole {
+        // (lowerSome kept each one whole, and their constants' tables)
+        for i in 0..len(self.fns) {
+            if len(self.fns[i].isConst) != len(self.fns[i].kinds) {
+                let nk = len(self.fns[i].kinds)
+                self.fns[i].isConst = [false] * nk
+                self.fns[i].constValue = [0] * nk
+            }
+        }
+    }
+    out
+}
+
+// the program lowered: its functions (whole, or their summaries), its data and its inlined calls
+pub fn Lower.lowered(var self) -> Lowered {
+    let fns = self.fns // taken: no copy of the program
+    self.fns = []
+    self.out.fns = fns
+    self.out.dataLen = len(self.data)
+    self.out.files = self.p.modules.map(m => m.path).toArray()
+    let out = self.out // taken
+    self.out = IrProgram()
+    Lowered(out, self.data, self.inlines)
+}
+
+// what is kept of a function once its machine code is made: all but its code (its registers' kinds too: an object's
+// table says its parameters'), and of that the instructions that name other functions, the runtime's or C's
+// (IrProgram.reached, the executable's runtime)
+pub fn Lower.summaryOf(self, f: IrFn) -> IrFn {
+    if self.keepWhole {
+        return f
+    }
+    var links: [IrIns] = []
+    for ins in f.code {
+        if ins.op is Call | HostCall | RtCall or ins.op == Op.Const and ins.c == 2 {
+            links.push(ins)
+        }
+    }
+    IrFn(
+        f.name,
+        line: f.line,
+        file: f.file,
+        params: f.params,
+        resultCount: f.resultCount,
+        labelCount: f.labelCount,
+        maxOut: f.maxOut,
+        machine: f.machine,
+        cHidden: f.cHidden,
+        cArgs: f.cArgs,
+        cRets: f.cRets,
+        exportName: f.exportName,
+        kinds: f.kinds,
+        code: links,
+    )
 }
 
 // The vars that calls want in memory (p.parse(), p.lexer.next()): kept there.

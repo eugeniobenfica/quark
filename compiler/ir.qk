@@ -110,6 +110,9 @@ pub const memF32Bits = 8
 // Div / Mod's cond & divNonNeg: neither operand can be negative, nor the divisor zero
 pub const divNonNeg = 2
 
+// Div / Mod's cond & divTruncated: rounded toward zero, as C does (a remainder only compared with 0: x % 3 == 0)
+pub const divTruncated = 4
+
 // IrFn.machine: std.machine's built-ins, code of the backend's own
 pub const machineNone = 0
 pub const machineSwitchStack = 1

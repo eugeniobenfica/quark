@@ -1,5 +1,6 @@
 // A field that holds a function, called as r.f(x): the field, even with a value named f in reach (a parameter of
-// the function around it), in a generic function too.
+// the function around it), in a generic function too; and a generic function whose lambda keeps the function it is
+// given.
 type Box { f: (Int) -> Int }
 
 fn apply(f: (Int) -> Int, x: Int) -> Int {
@@ -14,6 +15,15 @@ fn twice<A>(f: (A) -> A, x: A) -> A {
     by.f(by.f(x))
 }
 
+type Maker<T> { make: (Int) -> T }
+
+fn mapped<A, B>(m: Maker<A>, f: (A) -> B) -> Maker<B> {
+    let out: Maker<B> = Maker(n => f(m.make(n)))
+    out
+}
+
 fn main() {
     print(apply(n => n + 1, 1), twice(n => n * 3, 2))
+    let m: Maker<Int> = Maker(n => n + 1)
+    print(mapped(m, n => "#{n}").make(4), mapped(m, n => n * 10).make(4))
 }

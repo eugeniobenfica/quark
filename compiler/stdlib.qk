@@ -1284,9 +1284,9 @@ pub fn sha256Hex(text: Text) -> Text = hex(sha256(text.bytes()))
     if name == "http" {
         return r"""
 // HTTP/1.1: a server that runs each connection in a task of its own, and a client. A request's and a response's body
-// is read by its Content-Length (a chunked body, as servers send without one, is read to the end of the connection);
-// each connection serves one request (Connection: close). The client takes https:// too, over TLS (std.net's
-// connectTls); the server speaks plain HTTP (TLS before it is a proxy's).
+// is read by its Content-Length or in its chunks (Transfer-Encoding: chunked; a response with neither, to the end of
+// the connection); each connection serves one request (Connection: close). The client takes https:// too, over TLS
+// (std.net's connectTls); the server speaks plain HTTP (TLS before it is a proxy's).
 //
 //     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
 //     fn main() {
@@ -1379,18 +1379,73 @@ fn readHead(c: Conn) -> (Text, [Text: Text], Conn)! {
     Ok((all[0], headers, cc))
 }
 
-// the body its headers say: Content-Length bytes, else what comes until the other end closes it
-fn readBody(c: Conn, headers: [Text: Text]) -> (Bytes, Conn)! {
+// the body its headers say: Content-Length bytes, or the pieces of a chunked one; else (a response) what comes until
+// the other end closes it, or (a request) none
+fn readBody(c: Conn, headers: [Text: Text], response: Bool) -> (Bytes, Conn)! {
     var cc = c
-    if headers["content-length"] is Some(n) {
-        let count = n.parseInt().mapErr(why => "content-length: {why}")?
-        return Ok((cc.readBytes(count), cc))
+    if (headers["transfer-encoding"] ?? "").lower().contains("chunked") {
+        return readChunked(cc)
     }
-    if headers["transfer-encoding"] is Some(_) {
-        return Ok((cc.readAll()?, cc))
+    if headers["content-length"] is Some(n) {
+        let count = n.trim().parseInt().mapErr(why => "content-length: {why}")?
+        let body = cc.readBytes(count)
+        if len(body) < count {
+            return Err("the connection closed after {len(body)} of the body's {count} bytes")
+        }
+        return Ok((body, cc))
     }
     let none: Bytes = []
+    if response {
+        return Ok((cc.readAll()?, cc))
+    }
     Ok((none, cc))
+}
+
+// Transfer-Encoding: chunked: each piece's size in hex on a line of its own, the piece, an empty line; a size 0, the
+// trailer's lines (let go of), an empty line
+fn readChunked(c: Conn) -> (Bytes, Conn)! {
+    var cc = c
+    var body: Bytes = []
+    while true {
+        let Some(line) = cc.readLine() else {
+            return Err("the connection closed inside a chunked body")
+        }
+        let digits = (if line.indexOf(";") is Some(i) { line[..i] } else { line }).trim()
+        let size = hexSize(digits) ?? return Err("not a chunk's size: \"{line}\"")
+        if size == 0 {
+            while cc.readLine() is Some(trailer) {
+                if trailer == "" {
+                    break
+                }
+            }
+            return Ok((body, cc))
+        }
+        let piece = cc.readBytes(size)
+        if len(piece) < size {
+            return Err("the connection closed inside a chunk")
+        }
+        body += piece
+        let _ = cc.readLine() // the piece's line end
+    }
+    Ok((body, cc))
+}
+
+// a size in hex digits, None when it is not one
+fn hexSize(t: Text) -> Int? {
+    if len(t) == 0 or len(t) > 15 {
+        return None
+    }
+    var n = 0
+    for c in t.bytes() {
+        let v = match c {
+            '0'..='9' => c - '0'
+            'a'..='f' => c - 'a' + 10
+            'A'..='F' => c - 'A' + 10
+            _ => return None
+        }
+        n = n * 16 + v
+    }
+    Some(n)
 }
 
 // the request a connection carries
@@ -1404,7 +1459,7 @@ pub fn readRequest(c: Conn) -> (Request, Conn)! {
     let at = target.indexOf("?")
     let path = if at is Some(i) { target[..i] } else { target }
     let query = if at is Some(i) { parseQuery(target[i + 1..]) } else { [:] }
-    let (body, c2) = readBody(c1, headers)?
+    let (body, c2) = readBody(c1, headers, false)?
     Ok((Request(parts[0], percentDecode(path) ?? path, query, headers, body), c2))
 }
 
@@ -1497,7 +1552,7 @@ pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] 
     let (first, got, c1) = read ?? panic("read")
     let parts = first.split(" ")
     let status = if len(parts) >= 2 { parts[1].parseInt() ?? 0 } else { 0 }
-    let b = readBody(c1, got)
+    let b = readBody(c1, got, true)
     c1.close()
     let (responseBody, _) = b?
     Ok(Response(status, got, responseBody))
@@ -3118,12 +3173,9 @@ pub fn oneOf<T>(values: [T]) -> Gen<T> {
 
 // values of gen made into others by f (a record of them, say); f has no way back, so none is smaller
 pub fn mapGen<A, B>(gen: Gen<A>, f: (A) -> B) -> Gen<B> {
-    let by = Mapping(f) // (a lambda keeps a record of functions, not a function given to the one around it)
-    let g: Gen<B> = Gen((seed, size) => by.made(gen.make(seed, size)), b => [])
+    let g: Gen<B> = Gen((seed, size) => f(gen.make(seed, size)), b => [])
     g
 }
-
-type Mapping<A, B> { made: (A) -> B }
 
 // a text's characters, each a text
 fn textChars(t: Text) -> [Text] {
@@ -3974,7 +4026,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "2751047718-2420359"
+pub const compilerSources = "999972615-2433235"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -8947,11 +8999,14 @@ const gLive = 2
 const gBlock = 3
 const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
 const gWait = 5 // how many times what the last full one kept minor ones keep before the next is full (fullWait)
-const genWords = 6
+const gMade = 6 // what the turns made that minor ones looked through since the last full one
+const genWords = 7
 
 // A full collection copies everything since the mark again: worth it when there is garbage among what minor ones
 // kept. One that kept nearly all it looked at (data that grows) makes the next wait twice as long, up to fullWaitMost;
-// one that found much garbage brings the wait back down. With a memory limit, the wait stays 1.
+// one that found much garbage brings the wait back down. With a memory limit, the wait stays 1. While minor ones keep
+// two thirds of what the turns made or more (data that grows, not garbage), the first full one waits for four times
+// the least too: copying it all again would give nothing back.
 const fullWaitMost = 8
 
 pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
@@ -9809,7 +9864,9 @@ fn lookAgain(c: Int, r: Int, since: Int) {
 pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     let a = arena()
     let gen = word(f, frameGen)
-    let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), limited(a, nurseryMost))
+    let growing = word(gen, gPromoted) * 3 >= word(gen, gMade) * 2
+    let least = limited(a, if growing { 4 * nurseryMost } else { nurseryMost })
+    let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), least)
     let looked = word(gen, gLive) + word(gen, gPromoted) // what a full one looks through: its last, and what came since
     // young: made at this time or later (a full collection: since the mark)
     let since = if full { word(f, frameTime) } else { word(gen, gLast) }
@@ -9892,8 +9949,10 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         }
         setWord(gen, gLive, word(c, cTotal))
         setWord(gen, gPromoted, 0)
+        setWord(gen, gMade, 0)
     } else {
         setWord(gen, gPromoted, word(gen, gPromoted) + word(c, cTotal))
+        setWord(gen, gMade, word(gen, gMade) + word(f, frameLimit)) // (it collects once they made more than that)
     }
     setWord(gen, gBlock, word(c, cNow))
     setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was kept

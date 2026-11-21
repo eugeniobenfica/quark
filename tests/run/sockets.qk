@@ -76,6 +76,37 @@ fn main() {
     for p in pages.sorted() {
         print(p)
     }
+    // bodies in chunks (Transfer-Encoding: chunked): a response read by get, a request read by handleConnection
+    let raw = listen("127.0.0.1", 47914)?
+    go(() => {
+        var c = conn(accept(raw) ?? panic("accept"))
+        let _ = c.readUntil("\r\n\r\n".bytes())
+        let _ = c.write(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;x=1\r\nhello\r\nB\r\n, in chunks\r\n0\r\nx-end: 1\r\n\r\n",
+        )
+        c.close()
+        handleConnection(accept(raw) ?? panic("accept"), route)
+    })
+    let chunked: Channel<Text> = channel()
+    go(() => {
+        send(chunked, match get("http://127.0.0.1:47914/") {
+            Ok(r) => "{r.status} {r.text()}"
+            Err(why) => "error: {why}"
+        })
+        var c = conn(connect("127.0.0.1", 47914) ?? panic("connect"))
+        let _ = c.write(
+            "POST /echo HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n",
+        )
+        let text = Text(c.readAll() ?? []) ?? ""
+        send(chunked, text.split("\r\n\r\n")[1])
+        c.close()
+    })
+    runTasks()
+    closeSocket(raw)
+    closeChannel(chunked)
+    while receive(chunked) is Some(line) {
+        print(line)
+    }
     print(
         parseUrl("https://example.com"),
         get("ftp://example.com") is Err(_),

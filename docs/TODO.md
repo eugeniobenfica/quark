@@ -10,7 +10,7 @@ e **para onde ir agora** (o próximo trabalho, em ordem).
 
 Estado em 21/11/2026: a versão publicada é a 0.9.2; o `main` tem as fases A a E (menos o que está abaixo, em "ficou
 para trás"), com a CI verde em Windows, Linux x86-64 e ARM64, macOS (x86-64 e ARM64) e WebAssembly, o compilador
-se reconstruindo nos mesmos bytes e a suíte com 1189 de 1189.
+se reconstruindo nos mesmos bytes e a suíte inteira passando.
 
 ## Feito
 
@@ -46,7 +46,7 @@ se reconstruindo nos mesmos bytes e a suíte com 1189 de 1189.
   - [-] textos curtos dentro do valor: feitos em quatro etapas, medidos mais lentos (json +9%, words +16%), desfeitos
   - [x] opcionais sem etiqueta (`Text?`, `Bytes?`, `[T]?`: `None` é o comprimento −1): `counting` −12%, `json` −2,5%
   - [-] mapas em Swiss table: feita e medida; faltas 2× mais rápidas, acertos 18% mais lentos: desfeita
-- [~] B7 copiar menos na coleta de laço (o que falta está em "ficou para trás")
+- [x] B7 copiar menos na coleta de laço (`records` 1,46× o C: a meta do 0.12)
   - [x] a tabela de salas cresce quando perde salas demais (50.000 elementos com push: de 1.160 para 210 ms)
   - [x] um registro das salas: uma coleta olha só as feitas depois da sua marca
   - [-] pré-promoção por lugar: não alcança o caso de `records`
@@ -56,6 +56,9 @@ se reconstruindo nos mesmos bytes e a suíte com 1189 de 1189.
   - [x] coletas completas que esperam conforme o lixo que acham; valores pequenos copiados sem a tabela: `records`
     de 1,95× para 1,6× o C
   - [x] a barreira de escrita lembra a última entrada; arrays pequenos copiados no lugar: `records` ~1,52× o C
+  - [x] a coleta completa espera mais quando os dados só crescem; a checagem do turno numa leitura; `x % d == 0` sem
+    arredondar; instruções afundadas no ramo que as usa: `records` 1,66× → 1,46× o C (o melhor de três), `json` −6%
+  - [-] pré-promoção por chamada: não foi preciso para a meta (o desenho segue no plano)
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
@@ -74,6 +77,7 @@ se reconstruindo nos mesmos bytes e a suíte com 1189 de 1189.
 - [x] `Self` e implementações padrão em interfaces
 - [x] `pub` por campo (num tipo opaco)
 - [x] `T` dentro de uma lambda de uma função genérica; `r.f(x)` chama o campo `f` mesmo com um valor `f` ao alcance
+- [x] uma lambda guarda uma função dada à função genérica em volta (também dentro de um construtor genérico)
 
 ### D. Backends e sistema
 
@@ -96,7 +100,8 @@ se reconstruindo nos mesmos bytes e a suíte com 1189 de 1189.
 - [x] `std.encoding`, `std.hash`, `std.args`, `std.files`, `std.net`, `std.http`
 - [x] TLS pela biblioteca do sistema (Schannel, OpenSSL carregada ao primeiro uso, SecureTransport) atrás de um motor
   de bytes por sistema no runtime: `tlsConnect`, `readTls`, `writeTls`, `closeTls`; `connectTls` em std.net,
-  `https://` em std.http; um servidor por endereço IP conferido pelo endereço (OpenSSL, Schannel)
+  `https://` em std.http; um servidor por endereço IP conferido pelo endereço (a CI confere nos três sistemas)
+- [x] HTTP: corpos em `chunked` lidos (cliente e servidor); uma resposta sem tamanho lida até o fim da conexão
 - [x] JSON tipado: `encode(v)` e `decode(text)` por tipo (records, enums, arrays, mapas, opcionais, tuplas; padrões dos
   campos), feitos para cada tipo pelo checker quando usados
 - [x] subprocessos com entrada e saída em fluxo: `startProcess`, `writeProcess`, `readProcess(Errors)`,
@@ -116,25 +121,15 @@ se reconstruindo nos mesmos bytes e a suíte com 1189 de 1189.
 
 ## Ficou para trás
 
-O que as fases A a E pediam e não está feito, e as lacunas achadas no caminho. Cada item diz o que falta e por quê.
+O que as fases A a E pediam e não está feito. Cada item diz o que falta e por quê.
 
 - [ ] **A6 assinar o `quark.exe` no Windows.** Depende de um certificado de assinatura de código (Azure Trusted
   Signing, OV ou EV), que só o dono do projeto pode tirar. Sem ele, o Smart App Control e o SmartScreen barram
   executáveis novos.
-- [ ] **B7 pré-promoção por chamada** (meta do marco 0.12: `records` abaixo de 1,5× o C; hoje ~1,52×). O que
-  `build()` faz e vai para fora do laço é alocado já fora: uma região guardada na arena, e as saídas de laço
-  marcadas pelo lowering. Medido em 21/11: 72 ms sem coleta; a barreira e a cópia pequena já ficaram mais baratas.
-- [ ] **B10 rebuild do compilador abaixo de 0,5 s** (meta do marco 0.12; hoje 1,75 s no tier rápido). Leitura,
-  checagem e lowering guardados por módulo: uma arquitetura nova, porque genéricos, o bloco de dados e o inlining
-  cruzam os módulos.
-- [ ] **HTTP: corpo em `chunked`.** O cliente de std.http lê um corpo sem `Content-Length` até o fim da conexão,
-  sem tirar os tamanhos dos pedaços. Muitos servidores HTTPS respondem assim. Falta decodificar
-  `Transfer-Encoding: chunked` (no cliente e no servidor).
-- [ ] **HTTPS por endereço IP no macOS:** não verificado (SecureTransport recebe o IP como nome; a CI só testa por
-  nome).
-- [ ] **Uma lambda não guarda um parâmetro que é função** ("a function is not a value to keep here"): contornado
-  guardando a função num registro (`Mapping` em std.testing). Ou a regra se explica e fica, ou a captura passa a
-  valer.
+- [ ] **B10 rebuild do compilador abaixo de 0,5 s** (meta do marco 0.12; hoje ~1,75 s: ler e checar 0,62 s, lowering
+  0,80 s, otimizar 0,17 s, código de máquina 0,16 s). Os dois primeiros são do programa inteiro. Chegar a 0,5 s pede
+  guardá-los por módulo, o que é uma arquitetura nova: as instâncias de genéricos, os textos do bloco de dados e o
+  inlining cruzam os módulos ([PLANO.md](PLANO.md), B10).
 - [ ] **SIMD fora do `--release`:** os laços só são vetorizados no tier otimizador.
 - [-] **TLS do lado do servidor:** decidido que não por ora; um servidor Quark fala HTTP e o TLS fica num proxy
   na frente ([SERVERS.md](SERVERS.md)).
@@ -147,10 +142,10 @@ Em ordem. Os três primeiros fecham o marco 0.12 do plano; o resto leva ao 1.0 (
 1. [ ] **Publicar uma versão nova (0.12).** A CI ainda começa da 0.9.2, então o compilador não pode usar o que veio
    depois dela. Uma versão nova destrava isso e põe TLS, JSON tipado, pacotes com versões e o LSP novo nas mãos de
    quem usa. Precisa do OK do dono para publicar.
-2. [ ] **Fechar as lacunas de E que um usuário encontra logo:** corpo `chunked` no HTTP, HTTP por IP no macOS
-   verificado, a regra das lambdas com funções resolvida.
-3. [ ] **Fechar o marco 0.12:** B7 (pré-promoção por chamada, `records` abaixo de 1,5× o C) e B10 (rebuild abaixo
-   de 0,5 s, com o cache por módulo).
+2. [x] **Fechar as lacunas de E que um usuário encontra logo:** corpo `chunked` no HTTP, HTTPS por IP verificado na
+   CI, lambdas que guardam funções.
+3. [~] **Fechar o marco 0.12:** B7 feito (`records` 1,46× o C); falta B10 (rebuild abaixo de 0,5 s, com a checagem e o
+   lowering guardados por módulo).
 4. [ ] **Revisão para o congelamento.** Ler a std inteira como API pública: nomes, ordem dos parâmetros, o que é
    `pub`; tudo o que ficaria errado depois do 1.0 decidido agora. O mesmo para a sintaxe (cada forma canônica
    revista uma última vez) e para o layout dos valores que a API C expõe.
@@ -167,5 +162,6 @@ Em ordem. Os três primeiros fecham o marco 0.12 do plano; o resto leva ao 1.0 (
 
 ## Desempenho contra C (gcc -O2)
 
-Mais rápido que C: pipeline, sorting, strings, trees. A até 7%: counting, mandelbrot, words. Atrás: records (~1,52×
-em 21/11: o coletor de laço copia o que sobrevive; B7). `bash tools/bench.sh` mede.
+Medido em 21/11/2026 (`bash tools/bench.sh`, o melhor de três). Mais rápido que C: pipeline (0,42×), strings (0,59×),
+sorting (0,76×), trees (0,20×). Empatados ou até 7%: words (0,99×), mandelbrot (1,03×), counting (1,07×). Atrás:
+records (1,46×: o coletor de laço copia o que sobrevive).

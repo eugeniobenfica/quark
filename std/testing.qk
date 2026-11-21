@@ -215,12 +215,9 @@ pub fn oneOf<T>(values: [T]) -> Gen<T> {
 
 // values of gen made into others by f (a record of them, say); f has no way back, so none is smaller
 pub fn mapGen<A, B>(gen: Gen<A>, f: (A) -> B) -> Gen<B> {
-    let by = Mapping(f) // (a lambda keeps a record of functions, not a function given to the one around it)
-    let g: Gen<B> = Gen((seed, size) => by.made(gen.make(seed, size)), b => [])
+    let g: Gen<B> = Gen((seed, size) => f(gen.make(seed, size)), b => [])
     g
 }
-
-type Mapping<A, B> { made: (A) -> B }
 
 // a text's characters, each a text
 fn textChars(t: Text) -> [Text] {

@@ -132,6 +132,24 @@ fn IrFn.remainderFromQuotient(var self) {
     if found == 0 {
         return
     }
+    // x % d == 0 (or != 0) needs no rounding down: the remainder toward zero is 0 when the floored one is
+    var uses = [0] * n
+    var zeroTest = [false] * n
+    for k in 0..len(self.code) {
+        let ins = self.code[k]
+        for r in [ins.a, ins.b] + self.argsOf(ins) {
+            if r >= 0 and r < n {
+                uses[r] += 1
+            }
+        }
+        if ins.op == .Cmp and (ins.cond == condEq or ins.cond == condNe) and ins.a >= 0 and ins.b >= 0 {
+            if kv[ins.b] == 0 and defs[ins.b] == 1 and constZero(self, ins.b) {
+                zeroTest[ins.a] = true
+            } else if kv[ins.a] == 0 and defs[ins.a] == 1 and constZero(self, ins.a) {
+                zeroTest[ins.b] = true
+            }
+        }
+    }
     var code: [IrIns] = []
     for k in 0..len(self.code) {
         let ins = self.code[k]
@@ -139,7 +157,12 @@ fn IrFn.remainderFromQuotient(var self) {
             let w = self.weight[ins.dst]
             let q = self.addReg('I', w)
             let p = self.addReg('I', w)
-            code.push(ins with { op: .Div, dst: q })
+            let toward = if zeroTest[ins.dst] and uses[ins.dst] == 1 and defs[ins.dst] == 1 {
+                divTruncated
+            } else {
+                0
+            }
+            code.push(ins with { op: .Div, dst: q, cond: ins.cond | toward })
             code.push(ins with { op: .Mul, cond: ins.cond & 1, dst: p, a: q }) // divNonNeg is the division's
             code.push(ins with { op: .Sub, cond: ins.cond & 1, b: p })
             continue
@@ -147,6 +170,16 @@ fn IrFn.remainderFromQuotient(var self) {
         code.push(ins)
     }
     self.code = code
+}
+
+// r is a constant 0 (made once: Const with no data address)
+fn constZero(f: IrFn, r: Int) -> Bool {
+    for ins in f.code {
+        if ins.dst == r and ins.op == .Const {
+            return ins.imm == 0 and ins.c < 1
+        }
+    }
+    false
 }
 
 // ---- common subexpressions ----

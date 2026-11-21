@@ -3,4 +3,6 @@
 200 text/plain; charset=utf-8 hello, Ana Lu
 200 text/plain; charset=utf-8 hello, world
 404 text/plain; charset=utf-8 no page /x
+200 hello, in chunks
+POST 7 bytes: abcdefg
 Ok((example.com, 443, /)) true Ok((h, 8080, /a?b=1)) true

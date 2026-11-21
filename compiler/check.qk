@@ -4632,6 +4632,34 @@ fn Checker.instanceType(var self, d: Int, args: [Int]) -> Int {
     t
 }
 
+// A lambda of a template checked before it has types (not checked itself then): the functions given to the template
+// that it names are kept as values, as they are when a lambda that is checked names them.
+fn Checker.keepNamedFunctions(var self, e: Int) {
+    if e < 0 or not self.p.ast.exprs[e].node is Lambda(_, _) {
+        return
+    }
+    let text = exprText(self.p.ast, e, 0).bytes()
+    for b in self.c.scope {
+        let x = self.p.bindings[b]
+        if not x.fnParam {
+            continue
+        }
+        let name = x.name.bytes()
+        var i = 0
+        while i + len(name) <= len(text) {
+            let before = i > 0 and isWordByte(text[i - 1])
+            let after = i + len(name) < len(text) and isWordByte(text[i + len(name)])
+            if not before and not after and text[i..i + len(name)] == name {
+                self.keepsFunction(b)
+                break
+            }
+            i += 1
+        }
+    }
+}
+
+fn isWordByte(c: Int) -> Bool = c is 'a'..='z' | 'A'..='Z' | '0'..='9' | '_'
+
 // inside a template being checked before it has types (its lambdas too)
 fn Checker.inTemplate(self) -> Bool {
     var k = -1
@@ -4683,6 +4711,9 @@ fn Checker.inferInstance(var self, e: Int, d: Int, fields: [Int], hint: Int) -> 
     for (k, t) in bound.enumerate() {
         if t < 0 {
             if self.inTemplate() {
+                for a in args {
+                    self.keepNamedFunctions(a)
+                }
                 return -1 // a template's, checked before it has types: its instances will tell
             }
             self.sayAt(

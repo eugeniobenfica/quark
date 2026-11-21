@@ -379,6 +379,26 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 >   precisa ser alocado já na área do laço ativo mais de fora (a pré-promoção por chamada). Isso pede marcar cada saída
 >   de laço no lowering (`break`, `return`, `?`, pânico), para o runtime saber quais laços estão ativos. Sem isso, o
 >   lixo no que é mais velho que todos os laços ativos nunca seria coletado. É o desenho acima, ainda não feito.
+>
+> **Rodada 2 de 21/11/2026: 1,66× → 1,46× o C (meta do 0.12 alcançada).** Medido pelo `tools/bench.sh` (o melhor de
+> três) e pelo melhor de dez execuções intercaladas (`records` 82,8 ms, C 58,6 ms: 1,41×). Medido também por fase:
+> montar 29 ms (C 20,5), reescrever 66 ms (C 37). A distância maior era o código do laço, não a coleta: em regime, com
+> as coletas já feitas, 1,15 ms por passada contra 0,69 ms do C.
+> - **A coleta completa espera mais quando os dados só crescem.** Se as menores desde a última completa guardaram 2/3
+>   do que os turnos fizeram, ou mais, o piso da primeira completa sobe de 16 para 64 MB. A completa de 39 MB da
+>   montagem, que não devolvia nada, sumiu. Um laço que faz lixo continua com o piso de 16 MB. −6 ms.
+> - **A checagem do turno, de cinco leituras encadeadas a uma.** O endereço da arena e o prazo da próxima coleta
+>   (marca + limite) são calculados uma vez, antes do laço, em registradores. O prazo é recalculado só depois de uma
+>   coleta. −3 ms.
+> - **`x % d == 0` sem arredondar para baixo.** O resto truncado é zero exatamente quando o arredondado para baixo é:
+>   a divisão por constante leva a marca `divTruncated` e pula a correção de sinal (x86-64, ARM64; o WebAssembly a
+>   ignora, e continua certo). −4%.
+> - **Afundar nos ramos** (`sinkIntoBranches`, tier otimizador): uma instrução pura cujo valor só um lado de um desvio
+>   lê desce para esse lado. Os quatro campos de `ins` que só o ramo que reescreve usa deixaram de ser lidos e
+>   guardados na pilha em cada volta. As junções (phis) que nada lê não contam como uso. −4%.
+> - **Medido e desfeito:** calcular `i × 40` uma vez por elemento (em vez de um `imul` por campo) ficou mais lento, pelo
+>   registro a mais; esperar mais nas coletas menores que guardam 2/3 não mudou nada.
+> - `json` também ganhou (489 → 460 ms); os outros ficaram iguais, dentro do ruído.
 
 ### B8. O grafo sem JSON por dentro
 

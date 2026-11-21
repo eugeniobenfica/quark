@@ -1149,6 +1149,18 @@ fn X64.divideByConstant(var self, ins: IrIns) {
     self.movRR(rax, r8) // + 1 when n < 0: truncated toward zero
     self.shiftImm(rax, 5, 63)
     self.rr(true, opAdd, rdx, rax)
+    if ins.cond & divTruncated != 0 {
+        // toward zero is what was asked for: nothing to round down
+        if not quotient {
+            self.imulImm(rdx, d)
+            self.movRR(rax, r8)
+            self.rr(true, opSub, rax, rdx)
+            self.storeBits(ins.dst, rax)
+            return
+        }
+        self.storeBits(ins.dst, rdx)
+        return
+    }
     // r = n - q * d; when r < 0, q - 1 and r + d: rounded down
     self.movRR(rcx, rdx)
     self.imulImm(rcx, d)
@@ -1596,6 +1608,14 @@ fn X64.genDivide(var self, ins: IrIns) {
     self.byte(0x99)
     self.rex(true, 0, 0, rcx) // idiv rcx
     self.bytes([0xF7, 0xF8 | rcx])
+    if ins.cond & divTruncated != 0 {
+        if not quotient {
+            self.movRR(rax, rdx)
+        }
+        self.land(done)
+        self.storeBits(ins.dst, rax)
+        return
+    }
     // if rdx != 0 and (rdx ^ rcx) < 0: adjust
     self.rr(true, opTest, rdx, rdx)
     let exact = self.jccShort(ccE)

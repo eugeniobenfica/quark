@@ -213,7 +213,10 @@ type LatePatch { fnId: Int, at: Int, late: Int }
 type LoopMemory {
     frame: Int = 0
     slotsReg: Int = 0
-    nopAt: Int = 0
+    nopAt: Int = 0 // the loop's start (rtLoopStart), then the turn's check's values made before the loop (checkNops)
+    zero: Int = 0
+    arena: Int = 0 // the arena the loop allocates in: its word 4 is what it made
+    deadline: Int = 0 // what it will have made when the next collection is due
     bodyStart: Int = 0
     started: Bool = false
     roots: [Int] = []
@@ -6607,14 +6610,20 @@ fn Lower.loopBegin(var self, body: Int) -> Int {
         slots += if self.atAddress[b] { 1 } else { self.slots(self.bt(b)) }
     }
     let slotsReg = self.iconst(slots)
+    let zero = self.iconst(0)
     let nopAt = len(self.cur.code)
-    self.emit(.Nop, -1, -1, -1)
+    for _ in 0..checkNops + 1 {
+        self.emit(.Nop, -1, -1, -1)
+    }
     let frame = self.newReg('I')
     self.memories.push(
         LoopMemory(
             frame: frame,
             slotsReg: slotsReg,
             nopAt: nopAt,
+            zero: zero,
+            arena: self.newReg('I'),
+            deadline: self.newReg('I'),
             bodyStart: len(self.cur.code),
             roots: kept,
             inside: scan.inside,
@@ -6623,6 +6632,9 @@ fn Lower.loopBegin(var self, body: Int) -> Int {
     )
     len(self.memories) - 1
 }
+
+// the instructions a loop's start keeps room for after rtLoopStart: the turn's check's values (loopTurnEnd)
+const checkNops = 5
 
 fn Lower.onlyGrows(self, m: LoopMemory, at: Int) -> Bool {
     var i = len(self.growths) - 1
@@ -6660,17 +6672,25 @@ fn Lower.loopTurnEnd(var self, mi: Int, line: Int) {
         self.touch(m.slotsReg)
         self.touch(m.frame)
         self.maxOut(1)
+        // before the loop, once: the arena (the frame's generations, word 5, hold it at word 4), and the deadline
+        let gen = self.newReg('I')
+        let since = self.newReg('I')
+        let limit = self.newReg('I')
+        let at = m.nopAt + 1
+        self.cur.code[at] = IrIns(.Load, cond: mem64, dst: gen, a: m.frame, b: m.zero, c: 40, imm: 1, line: line)
+        self.cur.code[at + 1] = IrIns(.Load, cond: mem64, dst: m.arena, a: gen, b: m.zero, c: 32, imm: 1, line: line)
+        self.cur.code[at + 2] = IrIns(.Load, cond: mem64, dst: since, a: m.frame, b: m.zero, c: 16, imm: 1, line: line)
+        self.cur.code[at + 3] = IrIns(.Load, cond: mem64, dst: limit, a: m.frame, b: m.zero, c: 24, imm: 1, line: line)
+        self.cur.code[at + 4] = IrIns(.Add, dst: m.deadline, a: since, b: limit, line: line)
+        for r in [gen, since, limit, m.arena, m.deadline, m.zero] {
+            self.touch(r)
+        }
     }
-    // the turn's check, here (runtime/loops.qk's frame): what the arena made since the mark past the frame's limit.
-    // The frame's generations (word 5) hold the arena (word 4), whose word 4 is what it made
+    // the turn's check, here (runtime/loops.qk's frame): what the arena made past the deadline (the frame's mark's
+    // count and its limit), one load each turn
     let skip = self.label()
-    let gen = self.loadMem('I', m.frame, -1, 1, 40, mem64)
-    let arena = self.loadMem('I', gen, -1, 1, 32, mem64)
-    let made = self.loadMem('I', arena, -1, 1, 32, mem64)
-    let since = self.loadMem('I', m.frame, -1, 1, 16, mem64)
-    let limit = self.loadMem('I', m.frame, -1, 1, 24, mem64)
-    let grown = self.op2(.Sub, made, since, 'I')
-    let check = self.cmp(condGt, grown, limit)
+    let made = self.loadMem('I', m.arena, -1, 1, 32, mem64)
+    let check = self.cmp(condGt, made, m.deadline)
     self.jz(check, skip)
     var desc = Desc() // the vars' types, one description (a reference counts from its start)
     let zero = self.iconst(0)
@@ -6688,6 +6708,10 @@ fn Lower.loopTurnEnd(var self, mi: Int, line: Int) {
     let dd = self.dataBytes(desc.out)
     let da = self.dataAddress(dd)
     self.rtv(rtLoopCollect, [m.frame, da], line)
+    // the next deadline: the collection set the frame's count and limit again
+    let since = self.loadMem('I', m.frame, -1, 1, 16, mem64)
+    let limit = self.loadMem('I', m.frame, -1, 1, 24, mem64)
+    self.emit(.Add, m.deadline, since, limit)
     at = 48
     for b in m.roots {
         // and back, where the copies are (one in memory: changed there)

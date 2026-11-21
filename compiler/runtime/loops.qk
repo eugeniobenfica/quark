@@ -39,11 +39,14 @@ const gLive = 2
 const gBlock = 3
 const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
 const gWait = 5 // how many times what the last full one kept minor ones keep before the next is full (fullWait)
-const genWords = 6
+const gMade = 6 // what the turns made that minor ones looked through since the last full one
+const genWords = 7
 
 // A full collection copies everything since the mark again: worth it when there is garbage among what minor ones
 // kept. One that kept nearly all it looked at (data that grows) makes the next wait twice as long, up to fullWaitMost;
-// one that found much garbage brings the wait back down. With a memory limit, the wait stays 1.
+// one that found much garbage brings the wait back down. With a memory limit, the wait stays 1. While minor ones keep
+// two thirds of what the turns made or more (data that grows, not garbage), the first full one waits for four times
+// the least too: copying it all again would give nothing back.
 const fullWaitMost = 8
 
 pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
@@ -901,7 +904,9 @@ fn lookAgain(c: Int, r: Int, since: Int) {
 pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     let a = arena()
     let gen = word(f, frameGen)
-    let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), limited(a, nurseryMost))
+    let growing = word(gen, gPromoted) * 3 >= word(gen, gMade) * 2
+    let least = limited(a, if growing { 4 * nurseryMost } else { nurseryMost })
+    let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), least)
     let looked = word(gen, gLive) + word(gen, gPromoted) // what a full one looks through: its last, and what came since
     // young: made at this time or later (a full collection: since the mark)
     let since = if full { word(f, frameTime) } else { word(gen, gLast) }
@@ -984,8 +989,10 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         }
         setWord(gen, gLive, word(c, cTotal))
         setWord(gen, gPromoted, 0)
+        setWord(gen, gMade, 0)
     } else {
         setWord(gen, gPromoted, word(gen, gPromoted) + word(c, cTotal))
+        setWord(gen, gMade, word(gen, gMade) + word(f, frameLimit)) // (it collects once they made more than that)
     }
     setWord(gen, gBlock, word(c, cNow))
     setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was kept

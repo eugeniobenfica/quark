@@ -2632,6 +2632,160 @@ fn IrFn.deadCode(var self) {
     self.dropNops()
 }
 
+// Computations moved down into the one side of a branch that uses them: a block that ends in a branch, and an
+// instruction of it whose value only the code under one of its sides reads (a side entered from this block alone).
+// Then the other side does not compute it (and a loop's turn that takes that side keeps fewer values alive: no load
+// of a record's fields that only the other side reads). Taken from the block's end up, so what feeds what is moved
+// goes with it; a load only when nothing after it in the block writes memory.
+fn IrFn.sinkIntoBranches(var self, a: Analysis) -> Bool {
+    // each value's readers (instructions), and the values a phi reads (left where they are)
+    var readers: [[Int]] = [[]] * max(len(a.v), 1)
+    var inPhi = [false] * max(len(a.v), 1)
+    for k in 0..len(self.code) {
+        for s in 0..useSlots(self.code[k]) {
+            let v = useOf(a, k, s)
+            if v >= 0 and v < len(readers) {
+                readers[v].push(k)
+            }
+        }
+    }
+    // the phis something reads (a phi is made for every register a loop sets, read after it or not), and their values
+    var live = [false] * max(len(a.v), 1)
+    for k in 0..len(self.code) {
+        for s in 0..useSlots(self.code[k]) {
+            let v = useOf(a, k, s)
+            if v >= 0 and v < len(live) {
+                live[v] = true
+            }
+        }
+    }
+    var more = true
+    while more {
+        more = false
+        for p in a.phis {
+            if p < 0 or p >= len(live) or not live[p] {
+                continue
+            }
+            let blk = a.v[p].blk
+            for j in 0..len(predsOf(a, blk)) {
+                let v = a.phiArgs[a.v[p].argAt + j]
+                if v >= 0 and v < len(live) {
+                    inPhi[v] = true
+                    if not live[v] {
+                        live[v] = true
+                        more = true
+                    }
+                }
+            }
+        }
+    }
+    var e = Edit()
+    var changed = false
+    for b in 0..a.nb {
+        if a.nsucc[b] != 2 or a.start[b] >= a.end[b] {
+            continue
+        }
+        let last = a.end[b] - 1
+        if not self.code[last].op is Jz | Jnz {
+            continue
+        }
+        var sunk: [Int] = [] // instructions moved, from the block's end up
+        var sunkTo: [Int] = []
+        var writes = false // memory written after the one looked at
+        var k = last - 1
+        while k >= a.start[b] {
+            let ins = self.code[k]
+            let op = ins.op
+            if op is Store | Call | RtCall | HostCall | Bounds | Vstore | Fuel | Ret | Label {
+                writes = true
+                k -= 1
+                continue
+            }
+            let movable = definesReg(ins)
+                and a.defV[k] >= 0
+                and not inPhi[a.defV[k]]
+                and (op is Mov | Add | Sub | Mul | And | Or | Xor | Shl | Sar | Neg | Not | Cmp | Const
+                    and ins.cond == 0
+                    or op is Fadd | Fsub | Fmul | Fneg | Fcmp | IntToFloat
+                    or op == .Load and not writes)
+            var side = -1
+            if movable {
+                // where its value is read: only under one side (or by what goes there too)
+                for si in 0..2 {
+                    let target = a.succ[2 * b + si]
+                    if side >= 0 or target < 0 or len(predsOf(a, target)) != 1 {
+                        continue
+                    }
+                    var all = readers[a.defV[k]].any(r => r != k)
+                    for r in readers[a.defV[k]] {
+                        if r == k {
+                            continue
+                        }
+                        let at = sunk.indexOf(r) ?? -1
+                        let under = if at >= 0 {
+                            sunkTo[at] == target
+                        } else {
+                            dominates(a, target, a.blockOf[r])
+                        }
+                        if not under {
+                            all = false
+                        }
+                    }
+                    if all {
+                        side = target
+                    }
+                }
+            }
+            if side >= 0 {
+                // its operands unchanged from here to the block's end
+                for j in k + 1..last {
+                    if definesReg(self.code[j]) {
+                        let d = self.code[j].dst
+                        for s in 0..useSlots(ins) {
+                            if self.useReg(ins, s) == d {
+                                side = -1
+                            }
+                        }
+                        if d == ins.dst {
+                            side = -1
+                        }
+                    }
+                    for r in self.retsOf(self.code[j]) {
+                        for s in 0..useSlots(ins) {
+                            if self.useReg(ins, s) == r {
+                                side = -1
+                            }
+                        }
+                    }
+                }
+            }
+            if side >= 0 {
+                sunk.push(k)
+                sunkTo.push(side)
+            }
+            k -= 1
+        }
+        // moved in their order, after the side's label
+        var i = len(sunk) - 1
+        while i >= 0 {
+            let at = sunk[i]
+            let target = sunkTo[i]
+            var place = a.start[target]
+            if place < len(self.code) and self.code[place].op == .Label {
+                place += 1
+            }
+            e.add(place, self.code[at])
+            self.code[at] = self.code[at] with { op: .Nop }
+            changed = true
+            i -= 1
+        }
+    }
+    if changed {
+        self.apply(e)
+    }
+    changed
+}
+
 pub fn IrFn.releaseOptimize(var self, lanes: Int, fuel: Bool, tables: [IrTable], arch: Arch, sse42: Bool) {
     if len(self.code) == 0 {
         return
@@ -2669,6 +2823,10 @@ pub fn IrFn.releaseOptimize(var self, lanes: Int, fuel: Bool, tables: [IrTable],
     round = 0
     while round < 32 and self.strengthReduce(analyse(self)) {
         self.dropNops()
+        round += 1
+    }
+    round = 0
+    while round < 4 and self.sinkIntoBranches(analyse(self)) {
         round += 1
     }
     self.foldAddresses(analyse(self))

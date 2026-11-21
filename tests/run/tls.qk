@@ -1,6 +1,6 @@
 // TLS by the system's library (Schannel, OpenSSL, SecureTransport), through std.http's https:// and std.net's
-// connectTls: a page read, and a certificate refused for a name it does not have. (Without a network: what it would
-// have said.)
+// connectTls: a page read, one from a server reached by its address, and a certificate refused for a name it does
+// not have. (Without a network: what it would have said.)
 use std.http
 use std.net
 
@@ -8,6 +8,15 @@ fn main() {
     match get("https://example.com/") {
         Ok(r) => print(r.status, r.text().contains("Example Domain"))
         Err(why) => print(if why.startsWith("cannot connect") { "200 true" } else { why })
+    }
+    // a server reached by its IP address: its certificate checked for the address
+    match get("https://1.1.1.1/") {
+        Ok(r) => print("by address:", r.status < 500)
+        Err(why) => print(if why.startsWith("cannot connect") {
+            "by address: true"
+        } else {
+            why
+        })
     }
     match connect("example.com", 443) {
         Ok(s) => {

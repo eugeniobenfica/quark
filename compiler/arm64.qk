@@ -789,6 +789,14 @@ fn Arm64.divideByConstant(var self, ins: IrIns) {
     self.ins(0x8B400000 | n << 16 | 63 << 10 | x2 << 5 | x2) // add x2, x2, n, lsr #63
     self.movImm(x17, d)
     self.ins(0x9B008000 | x17 << 16 | n << 10 | x2 << 5 | x3) // x3 = n - x2 * d
+    if ins.cond & divTruncated != 0 {
+        self.storeBits(ins.dst, if quotient {
+            x2 // toward zero, as asked
+        } else {
+            x3
+        })
+        return
+    }
     self.ins(0xB6F80000 | 3 << 5 | x3) // tbz x3, #63: not below 0
     self.ins(0xD1000442) // sub x2, x2, #1
     self.add3(x3, x3, x17, 0) // add x3, x3, d
@@ -1103,6 +1111,14 @@ fn Arm64.genDivide(var self, ins: IrIns) {
     }
     self.ins(0x9AC00C00 | x1 << 16 | x0 << 5 | x2) // sdiv x2, x0, x1
     self.ins(0x9B008000 | x1 << 16 | x0 << 10 | x2 << 5 | x3) // msub x3 = x0 - x2 * x1
+    if ins.cond & divTruncated != 0 {
+        self.storeBits(ins.dst, if quotient {
+            x2 // toward zero, as asked
+        } else {
+            x3
+        })
+        return
+    }
     self.ins(0xB4000000 | 5 << 5 | x3) // cbz x3, past the adjustment
     self.ins(0xCA000000 | x1 << 16 | x3 << 5 | x4) // eor x4, x3, x1
     self.ins(0xB6F80000 | 3 << 5 | x4) // tbz x4, #63, +3 words

@@ -1,7 +1,7 @@
 // HTTP/1.1: a server that runs each connection in a task of its own, and a client. A request's and a response's body
-// is read by its Content-Length (a chunked body, as servers send without one, is read to the end of the connection);
-// each connection serves one request (Connection: close). The client takes https:// too, over TLS (std.net's
-// connectTls); the server speaks plain HTTP (TLS before it is a proxy's).
+// is read by its Content-Length or in its chunks (Transfer-Encoding: chunked; a response with neither, to the end of
+// the connection); each connection serves one request (Connection: close). The client takes https:// too, over TLS
+// (std.net's connectTls); the server speaks plain HTTP (TLS before it is a proxy's).
 //
 //     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
 //     fn main() {
@@ -94,18 +94,73 @@ fn readHead(c: Conn) -> (Text, [Text: Text], Conn)! {
     Ok((all[0], headers, cc))
 }
 
-// the body its headers say: Content-Length bytes, else what comes until the other end closes it
-fn readBody(c: Conn, headers: [Text: Text]) -> (Bytes, Conn)! {
+// the body its headers say: Content-Length bytes, or the pieces of a chunked one; else (a response) what comes until
+// the other end closes it, or (a request) none
+fn readBody(c: Conn, headers: [Text: Text], response: Bool) -> (Bytes, Conn)! {
     var cc = c
-    if headers["content-length"] is Some(n) {
-        let count = n.parseInt().mapErr(why => "content-length: {why}")?
-        return Ok((cc.readBytes(count), cc))
+    if (headers["transfer-encoding"] ?? "").lower().contains("chunked") {
+        return readChunked(cc)
     }
-    if headers["transfer-encoding"] is Some(_) {
-        return Ok((cc.readAll()?, cc))
+    if headers["content-length"] is Some(n) {
+        let count = n.trim().parseInt().mapErr(why => "content-length: {why}")?
+        let body = cc.readBytes(count)
+        if len(body) < count {
+            return Err("the connection closed after {len(body)} of the body's {count} bytes")
+        }
+        return Ok((body, cc))
     }
     let none: Bytes = []
+    if response {
+        return Ok((cc.readAll()?, cc))
+    }
     Ok((none, cc))
+}
+
+// Transfer-Encoding: chunked: each piece's size in hex on a line of its own, the piece, an empty line; a size 0, the
+// trailer's lines (let go of), an empty line
+fn readChunked(c: Conn) -> (Bytes, Conn)! {
+    var cc = c
+    var body: Bytes = []
+    while true {
+        let Some(line) = cc.readLine() else {
+            return Err("the connection closed inside a chunked body")
+        }
+        let digits = (if line.indexOf(";") is Some(i) { line[..i] } else { line }).trim()
+        let size = hexSize(digits) ?? return Err("not a chunk's size: \"{line}\"")
+        if size == 0 {
+            while cc.readLine() is Some(trailer) {
+                if trailer == "" {
+                    break
+                }
+            }
+            return Ok((body, cc))
+        }
+        let piece = cc.readBytes(size)
+        if len(piece) < size {
+            return Err("the connection closed inside a chunk")
+        }
+        body += piece
+        let _ = cc.readLine() // the piece's line end
+    }
+    Ok((body, cc))
+}
+
+// a size in hex digits, None when it is not one
+fn hexSize(t: Text) -> Int? {
+    if len(t) == 0 or len(t) > 15 {
+        return None
+    }
+    var n = 0
+    for c in t.bytes() {
+        let v = match c {
+            '0'..='9' => c - '0'
+            'a'..='f' => c - 'a' + 10
+            'A'..='F' => c - 'A' + 10
+            _ => return None
+        }
+        n = n * 16 + v
+    }
+    Some(n)
 }
 
 // the request a connection carries
@@ -119,7 +174,7 @@ pub fn readRequest(c: Conn) -> (Request, Conn)! {
     let at = target.indexOf("?")
     let path = if at is Some(i) { target[..i] } else { target }
     let query = if at is Some(i) { parseQuery(target[i + 1..]) } else { [:] }
-    let (body, c2) = readBody(c1, headers)?
+    let (body, c2) = readBody(c1, headers, false)?
     Ok((Request(parts[0], percentDecode(path) ?? path, query, headers, body), c2))
 }
 
@@ -212,7 +267,7 @@ pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] 
     let (first, got, c1) = read ?? panic("read")
     let parts = first.split(" ")
     let status = if len(parts) >= 2 { parts[1].parseInt() ?? 0 } else { 0 }
-    let b = readBody(c1, got)
+    let b = readBody(c1, got, true)
     c1.close()
     let (responseBody, _) = b?
     Ok(Response(status, got, responseBody))

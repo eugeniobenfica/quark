@@ -697,8 +697,9 @@ resultado.
 
 ### B12. A compilação em fluxo
 
-> **Feita (21/11/2026).** O pico do rebuild do compilador caiu de 3,1 GB para ~1,5 GB, com +5% de tempo de relógio
-> (o resultado está no fim desta seção).
+> **Feita em parte (21/11/2026).** Os lotes estão no compilador: o pico do rebuild caiu de 3,1 GB para ~2,1 GB, sem
+> mudar o tempo. A carga e o check numa tarefa (para ~1,5 GB) esperam uma release: o CI constrói o compilador com a
+> 0.9.2, que não tem canais tipados (o resultado está no fim desta seção).
 
 **Hoje:** o lowering faz o IR de todas as funções, a otimização faz outra cópia de todas, e só então sai o código de
 máquina. O IR de 25 mil funções (~380 MB, duas vezes) e o lixo de cada fase ficam vivos até o fim.
@@ -725,20 +726,23 @@ tempo do rebuild igual ou menor.
   - Uma função com um número de função tardia fica retida até `lowerRest`, que o preenche.
   - Ficam no caminho inteiro: o `--release` (o cache e o tier que otimiza), o runtime (guarda só o que alcança) e o
     wasm.
-- **A carga e o check numa tarefa** (`readAndCheck`, por um canal): a arena da tarefa vai embora quando ela termina,
-  e só o programa checado é copiado para fora. Era o maior pedaço do pico: ~1,1 GB feito, ~57 MB guardados.
+- **A carga e o check numa tarefa** (`readAndCheck`, por um `Channel<Program?>`): a arena da tarefa vai embora
+  quando ela termina, e só o programa checado é copiado para fora. Era o maior pedaço do pico: ~1,1 GB feito, ~57 MB
+  guardados. Feito, validado (1198 testes) e medido, mas desfeito até haver uma release com canais tipados, de onde o
+  CI parta: hoje ele parte da 0.9.2.
 - **A cópia de um worker** (`loadAgain`) usa a fonte e as relocações do original, sem copiá-las.
 - **Medido** (`quark build compiler/main.qk`, mediana de 4):
 
   | | pico | relógio |
   |---|---|---|
   | antes | 3,11 GB | 1,72 s |
-  | lotes de 1 milhão | 1,30 GB | 1,88 s |
-  | lotes de 2 milhões (o escolhido) | 1,49 GB | 1,82 s |
-  | um lote só | 1,61 GB | 1,85 s |
+  | só os lotes, de 1 milhão (o que está no compilador) | 2,07 GB | 1,76 s |
+  | só os lotes, de 400 mil | 1,92 GB | 1,85 s |
+  | lotes de 2 milhões e a tarefa (espera a release) | 1,49 GB | 1,82 s |
+  | lotes de 1 milhão e a tarefa | 1,30 GB | 1,88 s |
 
-  O pico ficou abaixo da meta. O tempo ficou ~5% acima: ~50 ms copiando o programa checado para fora da tarefa (o
-  canal copia duas vezes) e a recarga do programa em cada thread a cada lote.
+  Com a tarefa, o pico fica abaixo da meta e o tempo ~5% acima: ~50 ms copiando o programa checado para fora da
+  tarefa (o canal copia duas vezes) e a recarga do programa em cada thread a cada lote.
 - **Medido e deixado de lado:**
   - lotes pequenos (200 mil instruções): menos pico, mas cada lote recarrega o programa em 16 threads (+0,3 s);
   - guardar a cópia de cada worker para a chamada seguinte: quebrou (uma cópia reaproveitada por outra thread acaba

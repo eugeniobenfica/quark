@@ -62,9 +62,11 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
 - [-] B11 a memória de uma chamada devolvida na volta: feita (a suíte passa com toda volta coletando), medida e
   desfeita: o pico do compilador caiu só 5%. O pico é a soma das fases (o [PLANO.md](PLANO.md) tem a tabela)
-- [x] B12 a compilação em fluxo: lotes de funções baixados, otimizados e feitos código nas threads, só o código
-  guardado; a carga e o check numa tarefa (o lixo deles vai com ela). Pico do rebuild do compilador 3,1 → 1,5 GB,
-  relógio +5%
+- [~] B12 a compilação em fluxo
+  - [x] lotes de funções baixados, otimizados e feitos código nas threads, só o código guardado: pico do rebuild do
+    compilador 3,1 → 2,1 GB, o mesmo tempo
+  - [ ] a carga e o check numa tarefa (o lixo deles vai com ela: 1,5 GB): feita e medida, espera uma release com
+    canais tipados para o CI partir dela (hoje a 0.9.2)
   - [ ] o tempo de volta: workers do `parallelMap` que vivem entre chamadas; um canal que entrega o valor sem copiá-lo
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
@@ -83,7 +85,8 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
   - [x] arrays grandes crescem no lugar (reserva de endereços, páginas conforme crescem): sem cópia e sem bloco velho
     (50 milhões de Ints: 897 → 375 MB, 2× mais rápido)
   - [x] devolver ao fim de uma fase o que ela fez e não guardou: a B11 (a coleta na volta) foi medida e desfeita
-    (−5% do pico); a B12 resolveu de outro jeito (a carga e o check numa tarefa, o resto em lotes): 3,1 → 1,5 GB
+    (−5% do pico); a B12 resolve de outro jeito: os lotes (3,1 → 2,1 GB) e, com a próxima release, a carga e o check
+    numa tarefa (→ 1,5 GB)
   - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 
 ### C. A linguagem

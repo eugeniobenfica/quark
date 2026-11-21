@@ -113,14 +113,11 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         preludeSrc = Source(o.prelude, text)
     }
-    // read and checked as a task: what those two work with (most of the memory they make, little of it kept) goes
-    // when the task ends, and only the checked program is copied out
-    let out: Channel<Program?> = channel()
-    let _ = go(() => send(out, readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)))
-    let Some(Some(program)) = receive(out) else {
+    // (to do as a task once the compiler that builds this one has typed channels: what reading and checking work
+    // with, most of the memory they make, goes when the task ends; docs/PLANO.md B12)
+    let Some(program) = readAndCheck(src, preludeSrc, purpose, o.allowed, quiet) else {
         return None
     }
-    closeChannel(out)
     var checkedProgram = program
     if not purpose.runtime {
         let problems = checkedProgram.runConsts(host)
@@ -297,7 +294,7 @@ fn testsOf(p: Program) -> [(Text, Text)] {
 
 // the program's functions, lowered in batches of about this many instructions (each batch's threads load the program
 // again: a few batches)
-const streamBatch = 2000000
+const streamBatch = 1000000
 
 // lowered in batches, each one's machine code made on the threads (compileText)
 fn Lower.streamX64(var self, target: Target) -> MachineCode {

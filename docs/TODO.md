@@ -73,7 +73,9 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 - [x] ler `Float` sem o C (`strtod` não é mais usado)
 - [x] ARM64 em paridade: argumentos em registradores (x0-x7; o código do compilador 8,8% menor), NEON já com as operações do x86-64
 - [x] informação de depuração (`-g`): DWARF 4 nos objetos e CodeView no COFF (o PDB pelo linker); executáveis pela interface JIT do gdb
-- [ ] a suíte em wasm32
+- [x] a suíte em wasm32: `quark build --target wasm32-wasi`, 124 testes verdes no wasmtime (CI), 12 que o wasm não tem
+- [x] sem libc onde dá: o Windows só com kernel32 e ntdll; `{x:.2}` e `parseInt` sem C em todo sistema; o Linux fica
+  com a libc (DNS, fusos e `dlopen` dependem dela)
 - [x] libquark no macOS (Mach-O ligado, arquivo BSD), a API C revista (`qkVersion`, as bibliotecas do sistema, ARM64)
 - [x] executáveis menores: só o runtime que o programa alcança (hello 911 → 136 KB)
 

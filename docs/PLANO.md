@@ -575,6 +575,37 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 > - O executável carrega o programa ao começar. Com `quark build -g`, o compilador põe no payload um ELF com o DWARF, e o runtime o registra pela interface JIT do gdb (`__jit_debug_descriptor`, `__jit_debug_register_code`). Os executáveis agora têm tabela de símbolos (COFF, ELF `.symtab`, Mach-O `LC_SYMTAB`) com as funções do runtime e esses dois nomes.
 > - `quark run -g` não tem isso: o runtime do `quark run` é mapeado na memória, sem símbolos que o gdb ache; o depurador próprio (`quark debug`) cobre esse caso.
 - **wasm32:** rodar a suíte num runtime wasm; `std` sem sistema bem delimitada.
+
+> **Feito em 21/11/2026: wasm32.** `quark build --target wasm32-wasi` faz um módulo WebAssembly (WASI preview 1) com
+> o programa e o runtime juntos.
+> - **O backend** (`compiler/wasm.qk`, escrito byte a byte, sem ferramentas):
+>   - Cada registrador virtual é um local do seu tipo. Entre funções, todo slot é um i64, como os outros backends
+>     guardam 64 bits num registrador.
+>   - Os saltos do IR viram segmentos dentro de um `loop`, e o `br_table` vai ao segmento da vez.
+>   - O endereço de uma função é o seu número na tabela. Há uma parte da tabela para cada quantidade de argumentos das
+>     chamadas por valor: uma função com nome recebe um adaptador que deixa de fora o ambiente.
+>   - Uma função que o C chama tem um thunk com a forma única do C aqui (quatro i64). A que tem o endereço tomado ganha
+>     uma entrada por slots, para o `parallelMap` numa thread só.
+>   - O `memcpy` e o `memset` são `memory.copy` e `memory.fill`.
+>   - Só entra o que o programa alcança a partir de `_start`: um hello tem 247 KB.
+>   - A seção `name` faz o wasmtime mostrar os nomes das funções numa armadilha.
+> - **O runtime** (`runtime/wasi.qk`):
+>   - O heap é próprio, por faixas de tamanho, crescendo a memória.
+>   - Arquivos e pastas vão pelas pastas que o motor dá (as preopens de `--dir`). Também há relógio, ambiente e
+>     argumentos.
+>   - A matemática é a do fdlibm (`runtime/wasimath.qk`): a até um ulp da glibc em 194 mil pontos.
+>   - Um pânico termina com a mensagem e o status 1.
+> - **A suíte** (`tools/wasmtest.sh`, no CI em `.github/workflows/wasm.yml`): 124 programas de `tests/run` e
+>   `tests/panics` com a saída gravada, no wasmtime, todos verdes.
+> - **O que fica de fora**, com o porquê em `tests/wasm-skip.txt` (12):
+>   - tarefas em pilhas próprias: o wasm tem uma pilha só, e a troca de pilhas ainda não é padrão nos motores;
+>   - outros programas e sockets: o WASI preview 1 não tem;
+>   - as bibliotecas do C;
+>   - a pilha do motor: recursão funda demais vira armadilha dele;
+>   - o rastro de chamadas de um pânico, lido dos frames da máquina.
+> - **De passagem:**
+>   - um validador de wasm local para depurar sem motor (fora do repositório);
+>   - `fixedText` e `parseInt` em Quark, que serviram aos dois lados.
 - **libquark no macOS** e a API C revisada uma última vez antes de congelar.
 - **Executáveis menores:** só o que o programa usa do runtime (hoje vai inteiro).
 

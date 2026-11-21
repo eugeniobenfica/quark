@@ -4049,7 +4049,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "3822603218-2470746"
+pub const compilerSources = "3680472942-2472270"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -6815,6 +6815,8 @@ use text
 use print
 use tasks
 use loops
+use loader
+use map
 
 extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
 extern effect fn fwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
@@ -6951,22 +6953,39 @@ pub extern effect fn rtImageSave(slots: Int64, desc: Int64, path: Int64, pathLen
     let root = malloc(8 * n + 8)
     copyBytes(root, slots, 8 * n)
     let c = copierFresh(0)
+    setWord(c, cLogMaps, 1)
     copyValue(c, root, desc)
+    // each map's description is in the program's data, at another address in another run: written as where in it
+    let l = ctxGet(ctxRunning)
+    let data = if l != 0 { word(l, lData) } else { 0 }
+    let dataLen = if l != 0 { word(l, lDataLen) } else { 0 }
+    let maps = word(c, cMapCount)
+    let mapsAt = malloc(8 * maps + 8)
+    var ok = l != 0
+    for i in 0..maps {
+        let m = word(word(c, cMaps), i)
+        let d = word(m, mDesc)
+        ok = ok and d >= data and d < data + dataLen
+        setWord(m, mDesc, d - data)
+        setWord(mapsAt, i, m)
+    }
     copierFreshDone(c)
     freeCopier(c)
     setWord(c0, ctxArena, was)
     let used = word(a, aRegion) - base
-    var ok = word(a, aRegion) <= word(a, aRegionEnd)
+    ok = ok and word(a, aRegion) <= word(a, aRegionEnd)
     let name = cString(path, pathLen)
     let f = osOpen(name, textAt("wb\0"))
     if f != 0 {
-        let head = malloc(32)
+        let head = malloc(40)
         setWord(head, 0, imageMagic)
         setWord(head, 1, base)
         setWord(head, 2, used)
         setWord(head, 3, n)
-        ok = ok and fwrite(head, 1, 32, f) == 32
+        setWord(head, 4, maps)
+        ok = ok and fwrite(head, 1, 40, f) == 40
         ok = ok and fwrite(root, 1, 8 * n, f) == 8 * n
+        ok = ok and fwrite(mapsAt, 1, 8 * maps, f) == 8 * maps
         ok = ok and fwrite(base, 1, used, f) == used
         free(head)
         ok = fclose(f) == 0 and ok
@@ -6974,6 +6993,7 @@ pub extern effect fn rtImageSave(slots: Int64, desc: Int64, path: Int64, pathLen
         ok = false
     }
     free(root)
+    free(mapsAt)
     regionArenaFree(a)
     osReleaseRange(base, imageRoom)
     if ok { 1 } else { 0 }
@@ -6989,18 +7009,32 @@ pub extern effect fn rtImageLoad(path: Int64, pathLen: Int64, optSlots: Int64) -
     if f == 0 {
         return p
     }
-    let head = malloc(32)
-    var ok = fread(head, 1, 32, f) == 32 and word(head, 0) == imageMagic and word(head, 3) == n
+    let head = malloc(40)
+    var ok = fread(head, 1, 40, f) == 40 and word(head, 0) == imageMagic and word(head, 3) == n
     let base = word(head, 1)
     let used = word(head, 2)
+    let maps = word(head, 4)
     free(head)
-    ok = ok and used > 0 and used <= imageRoom and osReserveAt(base, imageRoom) == base
+    let l = ctxGet(ctxRunning)
+    ok = ok and l != 0 and used > 0 and used <= imageRoom and maps >= 0 and maps < used
+    ok = ok and osReserveAt(base, imageRoom) == base
     if ok {
         let made = (used + 65535) & -65536
-        ok = osCommit(base, made) != 0 and fread(p + 8, 1, 8 * n, f) == 8 * n and fread(base, 1, used, f) == used
-        if not ok {
+        let mapsAt = malloc(8 * maps + 8)
+        ok = osCommit(base, made) != 0
+            and fread(p + 8, 1, 8 * n, f) == 8 * n
+            and fread(mapsAt, 1, 8 * maps, f) == 8 * maps
+            and fread(base, 1, used, f) == used
+        if ok {
+            // each map's description, at this run's data
+            for i in 0..maps {
+                let m = word(mapsAt, i)
+                setWord(m, mDesc, word(m, mDesc) + word(l, lData))
+            }
+        } else {
             osReleaseRange(base, imageRoom)
         }
+        free(mapsAt)
     }
     let _ = fclose(f)
     if ok { setWord(p, 0, 1) } else { zeroBytes(p, 8 * optSlots) }
@@ -9387,7 +9421,11 @@ const cToData = 24 // ... and this program's, where the copy's description goes
 const cSides = 25 // for each young range (as cYoung is sorted), its side table or 0 (movedSlot)
 const cLastRange = 26 // the young range youngAt found last (the next address is most often in it too), or 0
 const cFresh = 27 // the copies made as the arena's own allocations (copierFresh)
-const copierWords = 28
+pub const cMaps = 28 // with cLogMaps: each map copied, its address (an image's: its description made relative after)
+pub const cMapCount = 29
+const cMapCap = 30
+pub const cLogMaps = 31
+const copierWords = 32
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -9397,6 +9435,7 @@ pub fn copierNew(a: Int, time: Int) -> Int {
 }
 
 pub fn freeCopier(c: Int) {
+    free(word(c, cMaps))
     forgetSides(c)
     free(word(c, cPending))
     free(word(c, cMoved))
@@ -9894,6 +9933,9 @@ fn copyMapInto(c: Int, slot: Int) {
     let n = survive(c, 8 * mapWords)
     setWord(to.to, 0, n)
     setWord(slot, 0, n)
+    if word(c, cLogMaps) != 0 {
+        setWord(grow(c, cMaps, cMapCount, cMapCap, 1), 0, n)
+    }
     copyBytes(n, m, 8 * mapWords)
     let d = word(n, mDesc)
     if word(c, cDataLen) != 0 and d >= word(c, cFromData) and d < word(c, cFromData) + word(c, cDataLen) {

@@ -109,7 +109,11 @@ const cToData = 24 // ... and this program's, where the copy's description goes
 const cSides = 25 // for each young range (as cYoung is sorted), its side table or 0 (movedSlot)
 const cLastRange = 26 // the young range youngAt found last (the next address is most often in it too), or 0
 const cFresh = 27 // the copies made as the arena's own allocations (copierFresh)
-const copierWords = 28
+pub const cMaps = 28 // with cLogMaps: each map copied, its address (an image's: its description made relative after)
+pub const cMapCount = 29
+const cMapCap = 30
+pub const cLogMaps = 31
+const copierWords = 32
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -119,6 +123,7 @@ pub fn copierNew(a: Int, time: Int) -> Int {
 }
 
 pub fn freeCopier(c: Int) {
+    free(word(c, cMaps))
     forgetSides(c)
     free(word(c, cPending))
     free(word(c, cMoved))
@@ -616,6 +621,9 @@ fn copyMapInto(c: Int, slot: Int) {
     let n = survive(c, 8 * mapWords)
     setWord(to.to, 0, n)
     setWord(slot, 0, n)
+    if word(c, cLogMaps) != 0 {
+        setWord(grow(c, cMaps, cMapCount, cMapCap, 1), 0, n)
+    }
     copyBytes(n, m, 8 * mapWords)
     let d = word(n, mDesc)
     if word(c, cDataLen) != 0 and d >= word(c, cFromData) and d < word(c, cFromData) + word(c, cDataLen) {

@@ -630,6 +630,21 @@ fatos dos chamados (o que um `var self` muda, se um resultado é todo seu, o tam
 
 **Meta:** o rebuild do compilador depois de editar uma função abaixo de 0,5 s; um build sem cache igual ao de hoje.
 
+**Feito até aqui (21/11/2026):**
+- **Etapa 1a:** uma linha no código é uma constante própria (`Const` com `c = 3`), escrita com largura fixa e com
+  o lugar anotado (`lineAt` das partes de código), para que um código guardado possa ter a linha reescrita. O código
+  cresceu 0,2%; o ponto fixo e a suíte passam.
+- **A base da etapa 3: imagens.** `std.machine.saveImage(value, path)` copia um valor inteiro (com o copiador da
+  coleta) para uma faixa de endereços reservada num lugar fixo e grava a faixa como está. `loadImage(path)` reserva o
+  mesmo lugar e lê o arquivo para lá: todo ponteiro vale sem correção, menos a descrição de cada mapa, que mora nos
+  dados do executável e é gravada relativa a eles. Dois lugares, usados em turnos. Uma imagem de 44 MB é lida em
+  9 ms.
+- **Etapa 3a, feita e medida, à espera da próxima versão:** o programa checado (com as constantes) guardado numa
+  imagem e lido de volta quando nenhum arquivo mudou. Ler e checar o compilador: de ~550 para ~20 ms, com o mesmo
+  executável. Não está no `main` porque o compilador é compilado com a std do compilador que o constrói, e a da
+  0.12.0 não tem `saveImage`; o `build.sh` também precisa rodar o estágio 1 com `QUARK_IMAGES=off` (o runtime dele é o
+  do compilador que o construiu).
+
 ### B11. A memória de uma chamada: devolvida na volta
 
 > **Feita, medida e desfeita (21/11/2026).** Funcionou e passou a suíte inteira com toda volta coletando, mas o pico do

@@ -114,13 +114,22 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         preludeSrc = Source(o.prelude, text)
     }
     // read and checked as a task: what those two work with (most of the memory they make, little of it kept) goes
-    // when the task ends, and only the checked program is copied out
-    let out: Channel<Program?> = channel()
-    let _ = go(() => send(out, readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)))
-    let Some(Some(program)) = receive(out) else {
+    // when the task ends, and only the checked program is copied out. (Not on ARM64 until the compiler that builds
+    // this one gives a task more than 8 MB of stack, 0.12.0's: checking the compiler takes more there.)
+    var checked: Program? = None
+    if host.arm {
+        checked = readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)
+    } else {
+        let out: Channel<Program?> = channel()
+        let _ = go(() => send(out, readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)))
+        if receive(out) is Some(got) {
+            checked = got
+        }
+        closeChannel(out)
+    }
+    let Some(program) = checked else {
         return None
     }
-    closeChannel(out)
     var checkedProgram = program
     if not purpose.runtime {
         let problems = checkedProgram.runConsts(host)

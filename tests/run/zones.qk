@@ -1,0 +1,21 @@
+// Time zones by name: offsets, summer time and abbreviations at moments, the clocks' date and time, and the moment a
+// zone's clocks show (an hour skipped, an hour shown twice).
+use std.time
+
+fn main() -> Unit! {
+    let lisbon = zone("Europe/Lisbon")?
+    let summer = (parseDateTime("2026-07-01T12:00:00Z")?).seconds()
+    let winter = (parseDateTime("2026-01-15T12:00:00Z")?).seconds()
+    print(lisbon.offsetAt(summer), lisbon.abbreviationAt(summer), lisbon.isSummerAt(summer), lisbon.isoAt(summer))
+    print(lisbon.offsetAt(winter), lisbon.abbreviationAt(winter), lisbon.isSummerAt(winter))
+    let ny = zone("America/New_York")?
+    print(ny.isoAt(summer), ny.abbreviationAt(summer), ny.at(winter).hour, ny.abbreviationAt(winter))
+    // 2026-03-08 02:30 is skipped in New York; 01:30 on 2026-11-01 is shown twice
+    let gap = ny.moment(Date(2026, 3, 8).at(2, 30))
+    let twice = ny.moment(Date(2026, 11, 1).at(1, 30))
+    print(utc(gap).toIso(), utc(twice).toIso())
+    let kolkata = zone("Asia/Kolkata")?
+    print(kolkata.offsetAt(summer), kolkata.isoAt(summer))
+    print((zone("UTC")?).isoAt(summer), zone("Mars/Olympus") is Err(_), zone("../etc/passwd") is Err(_))
+    print(zoneNames().contains("America/Sao_Paulo"), len(zoneNames()) > 500)
+}

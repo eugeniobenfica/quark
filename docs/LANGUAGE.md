@@ -873,24 +873,35 @@ program that uses files through `qkModuleReader` (the file system by default).
 ### Packages
 
 A project that uses other people's code names it in `quark.toml`, at its root: its own name and
-version, and each package by git URL (or a path to a repository) and a tag or a commit:
+version, and each package by git URL (or a path to a repository) and a semantic version, a tag or a commit, or by
+version alone, from a registry:
 
 ```toml
 [package]
 name = "app"
 version = "0.1.0"
 edition = 1
+registry = "https://example.org/registry.git"
 
 [dependencies]
-geom = { git = "https://example.org/geom.git", tag = "v1.2.0" }
+geom = { git = "https://example.org/geom.git", version = "1.2" }
 util = { git = "../util", rev = "3f2a9c1e07" }
+text = "2.0.1"
 ```
+
+A version is `major.minor.patch` (`1.2` is `1.2.0`), and a package's version `1.2.0` is its tag `v1.2.0`. A version
+asked for is the least one wanted: of the versions of a package that the project and its packages ask for, all of one
+major version (`1.x`; for `0.x`, one minor: `0.3.x`), the newest is taken (minimal version selection), so no package
+is newer than someone asked for, and the same ones come back until a `quark.toml` changes; two major versions of one
+package is an error (`geom is asked for as 2.x by app and as 1.x by util`). A registry is a git repository whose
+`index.toml` has a `[packages]` table, `name = "its git URL"`; `registry =` in `[package]` names it, and
+`QUARK_REGISTRY`, when set, wins.
 
 `edition` is the edition of the language the package is written in ([STABILITY.md](STABILITY.md)); a
 compiler that does not read that edition says so. `quark get` fetches each package with the system `git` into
 `.quark/pkg/<name>/`, and the packages
 those name in their own `quark.toml` (one folder per name for the whole project), and writes
-`quark.lock`: each package's exact commit and a SHA-256 of its files. Commit `quark.toml` and
+`quark.lock`: each package's version (or tag, or rev), exact commit and a SHA-256 of its files. Commit `quark.toml` and
 `quark.lock`; `.quark/` keeps itself out of git. Then `use geom.shapes` is `.quark/pkg/geom/shapes.qk`
 and `use geom` is `.quark/pkg/geom/geom.qk`, from any file of the project (the nearest `quark.toml`
 above it), with the same `pub` rules as a file's. `quark run`, `build`, `check` and the rest need no
@@ -899,8 +910,8 @@ not fetched, or whose files are not the locked ones (`hash mismatch`: `quark get
 
 The lock wins: while `quark.toml` asks for what was locked, `quark get` checks out the locked commit,
 even if the tag has moved since, and fails if its files hash to anything else. To update a package,
-change its tag or commit in `quark.toml` and run `quark get`. A package's name is what `use` says
-(lowercase, digits, `_`) and its own `quark.toml`'s name; one asked for at two different pins, or a
+change its version, tag or commit in `quark.toml` and run `quark get`. A package's name is what `use` says
+(lowercase, digits, `_`) and its own `quark.toml`'s name; one asked for at two different tags or commits, or a
 package that comes back to itself (`a cycle of packages: app -> util -> app`), is an error, found
 before any package's files change. A file next to yours with a package's name is one too.
 
@@ -979,6 +990,24 @@ $ quark test math.qk
 ok    gcd of two numbers (0.0 ms)
 1 passed, 0 failed
 ```
+
+A **property** is what holds for every value a generator makes: `forAll(gen, property)` from `std.testing` tries
+100 of them (`runs:`), small ones first, the same each time (`seed:` gives others), and when one fails it makes it
+smaller while it still fails, and says the smallest it found (`forAll: the property does not hold for: [10, 20]`).
+The generators are `ints(lo, hi)`, `floats(lo, hi)`, `bools()`, `texts(most, alphabet)`, `arrays(gen, most)`,
+`pairs(a, b)`, `oneOf(values)`, `mapGen(gen, f)`, and a `Gen<T>` of one's own (`make(seed, size)`, and
+`smaller(value)`: the simpler values, simplest first).
+
+```quark
+use std.testing
+
+test "sorting twice is sorting once" {
+    forAll(arrays(ints()), xs => xs.sorted().sorted() == xs.sorted())
+}
+```
+
+`quark test file.qk --coverage` also says which lines of the file the tests ran: `coverage of math.qk: 11 of 13
+lines run (84.6%); not run: 16-17` (a line is a statement, a function's body or a match arm's that is not a block).
 
 ## Statements
 
@@ -1428,6 +1457,7 @@ when it ends.
 | Background, channels | `go(f)` (f as a task the background runs, → `Task`), `runTasks()` (every such task, to its end), `channel()` (→ `Channel<T>`, its `T` written where it goes), `send(ch, value)`, `receive(ch)` (→ `T?`: `None` once closed and empty), `receiveWithin(ch, seconds)`, `closeChannel(ch)`, `cancel(task)`, `withTimeout(seconds, f)` (→ `T?`), `scope(body)` and `s.start(f)` (→ `Task`): effects, group `tasks` ([below](#tasks-in-the-background-and-channels)) |
 | Files a part at a time | `openFile(path, mode)` (→ `File!`; `"r"`, `"w"`, `"a"`, `"r+"`, `"w+"`, bytes as they are), `readChunk(file, most)` (→ `Bytes!`: none at the end), `writeChunk(file, bytes)` (→ `Unit!`), `seekFile(file, at, from)` (→ `Int!`, the place now; `from` 0 the start (left out), 1 where it is, 2 the end), `closeFile(file)`: effects, group `files` |
 | Sockets (TCP) | `listen(host, port)` (→ `Socket!`; host `"0.0.0.0"` every address), `accept(listener)` (→ `Socket!`), `connect(host, port)` (→ `Socket!`), `readSocket(socket, most)` (→ `Bytes!`: none when the other end closed it), `writeSocket(socket, bytes)` (→ `Unit!`, every byte), `closeSocket(socket)`: effects, group `net`; a read, write or accept waits only the task that makes it |
+| TLS | `tlsConnect(socket, serverName)` (→ `Tls!`: the handshake over a connected socket, the server's certificate checked for that name by the system's trust), `readTls(t, most)` (→ `Bytes!`, none at its end), `writeTls(t, bytes)`, `closeTls(t)` (the end sent, the socket closed): group `net`, by the system's library, never TLS of Quark's own: Schannel on Windows, OpenSSL (`libssl.so.3`, loaded when first used) on Linux, SecureTransport on macOS; WebAssembly has none. A client's: a server's TLS is a proxy's in front of it |
 | Local time | `localOffset(seconds)` (→ `Int`: the system's time zone's offset from UTC at that moment, in seconds east), group `clock` |
 | Enums | `c.index()` |
 | Tests, failures | `assert(condition)`, `assert(condition, message)`, `panic(message)` (→ `Never`) |
@@ -1439,6 +1469,21 @@ and to standard error (read as it writes, so neither one fills up and stops it).
 shell finds it (`PATH`; a `.exe` on Windows), its arguments go to it as they are (spaces and quotes too: no
 shell reads them), and it reads no input. `Err` says why it could not be started. On Linux and macOS, a program
 stopped by a signal has the status 128 plus the signal's number.
+
+**A program running beside this one.** `startProcess(program, args)` starts it and gives a `Subprocess`: its input,
+output and errors are pipes this program writes and reads while it runs. `writeProcess(p, bytes)` writes to its
+input (every byte; `Err` once it no longer reads), `closeProcessInput(p)` ends its input, `readProcess(p, most)` and
+`readProcessErrors(p, most)` give up to `most` bytes as they come (none: it ended them), `waitProcess(p)` waits for
+its end and gives its status (its input closed first), and `killProcess(p)` stops it. A read, a write or the wait
+gives a task's turn back while it waits, so a task can feed a process while another reads it. It is in the group
+`process`, as `runProcess` is.
+
+```quark
+let p = startProcess("sort", [])?
+writeProcess(p, "b\na\n".bytes())?
+closeProcessInput(p)
+print(Text(readProcess(p, 4096)?)?, waitProcess(p)?)
+```
 
 ```quark
 let r = runProcess("git", ["status", "--short"])?
@@ -1591,11 +1636,11 @@ passed to `quark graph --layout` can be either `[x, y]` or `{"pos": [x, y], "uid
 | `quark run file.qk [-- args]` | compile to machine code in memory and run it |
 | `quark build file.qk [-o out]` | a standalone executable |
 | `quark build file.qk --target arm64-macos` | ... for another machine: `x86_64-windows`, `arm64-windows` (PE32+), `x86_64-linux`, `arm64-linux` (ELF; `--libc musl` for Alpine's, glibc otherwise), `x86_64-macos`, `arm64-macos` (Mach-O, signed ad hoc as Apple Silicon wants) |
-| `quark test file.qk` | run its tests |
+| `quark test file.qk [--filter part] [--coverage]` | run its tests (those whose name has part; the lines they ran) |
 | `quark fmt file.qk [--write]` | the canonical text |
 | `quark check file.qk` | only the errors |
 | `quark get [dir]` | fetch the packages `quark.toml` names (git) into `.quark/pkg`, and write `quark.lock` (above) |
-| `quark lsp [--prelude host.qk]` | a language server for editors (stdio): errors as you type, formatting, the type under the cursor, go to definition, references, rename, the types worked out (inlay hints), a call's signature, the file's declarations, completion, and quick fixes (below) |
+| `quark lsp [--prelude host.qk]` | a language server for editors (stdio): errors as you type (edits of parts of a file; an open file's unsaved text is what the files using it see, and they are checked again when it changes), formatting, the type under the cursor and, on a function, the effects it reaches (`// effects: files, print`, through what it calls), go to definition, go to the implementations of an interface (the types that fit it) or of its function, references and rename in every file of the program's own (not the standard library's or a package's), the types worked out (inlay hints), a call's signature, the file's declarations, completion, and quick fixes (below) |
 | `quark dap [--prelude host.qk]` | a debug adapter for editors' debuggers (the Debug Adapter Protocol, stdio; below) |
 | `quark doc file.qk [-o out.md\|out.html]` | documentation: the `pub` declarations of the file and of the files it uses, each with its signature and the comment above it; Markdown on stdout or in a `.md`, one page in a `.html`. A type's own functions are listed under it; a result type left to be worked out is shown worked out |
 | `quark code file.qk [-o code.bin]` | the machine code (x86-64 or ARM64, as built), raw, and each function's offset: for a disassembler |
@@ -1642,9 +1687,9 @@ Written in Quark, in `std/`, kept inside the compiler (`use std.name`, no file n
 | | |
 | --- | --- |
 | `std.math` | `pi`, `tau`; `Vec2`, `Vec3` with `+ - * /` and unary `-`, `dot`, `cross`, `length`, `distance`, `normalized`, `lerp`, `angle`, `rotated` |
-| `std.json` | `parseJson(text) -> Json!`, `toJson(j)`, `j.field(name)`, `j.integer()`, `j.number()`, `j.text()`. Parsed numbers use `Integer` where a signed 64-bit integer is exact and `NumberText` for other JSON number spellings. `Num` constructs a number from a Float. Every escape is read (`\uXXXX` with its surrogate pairs, `\b`, `\f`, `\/`); a text in the input with no escape becomes a slice of it (no copy); `toJson` escapes control characters. An error says at which byte the input stops being JSON. |
+| `std.json` | `parseJson(text) -> Json!`, `toJson(j)`, `j.field(name)`, `j.integer()`, `j.number()`, `j.text()`. Parsed numbers use `Integer` where a signed 64-bit integer is exact and `NumberText` for other JSON number spellings. `Num` constructs a number from a Float. Every escape is read (`\uXXXX` with its surrogate pairs, `\b`, `\f`, `\/`); a text in the input with no escape becomes a slice of it (no copy); `toJson` escapes control characters. An error says at which byte the input stops being JSON. **Typed:** `encode(v)` writes any value of data as JSON text and `decode(text)` reads one back by the type it goes into (`let p: Person = decode(text)?`); `jsonOf(v)` and `fromJson(j)` do the same with a `Json`. They are made for each type when used: a record is an object of its fields, an enum's case without data its name (`"Dot"`), one with data an object of one entry (`{"Circle":{"radius":1.5}}`), an array a list, a map from `Text` or `Int` an object, an optional `null` when `None`, a tuple a list. Reading, a missing field takes its default, and an optional one `None`; an error names where it is (`age: JSON: an Int, not a text`). A type holding a function or a handle is not JSON, and says so where it is used. |
 | `std.graph` | the types of a program's graph (QGN, what `quark graph` writes): `Graph`, `Decl`, `Node`, `Pin`, `Param`, `Field`, `Case`, `Arm`, `Bind`, `Alt`, `Block`, `Note`; `const g: Graph = Graph(...)` takes one as it is |
-| `std.time` | UTC on the Gregorian calendar: `Date(year, month, day)`, `DateTime(year, month, day, hour, minute, second, millisecond)`, `enum Weekday`; `utc(seconds)` (`utc(unixTime())` is now), `dateOfDays(n)`, `isLeapYear`, `daysInMonth`; `d.days()`, `d.weekday()`, `d.addDays(n)`, `d.addMonths(n)`, `d.at(hour, minute, second, millisecond)`, `d.isValid()`, `dt.date()`, `dt.seconds()`, `dt.addSeconds(s)`, `dt.addDays(n)`; `<` and `sorted`; ISO 8601: `toIso()`, `parseDate(text) -> Date!`, `parseDateTime(text) -> DateTime!` (with seconds, fractions, `Z` or an offset turned to UTC); `now()` (UTC), `local(seconds)` and `localNow()` (the system's time zone, with its daylight saving time) |
+| `std.time` | UTC on the Gregorian calendar: `Date(year, month, day)`, `DateTime(year, month, day, hour, minute, second, millisecond)`, `enum Weekday`; `utc(seconds)` (`utc(unixTime())` is now), `dateOfDays(n)`, `isLeapYear`, `daysInMonth`; `d.days()`, `d.weekday()`, `d.addDays(n)`, `d.addMonths(n)`, `d.at(hour, minute, second, millisecond)`, `d.isValid()`, `dt.date()`, `dt.seconds()`, `dt.addSeconds(s)`, `dt.addDays(n)`; `<` and `sorted`; ISO 8601: `toIso()`, `parseDate(text) -> Date!`, `parseDateTime(text) -> DateTime!` (with seconds, fractions, `Z` or an offset turned to UTC); `now()` (UTC), `local(seconds)` and `localNow()` (the system's time zone, with its daylight saving time); `dt.toIsoOffset(seconds)`; time zones by name: `zone("Europe/Lisbon") -> Zone!`, `zoneNames()`, `z.offsetAt(t)`, `z.isSummerAt(t)`, `z.abbreviationAt(t)`, `z.at(t)` (its clocks), `z.isoAt(t)` (`2026-07-01T13:00:00+01:00`), `z.moment(dateTime)` (the moment its clocks show that: of two, the first; in a skipped hour, after it), `z.now()`; from the system's zone files (TZif, every zone's history) where there are some, else from `std.zones` (each zone's rule now, from tzdata, made by `tools/zones.py`) |
 | `std.regex` | `regex(pattern) -> Regex!`: literals, `.`, `[a-z]`, `[^...]`, `\d \w \s \D \W \S \b \B`, `^ $`, `* + ? {n} {n,} {n,m}` (and lazy, with `?` after), `\|`, groups `( )` and `(?: )`; `r.matches(text)` (all of it), `r.find(text) -> Match?`, `r.findAll(text)`, `r.replaceAll(text, "$1")`, `r.replaceEach(text, m => ...)`, `r.split(text)`; `Match(start, end, text, groups)`, in bytes. Linear in the text times the pattern, never exponential |
 | `std.collections` | values that share what they hold: `Queue<T>` (a deque: `Queue.Empty`, `queueOf(xs)`, `pushBack`, `pushFront`, `front`, `back`, `popFront`, `popBack`, `size`, `isEmpty`, `toArray`, each end O(1)) and `Heap<T>` (a priority queue, smallest by `<` on top: `Heap.Empty`, `heapOf(xs)`, `push`, `top`, `pop`, `merge`, `size`, `isEmpty`, `toArray` sorted; O(log n)); `Keyed(key, value)` orders a heap by a key |
 | `std.path` | `/` and `\` both: `joinPath(a, b)`, `normalize(path)`, `parent`, `fileName`, `extension`, `stem`, `withExtension(path, ext)`, `pathParts`, `isAbsolute`, `windowsPath` |
@@ -1653,10 +1698,10 @@ Written in Quark, in `std/`, kept inside the compiler (`use std.name`, no file n
 | `std.args` | a command line read by what it takes: `flag(name, short:, help:)`, `option(name, short:, help:, default:)`, `parseArgs(args(), spec) -> Args!` (`--name`, `--name=value`, `--name value`, `-v`, `-vq`, `-o value`, `-ovalue`, `--` then positional), `a.has(name)`, `a.value(name) -> Text?`, `a.int(name) -> Int!`, `a.positional`; `usage(program, spec, positional:)` |
 | `std.files` | on `openFile` and its kin: `lineReader(file)` (`while r.next() is Some(line)`, `r.error` after; any size, a part at a time), `copyFile(from, to) -> Unit!`, `fileSize(path) -> Int!`, `walkFiles(folder) -> [Text]!` (every file under it, at any depth, sorted) |
 | `std.csv` | RFC 4180: `parseCsv(text, separator: ',') -> [[Text]]!` (quotes, `""` inside, separators and line breaks inside quotes, `\r\n`), `toCsv(rows, separator: ',')`, `csvField(text)`, `csvRecords(rows) -> [[Text: Text]]` (the first row's names as keys) |
-| `std.net` | on the sockets: `conn(socket) -> Conn` and `c.readLine() -> Text?`, `c.readUntil(bytes) -> Bytes?`, `c.readBytes(n)`, `c.readAll() -> Bytes!`, `c.write(text)`, `c.writeBytes(bytes)`, `c.close()`; `c.error` says why a read stopped early |
-| `std.http` | HTTP/1.1 without TLS: `serve(host, port, handler)` (each connection a task; the handler `(Request) -> Response`), `handleConnection(socket, handler)`, `Request(method, path, query, headers, body)`, `Response(status, headers, body)`, `textResponse(text, status:)`, `jsonResponse(text, status:)`, `get(url) -> Response!`, `post(url, body, contentType:)`, `request(method, url, body, headers)`, `parseUrl`, `parseQuery`; one request a connection; `https://` is an error |
+| `std.net` | on the sockets: `conn(socket) -> Conn`, `connectTls(host, port = 443) -> Conn!` (over TLS, read and written the same) and `c.readLine() -> Text?`, `c.readUntil(bytes) -> Bytes?`, `c.readBytes(n)`, `c.readAll() -> Bytes!`, `c.write(text)`, `c.writeBytes(bytes)`, `c.close()`; `c.error` says why a read stopped early |
+| `std.http` | HTTP/1.1: `serve(host, port, handler)` (each connection a task; the handler `(Request) -> Response`), `handleConnection(socket, handler)`, `Request(method, path, query, headers, body)`, `Response(status, headers, body)`, `textResponse(text, status:)`, `jsonResponse(text, status:)`, `get(url) -> Response!`, `post(url, body, contentType:)`, `request(method, url, body, headers)`, `parseUrl`, `parseQuery`; one request a connection; the client takes `https://` (over `connectTls`) |
 | `std.machine` | what only the compiler gives the runtime written in Quark: `switchStack(save, load)`, `frame()`, `cpu()` ([C](#c)) |
-| `std.testing` | `assertEqual(actual, expected, what: ...)` shows both values (of any type print shows) when they differ, `assertNotEqual`, `assertNear(a, b, tolerance: ...)`, `assertErr(result, part: ...)` |
+| `std.testing` | `assertEqual(actual, expected, what: ...)` shows both values (of any type print shows) when they differ, `assertNotEqual`, `assertNear(a, b, tolerance: ...)`, `assertErr(result, part: ...)`; properties: `forAll(gen, property, runs:, seed:)`, `Gen<T>`, `ints`, `floats`, `bools`, `texts`, `arrays`, `pairs`, `oneOf`, `mapGen` ([Tests](#tests)) |
 
 ## C
 

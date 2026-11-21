@@ -131,6 +131,9 @@ pub extern effect fn hostDebugStep(t: Int64, stepping: Int64) -> Int64 as "qkHos
     r
 }
 
+// quark test --coverage: its lines run (a byte each, coverRoom of them), or 0 when none ran
+pub extern effect fn hostCoverage() -> Int64 as "qkHostCoverage" = word(word(cell(), 0), gCover)
+
 // ---- --profile: where this thread is, every millisecond (windows.qk, linux.qk sample it) ----
 // the sampler's words: on, the sampled thread, the sampling thread, the samples, their count, room, the sampled
 // thread's stack (low, high). A sample is sampleWords words: where the thread was, then the return addresses of the

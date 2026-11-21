@@ -76,5 +76,10 @@ fn main() {
     for p in pages.sorted() {
         print(p)
     }
-    print(get("https://example.com"), parseUrl("http://h:8080/a?b=1"), connect("127.0.0.1", 47913) is Err(_))
+    print(
+        parseUrl("https://example.com"),
+        get("ftp://example.com") is Err(_),
+        parseUrl("http://h:8080/a?b=1"),
+        connect("127.0.0.1", 47913) is Err(_),
+    )
 }

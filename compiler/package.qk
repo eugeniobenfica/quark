@@ -1,15 +1,22 @@
 // Packages: code from other people's git repositories.
 //
-// quark.toml, at a project's root, names the project and what it depends on, each by git URL and a pinned tag or
-// commit:
+// quark.toml, at a project's root, names the project and what it depends on, each by git URL and a semantic version
+// (its tag vX.Y.Z), a tag or a commit, or by version alone, its URL then the registry's:
 //
 //     [package]
 //     name = "app"
 //     version = "0.1.0"
+//     registry = "https://example.org/registry.git"
 //
 //     [dependencies]
-//     geom = { git = "https://example.org/geom.git", tag = "v1.2.0" }
+//     geom = { git = "https://example.org/geom.git", version = "1.2" }
 //     util = { git = "../util", rev = "3f2a9c1" }
+//     text = "2.0.1"
+//
+// A version asked for is the least one wanted: of all the versions of a package that the project and its packages ask
+// for (one major version: 1.x, or 0.x for each x), the newest is taken (minimal version selection: no newer one than
+// someone asked for, so the same packages come out until a quark.toml changes). A registry is a git repository whose
+// index.toml has a [packages] table, each name = "its git URL"; QUARK_REGISTRY, when set, is the one used.
 //
 // `quark get` fetches every package (and the packages they name, in their own quark.toml) with the system git into
 // .quark/pkg/<name>/, one folder per name for the whole project, and writes quark.lock: the exact commit and a
@@ -250,11 +257,12 @@ fn parseToml(file: Text, text: Text) -> [Entry]! {
 }
 
 // ---- the manifest and the lock -----------------------------------------------------------------------------------
-// a package asked for (by quark.toml) or locked (by quark.lock): one of tag and rev; commit the lock's, and what
-// quark get found; by the package that asked for it
+// a package asked for (by quark.toml) or locked (by quark.lock): one of version, tag and rev (a version alone: its git
+// URL is the registry's); commit the lock's, and what quark get found; by the package that asked for it
 pub type Dep {
     name: Text
     git: Text? = None
+    version: Text? = None // major.minor.patch: the least one wanted (the lock: the one taken)
     tag: Text? = None
     rev: Text? = None
     commit: Text = ""
@@ -262,7 +270,37 @@ pub type Dep {
     by: Text = ""
 }
 
-pub type Manifest { name: Text = "", version: Text? = None, deps: [Dep] = [] }
+pub type Manifest { name: Text = "", version: Text? = None, registry: Text? = None, deps: [Dep] = [] }
+
+// a semantic version, "1", "1.2" or "1.2.3" (a v before it let go): its three numbers; None when it is not one
+pub fn semver(t: Text) -> [Int]? {
+    let parts = (if t.startsWith("v") { t[1..] } else { t }).split(".")
+    if len(parts) > 3 {
+        return None
+    }
+    var v: [Int] = []
+    for part in parts {
+        if len(part) == 0 or len(part) > 9 or not part.bytes().all(c => c is '0'..='9') {
+            return None
+        }
+        v.push(part.parseInt() ?? return None)
+    }
+    while len(v) < 3 {
+        v.push(0)
+    }
+    v
+}
+
+fn versionText(v: [Int]) -> Text = "{v[0]}.{v[1]}.{v[2]}"
+
+// two versions one can stand for the other: the same major (for 0.x, the same minor too)
+fn compatible(a: [Int], b: [Int]) -> Bool = a[0] == b[0] and (a[0] != 0 or a[1] == b[1])
+
+fn newer(a: [Int], b: [Int]) -> Bool =
+    a[0] > b[0] or a[0] == b[0] and (a[1] > b[1] or a[1] == b[1] and a[2] > b[2])
+
+// "1.x", "0.3.x": the versions compatible with v
+fn line(v: [Int]) -> Text = if v[0] == 0 { "0.{v[1]}.x" } else { "{v[0]}.x" }
 
 // a name `use` can say: lowercase letters, digits and _, not std
 fn goodName(s: Text) -> Bool {
@@ -287,10 +325,34 @@ fn findDep(deps: [Dep], name: Text) -> Int {
     -1
 }
 
-// what tag or rev a package is pinned to, for messages
-fn pinOf(d: Dep) -> Text = d.tag ?? d.rev ?? ""
+// what version, tag or rev a package is pinned to, for messages
+fn pinOf(d: Dep) -> Text = d.version ?? d.tag ?? d.rev ?? ""
 
-fn samePin(a: Dep, b: Dep) -> Bool = a.git == b.git and a.tag == b.tag and a.rev == b.rev
+fn pinKind(d: Dep) -> Text = if d.version != None {
+    "version"
+} else if d.tag != None {
+    "tag"
+} else {
+    "rev"
+}
+
+fn samePin(a: Dep, b: Dep) -> Bool =
+    a.git == b.git and a.version == b.version and a.tag == b.tag and a.rev == b.rev
+
+// does the locked package do for the one asked for? the same pin, or (a version) a compatible one as new or newer;
+// a package asked for by version alone takes the registry's URL, whatever the lock says
+fn doesFor(locked: Dep, asked: Dep) -> Bool {
+    if asked.git != None and asked.git != locked.git {
+        return false
+    }
+    let Some(want) = semver(asked.version ?? "") else {
+        return samePin(locked, asked with { git: locked.git })
+    }
+    let Some(have) = semver(locked.version ?? "") else {
+        return false
+    }
+    compatible(have, want) and not newer(want, have)
+}
 
 fn hasQuote(t: Text) -> Bool = t.bytes().contains('"')
 
@@ -307,7 +369,12 @@ pub fn parseManifest(path: Text, text: Text) -> Manifest! {
                 m.name = e.value
                 named = true
             } else if e.key == "version" {
+                if semver(e.value) == None and error == "" {
+                    error = here + "a version is major.minor.patch: 1.4.2"
+                }
                 m.version = e.value
+            } else if e.key == "registry" {
+                m.registry = e.value
             } else if e.key == "edition" {
                 // the language edition the package is written in (docs/STABILITY.md): this compiler's, or an error
                 if e.value != "{languageEdition}" and error == "" {
@@ -315,15 +382,9 @@ pub fn parseManifest(path: Text, text: Text) -> Manifest! {
                         + "this compiler reads edition {languageEdition} of the language, and the package says edition {e.value}"
                 }
             } else if error == "" {
-                error = here + "[package] has name, version and edition"
+                error = here + "[package] has name, version, edition and registry"
             }
         } else if e.table == "dependencies" and e.index < 0 {
-            if e.sub == "" {
-                if error == "" {
-                    error = here + "a dependency is name = \{ git = \"url\", tag = \"v1.0.0\" \} (or rev = \"commit\")"
-                }
-                continue
-            }
             if not goodName(e.key) {
                 if error == "" {
                     error = here + "a package's name is lowercase letters, digits and _ (and not std): what use says"
@@ -336,22 +397,34 @@ pub fn parseManifest(path: Text, text: Text) -> Manifest! {
                 i = len(m.deps) - 1
             }
             let d = m.deps[i]
-            let slot = match e.sub {
+            let sub = if e.sub == "" {
+                "version" // name = "1.2": a version, from the registry
+            } else {
+                e.sub
+            }
+            let slot = match sub {
                 "git" => d.git
+                "version" => d.version
                 "tag" => d.tag
                 "rev" => d.rev
                 _ => None
             }
-            if not e.sub is "git" | "tag" | "rev" {
+            if not sub is "git" | "version" | "tag" | "rev" {
                 if error == "" {
-                    error = here + "a dependency has git, and tag or rev"
+                    error = here + "a dependency has git, and version, tag or rev"
                 }
             } else if slot != None {
                 if error == "" {
                     error = here + "said twice"
                 }
-            } else if e.sub == "git" {
+            } else if sub == "git" {
                 m.deps[i].git = e.value
+            } else if sub == "version" {
+                if semver(e.value) is Some(v) {
+                    m.deps[i].version = versionText(v)
+                } else if error == "" {
+                    error = here + "a version is major.minor.patch (or major.minor, or major): 1.4.2"
+                }
             } else if e.sub == "tag" {
                 m.deps[i].tag = e.value
             } else {
@@ -371,10 +444,13 @@ pub fn parseManifest(path: Text, text: Text) -> Manifest! {
         if error != "" {
             break
         }
-        if d.git == None {
-            error = "{path}: {d.name} needs git = \"url\""
-        } else if (d.tag == None) == (d.rev == None) {
-            error = "{path}: {d.name} needs one of tag = \"...\" and rev = \"commit\""
+        let pins = (if d.version != None { 1 } else { 0 })
+            + (if d.tag != None { 1 } else { 0 })
+            + (if d.rev != None { 1 } else { 0 })
+        if d.git == None and d.version == None {
+            error = "{path}: {d.name} needs git = \"url\" (or a version alone, from the registry)"
+        } else if pins != 1 {
+            error = "{path}: {d.name} needs one of version = \"1.2.0\", tag = \"...\" and rev = \"commit\""
         } else {
             let git = d.git ?? ""
             let pin = pinOf(d)
@@ -422,6 +498,8 @@ fn readLock(path: Text) -> [Dep]! {
             deps[i].name = e.value
         } else if e.key == "git" {
             deps[i].git = e.value
+        } else if e.key == "version" {
+            deps[i].version = e.value
         } else if e.key == "tag" {
             deps[i].tag = e.value
         } else if e.key == "rev" {
@@ -431,7 +509,7 @@ fn readLock(path: Text) -> [Dep]! {
         } else if e.key == "hash" {
             deps[i].hash = e.value
         } else if error == "" {
-            error = "{path}:{e.line}: a locked package has name, git, tag or rev, commit and hash"
+            error = "{path}:{e.line}: a locked package has name, git, version, tag or rev, commit and hash"
         }
     }
     if error != "" {
@@ -452,9 +530,7 @@ fn writeLock(path: Text, deps: [Dep]) -> Bool {
     var out = "# The exact code of every package, written by quark get: commit it with quark.toml.\n"
     for d in deps.sortedBy(d => d.name) {
         out += "\n[[package]]\n" + quotedLine("name", d.name) + quotedLine("git", d.git ?? "")
-        out += quotedLine(if d.tag != None { "tag" } else { "rev" }, pinOf(d))
-            + quotedLine("commit", d.commit)
-            + quotedLine("hash", d.hash)
+        out += quotedLine(pinKind(d), pinOf(d)) + quotedLine("commit", d.commit) + quotedLine("hash", d.hash)
     }
     writeFile(path, out) is Ok(_)
 }
@@ -481,7 +557,14 @@ fn git(args: [Text], quiet: Bool = false) -> GitRun {
 // ---- quark get ---------------------------------------------------------------------------------------------------
 // a run of quark get: the project ("." or "dir"), quark.lock as it was, what this run found, the packages being
 // visited (a cycle comes back to one)
-type Get { root: Text, lock: [Dep], got: [Dep] = [], stack: [Text] = [] }
+type Get {
+    root: Text
+    lock: [Dep]
+    registry: Text = "" // its URL ("": none)
+    index: [Text: Text]? = None // the registry's packages, once read: each one's git URL
+    got: [Dep] = []
+    stack: [Text] = []
+}
 
 fn getError(message: Text) -> Bool {
     printErr("quark get: " + message)
@@ -499,12 +582,15 @@ fn Get.lockedFor(self, d: Dep) -> Int {
 fn Get.resolve(self, d: Dep) -> Text? {
     let dir = "{self.root}/.quark/pkg/{d.name}"
     let locked = self.lockedFor(d)
-    let want = if locked >= 0 {
-        self.lock[locked].commit + "^\{commit\}"
+    // what may name it: the locked commit; a version's tag, v1.2.0 (or 1.2.0); the tag; the commit
+    let wants = if locked >= 0 {
+        [self.lock[locked].commit + "^\{commit\}"]
+    } else if d.version is Some(v) {
+        ["refs/tags/v{v}^\{commit\}", "refs/tags/{v}^\{commit\}"]
     } else if d.tag is Some(tag) {
-        "refs/tags/{tag}^\{commit}"
+        ["refs/tags/{tag}^\{commit}"]
     } else {
-        pinOf(d) + "^\{commit\}"
+        [pinOf(d) + "^\{commit\}"]
     }
     let source = d.git ?? ""
     // line ends exactly as committed: the same files, so the same hash, on every system
@@ -528,17 +614,21 @@ fn Get.resolve(self, d: Dep) -> Text? {
         getError("{d.name}: cannot clone {source}")
         return None
     }
-    let found = git(["-C", dir, "rev-parse", "--verify", "--quiet", want])
-    if found.ok {
-        return found.out
-    }
-    git(["-C", dir, "fetch", "--quiet", "--tags", "origin"]) // not here yet: ask the remote
-    let fetched = git(["-C", dir, "rev-parse", "--verify", "--quiet", want])
-    if fetched.ok {
-        return fetched.out
+    for fetch in [false, true] {
+        if fetch {
+            git(["-C", dir, "fetch", "--quiet", "--tags", "origin"]) // not here yet: ask the remote
+        }
+        for want in wants {
+            let found = git(["-C", dir, "rev-parse", "--verify", "--quiet", want])
+            if found.ok {
+                return found.out
+            }
+        }
     }
     if locked >= 0 {
         getError("{d.name}: the locked commit {self.lock[locked].commit} is not in {source}")
+    } else if d.version is Some(v) {
+        getError("{d.name}: no version {v} (a tag v{v}) in {source}")
     } else {
         getError("{d.name}: no {if d.tag != None { "tag" } else { "commit" }} {pinOf(d)} in {source}")
     }
@@ -586,6 +676,12 @@ fn cut12(t: Text) -> Text = if len(t) > 12 { t[..12] } else { t }
 fn Get.visit(var self, m: Manifest) -> Bool {
     for dep in m.deps {
         var want = dep with { by: m.name }
+        if want.git == None {
+            let Some(url) = self.fromRegistry(want.name) else {
+                return false
+            }
+            want.git = url
+        }
         for (k, s) in self.stack.enumerate() {
             if s == want.name {
                 var path = ""
@@ -598,6 +694,26 @@ fn Get.visit(var self, m: Manifest) -> Bool {
         let had = findDep(self.got, want.name)
         if had >= 0 {
             let h = self.got[had]
+            if semver(h.version ?? "") is Some(hv) and semver(want.version ?? "") is Some(wv) and h.git == want.git {
+                if not compatible(hv, wv) {
+                    return getError(
+                        "{want.name} is asked for as {line(hv)} by {h.by} and as {line(wv)} by {want.by}: no version is both",
+                    )
+                }
+                if not newer(wv, hv) {
+                    continue
+                }
+                // a newer one wanted: it, and what it asks for in turn
+                let Some(commit) = self.resolve(want) else {
+                    return false
+                }
+                want.commit = commit
+                self.got[had] = want
+                if not self.visitOwn(want) {
+                    return false
+                }
+                continue
+            }
             if not samePin(h, want) {
                 return getError(
                     "{want.name} is asked for twice: {h.git ?? ""} {pinOf(h)} by {h.by}, {want.git ?? ""} {pinOf(want)} by {want.by}",
@@ -613,25 +729,80 @@ fn Get.visit(var self, m: Manifest) -> Bool {
         }
         want.commit = commit
         self.got.push(want)
-        // its own quark.toml, at its commit
-        let shown = git(["-C", "{self.root}/.quark/pkg/{want.name}", "show", "{commit}:quark.toml"], quiet: true)
-        if shown.ok {
-            let sub = match parseManifest("{want.name}/quark.toml", shown.out) {
-                Ok(s) => s
-                Err(why) => return getError(why)
-            }
-            if sub.name != want.name {
-                return getError("{want.name}'s quark.toml calls it {sub.name}: depend on it by its own name")
-            }
-            self.stack.push(want.name)
-            let ok = self.visit(sub)
-            self.stack.pop()
-            if not ok {
-                return false
-            }
+        if not self.visitOwn(want) {
+            return false
         }
     }
     true
+}
+
+// the packages a package's own quark.toml names, at its commit
+fn Get.visitOwn(var self, d: Dep) -> Bool {
+    let shown = git(["-C", "{self.root}/.quark/pkg/{d.name}", "show", "{d.commit}:quark.toml"], quiet: true)
+    if not shown.ok {
+        return true
+    }
+    let sub = match parseManifest("{d.name}/quark.toml", shown.out) {
+        Ok(s) => s
+        Err(why) => return getError(why)
+    }
+    if sub.name != d.name {
+        return getError("{d.name}'s quark.toml calls it {sub.name}: depend on it by its own name")
+    }
+    if d.version is Some(v) and sub.version is Some(own) and own != v {
+        return getError("{d.name}: its tag says version {v}, its quark.toml {own}")
+    }
+    self.stack.push(d.name)
+    let ok = self.visit(sub)
+    self.stack.pop()
+    ok
+}
+
+// a package's git URL, from the registry's index.toml (fetched once a run, into .quark/registry)
+fn Get.fromRegistry(var self, name: Text) -> Text? {
+    if self.index == None {
+        if self.registry == "" {
+            getError(
+                "{name} is asked for by version alone, and there is no registry (registry = in [package], or QUARK_REGISTRY)",
+            )
+            return None
+        }
+        let dir = "{self.root}/.quark/registry"
+        let ready = if pathExists(dir + "/.git") {
+            git(["-C", dir, "fetch", "--quiet", "origin"]).ok
+        } else {
+            git(["-C", self.root, "clone", "--quiet", "--no-checkout", "--", self.registry, ".quark/registry"]).ok
+        }
+        let shown = git(["-C", dir, "show", "FETCH_HEAD:index.toml"], quiet: true)
+        let text = if shown.ok {
+            shown
+        } else {
+            git(["-C", dir, "show", "origin/HEAD:index.toml"], quiet: true)
+        }
+        if not ready or not text.ok {
+            getError("cannot read the registry {self.registry}: a git repository with index.toml")
+            return None
+        }
+        let parsed = parseToml("{self.registry}/index.toml", text.out)
+        if parsed is Err(why) {
+            getError(why)
+            return None
+        }
+        let entries = parsed ?? []
+        var index: [Text: Text] = [:]
+        for e in entries {
+            if e.table == "packages" and e.index < 0 and e.sub == "" and goodName(e.key) {
+                index[e.key] = e.value
+            }
+        }
+        self.index = index
+    }
+    let index = self.index ?? [:]
+    if not index.contains(name) {
+        getError("{name} is not in the registry {self.registry}")
+        return None
+    }
+    index[name]
 }
 
 fn padded(t: Text, n: Int) -> Text {
@@ -660,7 +831,8 @@ pub fn getPackages(root: Text) -> Int {
         getError(why)
         return 1
     }
-    var g = Get(root, locked ?? [], stack: [m.name])
+    let registry = env("QUARK_REGISTRY") ?? m.registry ?? ""
+    var g = Get(root, locked ?? [], registry: registry, stack: [m.name])
     if not g.visit(m) {
         return 1
     }
@@ -806,7 +978,7 @@ fn checkPackage(pl: Place, name: Text, asked: Dep, dir: Text) -> Text {
         return "{name} is not in {lockPath}: run quark get"
     }
     let d = lock[i]
-    if not samePin(d, asked) {
+    if not doesFor(d, asked) {
         return "{pl.pkg}quark.toml asks for {name} {pinOf(asked)}, quark.lock has {pinOf(d)}: run quark get"
     }
     let Some(hash) = hashDir(dir) else {
@@ -843,7 +1015,7 @@ pub fn Packages.fileFor(var self, from: Text, name: Text) -> PackageUse {
     if pathExists(local) {
         return PackageUse(error: "{name} is both the package {first} and the file {local}: rename the file")
     }
-    let key = "{dir} {d.git ?? ""} {if d.tag != None { "tag" } else { "rev" }} {pinOf(d)}"
+    let key = "{dir} {d.git ?? ""} {pinKind(d)} {pinOf(d)}"
     if not self.checked.contains(key) {
         self.checked[key] = checkPackage(pl, first, d, dir)
     }

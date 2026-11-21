@@ -1,0 +1,10 @@
+// What tests/run/processStream.qk starts: each line of its input back in capitals, a note on its errors, status 3.
+fn main() -> Int {
+    var n = 0
+    while readLine() is Some(line) {
+        print(line.upper())
+        n += 1
+    }
+    printErr("{n} lines")
+    3
+}

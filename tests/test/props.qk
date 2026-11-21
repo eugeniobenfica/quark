@@ -1,0 +1,42 @@
+// Properties (std.testing's forAll): what holds for every value a generator makes; one that does not hold says the
+// smallest value found that fails it. Run with --coverage: the lines the tests ran, and the ones they did not.
+use std.testing
+
+fn clampTo(x: Int, lo: Int, hi: Int) -> Int {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    x
+}
+
+fn neverCalled() -> Int {
+    let a = 1
+    a + 1
+}
+
+test "a clamped value is in its range" {
+    forAll(pairs(ints(), ints(-10, 10)), p => {
+        let c = clampTo(p.0, p.1 - 5, p.1 + 5)
+        c >= p.1 - 5 and c <= p.1 + 5
+    })
+}
+
+test "reversing twice gives the array back" {
+    forAll(arrays(texts()), xs => xs.reversed().reversed() == xs)
+}
+
+test "one of the values, a Bool, a Float" {
+    forAll(oneOf(["a", "b", "c"]), v => len(v) == 1)
+    forAll(pairs(bools(), floats(0.0, 1.0)), p => p.1 >= 0.0 and p.1 <= 1.0)
+}
+
+test "made from another generator" {
+    forAll(mapGen(ints(0, 50), n => n * 2), n => n % 2 == 0, runs: 50)
+}
+
+test "a property that does not hold: the smallest value that fails it" {
+    forAll(arrays(ints(-20, 20)), xs => xs.sum() < 30)
+}

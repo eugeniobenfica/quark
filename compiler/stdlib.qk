@@ -47,6 +47,36 @@ pub type Process { status: Int, out: Text, err: Text }
 pub effect fn runProcess(program: Text, args: [Text]) -> Process! =
     runtime("process", "runProcess", program, args)
 
+// a program running beside this one, its input, output and errors in pipes (startProcess)
+pub type Subprocess { handle: Int }
+
+// program started with args: what it reads, writes and leaves are this program's to give and take as it runs
+// (writeProcess, readProcess, readProcessErrors, closeProcessInput, waitProcess, killProcess). A read, a write or the
+// wait that would wait gives a task's turn back.
+pub effect fn startProcess(program: Text, args: [Text]) -> Subprocess! =
+    runtime("process", "startProcess", program, args)
+
+// bytes to the process's input (every one: the task waits while the pipe is full)
+pub effect fn writeProcess(p: Subprocess, bytes: Bytes) -> Unit! =
+    runtime("process", "processWrite", p, bytes)
+
+// the process's input ended: it reads its end (a program that reads to the end of its input goes on)
+pub effect fn closeProcessInput(p: Subprocess) = runtime("process", "processCloseInput", p)
+
+// up to most bytes of what the process wrote to its output, as they come; none: it ended its output
+pub effect fn readProcess(p: Subprocess, most: Int) -> Bytes! =
+    runtime("process", "processRead", p, most, 0)
+
+// the same of its errors
+pub effect fn readProcessErrors(p: Subprocess, most: Int) -> Bytes! =
+    runtime("process", "processRead", p, most, 1)
+
+// its end waited for: its exit status (its input closed first; what it still writes is not read)
+pub effect fn waitProcess(p: Subprocess) -> Int! = runtime("process", "processWait", p)
+
+// stopped now (waitProcess then gives the status it stopped with)
+pub effect fn killProcess(p: Subprocess) = runtime("process", "processKill", p)
+
 // an environment variable's value
 pub effect fn env(name: Text) -> Text? = runtime("env", "env", name)
 
@@ -103,6 +133,23 @@ pub effect fn writeSocket(socket: Socket, bytes: Bytes) -> Unit! =
     runtime("net", "writeSocket", socket, bytes)
 
 pub effect fn closeSocket(socket: Socket) = runtime("net", "closeSocket", socket)
+
+// TLS over a connected socket, by the system's library (Schannel, OpenSSL, SecureTransport): the server's certificate
+// checked for serverName by the system's trust (std.net's connectTls and std.http's https:// use it)
+pub type Tls { handle: Int }
+
+// the handshake with the server at the other end of the socket
+pub effect fn tlsConnect(socket: Socket, serverName: Text) -> Tls! =
+    runtime("net", "tlsConnect", socket, serverName)
+
+// what the server said, decrypted, up to most bytes; none when it ended the connection
+pub effect fn readTls(t: Tls, most: Int) -> Bytes! = runtime("net", "readTls", t, most)
+
+// every byte sent, encrypted
+pub effect fn writeTls(t: Tls, bytes: Bytes) -> Unit! = runtime("net", "writeTls", t, bytes)
+
+// the end sent, and the socket closed
+pub effect fn closeTls(t: Tls) = runtime("net", "closeTls", t)
 
 // ---- tasks: functions run a step at a time (runtime/tasks.qk) ----
 // a task of f: step runs it until it gives its turn back
@@ -1236,9 +1283,10 @@ pub fn sha256Hex(text: Text) -> Text = hex(sha256(text.bytes()))
     }
     if name == "http" {
         return r"""
-// HTTP/1.1 without TLS (http://, not https://): a server that runs each connection in a task of its own, and a
-// client. A request's and a response's body is read by its Content-Length (a chunked body, as servers send without
-// one, is read to the end of the connection); each connection serves one request (Connection: close).
+// HTTP/1.1: a server that runs each connection in a task of its own, and a client. A request's and a response's body
+// is read by its Content-Length (a chunked body, as servers send without one, is read to the end of the connection);
+// each connection serves one request (Connection: close). The client takes https:// too, over TLS (std.net's
+// connectTls); the server speaks plain HTTP (TLS before it is a proxy's).
 //
 //     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
 //     fn main() {
@@ -1403,15 +1451,13 @@ pub fn serve(host: Text, port: Int, handler: effect (Request) -> Response) -> Un
     Ok(())
 }
 
-// http://host[:port]/path?query: (host, port, the path with its query)
+// http://host[:port]/path?query (https://: over TLS): (host, port, the path with its query)
 pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
-    if url.startsWith("https://") {
-        return Err("https is not supported (no TLS): {url}")
+    let secure = url.startsWith("https://")
+    if not secure and not url.startsWith("http://") {
+        return Err("not an http:// or https:// URL: {url}")
     }
-    if not url.startsWith("http://") {
-        return Err("not an http:// URL: {url}")
-    }
-    let rest = url[7..]
+    let rest = url[(if secure { 8 } else { 7 })..]
     let slash = rest.indexOf("/")
     let authority = if slash is Some(i) { rest[..i] } else { rest }
     let target = if slash is Some(i) { rest[i..] } else { "/" }
@@ -1420,16 +1466,24 @@ pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
         let port = authority[i + 1..].parseInt().mapErr(why => "the port: {why}")?
         return Ok((authority[..i], port, target))
     }
-    Ok((authority, 80, target))
+    Ok((authority, if secure { 443 } else { 80 }, target))
 }
 
 // a request to url: its method, its headers (names in lower case) and its body; the response
 pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
     let (host, port, target) = parseUrl(url)?
-    let socket = connect(host, port)?
-    let c = conn(socket)
+    let secure = url.startsWith("https://")
+    let c = if secure {
+        connectTls(host, port)?
+    } else {
+        conn(connect(host, port)?)
+    }
     var all = headers
-    all["host"] = if port == 80 { host } else { "{host}:{port}" }
+    all["host"] = if port == (if secure { 443 } else { 80 }) {
+        host
+    } else {
+        "{host}:{port}"
+    }
     let sent = c.writeBytes(head("{method} {target} HTTP/1.1", all, body))
     if sent is Err(why) {
         c.close()
@@ -1517,6 +1571,182 @@ pub fn Json.integer(self) -> Int? = match self {
 pub fn Json.text(self) -> Text? = match self {
     Str(s) => s
     _ => None
+}
+
+// ---- a program's values as JSON, and back, by their types ----
+// jsonOf and fromJson are made for each type they are used with (compiler/check.qk's jsonBody): a record is an
+// object of its fields; an enum's case without data its name, one with data an object of one entry, its name and an
+// object of its fields; an array a list; a map from Text (or Int, as text) an object; an optional null when None; a
+// tuple a list; Int, Float, Bool and Text themselves. A field missing from an object takes its default, and an
+// optional one None.
+//   let text = encode(Person("Ana", 34, ["x"]))       // {"name":"Ana","age":34,"tags":["x"]}
+//   let p: Person = decode(text)?
+// v as JSON
+pub fn jsonOf<T>(value: T) -> Json = Json.Null
+
+// the T this JSON is, or why it is not one
+pub fn fromJson<T>(j: Json) -> T! = Err("JSON: no reading for this type")
+
+// v as JSON text, on one line
+pub fn encode<T>(value: T) -> Text = toJson(jsonOf(value))
+
+// the T this JSON text is, or why it is not one
+pub fn decode<T>(text: Text) -> T! {
+    let got: T! = fromJson(parseJson(text)?)
+    got
+}
+
+// what kind of JSON value this is, for a message
+pub fn Json.kindName(self) -> Text = match self {
+    Null => "null"
+    Bool(_) => "a boolean"
+    Num(_) | Integer(_) | NumberText(_) => "a number"
+    Str(_) => "a text"
+    List(_) => "a list"
+    Object(_) => "an object"
+}
+
+// an object's fields, or None
+pub fn Json.fields(self) -> [Text: Json]? = match self {
+    Object(fields) => Some(fields)
+    _ => None
+}
+
+// a list's items, or None
+pub fn Json.items(self) -> [Json]? = match self {
+    List(items) => Some(items)
+    _ => None
+}
+
+pub fn intOfJson(j: Json) -> Int! {
+    if j.integer() is Some(n) {
+        return n
+    }
+    if j.number() is Some(x) and x == floor(x) and abs(x) < 9007199254740992.0 {
+        return toInt(x)
+    }
+    Err("JSON: an Int, not {j.kindName()}")
+}
+
+pub fn floatOfJson(j: Json) -> Float! =
+    j.number() ?? return Err("JSON: a number, not {j.kindName()}")
+
+pub fn boolOfJson(j: Json) -> Bool! = match j {
+    Bool(b) => b
+    _ => Err("JSON: true or false, not {j.kindName()}")
+}
+
+pub fn textOfJson(j: Json) -> Text! = j.text() ?? return Err("JSON: a text, not {j.kindName()}")
+
+// field name of an object as a T: its error said with its name
+pub fn fieldFromJson<T>(fields: [Text: Json], name: Text) -> T! {
+    let got: T! = fromJson(fields[name] ?? Json.Null)
+    match got {
+        Ok(v) => v
+        Err(why) => Err("{name}: {why}")
+    }
+}
+
+// an optional field: None when it is missing or null (none: None, which tells E)
+pub fn optionFieldFromJson<E>(fields: [Text: Json], name: Text, none: E?) -> E?! {
+    let j = fields[name] ?? Json.Null
+    if j == Json.Null {
+        return Ok(none)
+    }
+    let got: E! = fromJson(j)
+    match got {
+        Ok(v) => Ok(Some(v))
+        Err(why) => Err("{name}: {why}")
+    }
+}
+
+// a list as [E] (out: an empty one, of the type)
+pub fn listFromJson<E>(j: Json, out: [E]) -> [E]! {
+    let items = j.items() ?? return Err("JSON: a list, not {j.kindName()}")
+    var r = out
+    for (i, x) in items.enumerate() {
+        let got: E! = fromJson(x)
+        match got {
+            Ok(v) => r.push(v)
+            Err(why) => return Err("[{i}]: {why}")
+        }
+    }
+    r
+}
+
+// an object as [Text: V]
+pub fn mapFromJson<V>(j: Json, out: [Text: V]) -> [Text: V]! {
+    let fields = j.fields() ?? return Err("JSON: an object, not {j.kindName()}")
+    var r = out
+    for (k, x) in fields {
+        let got: V! = fromJson(x)
+        match got {
+            Ok(v) => {
+                r[k] = v
+            }
+            Err(why) => return Err("{k}: {why}")
+        }
+    }
+    r
+}
+
+// an object as [Int: V]: its keys whole numbers
+pub fn intMapFromJson<V>(j: Json, out: [Int: V]) -> [Int: V]! {
+    let fields = j.fields() ?? return Err("JSON: an object, not {j.kindName()}")
+    var r = out
+    for (k, x) in fields {
+        let n = k.parseInt() ?? return Err("JSON: the key {k} is not an Int")
+        let got: V! = fromJson(x)
+        match got {
+            Ok(v) => {
+                r[n] = v
+            }
+            Err(why) => return Err("{k}: {why}")
+        }
+    }
+    r
+}
+
+// null as None, anything else as Some
+pub fn optionFromJson<E>(j: Json, none: E?) -> E?! {
+    if j == Json.Null {
+        return Ok(none)
+    }
+    let got: E! = fromJson(j)
+    match got {
+        Ok(v) => Ok(Some(v))
+        Err(why) => Err(why)
+    }
+}
+
+// a tuple's item i
+pub fn itemFromJson<E>(items: [Json], i: Int) -> E! {
+    let got: E! = fromJson(items.get(i) ?? return Err("JSON: the tuple has no item {i}"))
+    match got {
+        Ok(v) => v
+        Err(why) => Err("[{i}]: {why}")
+    }
+}
+
+// an enum's case in JSON: its name, and the object of its fields ({} for a case without data)
+pub fn caseOfJson(j: Json, typeName: Text) -> (Text, [Text: Json])! {
+    let none: [Text: Json] = [:]
+    match j {
+        Str(name) => (name, none)
+        Object(fields) => {
+            if len(fields) != 1 {
+                return Err("JSON: a {typeName} is a case's name, or an object of one case")
+            }
+            for (name, inner) in fields {
+                let f = inner.fields() ?? return Err(
+                    "JSON: case {name} of {typeName}: an object of its fields, not {inner.kindName()}",
+                )
+                return (name, f)
+            }
+            Err("JSON: no case")
+        }
+        _ => Err("JSON: a {typeName} is a case's name, or an object of one case, not {j.kindName()}")
+    }
 }
 
 // a text in quotes, with what JSON escapes escaped (every piece between them goes in whole)
@@ -1873,20 +2103,46 @@ pub const tau = 6.283185307179586
 //         }
 //     })
 //     runTasks()
+//
+// connectTls(host) is a connection over TLS (the system's: Schannel, OpenSSL, SecureTransport), read and written as
+// any other.
 const part = 16384
 
-// a socket read with what came and was not used yet kept. closed: the other end closed it; error: why a read
-// stopped early ("" when none did)
-pub type Conn { socket: Socket, buffer: Bytes = [], closed: Bool = false, error: Text = "" }
+// a socket read with what came and was not used yet kept (through TLS when tls is there). closed: the other end
+// closed it; error: why a read stopped early ("" when none did)
+pub type Conn {
+    socket: Socket
+    tls: Tls? = None
+    buffer: Bytes = []
+    closed: Bool = false
+    error: Text = ""
+}
 
 pub fn conn(socket: Socket) -> Conn = Conn(socket)
+
+// a connection to host:port over TLS, the server's certificate checked for host by the system's trust
+pub fn connectTls(host: Text, port: Int = 443) -> Conn! {
+    let socket = connect(host, port)?
+    match tlsConnect(socket, host) {
+        Ok(t) => Ok(Conn(socket, tls: Some(t)))
+        Err(why) => {
+            closeSocket(socket)
+            Err(why)
+        }
+    }
+}
 
 // more bytes into the buffer; false when there will be no more (closed, or an error)
 fn Conn.fill(var self) -> Bool {
     if self.closed or self.error != "" {
         return false
     }
-    match readSocket(self.socket, part) {
+    let got = if self.tls is Some(t) {
+        readTls(t, part)
+    } else {
+        readSocket(self.socket, part)
+    }
+    match got {
         Ok(more) => {
             if len(more) == 0 {
                 self.closed = true
@@ -1964,11 +2220,19 @@ pub fn Conn.readAll(var self) -> Bytes! {
     Ok(got)
 }
 
-pub fn Conn.write(self, text: Text) -> Unit! = writeSocket(self.socket, text.bytes())
+pub fn Conn.write(self, text: Text) -> Unit! = self.writeBytes(text.bytes())
 
-pub fn Conn.writeBytes(self, bytes: Bytes) -> Unit! = writeSocket(self.socket, bytes)
+pub fn Conn.writeBytes(self, bytes: Bytes) -> Unit! = if self.tls is Some(t) {
+    writeTls(t, bytes)
+} else {
+    writeSocket(self.socket, bytes)
+}
 
-pub fn Conn.close(self) = closeSocket(self.socket)
+pub fn Conn.close(self) = if self.tls is Some(t) {
+    closeTls(t)
+} else {
+    closeSocket(self.socket)
+}
 """ + "\n"
     }
     if name == "path" {
@@ -2684,13 +2948,218 @@ pub fn assertErr<T>(result: T!, part: Text = "", what: Text = "") {
 }
 
 fn named(what: Text) -> Text = if what == "" { "" } else { "{what}: " }
+
+// ---- properties: what holds for every value a generator makes; when one fails, the smallest value found that fails --
+//
+//     test "reversing twice gives the array back" {
+//         forAll(arrays(ints()), xs => xs.reversed().reversed() == xs)
+//     }
+// values of T: one made from a seed and a size (0 to 99: how big it may be; small ones come first), and the values
+// smaller than one, simplest first (tried when a property fails, to find the smallest value that fails it)
+pub type Gen<T> { make: (Int, Int) -> T, smaller: (T) -> [T] }
+
+// the property holds for runs values of gen, or stop, saying the smallest value found that it does not hold for. The
+// values are the same each time (another seed gives others).
+pub fn forAll<T>(gen: Gen<T>, property: (T) -> Bool, runs: Int = 100, seed: Int = 1) {
+    for run in 0..runs {
+        let value = gen.make(mixed(seed *% 1_000_003 +% run), run * 100 / max(runs, 1))
+        if property(value) {
+            continue
+        }
+        var least = value
+        var steps = 0
+        var smaller = true
+        while smaller and steps < 1000 {
+            smaller = false
+            for candidate in gen.smaller(least) {
+                if not property(candidate) {
+                    least = candidate
+                    steps += 1
+                    smaller = true
+                    break
+                }
+            }
+        }
+        printErr("forAll: the property does not hold for:", least)
+        if steps > 0 {
+            printErr("        made smaller {steps} times from:", value)
+        }
+        assert(false, "forAll: the property does not hold (value {run + 1} of {runs}, seed {seed})")
+    }
+}
+
+// Ints from lo to hi, both in: near 0 (or the end of the range nearest it) first, then from all of it
+pub fn ints(lo: Int = -1000, hi: Int = 1000) -> Gen<Int> = Gen((seed, size) => {
+    let center = clamped(0, lo, hi)
+    let reach = max(1, (hi - lo) / 100 * (size + 1) + size)
+    between(seed, max(lo, center - reach), min(hi, center + reach))
+}, x => {
+    let center = clamped(0, lo, hi)
+    var out: [Int] = []
+    for c in [center, x - (x - center) / 2, if x > center { x - 1 } else { x + 1 }] {
+        if c != x and c >= lo and c <= hi and not out.contains(c) and abs(c - center) < abs(x - center) {
+            out.push(c)
+        }
+    }
+    out
+})
+
+// Floats from lo to hi
+pub fn floats(lo: Float = -1000.0, hi: Float = 1000.0) -> Gen<Float> = Gen((seed, size) => {
+    let unit = toFloat(seed & (1 << 53 - 1)) / 9007199254740992.0
+    let center = min(max(0.0, lo), hi)
+    let reach = (hi - lo) * toFloat(size + 1) / 100.0
+    min(hi, max(lo, center - reach + 2.0 * reach * unit))
+}, x => {
+    let center = min(max(0.0, lo), hi)
+    var out: [Float] = []
+    for c in [center, toFloat(round(x)), (x + center) / 2.0] {
+        if c != x and c >= lo and c <= hi and not out.contains(c) and abs(c - center) < abs(x - center) {
+            out.push(c)
+        }
+    }
+    out
+})
+
+// true or false; false is the smaller
+pub fn bools() -> Gen<Bool> = Gen((seed, size) => seed & 1 == 1, b => if b { [false] } else { [] })
+
+// texts of up to most characters from those of alphabet
+pub fn texts(most: Int = 20, alphabet: Text = "abcdefghijklmnopqrstuvwxyz ABC0123,.é😀") -> Gen<Text> {
+    let chars = textChars(alphabet)
+    Gen((seed, size) => {
+        let n = between(seed, 0, min(most, size / 4 + 1))
+        var t = ""
+        for i in 0..n {
+            t += chars[between(mixed(seed +% i +% 1), 0, len(chars) - 1)]
+        }
+        t
+    }, t => {
+        let cs = textChars(t)
+        var out: [Text] = []
+        if len(cs) > 0 {
+            out.push("")
+            out.push(cs[..len(cs) / 2].join(""))
+            out.push(cs[len(cs) / 2..].join(""))
+        }
+        for i in 0..min(len(cs), 20) {
+            out.push(cs[..i].join("") + cs[i + 1..].join(""))
+            if cs[i] != chars[0] {
+                out.push(cs[..i].join("") + chars[0] + cs[i + 1..].join(""))
+            }
+        }
+        out.filter(s => s != t).toArray()
+    })
+}
+
+// arrays of up to most values of of
+pub fn arrays<T>(of: Gen<T>, most: Int = 20) -> Gen<[T]> {
+    let g: Gen<[T]> = Gen((seed, size) => {
+        let n = between(seed, 0, min(most, size / 4 + 1))
+        var xs: [T] = []
+        for i in 0..n {
+            xs.push(of.make(mixed(seed +% i +% 1), size))
+        }
+        xs
+    }, xs => {
+        var out: [[T]] = []
+        if len(xs) > 0 {
+            out.push([])
+        }
+        if len(xs) > 1 {
+            out.push(xs[..len(xs) / 2])
+            out.push(xs[len(xs) / 2..])
+        }
+        for i in 0..min(len(xs), 20) {
+            out.push(xs[..i] + xs[i + 1..]) // one fewer
+        }
+        for i in 0..min(len(xs), 20) {
+            for s in of.smaller(xs[i]) {
+                var ys = xs
+                ys[i] = s // one smaller
+                out.push(ys)
+            }
+        }
+        out
+    })
+    g
+}
+
+// pairs of a value of a and one of b
+pub fn pairs<A, B>(a: Gen<A>, b: Gen<B>) -> Gen<(A, B)> {
+    let g: Gen<(A, B)> = Gen((seed, size) => (a.make(mixed(seed), size), b.make(mixed(seed +% 1), size)), p => {
+        let (x, y) = p
+        var out: [(A, B)] = []
+        for s in a.smaller(x) {
+            out.push((s, y))
+        }
+        for s in b.smaller(y) {
+            out.push((x, s))
+        }
+        out
+    })
+    g
+}
+
+// one of the values (the ones before it are the smaller)
+pub fn oneOf<T>(values: [T]) -> Gen<T> {
+    let g: Gen<T> = Gen((seed, size) => values[between(seed, 0, len(values) - 1)], v => {
+        var out: [T] = []
+        for x in values {
+            if x == v {
+                break
+            }
+            out.push(x)
+        }
+        out
+    })
+    g
+}
+
+// values of gen made into others by f (a record of them, say); f has no way back, so none is smaller
+pub fn mapGen<A, B>(gen: Gen<A>, f: (A) -> B) -> Gen<B> {
+    let by = Mapping(f) // (a lambda keeps a record of functions, not a function given to the one around it)
+    let g: Gen<B> = Gen((seed, size) => by.made(gen.make(seed, size)), b => [])
+    g
+}
+
+type Mapping<A, B> { made: (A) -> B }
+
+// a text's characters, each a text
+fn textChars(t: Text) -> [Text] {
+    var out: [Text] = []
+    for c in t.codePoints() {
+        out.push(char(c))
+    }
+    out
+}
+
+// from lo to hi, both in, as the seed says
+fn between(seed: Int, lo: Int, hi: Int) -> Int =
+    if hi <= lo { lo } else { lo + seed & intMaxBits % (hi - lo + 1) }
+
+const intMaxBits = 1 << 62 - 1 + 1 << 62
+
+fn clamped(x: Int, lo: Int, hi: Int) -> Int = min(max(x, lo), hi)
+
+// a seed's bits mixed (SplitMix64's): a new seed for each value, each part of a value
+fn mixed(x: Int) -> Int {
+    var z = x +% -7046029254386353131
+    z = (z ^ shiftedDown(z, 30)) *% -4658895280553007687
+    z = (z ^ shiftedDown(z, 27)) *% -7723592293110705685
+    z ^ shiftedDown(z, 31)
+}
+
+fn shiftedDown(x: Int, n: Int) -> Int = x >> n & (1 << (64 - n)) - 1
 """ + "\n"
     }
     if name == "time" {
         return r"""
 // Dates and times in UTC, on the Gregorian calendar: from and to the seconds unixTime() gives, weekdays, days
 // added, and ISO 8601 text both ways (2026-11-13, 2026-11-13T09:30:05.250Z); and the local time, by the system's
-// time zone (localOffset).
+// time zone (localOffset); and time zones by name (zone("Europe/Lisbon")).
+use std.zones
+
 pub type Date { year: Int, month: Int, day: Int }
 
 // a moment to the millisecond, in UTC
@@ -2802,6 +3271,17 @@ pub fn DateTime.toIso(self) -> Text {
         ".{padded(self.millisecond, 3)}"
     }
     "{self.date().toIso()}T{padded(self.hour, 2)}:{padded(self.minute, 2)}:{padded(self.second, 2)}{ms}Z"
+}
+
+// as ISO 8601 for clocks that many seconds east of UTC: 2026-11-13T10:30:05+01:00 (Z when 0)
+pub fn DateTime.toIsoOffset(self, offset: Int) -> Text {
+    let t = self.toIso()
+    if offset == 0 {
+        return t
+    }
+    let sign = if offset < 0 { "-" } else { "+" }
+    let a = abs(offset) / 60
+    "{t[..len(t) - 1]}{sign}{padded(a / 60, 2)}:{padded(a % 60, 2)}"
 }
 
 // an ISO 8601 date, YYYY-MM-DD, or why it is not one
@@ -2937,6 +3417,556 @@ pub fn local(seconds: Float) -> DateTime = utc(seconds + toFloat(localOffset(sec
 
 // now, in local time
 pub fn localNow() -> DateTime = local(unixTime())
+
+// ---- time zones by name (the IANA database's: "Europe/Lisbon", "America/Sao_Paulo", "UTC") ----
+// A zone's offsets from UTC over time: from the system's zone files where it has them (Linux, macOS: their whole
+// history, TZif), else from the rule of each zone now that std.zones keeps (Windows, WebAssembly).
+pub type Zone {
+    name: Text
+    times: [Int] = [] // the moments its offset changed (seconds since 1970), in order
+    kinds: [Int] = [] // the kind in force from each
+    offsets: [Int] = [] // each kind's offset (seconds east of UTC), whether it is summer time, its abbreviation
+    summer: [Bool] = []
+    abbreviations: [Text] = []
+    rule: Text = "" // after the last change: a POSIX TZ rule ("WET0WEST,M3.5.0/1,M10.5.0")
+}
+
+// the zone of this name, or why there is none
+pub fn zone(name: Text) -> Zone! {
+    if name == "" or name.startsWith("/") or name.contains("..") or name.bytes().any(c => not isZoneChar(c)) {
+        return Err("time zone {name}: not a zone's name")
+    }
+    for root in zoneRoots() {
+        if readBytes("{root}/{name}") is Ok(b) and len(b) > 44 and b[..4] == "TZif".bytes() {
+            return readTzif(name, b)
+        }
+    }
+    let rule = ruleOf(name) ?? return Err("time zone {name}: no such zone")
+    let _ = ruleOffsets(rule)?
+    Zone(name, rule: rule)
+}
+
+fn isZoneChar(c: Int) -> Bool = c is 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '-' | '+'
+
+fn zoneRoots() -> [Text] {
+    var roots: [Text] = []
+    if env("ZONEINFO") is Some(z) {
+        roots.push(z)
+    }
+    roots + ["/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo"]
+}
+
+// the zones std.zones knows by name
+pub fn zoneNames() -> [Text] = zoneRules.map(l => l.split(" ")[0]).toArray()
+
+fn ruleOf(name: Text) -> Text? {
+    for line in zoneRules {
+        let at = line.indexOf(" ") ?? continue
+        if line[..at] == name {
+            return line[at + 1..]
+        }
+    }
+    None
+}
+
+// a zone's offset from UTC at that moment, in seconds east (summer time counted)
+pub fn Zone.offsetAt(self, seconds: Float) -> Int = self.kindAt(toInt(floor(seconds))).0
+
+// whether that moment is in the zone's summer time
+pub fn Zone.isSummerAt(self, seconds: Float) -> Bool = self.kindAt(toInt(floor(seconds))).1
+
+// the zone's abbreviation then ("WEST", "-03")
+pub fn Zone.abbreviationAt(self, seconds: Float) -> Text = self.kindAt(toInt(floor(seconds))).2
+
+// the date and time on the zone's clocks at that moment
+pub fn Zone.at(self, seconds: Float) -> DateTime = utc(seconds + toFloat(self.offsetAt(seconds)))
+
+// that moment as ISO 8601 on the zone's clocks, with its offset: 2026-07-01T13:00:00+01:00
+pub fn Zone.isoAt(self, seconds: Float) -> Text =
+    self.at(seconds).toIsoOffset(self.offsetAt(seconds))
+
+// the moment the zone's clocks show that date and time: of two (the hour clocks go back), the first; in a gap
+// (the hour they skip), as many seconds after it as into it
+pub fn Zone.moment(self, local: DateTime) -> Float {
+    let wall = local.seconds()
+    var best = -1.0
+    var found = false
+    for d in [-86400.0, 0.0, 86400.0] {
+        let off = toFloat(self.offsetAt(wall + d))
+        let t = wall - off
+        if toFloat(self.offsetAt(t)) == off and (not found or t < best) {
+            best = t
+            found = true
+        }
+    }
+    if found {
+        best
+    } else {
+        wall - toFloat(self.offsetAt(wall - 86400.0))
+    }
+}
+
+// now, on the zone's clocks
+pub fn Zone.now(self) -> DateTime = self.at(unixTime())
+
+// (offset, summer, abbreviation) at moment t
+fn Zone.kindAt(self, t: Int) -> (Int, Bool, Text) {
+    let n = len(self.times)
+    if n > 0 and t >= self.times[0] and (t < self.times[n - 1] or self.rule == "") {
+        // the last change at or before t
+        var lo = 0
+        var hi = n - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if self.times[mid] <= t {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        let k = self.kinds[lo]
+        return (self.offsets[k], self.summer[k], self.abbreviations[k])
+    }
+    if n > 0 and t < self.times[0] or self.rule == "" {
+        // before the first change: the first kind that is not summer time
+        for (k, s) in self.summer.enumerate() {
+            if not s {
+                return (self.offsets[k], false, self.abbreviations[k])
+            }
+        }
+        if len(self.offsets) > 0 {
+            return (self.offsets[0], self.summer[0], self.abbreviations[0])
+        }
+        return (0, false, "UTC")
+    }
+    ruleAt(self.rule, t)
+}
+
+// ---- TZif (RFC 8536): version 2 and on, its 64-bit part ----
+fn bigEndian(b: Bytes, at: Int, n: Int) -> Int {
+    var v = 0
+    for i in 0..n {
+        v = v << 8 | b[at + i]
+    }
+    if n < 8 and v >= 1 << (8 * n - 1) { v - 1 << (8 * n) } else { v }
+}
+
+fn readTzif(name: Text, b: Bytes) -> Zone! {
+    let bad = "time zone {name}: its file is not TZif"
+    var at = 0
+    var wide = false
+    if b[4] >= '2' {
+        // past the version 1 part: its counts say how long it is
+        let counts = (0..6).map(i => bigEndian(b, 20 + 4 * i, 4)).toArray()
+        at = 44 + counts[3] * 5 + counts[4] * 6 + counts[5] + counts[2] * 8 + counts[1] + counts[0]
+        wide = true
+        if at + 44 > len(b) or b[at..at + 4] != "TZif".bytes() {
+            return Err(bad)
+        }
+    }
+    let c = (0..6).map(i => bigEndian(b, at + 20 + 4 * i, 4)).toArray()
+    let isut = c[0]
+    let isstd = c[1]
+    let leap = c[2]
+    let timecnt = c[3]
+    let typecnt = c[4]
+    let charcnt = c[5]
+    let tsize = if wide { 8 } else { 4 }
+    var p = at + 44
+    let need = p + timecnt * (tsize + 1) + typecnt * 6 + charcnt + leap * (tsize + 4) + isstd + isut
+    if need > len(b) or typecnt == 0 {
+        return Err(bad)
+    }
+    var z = Zone(name)
+    for i in 0..timecnt {
+        z.times.push(bigEndian(b, p + tsize * i, tsize))
+    }
+    p += timecnt * tsize
+    for i in 0..timecnt {
+        z.kinds.push(b[p + i])
+    }
+    p += timecnt
+    let chars = p + typecnt * 6
+    for i in 0..typecnt {
+        z.offsets.push(bigEndian(b, p + 6 * i, 4))
+        z.summer.push(b[p + 6 * i + 4] != 0)
+        let from = chars + b[p + 6 * i + 5]
+        var to = from
+        while to < chars + charcnt and b[to] != 0 {
+            to += 1
+        }
+        z.abbreviations.push(Text(b[from..to]) ?? "")
+    }
+    p = need
+    if wide and p < len(b) and b[p] == '\n' {
+        var e = p + 1
+        while e < len(b) and b[e] != '\n' {
+            e += 1
+        }
+        z.rule = Text(b[p + 1..e]) ?? ""
+        if z.rule != "" {
+            let _ = ruleOffsets(z.rule)?
+        }
+    }
+    z
+}
+
+// ---- POSIX TZ rules: "EST5EDT,M3.2.0,M11.1.0", "<-03>3", "WET0WEST,M3.5.0/1,M10.5.0" ----
+type Rule {
+    std: Text
+    stdOffset: Int // seconds east of UTC
+    dst: Text = ""
+    dstOffset: Int = 0
+    start: Text = "" // Mm.w.d, Jn or n, and the time (seconds) on the clocks then
+    startTime: Int = 7200
+    end: Text = ""
+    endTime: Int = 7200
+}
+
+type RuleReader { t: Bytes, at: Int = 0 }
+
+fn RuleReader.name(var self) -> Text! {
+    let b = self.t
+    if self.at < len(b) and b[self.at] == '<' {
+        let from = self.at + 1
+        while self.at < len(b) and b[self.at] != '>' {
+            self.at += 1
+        }
+        if self.at >= len(b) {
+            return Err("an abbreviation's < has no >")
+        }
+        self.at += 1
+        return Text(b[from..self.at - 1]) ?? ""
+    }
+    let from = self.at
+    while self.at < len(b) and b[self.at] is 'a'..='z' | 'A'..='Z' {
+        self.at += 1
+    }
+    if self.at - from < 3 {
+        return Err("an abbreviation of 3 letters or more")
+    }
+    Text(b[from..self.at]) ?? ""
+}
+
+// [+-]hh[:mm[:ss]] as seconds
+fn RuleReader.time(var self) -> Int! {
+    let b = self.t
+    var sign = 1
+    if self.at < len(b) and b[self.at] is '+' | '-' {
+        sign = if b[self.at] == '-' { -1 } else { 1 }
+        self.at += 1
+    }
+    var parts = [0, 0, 0]
+    for k in 0..3 {
+        if k > 0 {
+            if self.at >= len(b) or b[self.at] != ':' {
+                break
+            }
+            self.at += 1
+        }
+        let from = self.at
+        while self.at < len(b) and b[self.at] is '0'..='9' {
+            parts[k] = parts[k] * 10 + b[self.at] - '0'
+            self.at += 1
+        }
+        if self.at == from {
+            return Err("a time (hh[:mm[:ss]])")
+        }
+    }
+    sign * (parts[0] * 3600 + parts[1] * 60 + parts[2])
+}
+
+fn RuleReader.date(var self) -> Text {
+    let b = self.t
+    let from = self.at
+    while self.at < len(b) and b[self.at] != ',' and b[self.at] != '/' {
+        self.at += 1
+    }
+    Text(b[from..self.at]) ?? ""
+}
+
+fn parseRule(text: Text) -> Rule! {
+    var r = RuleReader(text.bytes())
+    let std = r.name()?
+    var rule = Rule(std, -r.time()?)
+    if r.at >= len(r.t) {
+        return rule
+    }
+    rule.dst = r.name()?
+    rule.dstOffset = rule.stdOffset + 3600
+    if r.at < len(r.t) and r.t[r.at] != ',' {
+        rule.dstOffset = -r.time()?
+    }
+    if r.at >= len(r.t) {
+        rule.start = "M3.2.0" // a summer time with no dates: the United States' (POSIX's default)
+        rule.end = "M11.1.0"
+        return rule
+    }
+    r.at += 1
+    rule.start = r.date()
+    if r.at < len(r.t) and r.t[r.at] == '/' {
+        r.at += 1
+        rule.startTime = r.time()?
+    }
+    if r.at >= len(r.t) or r.t[r.at] != ',' {
+        return Err("the summer time's end")
+    }
+    r.at += 1
+    rule.end = r.date()
+    if r.at < len(r.t) and r.t[r.at] == '/' {
+        r.at += 1
+        rule.endTime = r.time()?
+    }
+    rule
+}
+
+// the rule read, or why it is not one (a zone checks its rule once, when made)
+fn ruleOffsets(text: Text) -> Rule! = parseRule(text).mapErr(why => "time zone rule {text}: {why}")
+
+// the day (since 1970) a rule's date names in year y: Mm.w.d (the d-th weekday, Sunday 0, of week w, 5 the last, of
+// month m), Jn (day n of 365, February 29 never counted), n (day n from 0, February 29 counted)
+fn ruleDay(date: Text, y: Int) -> Int {
+    let jan1 = Date(y, 1, 1).days()
+    if date.startsWith("M") {
+        let parts = date[1..].split(".").map(p => p.parseInt() ?? 0).toArray()
+        let m = parts.get(0) ?? 1
+        let w = parts.get(1) ?? 1
+        let d = parts.get(2) ?? 0
+        let first = Date(y, m, 1).days()
+        let wd = (first + 4) % 7 // 1970-01-01 was a Thursday
+        var day = 1 + (d - wd + 7) % 7 + 7 * (w - 1)
+        while day > daysInMonth(y, m) {
+            day -= 7
+        }
+        return first + day - 1
+    }
+    if date.startsWith("J") {
+        let n = date[1..].parseInt() ?? 1
+        return jan1 + n - 1 + (if isLeapYear(y) and n >= 60 { 1 } else { 0 })
+    }
+    jan1 + (date.parseInt() ?? 0)
+}
+
+fn ruleAt(text: Text, t: Int) -> (Int, Bool, Text) {
+    let Ok(r) = parseRule(text) else {
+        return (0, false, "UTC")
+    }
+    if r.dst == "" {
+        return (r.stdOffset, false, r.std)
+    }
+    let y = utc(toFloat(t + r.stdOffset)).year
+    // the summer's start on the standard clocks, its end on the summer ones
+    let start = ruleDay(r.start, y) * 86400 + r.startTime - r.stdOffset
+    let end = ruleDay(r.end, y) * 86400 + r.endTime - r.dstOffset
+    let summer = if start < end {
+        t >= start and t < end
+    } else {
+        not (t >= end and t < start)
+    }
+    if summer {
+        (r.dstOffset, true, r.dst)
+    } else {
+        (r.stdOffset, false, r.std)
+    }
+}
+""" + "\n"
+    }
+    if name == "zones" {
+        return r"""
+// Made by tools/zones.py from the IANA time zone database (tzdata 2026f, public domain): each zone's rule now,
+// as POSIX TZ text, for std.time where the system has no zone files (Windows, WebAssembly).
+pub const tzdataVersion = "2026f"
+
+// each zone's "name rule"
+pub const zoneRules = [
+    "Africa/Abidjan GMT0", "Africa/Accra GMT0", "Africa/Addis_Ababa EAT-3", "Africa/Algiers CET-1",
+    "Africa/Asmara EAT-3", "Africa/Asmera EAT-3", "Africa/Bamako GMT0", "Africa/Bangui WAT-1", "Africa/Banjul GMT0",
+    "Africa/Bissau GMT0", "Africa/Blantyre CAT-2", "Africa/Brazzaville WAT-1", "Africa/Bujumbura CAT-2",
+    "Africa/Cairo EET-2EEST,M4.5.5/0,M10.5.4/24", "Africa/Casablanca <+00>0", "Africa/Ceuta CET-1CEST,M3.5.0,M10.5.0/3",
+    "Africa/Conakry GMT0", "Africa/Dakar GMT0", "Africa/Dar_es_Salaam EAT-3", "Africa/Djibouti EAT-3",
+    "Africa/Douala WAT-1", "Africa/El_Aaiun <+00>0", "Africa/Freetown GMT0", "Africa/Gaborone CAT-2",
+    "Africa/Harare CAT-2", "Africa/Johannesburg SAST-2", "Africa/Juba CAT-2", "Africa/Kampala EAT-3",
+    "Africa/Khartoum CAT-2", "Africa/Kigali CAT-2", "Africa/Kinshasa WAT-1", "Africa/Lagos WAT-1",
+    "Africa/Libreville WAT-1", "Africa/Lome GMT0", "Africa/Luanda WAT-1", "Africa/Lubumbashi CAT-2",
+    "Africa/Lusaka CAT-2", "Africa/Malabo WAT-1", "Africa/Maputo CAT-2", "Africa/Maseru SAST-2",
+    "Africa/Mbabane SAST-2", "Africa/Mogadishu EAT-3", "Africa/Monrovia GMT0", "Africa/Nairobi EAT-3",
+    "Africa/Ndjamena WAT-1", "Africa/Niamey WAT-1", "Africa/Nouakchott GMT0", "Africa/Ouagadougou GMT0",
+    "Africa/Porto-Novo WAT-1", "Africa/Sao_Tome GMT0", "Africa/Timbuktu GMT0", "Africa/Tripoli EET-2",
+    "Africa/Tunis CET-1", "Africa/Windhoek CAT-2", "America/Adak HST10HDT,M3.2.0,M11.1.0",
+    "America/Anchorage AKST9AKDT,M3.2.0,M11.1.0", "America/Anguilla AST4", "America/Antigua AST4",
+    "America/Araguaina <-03>3", "America/Argentina/Buenos_Aires <-03>3", "America/Argentina/Catamarca <-03>3",
+    "America/Argentina/ComodRivadavia <-03>3", "America/Argentina/Cordoba <-03>3", "America/Argentina/Jujuy <-03>3",
+    "America/Argentina/La_Rioja <-03>3", "America/Argentina/Mendoza <-03>3", "America/Argentina/Rio_Gallegos <-03>3",
+    "America/Argentina/Salta <-03>3", "America/Argentina/San_Juan <-03>3", "America/Argentina/San_Luis <-03>3",
+    "America/Argentina/Tucuman <-03>3", "America/Argentina/Ushuaia <-03>3", "America/Aruba AST4",
+    "America/Asuncion <-03>3", "America/Atikokan EST5", "America/Atka HST10HDT,M3.2.0,M11.1.0", "America/Bahia <-03>3",
+    "America/Bahia_Banderas CST6", "America/Barbados AST4", "America/Belem <-03>3", "America/Belize CST6",
+    "America/Blanc-Sablon AST4", "America/Boa_Vista <-04>4", "America/Bogota <-05>5",
+    "America/Boise MST7MDT,M3.2.0,M11.1.0", "America/Buenos_Aires <-03>3",
+    "America/Cambridge_Bay MST7MDT,M3.2.0,M11.1.0", "America/Campo_Grande <-04>4", "America/Cancun EST5",
+    "America/Caracas <-04>4", "America/Catamarca <-03>3", "America/Cayenne <-03>3", "America/Cayman EST5",
+    "America/Chicago CST6CDT,M3.2.0,M11.1.0", "America/Chihuahua CST6", "America/Ciudad_Juarez MST7MDT,M3.2.0,M11.1.0",
+    "America/Coral_Harbour EST5", "America/Cordoba <-03>3", "America/Costa_Rica CST6", "America/Coyhaique <-03>3",
+    "America/Creston MST7", "America/Cuiaba <-04>4", "America/Curacao AST4", "America/Danmarkshavn GMT0",
+    "America/Dawson MST7", "America/Dawson_Creek MST7", "America/Denver MST7MDT,M3.2.0,M11.1.0",
+    "America/Detroit EST5EDT,M3.2.0,M11.1.0", "America/Dominica AST4", "America/Edmonton CST6",
+    "America/Eirunepe <-05>5", "America/El_Salvador CST6", "America/Ensenada PST8PDT,M3.2.0,M11.1.0",
+    "America/Fort_Nelson MST7", "America/Fort_Wayne EST5EDT,M3.2.0,M11.1.0", "America/Fortaleza <-03>3",
+    "America/Glace_Bay AST4ADT,M3.2.0,M11.1.0", "America/Godthab <-02>2<-01>,M3.5.0/-1,M10.5.0/0",
+    "America/Goose_Bay AST4ADT,M3.2.0,M11.1.0", "America/Grand_Turk EST5EDT,M3.2.0,M11.1.0", "America/Grenada AST4",
+    "America/Guadeloupe AST4", "America/Guatemala CST6", "America/Guayaquil <-05>5", "America/Guyana <-04>4",
+    "America/Halifax AST4ADT,M3.2.0,M11.1.0", "America/Havana CST5CDT,M3.2.0/0,M11.1.0/1", "America/Hermosillo MST7",
+    "America/Indiana/Indianapolis EST5EDT,M3.2.0,M11.1.0", "America/Indiana/Knox CST6CDT,M3.2.0,M11.1.0",
+    "America/Indiana/Marengo EST5EDT,M3.2.0,M11.1.0", "America/Indiana/Petersburg EST5EDT,M3.2.0,M11.1.0",
+    "America/Indiana/Tell_City CST6CDT,M3.2.0,M11.1.0", "America/Indiana/Vevay EST5EDT,M3.2.0,M11.1.0",
+    "America/Indiana/Vincennes EST5EDT,M3.2.0,M11.1.0", "America/Indiana/Winamac EST5EDT,M3.2.0,M11.1.0",
+    "America/Indianapolis EST5EDT,M3.2.0,M11.1.0", "America/Inuvik CST6", "America/Iqaluit EST5EDT,M3.2.0,M11.1.0",
+    "America/Jamaica EST5", "America/Jujuy <-03>3", "America/Juneau AKST9AKDT,M3.2.0,M11.1.0",
+    "America/Kentucky/Louisville EST5EDT,M3.2.0,M11.1.0", "America/Kentucky/Monticello EST5EDT,M3.2.0,M11.1.0",
+    "America/Knox_IN CST6CDT,M3.2.0,M11.1.0", "America/Kralendijk AST4", "America/La_Paz <-04>4", "America/Lima <-05>5",
+    "America/Los_Angeles PST8PDT,M3.2.0,M11.1.0", "America/Louisville EST5EDT,M3.2.0,M11.1.0",
+    "America/Lower_Princes AST4", "America/Maceio <-03>3", "America/Managua CST6", "America/Manaus <-04>4",
+    "America/Marigot AST4", "America/Martinique AST4", "America/Matamoros CST6CDT,M3.2.0,M11.1.0",
+    "America/Mazatlan MST7", "America/Mendoza <-03>3", "America/Menominee CST6CDT,M3.2.0,M11.1.0",
+    "America/Merida CST6", "America/Metlakatla AKST9AKDT,M3.2.0,M11.1.0", "America/Mexico_City CST6",
+    "America/Miquelon <-03>3<-02>,M3.2.0,M11.1.0", "America/Moncton AST4ADT,M3.2.0,M11.1.0", "America/Monterrey CST6",
+    "America/Montevideo <-03>3", "America/Montreal EST5EDT,M3.2.0,M11.1.0", "America/Montserrat AST4",
+    "America/Nassau EST5EDT,M3.2.0,M11.1.0", "America/New_York EST5EDT,M3.2.0,M11.1.0",
+    "America/Nipigon EST5EDT,M3.2.0,M11.1.0", "America/Nome AKST9AKDT,M3.2.0,M11.1.0", "America/Noronha <-02>2",
+    "America/North_Dakota/Beulah CST6CDT,M3.2.0,M11.1.0", "America/North_Dakota/Center CST6CDT,M3.2.0,M11.1.0",
+    "America/North_Dakota/New_Salem CST6CDT,M3.2.0,M11.1.0", "America/Nuuk <-02>2<-01>,M3.5.0/-1,M10.5.0/0",
+    "America/Ojinaga CST6CDT,M3.2.0,M11.1.0", "America/Panama EST5", "America/Pangnirtung EST5EDT,M3.2.0,M11.1.0",
+    "America/Paramaribo <-03>3", "America/Phoenix MST7", "America/Port-au-Prince EST5EDT,M3.2.0,M11.1.0",
+    "America/Port_of_Spain AST4", "America/Porto_Acre <-05>5", "America/Porto_Velho <-04>4", "America/Puerto_Rico AST4",
+    "America/Punta_Arenas <-03>3", "America/Rainy_River EST5", "America/Rankin_Inlet CST6CDT,M3.2.0,M11.1.0",
+    "America/Recife <-03>3", "America/Regina CST6", "America/Resolute CST6CDT,M3.2.0,M11.1.0",
+    "America/Rio_Branco <-05>5", "America/Rosario <-03>3", "America/Santa_Isabel PST8PDT,M3.2.0,M11.1.0",
+    "America/Santarem <-03>3", "America/Santiago <-04>4<-03>,M9.1.6/24,M4.1.6/24", "America/Santo_Domingo AST4",
+    "America/Sao_Paulo <-03>3", "America/Scoresbysund <-02>2<-01>,M3.5.0/-1,M10.5.0/0",
+    "America/Shiprock MST7MDT,M3.2.0,M11.1.0", "America/Sitka AKST9AKDT,M3.2.0,M11.1.0", "America/St_Barthelemy AST4",
+    "America/St_Johns NST3:30NDT,M3.2.0,M11.1.0", "America/St_Kitts AST4", "America/St_Lucia AST4",
+    "America/St_Thomas AST4", "America/St_Vincent AST4", "America/Swift_Current CST6", "America/Tegucigalpa CST6",
+    "America/Thule AST4ADT,M3.2.0,M11.1.0", "America/Thunder_Bay EST5EDT,M3.2.0,M11.1.0",
+    "America/Tijuana PST8PDT,M3.2.0,M11.1.0", "America/Toronto EST5EDT,M3.2.0,M11.1.0", "America/Tortola AST4",
+    "America/Vancouver MST7", "America/Virgin AST4", "America/Whitehorse MST7", "America/Winnipeg EST5",
+    "America/Yakutat AKST9AKDT,M3.2.0,M11.1.0", "America/Yellowknife CST6", "Antarctica/Casey <+08>-8",
+    "Antarctica/Davis <+07>-7", "Antarctica/DumontDUrville <+10>-10",
+    "Antarctica/Macquarie AEST-10AEDT,M10.1.0,M4.1.0/3", "Antarctica/Mawson <+05>-5",
+    "Antarctica/McMurdo NZST-12NZDT,M9.5.0,M4.1.0/3", "Antarctica/Palmer <-03>3", "Antarctica/Rothera <-03>3",
+    "Antarctica/South_Pole NZST-12NZDT,M9.5.0,M4.1.0/3", "Antarctica/Syowa <+03>-3",
+    "Antarctica/Troll <+00>0<+02>-2,M3.5.0/1,M10.5.0/3", "Antarctica/Vostok <+05>-5",
+    "Arctic/Longyearbyen CET-1CEST,M3.5.0,M10.5.0/3", "Asia/Aden <+03>-3", "Asia/Almaty <+05>-5", "Asia/Amman <+03>-3",
+    "Asia/Anadyr <+12>-12", "Asia/Aqtau <+05>-5", "Asia/Aqtobe <+05>-5", "Asia/Ashgabat <+05>-5",
+    "Asia/Ashkhabad <+05>-5", "Asia/Atyrau <+05>-5", "Asia/Baghdad <+03>-3", "Asia/Bahrain <+03>-3",
+    "Asia/Baku <+04>-4", "Asia/Bangkok <+07>-7", "Asia/Barnaul <+07>-7", "Asia/Beirut EET-2EEST,M3.5.0/0,M10.5.0/0",
+    "Asia/Bishkek <+06>-6", "Asia/Brunei <+08>-8", "Asia/Calcutta IST-5:30", "Asia/Chita <+09>-9",
+    "Asia/Choibalsan <+08>-8", "Asia/Chongqing CST-8", "Asia/Chungking CST-8", "Asia/Colombo <+0530>-5:30",
+    "Asia/Dacca <+06>-6", "Asia/Damascus <+03>-3", "Asia/Dhaka <+06>-6", "Asia/Dili <+09>-9", "Asia/Dubai <+04>-4",
+    "Asia/Dushanbe <+05>-5", "Asia/Famagusta EET-2EEST,M3.5.0/3,M10.5.0/4", "Asia/Gaza EET-2EEST,M3.4.4/50,M10.4.4/50",
+    "Asia/Harbin CST-8", "Asia/Hebron EET-2EEST,M3.4.4/50,M10.4.4/50", "Asia/Ho_Chi_Minh <+07>-7",
+    "Asia/Hong_Kong HKT-8", "Asia/Hovd <+07>-7", "Asia/Irkutsk <+08>-8", "Asia/Istanbul <+03>-3", "Asia/Jakarta WIB-7",
+    "Asia/Jayapura WIT-9", "Asia/Jerusalem IST-2IDT,M3.4.4/26,M10.5.0", "Asia/Kabul <+0430>-4:30",
+    "Asia/Kamchatka <+12>-12", "Asia/Karachi PKT-5", "Asia/Kashgar <+06>-6", "Asia/Kathmandu <+0545>-5:45",
+    "Asia/Katmandu <+0545>-5:45", "Asia/Khandyga <+09>-9", "Asia/Kolkata IST-5:30", "Asia/Krasnoyarsk <+07>-7",
+    "Asia/Kuala_Lumpur <+08>-8", "Asia/Kuching <+08>-8", "Asia/Kuwait <+03>-3", "Asia/Macao CST-8", "Asia/Macau CST-8",
+    "Asia/Magadan <+11>-11", "Asia/Makassar WITA-8", "Asia/Manila PST-8", "Asia/Muscat <+04>-4",
+    "Asia/Nicosia EET-2EEST,M3.5.0/3,M10.5.0/4", "Asia/Novokuznetsk <+07>-7", "Asia/Novosibirsk <+07>-7",
+    "Asia/Omsk <+06>-6", "Asia/Oral <+05>-5", "Asia/Phnom_Penh <+07>-7", "Asia/Pontianak WIB-7", "Asia/Pyongyang KST-9",
+    "Asia/Qatar <+03>-3", "Asia/Qostanay <+05>-5", "Asia/Qyzylorda <+05>-5", "Asia/Rangoon <+0630>-6:30",
+    "Asia/Riyadh <+03>-3", "Asia/Saigon <+07>-7", "Asia/Sakhalin <+11>-11", "Asia/Samarkand <+05>-5",
+    "Asia/Seoul KST-9", "Asia/Shanghai CST-8", "Asia/Singapore <+08>-8", "Asia/Srednekolymsk <+11>-11",
+    "Asia/Taipei CST-8", "Asia/Tashkent <+05>-5", "Asia/Tbilisi <+04>-4", "Asia/Tehran <+0330>-3:30",
+    "Asia/Tel_Aviv IST-2IDT,M3.4.4/26,M10.5.0", "Asia/Thimbu <+06>-6", "Asia/Thimphu <+06>-6", "Asia/Tokyo JST-9",
+    "Asia/Tomsk <+07>-7", "Asia/Ujung_Pandang WITA-8", "Asia/Ulaanbaatar <+08>-8", "Asia/Ulan_Bator <+08>-8",
+    "Asia/Urumqi <+06>-6", "Asia/Ust-Nera <+10>-10", "Asia/Vientiane <+07>-7", "Asia/Vladivostok <+10>-10",
+    "Asia/Yakutsk <+09>-9", "Asia/Yangon <+0630>-6:30", "Asia/Yekaterinburg <+05>-5", "Asia/Yerevan <+04>-4",
+    "Atlantic/Azores <-01>1<+00>,M3.5.0/0,M10.5.0/1", "Atlantic/Bermuda AST4ADT,M3.2.0,M11.1.0",
+    "Atlantic/Canary WET0WEST,M3.5.0/1,M10.5.0", "Atlantic/Cape_Verde <-01>1",
+    "Atlantic/Faeroe WET0WEST,M3.5.0/1,M10.5.0", "Atlantic/Faroe WET0WEST,M3.5.0/1,M10.5.0",
+    "Atlantic/Jan_Mayen CET-1CEST,M3.5.0,M10.5.0/3", "Atlantic/Madeira WET0WEST,M3.5.0/1,M10.5.0",
+    "Atlantic/Reykjavik GMT0", "Atlantic/South_Georgia <-02>2", "Atlantic/St_Helena GMT0", "Atlantic/Stanley <-03>3",
+    "Australia/ACT AEST-10AEDT,M10.1.0,M4.1.0/3", "Australia/Adelaide ACST-9:30ACDT,M10.1.0,M4.1.0/3",
+    "Australia/Brisbane AEST-10", "Australia/Broken_Hill ACST-9:30ACDT,M10.1.0,M4.1.0/3",
+    "Australia/Canberra AEST-10AEDT,M10.1.0,M4.1.0/3", "Australia/Currie AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/Darwin ACST-9:30", "Australia/Eucla <+0845>-8:45", "Australia/Hobart AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/LHI <+1030>-10:30<+11>-11,M10.1.0,M4.1.0", "Australia/Lindeman AEST-10",
+    "Australia/Lord_Howe <+1030>-10:30<+11>-11,M10.1.0,M4.1.0", "Australia/Melbourne AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/NSW AEST-10AEDT,M10.1.0,M4.1.0/3", "Australia/North ACST-9:30", "Australia/Perth AWST-8",
+    "Australia/Queensland AEST-10", "Australia/South ACST-9:30ACDT,M10.1.0,M4.1.0/3",
+    "Australia/Sydney AEST-10AEDT,M10.1.0,M4.1.0/3", "Australia/Tasmania AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/Victoria AEST-10AEDT,M10.1.0,M4.1.0/3", "Australia/West AWST-8",
+    "Australia/Yancowinna ACST-9:30ACDT,M10.1.0,M4.1.0/3", "Brazil/Acre <-05>5", "Brazil/DeNoronha <-02>2",
+    "Brazil/East <-03>3", "Brazil/West <-04>4", "CET CET-1CEST,M3.5.0,M10.5.0/3", "CST6CDT CST6CDT,M3.2.0,M11.1.0",
+    "Canada/Atlantic AST4ADT,M3.2.0,M11.1.0", "Canada/Central EST5", "Canada/Eastern EST5EDT,M3.2.0,M11.1.0",
+    "Canada/Mountain CST6", "Canada/Newfoundland NST3:30NDT,M3.2.0,M11.1.0", "Canada/Pacific MST7",
+    "Canada/Saskatchewan CST6", "Canada/Yukon MST7", "Chile/Continental <-04>4<-03>,M9.1.6/24,M4.1.6/24",
+    "Chile/EasterIsland <-06>6<-05>,M9.1.6/22,M4.1.6/22", "Cuba CST5CDT,M3.2.0/0,M11.1.0/1",
+    "EET EET-2EEST,M3.5.0/3,M10.5.0/4", "EST EST5", "EST5EDT EST5EDT,M3.2.0,M11.1.0",
+    "Egypt EET-2EEST,M4.5.5/0,M10.5.4/24", "Eire IST-1GMT0,M10.5.0,M3.5.0/1", "Etc/GMT GMT0", "Etc/GMT+0 GMT0",
+    "Etc/GMT+1 <-01>1", "Etc/GMT+10 <-10>10", "Etc/GMT+11 <-11>11", "Etc/GMT+12 <-12>12", "Etc/GMT+2 <-02>2",
+    "Etc/GMT+3 <-03>3", "Etc/GMT+4 <-04>4", "Etc/GMT+5 <-05>5", "Etc/GMT+6 <-06>6", "Etc/GMT+7 <-07>7",
+    "Etc/GMT+8 <-08>8", "Etc/GMT+9 <-09>9", "Etc/GMT-0 GMT0", "Etc/GMT-1 <+01>-1", "Etc/GMT-10 <+10>-10",
+    "Etc/GMT-11 <+11>-11", "Etc/GMT-12 <+12>-12", "Etc/GMT-13 <+13>-13", "Etc/GMT-14 <+14>-14", "Etc/GMT-2 <+02>-2",
+    "Etc/GMT-3 <+03>-3", "Etc/GMT-4 <+04>-4", "Etc/GMT-5 <+05>-5", "Etc/GMT-6 <+06>-6", "Etc/GMT-7 <+07>-7",
+    "Etc/GMT-8 <+08>-8", "Etc/GMT-9 <+09>-9", "Etc/GMT0 GMT0", "Etc/Greenwich GMT0", "Etc/UCT UTC0", "Etc/UTC UTC0",
+    "Etc/Universal UTC0", "Etc/Zulu UTC0", "Europe/Amsterdam CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Andorra CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Astrakhan <+04>-4",
+    "Europe/Athens EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Belfast GMT0BST,M3.5.0/1,M10.5.0",
+    "Europe/Belgrade CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Berlin CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Bratislava CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Brussels CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Bucharest EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Budapest CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Busingen CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Chisinau EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Copenhagen CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Dublin IST-1GMT0,M10.5.0,M3.5.0/1",
+    "Europe/Gibraltar CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Guernsey GMT0BST,M3.5.0/1,M10.5.0",
+    "Europe/Helsinki EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Isle_of_Man GMT0BST,M3.5.0/1,M10.5.0",
+    "Europe/Istanbul <+03>-3", "Europe/Jersey GMT0BST,M3.5.0/1,M10.5.0", "Europe/Kaliningrad EET-2",
+    "Europe/Kiev EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Kirov MSK-3", "Europe/Kyiv EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Lisbon WET0WEST,M3.5.0/1,M10.5.0", "Europe/Ljubljana CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/London GMT0BST,M3.5.0/1,M10.5.0", "Europe/Luxembourg CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Madrid CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Malta CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Mariehamn EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Minsk <+03>-3", "Europe/Monaco CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Moscow MSK-3", "Europe/Nicosia EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Oslo CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Paris CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Podgorica CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Prague CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Riga EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Rome CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Samara <+04>-4", "Europe/San_Marino CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Sarajevo CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Saratov <+04>-4", "Europe/Simferopol MSK-3",
+    "Europe/Skopje CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Sofia EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Stockholm CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Tallinn EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Tirane CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Tiraspol EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Ulyanovsk <+04>-4", "Europe/Uzhgorod EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Vaduz CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Vatican CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Vienna CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Vilnius EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Volgograd MSK-3",
+    "Europe/Warsaw CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Zagreb CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Zaporozhye EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Zurich CET-1CEST,M3.5.0,M10.5.0/3",
+    "GB GMT0BST,M3.5.0/1,M10.5.0", "GB-Eire GMT0BST,M3.5.0/1,M10.5.0", "GMT GMT0", "GMT+0 GMT0", "GMT-0 GMT0",
+    "GMT0 GMT0", "Greenwich GMT0", "HST HST10", "Hongkong HKT-8", "Iceland GMT0", "Indian/Antananarivo EAT-3",
+    "Indian/Chagos <+06>-6", "Indian/Christmas <+07>-7", "Indian/Cocos <+0630>-6:30", "Indian/Comoro EAT-3",
+    "Indian/Kerguelen <+05>-5", "Indian/Mahe <+04>-4", "Indian/Maldives <+05>-5", "Indian/Mauritius <+04>-4",
+    "Indian/Mayotte EAT-3", "Indian/Reunion <+04>-4", "Iran <+0330>-3:30", "Israel IST-2IDT,M3.4.4/26,M10.5.0",
+    "Jamaica EST5", "Japan JST-9", "Kwajalein <+12>-12", "Libya EET-2", "MET CET-1CEST,M3.5.0,M10.5.0/3", "MST MST7",
+    "MST7MDT MST7MDT,M3.2.0,M11.1.0", "Mexico/BajaNorte PST8PDT,M3.2.0,M11.1.0", "Mexico/BajaSur MST7",
+    "Mexico/General CST6", "NZ NZST-12NZDT,M9.5.0,M4.1.0/3", "NZ-CHAT <+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45",
+    "Navajo MST7MDT,M3.2.0,M11.1.0", "PRC CST-8", "PST8PDT PST8PDT,M3.2.0,M11.1.0", "Pacific/Apia <+13>-13",
+    "Pacific/Auckland NZST-12NZDT,M9.5.0,M4.1.0/3", "Pacific/Bougainville <+11>-11",
+    "Pacific/Chatham <+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45", "Pacific/Chuuk <+10>-10",
+    "Pacific/Easter <-06>6<-05>,M9.1.6/22,M4.1.6/22", "Pacific/Efate <+11>-11", "Pacific/Enderbury <+13>-13",
+    "Pacific/Fakaofo <+13>-13", "Pacific/Fiji <+12>-12", "Pacific/Funafuti <+12>-12", "Pacific/Galapagos <-06>6",
+    "Pacific/Gambier <-09>9", "Pacific/Guadalcanal <+11>-11", "Pacific/Guam ChST-10", "Pacific/Honolulu HST10",
+    "Pacific/Johnston HST10", "Pacific/Kanton <+13>-13", "Pacific/Kiritimati <+14>-14", "Pacific/Kosrae <+11>-11",
+    "Pacific/Kwajalein <+12>-12", "Pacific/Majuro <+12>-12", "Pacific/Marquesas <-0930>9:30", "Pacific/Midway SST11",
+    "Pacific/Nauru <+12>-12", "Pacific/Niue <-11>11", "Pacific/Norfolk <+11>-11<+12>,M10.1.0,M4.1.0/3",
+    "Pacific/Noumea <+11>-11", "Pacific/Pago_Pago SST11", "Pacific/Palau <+09>-9", "Pacific/Pitcairn <-08>8",
+    "Pacific/Pohnpei <+11>-11", "Pacific/Ponape <+11>-11", "Pacific/Port_Moresby <+10>-10", "Pacific/Rarotonga <-10>10",
+    "Pacific/Saipan ChST-10", "Pacific/Samoa SST11", "Pacific/Tahiti <-10>10", "Pacific/Tarawa <+12>-12",
+    "Pacific/Tongatapu <+13>-13", "Pacific/Truk <+10>-10", "Pacific/Wake <+12>-12", "Pacific/Wallis <+12>-12",
+    "Pacific/Yap <+10>-10", "Poland CET-1CEST,M3.5.0,M10.5.0/3", "Portugal WET0WEST,M3.5.0/1,M10.5.0", "ROC CST-8",
+    "ROK KST-9", "Singapore <+08>-8", "Turkey <+03>-3", "UCT UTC0", "US/Alaska AKST9AKDT,M3.2.0,M11.1.0",
+    "US/Aleutian HST10HDT,M3.2.0,M11.1.0", "US/Arizona MST7", "US/Central CST6CDT,M3.2.0,M11.1.0",
+    "US/East-Indiana EST5EDT,M3.2.0,M11.1.0", "US/Eastern EST5EDT,M3.2.0,M11.1.0", "US/Hawaii HST10",
+    "US/Indiana-Starke CST6CDT,M3.2.0,M11.1.0", "US/Michigan EST5EDT,M3.2.0,M11.1.0",
+    "US/Mountain MST7MDT,M3.2.0,M11.1.0", "US/Pacific PST8PDT,M3.2.0,M11.1.0", "US/Samoa SST11", "UTC UTC0",
+    "Universal UTC0", "W-SU MSK-3", "WET WET0WEST,M3.5.0/1,M10.5.0", "Zulu UTC0",
+]
 """ + "\n"
     }
     None
@@ -2944,7 +3974,7 @@ pub fn localNow() -> DateTime = local(unixTime())
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "1740290396-2288143"
+pub const compilerSources = "3650074383-2418922"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -3943,7 +4973,9 @@ pub const gTaskSpareCount = 36
 pub const gScopes = 37 // scope()'s: (open, tasks alive) pairs, by number
 pub const gScopeCount = 38
 pub const gScopeCap = 39
-pub const gWords = 40
+pub const gTlsLibrary = 40 // the system's TLS library, loaded the first time it is used (its handle; 0 not yet)
+pub const gCover = 41 // quark test --coverage: a byte for each line of the program's file, 1 once run (0: none yet)
+pub const gWords = 42
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -3951,6 +4983,41 @@ pub fn gGet(i: Int) -> Int = word(globals(), i)
 
 pub fn gSet(i: Int, v: Int) {
     setWord(globals(), i, v)
+}
+
+// ---- bytes kept in malloc'd memory that grows: (place, length, capacity) in the words at, at + 1, at + 2 of a block ----
+pub fn heldAppend(block: Int, at: Int, p: Int, n: Int) {
+    if n <= 0 {
+        return
+    }
+    let have = word(block, at + 1)
+    var cap = word(block, at + 2)
+    if have + n > cap {
+        cap = if cap == 0 { 16384 } else { cap }
+        while have + n > cap {
+            cap *= 2
+        }
+        setWord(block, at, realloc(word(block, at), cap))
+        setWord(block, at + 2, cap)
+    }
+    copyBytes(word(block, at) + have, p, n)
+    setWord(block, at + 1, have + n)
+}
+
+// the first k of them let go of
+pub fn heldDrop(block: Int, at: Int, k: Int) {
+    let rest = word(block, at + 1) - k
+    if rest > 0 {
+        moveBytes(word(block, at), word(block, at) + k, rest)
+    }
+    setWord(block, at + 1, if rest > 0 { rest } else { 0 })
+}
+
+pub fn heldFree(block: Int, at: Int) {
+    free(word(block, at))
+    setWord(block, at, 0)
+    setWord(block, at + 1, 0)
+    setWord(block, at + 2, 0)
 }
 
 // ---- a message, built in place: bytes at p, room for cap (one kept for the zero) ----
@@ -5261,6 +6328,20 @@ fn readCommand(p: Int, cap: Int) -> Bool {
 
 fn isWord(p: Int, n: Int, w: Text) -> Bool = n == len(w) and sameBytes(p, textAt(w), n)
 
+// quark test --coverage: a line of the program's file runs
+pub const coverRoom = 1 << 20 // lines
+
+pub extern effect fn rtCoverLine(line: Int64) as "qk_coverLine" {
+    var map = gGet(gCover)
+    if map == 0 {
+        map = calloc(coverRoom, 1)
+        gSet(gCover, map)
+    }
+    if line > 0 and line < coverRoom {
+        setByte(map, line, 1)
+    }
+}
+
 // a statement starts: stop when it is a breakpoint, or the debugger is stepping; then read commands
 pub extern effect fn rtDebugLine(line: Int64) as "qk_debugLine" {
     let d = state()
@@ -5597,6 +6678,15 @@ pub extern effect fn rtAppendFile(path: Int64, pathLen: Int64, text: Int64, n: I
 
 extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 
+// a process started with pipes: 0 and (its handle, the input's write end, the output's and the errors' read ends) in
+// out; 1 and the message (malloc'd) in out[1]
+extern effect fn osStartProcess(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess"
+extern effect fn osPipeRead(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" // bytes read, 0 at the end, -1
+extern effect fn osPipeWrite(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" // bytes written, or -1
+extern effect fn osPipeClose(h: Int64) as "qkosPipeClose"
+extern effect fn osProcessWait(h: Int64) -> Int64 as "qkosProcessWait" // its exit status (the handle let go of)
+extern effect fn osProcessKill(h: Int64) as "qkosProcessKill"
+
 // The calls that wait for the input or a process, on a thread of their own in a task (tasks.qk offThread): the
 // others go on meanwhile. Their jobs: what the call takes, then what it gives.
 fn readInJob(j: Int) -> Int {
@@ -5620,6 +6710,27 @@ fn runProcessJob(j: Int) -> Int {
         jobArgs + 4,
         osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)),
     )
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn pipeReadJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 3, osPipeRead(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn pipeWriteJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 3, osPipeWrite(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn processWaitJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 1, osProcessWait(word(j, jobArgs)))
     setWord(j, jobDone, 1)
     0
 }
@@ -5855,6 +6966,113 @@ pub extern effect fn rtRunProcess(prog: Int64, progLen: Int64, args: Int64, coun
     free(word(out, 3))
     p
 }
+
+// ---- a process running beside this one (startProcess): its words ----
+const spHandle = 0
+const spIn = 1 // -1 once closed
+const spOut = 2
+const spErr = 3
+const spEnded = 4 // waited for: 1, and its status then
+const spStatus = 5
+
+pub extern effect fn rtStartProcess(prog: Int64, progLen: Int64, args: Int64, count: Int64) -> Int64 as "qk_startProcess" {
+    let name = cString(prog, progLen)
+    flush() // what was printed before comes first
+    let out = calloc(5, 8)
+    if osStartProcess(name, args, count, out) != 0 {
+        let m = word(out, 1)
+        let r = errResult(message().zeroText(m))
+        free(m)
+        free(out)
+        return r
+    }
+    let p = calloc(6, 8) // (malloc'd: a process may outlive the arena it was started in)
+    for i in 0..4 {
+        setWord(p, i, word(out, i))
+    }
+    free(out)
+    okResult(p, 0)
+}
+
+pub extern effect fn rtProcessWrite(p: Int64, bytes: Int64, n: Int64) -> Int64 as "qk_processWrite" {
+    if word(p, spIn) == -1 or word(p, spEnded) != 0 {
+        return errResult(message().text("writeProcess: the process's input is closed"))
+    }
+    var at = 0
+    while at < n {
+        let j = calloc(jobArgs + 4, 8)
+        setWord(j, jobArgs, word(p, spIn))
+        setWord(j, jobArgs + 1, bytes + at)
+        setWord(j, jobArgs + 2, n - at)
+        if not offThread(jobAddress(x => pipeWriteJob(x)), j) {
+            let _ = pipeWriteJob(j)
+        }
+        let k = jobGives(j, 3)
+        if k <= 0 {
+            return errResult(message().text("writeProcess: the process no longer reads its input"))
+        }
+        at += k
+    }
+    okResult(0, 0)
+}
+
+pub extern effect fn rtProcessCloseInput(p: Int64) as "qk_processCloseInput" {
+    if word(p, spIn) != -1 {
+        osPipeClose(word(p, spIn))
+        setWord(p, spIn, -1)
+    }
+}
+
+pub extern effect fn rtProcessRead(p: Int64, most: Int64, errors: Int64) -> Int64 as "qk_processRead" {
+    let h = word(p, if errors != 0 { spErr } else { spOut })
+    let room = allocRaw(if most > 0 { most } else { 1 }, 1)
+    if h == -1 or most <= 0 {
+        return okResult(room, 0)
+    }
+    let j = calloc(jobArgs + 4, 8)
+    setWord(j, jobArgs, h)
+    setWord(j, jobArgs + 1, room)
+    setWord(j, jobArgs + 2, most)
+    if not offThread(jobAddress(x => pipeReadJob(x)), j) {
+        let _ = pipeReadJob(j)
+    }
+    let k = jobGives(j, 3)
+    if k < 0 {
+        return errResult(message().text("readProcess: the process's output cannot be read"))
+    }
+    if k == 0 {
+        // its end: the pipe let go of
+        osPipeClose(h)
+        setWord(p, if errors != 0 { spErr } else { spOut }, -1)
+    }
+    okResult(room, k)
+}
+
+pub extern effect fn rtProcessWait(p: Int64) -> Int64 as "qk_processWait" {
+    if word(p, spEnded) == 0 {
+        rtProcessCloseInput(p)
+        let j = calloc(jobArgs + 2, 8)
+        setWord(j, jobArgs, word(p, spHandle))
+        if not offThread(jobAddress(x => processWaitJob(x)), j) {
+            let _ = processWaitJob(j)
+        }
+        setWord(p, spStatus, jobGives(j, 1))
+        setWord(p, spEnded, 1)
+        for at in [spOut, spErr] {
+            if word(p, at) != -1 {
+                osPipeClose(word(p, at))
+                setWord(p, at, -1)
+            }
+        }
+    }
+    okResult(word(p, spStatus), 0)
+}
+
+pub extern effect fn rtProcessKill(p: Int64) as "qk_processKill" {
+    if word(p, spEnded) == 0 {
+        osProcessKill(word(p, spHandle))
+    }
+}
 """ + "\n"
     }
     if name == "host" {
@@ -5992,6 +7210,9 @@ pub extern effect fn hostDebugStep(t: Int64, stepping: Int64) -> Int64 as "qkHos
     r
 }
 
+// quark test --coverage: its lines run (a byte each, coverRoom of them), or 0 when none ran
+pub extern effect fn hostCoverage() -> Int64 as "qkHostCoverage" = word(word(cell(), 0), gCover)
+
 // ---- --profile: where this thread is, every millisecond (windows.qk, linux.qk sample it) ----
 // the sampler's words: on, the sampled thread, the sampling thread, the samples, their count, room, the sampled
 // thread's stack (low, high). A sample is sampleWords words: where the thread was, then the return addresses of the
@@ -6043,6 +7264,14 @@ extern effect fn osSend(s: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "q
 extern effect fn osCloseSocket(s: Int64) as "qkosCloseSocket"
 extern effect fn osLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" // seconds east of UTC, then
 extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+// TLS, the system's (windows.qk: Schannel; linux.qk: OpenSSL; macos.qk: SecureTransport): a state of a block that
+// starts with the words below (calloc'd by the system's layer, which keeps its own after them). Bytes from the server
+// go into tIn; work turns them into what to send it (tOut) and what it said (tPlain)
+extern effect fn osTlsNew(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" // the block, the hello in tOut; or 0
+extern effect fn osTlsWork(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" // tIn used as far as it goes: 0, or -1
+extern effect fn osTlsSeal(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" // into tOut: 0, -1
+extern effect fn osTlsEnd(t: Int64) as "qkosTlsEnd" // the end's notice into tOut; the system's state let go of
 
 // the job of a connect or a listen (tasks.qk offThread): host, port, why, then the socket made
 fn connectJob(j: Int) -> Int {
@@ -6232,6 +7461,139 @@ pub extern effect fn rtCloseSocket(s: Int64) as "qk_closeSocket" = osCloseSocket
 // localOffset(seconds) -> Int: the local time's offset from UTC at that moment, in seconds (east positive)
 pub extern effect fn rtLocalOffset(seconds: Float64) -> Int64 as "qk_localOffset" =
     osLocalOffset(seconds)
+
+// ---- TLS over a socket: the handshake, then reads and writes through the system's library (osTls*) ----
+pub const tOut = 0 // (place, length, capacity): what to send the server
+pub const tPlain = 3 // what the server said, decrypted, not read yet
+pub const tState = 6 // 0 the handshake, 1 open, 2 the server ended it
+pub const tSocket = 7
+pub const tIn = 8 // what came from the server, not used yet
+pub const tWords = 12 // the system's words from here
+
+// every byte of tOut sent (the task waits while the system's buffer is full); false with why
+fn tlsSend(t: Int, w: Int) -> Bool {
+    let p = word(t, tOut)
+    let n = word(t, tOut + 1)
+    var at = 0
+    while at < n {
+        let k = osSend(word(t, tSocket), p + at, n - at, w)
+        if k == -2 {
+            return false
+        }
+        if k < 0 {
+            waitSocket(word(t, tSocket), true)
+        } else {
+            at += k
+        }
+    }
+    setWord(t, tOut + 1, 0)
+    true
+}
+
+// more from the server into tIn, then worked on; 0, 1 when it closed the connection, -1 with why
+fn tlsReceive(t: Int, w: Int) -> Int {
+    let room = malloc(16384)
+    var n = -1
+    while n == -1 {
+        n = osRecv(word(t, tSocket), room, 16384, w)
+        if n == -1 {
+            waitSocket(word(t, tSocket), false)
+        }
+    }
+    if n > 0 {
+        heldAppend(t, tIn, room, n)
+    }
+    free(room)
+    if n == -2 {
+        return -1
+    }
+    if n == 0 {
+        return 1
+    }
+    osTlsWork(t, w)
+}
+
+fn tlsFree(t: Int) {
+    heldFree(t, tOut)
+    heldFree(t, tPlain)
+    heldFree(t, tIn)
+    free(t)
+}
+
+// tlsConnect(socket, serverName) -> Tls!: the handshake over a connected socket, the server's certificate checked
+// for that name by the system's trust
+pub extern effect fn rtTlsConnect(s: Int64, host: Int64, hostLen: Int64) -> Int64 as "qk_tlsConnect" {
+    let w = why()
+    let name = cString(host, hostLen)
+    let t = osTlsNew(name, w)
+    if t == 0 {
+        return errResult(message().text("TLS with ").zeroText(name).text(": ").zeroText(w))
+    }
+    setWord(t, tSocket, s)
+    while true {
+        if not tlsSend(t, w) {
+            break
+        }
+        if word(t, tState) != 0 {
+            return okResult(t, 0)
+        }
+        let r = tlsReceive(t, w)
+        if r == 1 {
+            let _ = bufAt(w, 256).text("the server closed the connection during the handshake")
+        }
+        if r != 0 {
+            break
+        }
+    }
+    osTlsEnd(t)
+    tlsFree(t)
+    errResult(message().text("TLS with ").zeroText(name).text(": ").zeroText(w))
+}
+
+// readTls(t, most) -> Bytes!: what the server said, up to most bytes (the task waits for some); none: it ended
+pub extern effect fn rtReadTls(t: Int64, most: Int64) -> Int64 as "qk_readTls" {
+    let w = why()
+    while true {
+        let have = word(t, tPlain + 1)
+        if have > 0 or word(t, tState) == 2 or most <= 0 {
+            let k = if have < most { have } else { most }
+            let p = allocRaw(if k > 0 { k } else { 1 }, 1)
+            copyBytes(p, word(t, tPlain), k)
+            heldDrop(t, tPlain, k)
+            return okResult(p, k)
+        }
+        if not tlsSend(t, w) {
+            return failed("cannot write to the socket", w)
+        }
+        let r = tlsReceive(t, w)
+        if r == 1 {
+            setWord(t, tState, 2) // closed without TLS's notice: its end all the same
+        } else if r != 0 {
+            return failed("TLS", w)
+        }
+    }
+    0
+}
+
+// writeTls(t, bytes) -> Unit!: every byte sent, encrypted
+pub extern effect fn rtWriteTls(t: Int64, p: Int64, n: Int64) -> Int64 as "qk_writeTls" {
+    let w = why()
+    if osTlsSeal(t, p, n, w) != 0 {
+        return failed("TLS", w)
+    }
+    if not tlsSend(t, w) {
+        return failed("cannot write to the socket", w)
+    }
+    okResult(0, 0)
+}
+
+// closeTls(t): the end's notice sent (as far as it goes), the socket closed
+pub extern effect fn rtCloseTls(t: Int64) as "qk_closeTls" {
+    osTlsEnd(t)
+    let _ = tlsSend(t, why())
+    osCloseSocket(word(t, tSocket))
+    tlsFree(t)
+}
 """ + "\n"
     }
     if name == "linux" {
@@ -6239,6 +7601,7 @@ pub extern effect fn rtLocalOffset(seconds: Float64) -> Int64 as "qk_localOffset
 // The runtime's system calls on Linux: the C library (glibc: POSIX, pthreads, dlopen), each behind a symbol of the
 // runtime's own (qkos*, C's calls; windows.qk gives the same ones), and the executable's entry, main.
 use base
+use io
 use start
 use host
 
@@ -6547,6 +7910,117 @@ pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, ou
     setWord(out, 3, word(bufs, 3))
     setWord(out, 4, word(bufs, 4))
     0
+}
+
+// ---- a process with pipes (startProcess): its input, output and errors this program's to use ----
+extern effect fn cKill(pid: Int32, sig: Int32) -> Int32 as "kill"
+extern effect fn cSignal(sig: Int32, handler: Int64) -> Int64 as "signal"
+
+fn closeAll(fds: Int, n: Int) {
+    for i in 0..n {
+        let _ = cClose(int32At(fds, i))
+    }
+}
+
+pub extern effect fn osStartProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let _ = cSignal(13, 1) // SIGPIPE ignored: a write to a process that ended fails instead of ending this one
+    let argv = calloc(count + 2, 8)
+    setWord(argv, 0, name)
+    for i in 0..count {
+        let n = word(args, 2 * i + 1)
+        let s = calloc(n + 1, 1)
+        copyBytes(s, word(args, 2 * i), n)
+        setWord(argv, i + 1, s)
+    }
+    let fds = calloc(4, 8) // input (read, write), output, errors, exec's failure: each (read end, write end)
+    for k in 0..4 {
+        if pipe(fds + 8 * k) != 0 {
+            let e = errno()
+            closeAll(fds, 2 * k)
+            return cannotRun(out, name, e)
+        }
+    }
+    for i in [1, 2, 4, 6, 7] {
+        let _ = fcntl(int32At(fds, i), 2, 1) // FD_CLOEXEC: this program's ends, kept from the process and from others
+    }
+    let pid = fork()
+    if pid < 0 {
+        let e = errno()
+        closeAll(fds, 8)
+        return cannotRun(out, name, e)
+    }
+    if pid == 0 {
+        // the child: the pipes its input, output and errors
+        let _ = dup2(int32At(fds, 0), 0) + dup2(int32At(fds, 3), 1) + dup2(int32At(fds, 5), 2)
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5))
+        let _ = execvp(name, argv)
+        let e = calloc(1, 8)
+        setInt32(e, 0, errno())
+        let _ = cWrite(int32At(fds, 7), e, 4)
+        cExitNow(127)
+    }
+    let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5)) + cClose(int32At(fds, 7))
+    let execError = calloc(1, 8)
+    var got = cRead(int32At(fds, 6), execError, 4)
+    while got < 0 and errno() == eintr {
+        got = cRead(int32At(fds, 6), execError, 4)
+    }
+    let _ = cClose(int32At(fds, 6))
+    if got == 4 {
+        let ws = calloc(1, 8)
+        while waitpid(pid, ws, 0) < 0 and errno() == eintr {}
+        let _ = cClose(int32At(fds, 1)) + cClose(int32At(fds, 2)) + cClose(int32At(fds, 4))
+        return cannotRun(out, name, int32At(execError, 0))
+    }
+    setWord(out, 0, pid)
+    setWord(out, 1, int32At(fds, 1))
+    setWord(out, 2, int32At(fds, 2))
+    setWord(out, 3, int32At(fds, 4))
+    0
+}
+
+pub extern effect fn osPipeReadImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" {
+    while true {
+        let k = cRead(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeWriteImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" {
+    while true {
+        let k = cWrite(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeCloseImpl(h: Int64) as "qkosPipeClose" {
+    let _ = cClose(h)
+}
+
+pub extern effect fn osProcessWaitImpl(h: Int64) -> Int64 as "qkosProcessWait" {
+    let ws = calloc(1, 8)
+    while waitpid(h, ws, 0) < 0 and errno() == eintr {}
+    let s = int32At(ws, 0)
+    free(ws)
+    if s & 127 == 0 {
+        s >> 8 & 255
+    } else if s & 127 != 127 {
+        128 + s & 127
+    } else {
+        -1
+    }
+}
+
+pub extern effect fn osProcessKillImpl(h: Int64) as "qkosProcessKill" {
+    let _ = cKill(h, 9)
 }
 
 // ---- code in memory, the stack, C's libraries, threads ----
@@ -6969,6 +8443,214 @@ pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalO
     }
     free(t)
     offset
+}
+
+// ---- TLS: OpenSSL (libssl, loaded the first time TLS is used), each function found by its name; the bytes go
+// through two memory BIOs, io.qk's sockets carry them ----
+// io.qk's words first (tOut ... tIn), then these
+const lSsl = 12
+const lIn = 13 // the BIO the server's bytes go into
+const lOut = 14 // the BIO what to send it comes out of
+const lWords = 15
+
+fn openssl() -> Int {
+    let have = gGet(gTlsLibrary)
+    if have != 0 {
+        return have
+    }
+    var h = 0
+    for name in ["libssl.so.3\0", "libssl.so\0", "libssl.so.1.1\0"] {
+        if h == 0 {
+            h = dlopen(textAt(name), 258)
+        }
+    }
+    gSet(gTlsLibrary, h)
+    h
+}
+
+extern effect fn findSsl0(h: Int64, name: Int64) -> (extern () -> Int64)? as "dlsym"
+extern effect fn findSsl1(h: Int64, name: Int64) -> (extern (Int64) -> Int64)? as "dlsym"
+extern effect fn findSsl1i(h: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "dlsym"
+extern effect fn findSsl2i(h: Int64, name: Int64) -> (extern (Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSslError(h: Int64, name: Int64) -> (extern (Int64, Int32) -> Int32)? as "dlsym"
+extern effect fn findSsl3(h: Int64, name: Int64) -> (extern (Int64, Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSslVerify(h: Int64, name: Int64) -> (extern (Int64, Int32, Int64) -> Int32)? as "dlsym"
+extern effect fn findSslIo(h: Int64, name: Int64) -> (extern (Int64, Int64, Int32) -> Int32)? as "dlsym"
+extern effect fn findSslCtrl(h: Int64, name: Int64) -> (extern (Int64, Int32, Int64, Int64) -> Int64)? as "dlsym"
+
+fn ssl0(name: Text) -> Int = match findSsl0(openssl(), textAt(name)) {
+    Some(f) => f()
+    None => 0
+}
+
+fn ssl1(name: Text, a: Int) -> Int = match findSsl1(openssl(), textAt(name)) {
+    Some(f) => f(a)
+    None => 0
+}
+
+fn ssl1i(name: Text, a: Int) -> Int = match findSsl1i(openssl(), textAt(name)) {
+    Some(f) => f(a)
+    None => -1
+}
+
+fn sslIo(name: Text, a: Int, p: Int, n: Int) -> Int = match findSslIo(openssl(), textAt(name)) {
+    Some(f) => f(a, p, n)
+    None => -1
+}
+
+fn sslError(ssl: Int, r: Int) -> Int = match findSslError(openssl(), textAt("SSL_get_error\0")) {
+    Some(f) => f(ssl, r)
+    None => 1
+}
+
+// OpenSSL's words for what went wrong: the certificate's check, else its error queue's first
+fn sslWhy(t: Int, why: Int) {
+    let b = bufAt(why, 256)
+    let v = ssl1("SSL_get_verify_result\0", word(t, lSsl))
+    if v != 0 {
+        let _ = b.text("the server's certificate: ").zeroText(ssl1("X509_verify_cert_error_string\0", v))
+        return
+    }
+    let e = ssl0("ERR_get_error\0")
+    if e != 0 {
+        match findSsl3(openssl(), textAt("ERR_error_string_n\0")) {
+            Some(f) => {
+                let _ = f(e, why, 256)
+            }
+            None => {}
+        }
+    } else {
+        let _ = b.text("OpenSSL's handshake failed")
+    }
+}
+
+// what OpenSSL made to send, into tOut
+fn sslDrain(t: Int) {
+    let room = malloc(16384)
+    while true {
+        let n = sslIo("BIO_read\0", word(t, lOut), room, 16384)
+        if n <= 0 {
+            break
+        }
+        heldAppend(t, tOut, room, n)
+    }
+    free(room)
+}
+
+pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    if openssl() == 0 {
+        let _ = bufAt(why, 256).text("cannot load OpenSSL (libssl.so.3)")
+        return 0
+    }
+    let ctx = ssl1("SSL_CTX_new\0", ssl0("TLS_client_method\0"))
+    if ctx == 0 {
+        let _ = bufAt(why, 256).text("OpenSSL made no context")
+        return 0
+    }
+    let _ = ssl1i("SSL_CTX_set_default_verify_paths\0", ctx) // the system's trusted certificates
+    let _ = match findSslVerify(openssl(), textAt("SSL_CTX_set_verify\0")) {
+        Some(f) => f(ctx, 1, 0)
+        // SSL_VERIFY_PEER
+        None => 0
+    }
+    let ssl = ssl1("SSL_new\0", ctx)
+    let _ = ssl1i("SSL_CTX_free\0", ctx) // (the SSL holds it)
+    let t = calloc(lWords, 8)
+    setWord(t, lSsl, ssl)
+    setWord(t, lIn, ssl1("BIO_new\0", ssl0("BIO_s_mem\0")))
+    setWord(t, lOut, ssl1("BIO_new\0", ssl0("BIO_s_mem\0")))
+    let _ = match findSsl3(openssl(), textAt("SSL_set_bio\0")) {
+        Some(f) => f(ssl, word(t, lIn), word(t, lOut))
+        None => 0
+    }
+    let _ = match findSslCtrl(openssl(), textAt("SSL_ctrl\0")) {
+        Some(f) => f(ssl, 55, 0, host)
+        // SSL_CTRL_SET_TLSEXT_HOSTNAME: the server's name, said in the hello
+        None => 0
+    }
+    let _ = match findSsl2i(openssl(), textAt("SSL_set1_host\0")) {
+        Some(f) => f(ssl, host)
+        // the name its certificate must have
+        None => 0
+    }
+    let _ = ssl1i("SSL_set_connect_state\0", ssl)
+    if osTlsWorkImpl(t, why) != 0 {
+        osTlsEndImpl(t)
+        heldFree(t, tOut)
+        free(t)
+        return 0
+    }
+    t
+}
+
+pub extern effect fn osTlsWorkImpl(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" {
+    let ssl = word(t, lSsl)
+    let n = word(t, tIn + 1)
+    if n > 0 {
+        let k = sslIo("BIO_write\0", word(t, lIn), word(t, tIn), n) // (a memory BIO takes it all)
+        heldDrop(t, tIn, if k > 0 { k } else { 0 })
+    }
+    if word(t, tState) == 0 {
+        let r = ssl1i("SSL_do_handshake\0", ssl)
+        sslDrain(t)
+        if r != 1 {
+            let e = sslError(ssl, r)
+            if e == 2 or e == 3 {
+                return 0 // SSL_ERROR_WANT_READ, _WRITE: more from the server first
+            }
+            sslWhy(t, why)
+            return -1
+        }
+        setWord(t, tState, 1)
+    }
+    if word(t, tState) == 1 {
+        let room = malloc(16384)
+        while true {
+            let k = sslIo("SSL_read\0", ssl, room, 16384)
+            if k > 0 {
+                heldAppend(t, tPlain, room, k)
+            } else {
+                let e = sslError(ssl, k)
+                if e == 6 {
+                    setWord(t, tState, 2) // SSL_ERROR_ZERO_RETURN: the server's close_notify
+                } else if e != 2 and e != 3 {
+                    free(room)
+                    sslWhy(t, why)
+                    return -1
+                }
+                break
+            }
+        }
+        free(room)
+        sslDrain(t)
+    }
+    0
+}
+
+pub extern effect fn osTlsSealImpl(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" {
+    var at = 0
+    while at < n {
+        let k = sslIo("SSL_write\0", word(t, lSsl), p + at, if n - at < 1 << 30 { n - at } else { 1 << 30 })
+        if k <= 0 {
+            sslWhy(t, why)
+            return -1
+        }
+        at += k
+        sslDrain(t)
+    }
+    0
+}
+
+pub extern effect fn osTlsEndImpl(t: Int64) as "qkosTlsEnd" {
+    let ssl = word(t, lSsl)
+    if ssl != 0 {
+        if word(t, tState) == 1 {
+            let _ = ssl1i("SSL_shutdown\0", ssl) // close_notify
+            sslDrain(t)
+        }
+        let _ = ssl1i("SSL_free\0", ssl) // (and its BIOs)
+        setWord(t, lSsl, 0)
+    }
 }
 """ + "\n"
     }
@@ -8329,6 +10011,7 @@ fn growingCollected(a: Int, c: Int, since: Int) {
 // from its file. Code made while running goes into MAP_JIT memory, writable on this thread until it is protected.
 use std.machine as machine
 use base
+use io
 use start
 use host
 
@@ -8645,6 +10328,117 @@ pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, ou
     setWord(out, 3, word(bufs, 3))
     setWord(out, 4, word(bufs, 4))
     0
+}
+
+// ---- a process with pipes (startProcess): its input, output and errors this program's to use ----
+extern effect fn cKill(pid: Int32, sig: Int32) -> Int32 as "kill"
+extern effect fn cSignal(sig: Int32, handler: Int64) -> Int64 as "signal"
+
+fn closeAll(fds: Int, n: Int) {
+    for i in 0..n {
+        let _ = cClose(int32At(fds, i))
+    }
+}
+
+pub extern effect fn osStartProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let _ = cSignal(13, 1) // SIGPIPE ignored: a write to a process that ended fails instead of ending this one
+    let argv = calloc(count + 2, 8)
+    setWord(argv, 0, name)
+    for i in 0..count {
+        let n = word(args, 2 * i + 1)
+        let s = calloc(n + 1, 1)
+        copyBytes(s, word(args, 2 * i), n)
+        setWord(argv, i + 1, s)
+    }
+    let fds = calloc(4, 8) // input (read, write), output, errors, exec's failure: each (read end, write end)
+    for k in 0..4 {
+        if pipe(fds + 8 * k) != 0 {
+            let e = errno()
+            closeAll(fds, 2 * k)
+            return cannotRun(out, name, e)
+        }
+    }
+    for i in [1, 2, 4, 6, 7] {
+        let _ = fcntl(int32At(fds, i), 2, 1) // FD_CLOEXEC: this program's ends, kept from the process and from others
+    }
+    let pid = fork()
+    if pid < 0 {
+        let e = errno()
+        closeAll(fds, 8)
+        return cannotRun(out, name, e)
+    }
+    if pid == 0 {
+        // the child: the pipes its input, output and errors
+        let _ = dup2(int32At(fds, 0), 0) + dup2(int32At(fds, 3), 1) + dup2(int32At(fds, 5), 2)
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5))
+        let _ = execvp(name, argv)
+        let e = calloc(1, 8)
+        setInt32(e, 0, errno())
+        let _ = cWrite(int32At(fds, 7), e, 4)
+        cExitNow(127)
+    }
+    let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5)) + cClose(int32At(fds, 7))
+    let execError = calloc(1, 8)
+    var got = cRead(int32At(fds, 6), execError, 4)
+    while got < 0 and errno() == eintr {
+        got = cRead(int32At(fds, 6), execError, 4)
+    }
+    let _ = cClose(int32At(fds, 6))
+    if got == 4 {
+        let ws = calloc(1, 8)
+        while waitpid(pid, ws, 0) < 0 and errno() == eintr {}
+        let _ = cClose(int32At(fds, 1)) + cClose(int32At(fds, 2)) + cClose(int32At(fds, 4))
+        return cannotRun(out, name, int32At(execError, 0))
+    }
+    setWord(out, 0, pid)
+    setWord(out, 1, int32At(fds, 1))
+    setWord(out, 2, int32At(fds, 2))
+    setWord(out, 3, int32At(fds, 4))
+    0
+}
+
+pub extern effect fn osPipeReadImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" {
+    while true {
+        let k = cRead(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeWriteImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" {
+    while true {
+        let k = cWrite(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeCloseImpl(h: Int64) as "qkosPipeClose" {
+    let _ = cClose(h)
+}
+
+pub extern effect fn osProcessWaitImpl(h: Int64) -> Int64 as "qkosProcessWait" {
+    let ws = calloc(1, 8)
+    while waitpid(h, ws, 0) < 0 and errno() == eintr {}
+    let s = int32At(ws, 0)
+    free(ws)
+    if s & 127 == 0 {
+        s >> 8 & 255
+    } else if s & 127 != 127 {
+        128 + s & 127
+    } else {
+        -1
+    }
+}
+
+pub extern effect fn osProcessKillImpl(h: Int64) as "qkosProcessKill" {
+    let _ = cKill(h, 9)
 }
 
 // ---- code in memory, the stack, C's libraries, threads ----
@@ -9066,6 +10860,185 @@ pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalO
     }
     free(t)
     offset
+}
+
+// ---- TLS: SecureTransport (Security.framework, loaded the first time TLS is used), each function found by its
+// name; its reads and writes are of io.qk's buffers (tIn, tOut), its sockets carry the bytes ----
+// io.qk's words first (tOut ... tIn), then this
+const mCtx = 12
+const mWords = 13
+const stWouldBlock = -9803 // errSSLWouldBlock: more from the server first
+const stClosed = -9805 // errSSLClosedGraceful
+const stAborted = -9806 // errSSLClosedAbort
+
+fn security() -> Int {
+    let have = gGet(gTlsLibrary)
+    if have != 0 {
+        return have
+    }
+    let h = dlopen(textAt("/System/Library/Frameworks/Security.framework/Security\0"), 2)
+    gSet(gTlsLibrary, h)
+    h
+}
+
+extern effect fn findSt1(h: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "dlsym"
+extern effect fn findSt2(h: Int64, name: Int64) -> (extern (Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSt3(h: Int64, name: Int64) -> (extern (Int64, Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSt4(h: Int64, name: Int64) -> (extern (Int64, Int64, Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findStCreate(h: Int64, name: Int64) -> (extern (Int64, Int32, Int32) -> Int64)? as "dlsym"
+extern fn ioAddress(f: extern (Int64, Int64, Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+fn st1(name: Text, a: Int) -> Int = match findSt1(security(), textAt(name)) {
+    Some(f) => f(a)
+    None => -1
+}
+
+fn st3(name: Text, a: Int, b: Int, c: Int) -> Int = match findSt3(security(), textAt(name)) {
+    Some(f) => f(a, b, c)
+    None => -1
+}
+
+fn st4(name: Text, a: Int, b: Int, c: Int, d: Int) -> Int = match findSt4(security(), textAt(name)) {
+    Some(f) => f(a, b, c, d)
+    None => -1
+}
+
+// SecureTransport's read: what came from the server (connection: the block); errSSLWouldBlock when it wants more
+fn stRead(t: Int, data: Int, length: Int) -> Int {
+    let want = word(length, 0)
+    let have = word(t, tIn + 1)
+    let k = if have < want { have } else { want }
+    copyBytes(data, word(t, tIn), k)
+    heldDrop(t, tIn, k)
+    setWord(length, 0, k)
+    if k < want { stWouldBlock } else { 0 }
+}
+
+// its write: kept to send
+fn stWrite(t: Int, data: Int, length: Int) -> Int {
+    heldAppend(t, tOut, data, word(length, 0))
+    0
+}
+
+fn stWhy(why: Int, s: Int) {
+    let m = match s {
+        -9807 => "the server's certificate chain is not valid"
+        -9808 => "the server's certificate is bad"
+        -9812 => "the server's certificate's root is not known"
+        -9813 => "the server's certificate has no root that is trusted"
+        -9814 => "the server's certificate has expired"
+        -9815 => "the server's certificate is not valid yet"
+        -9843 => "the server's certificate is for another name"
+        -9806 => "the server closed the connection"
+        _ => ""
+    }
+    let b = bufAt(why, 256)
+    let _ = if m != "" {
+        b.text(m)
+    } else {
+        b.text("SecureTransport's status ").int(s)
+    }
+}
+
+pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    if security() == 0 {
+        let _ = bufAt(why, 256).text("cannot load Security.framework")
+        return 0
+    }
+    let ctx = match findStCreate(security(), textAt("SSLCreateContext\0")) {
+        Some(f) => f(0, 1, 0)
+        // kSSLClientSide, kSSLStreamType
+        None => 0
+    }
+    if ctx == 0 {
+        let _ = bufAt(why, 256).text("SecureTransport made no context")
+        return 0
+    }
+    let t = calloc(mWords, 8)
+    setWord(t, mCtx, ctx)
+    let _ = st3(
+        "SSLSetIOFuncs\0",
+        ctx,
+        ioAddress((c, d, n) => stRead(c, d, n)),
+        ioAddress((c, d, n) => stWrite(c, d, n)),
+    )
+    let _ = match findSt2(security(), textAt("SSLSetConnection\0")) {
+        Some(f) => f(ctx, t)
+        None => -1
+    }
+    let _ = st3("SSLSetPeerDomainName\0", ctx, host, strlen(host)) // the hello's name, and the certificate's
+    if osTlsWorkImpl(t, why) != 0 {
+        osTlsEndImpl(t)
+        heldFree(t, tOut)
+        free(t)
+        return 0
+    }
+    t
+}
+
+pub extern effect fn osTlsWorkImpl(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" {
+    let ctx = word(t, mCtx)
+    if word(t, tState) == 0 {
+        let s = st1("SSLHandshake\0", ctx)
+        if s == stWouldBlock {
+            return 0
+        }
+        if s != 0 {
+            stWhy(why, s)
+            return -1
+        }
+        setWord(t, tState, 1)
+    }
+    if word(t, tState) == 1 {
+        let room = malloc(16384)
+        let done = calloc(1, 8)
+        while true {
+            setWord(done, 0, 0)
+            let s = st4("SSLRead\0", ctx, room, 16384, done)
+            let k = word(done, 0)
+            if k > 0 {
+                heldAppend(t, tPlain, room, k)
+            }
+            if s == stClosed or s == stAborted {
+                setWord(t, tState, 2)
+                break
+            }
+            if s != 0 and s != stWouldBlock {
+                free(room)
+                free(done)
+                stWhy(why, s)
+                return -1
+            }
+            if s == stWouldBlock or k == 0 {
+                break
+            }
+        }
+        free(room)
+        free(done)
+    }
+    0
+}
+
+pub extern effect fn osTlsSealImpl(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" {
+    let done = calloc(1, 8)
+    let s = st4("SSLWrite\0", word(t, mCtx), p, n, done) // (its write takes everything at once)
+    free(done)
+    if s != 0 {
+        stWhy(why, s)
+        return -1
+    }
+    0
+}
+
+pub extern effect fn osTlsEndImpl(t: Int64) as "qkosTlsEnd" {
+    let ctx = word(t, mCtx)
+    if ctx != 0 {
+        if word(t, tState) == 1 {
+            let _ = st1("SSLClose\0", ctx) // close_notify
+        }
+        let _ = st1("CFRelease\0", ctx)
+        setWord(t, mCtx, 0)
+    }
 }
 """ + "\n"
     }
@@ -10015,7 +11988,16 @@ fn named() -> Buf {
     if path != 0 { b.zeroText(path) } else { b.text("program") }
 }
 
-fn at(line: Int) -> Buf = named().text(":").int(lineOf(line)).text(": ")
+// where a panic is: the file of its code (another file's than the program's, std/testing.qk say) and the line
+fn at(line: Int) -> Buf {
+    let file = panicFile(line >> 32)
+    let b = if file != 0 {
+        bufAt(panicText(), panicTextSize).zeroText(file)
+    } else {
+        named()
+    }
+    b.text(":").int(lineOf(line)).text(": ")
+}
 
 pub extern effect fn rtPanic(code: Int64, line: Int64, a: Int64, b: Int64) as "qk_panic" {
     let m = match code {
@@ -10282,7 +12264,7 @@ extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as 
 // ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
 // ---- each runtime function's address, by its number: its Quark function, which the
 // program calls the Quark way ----
-const runtimeCount = 127 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+const runtimeCount = 138 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
 
 fn runtimeTable() -> Int {
     let t = calloc(runtimeCount, 8)
@@ -12485,7 +14467,10 @@ pub const trFnAt = 2 // each function's offset in the code
 pub const trSiteCount = 3
 pub const trSites = 4 // each call's 5 words: where it returns to, its line, caller, callee, inlined call
 pub const trInlineCount = 5
-pub const trInlines = 6 // each inlined call's 3 words: the one it is in (0: the function), its line, the callee's name
+pub const trInlines = 6 // each inlined call's 4 words: the one it is in (0: the function), its line, the callee's
+
+// name, its file (0: the program's)
+pub const trFiles = 7 // each function's file, zero-ended (0: the program's)
 
 fn functionAt(t: Int, offset: Int) -> Int {
     for i in 0..word(t, trFnCount) {
@@ -12498,7 +14483,37 @@ fn functionAt(t: Int, offset: Int) -> Int {
 
 fn fnName(t: Int, i: Int) -> Int = word(word(t, trNames), i)
 
-fn inlineAt(t: Int, i: Int) -> Int = word(t, trInlines) + 24 * i
+fn inlineAt(t: Int, i: Int) -> Int = word(t, trInlines) + 32 * i
+
+// the file of the code a panic is in (inl: the inlined calls it is in), zero-ended; 0 the program's, or not known
+pub fn panicFile(inl: Int) -> Int {
+    let c = ctx()
+    let l = word(c, ctxRunning)
+    if l == 0 or word(l, lTrace) == 0 {
+        return 0
+    }
+    let t = word(l, lTrace)
+    if inl > 0 and inl < word(t, trInlineCount) {
+        return word(inlineAt(t, inl), 3)
+    }
+    // the function it stopped in: the callee of the call its frame returns through, else the one the call began with
+    var f = functionAt(t, word(c, ctxRunningEntry))
+    let frame = word(c, ctxPanicFrame)
+    if frame != 0 {
+        let ret = word(frame, 1)
+        for i in 0..word(t, trSiteCount) {
+            let s = word(t, trSites) + 40 * i
+            if word(s, 0) == ret - word(l, 0) {
+                f = word(s, 3)
+            }
+        }
+    }
+    if f >= 0 and f < word(t, trFnCount) {
+        word(word(t, trFiles), f)
+    } else {
+        0
+    }
+}
 
 fn calledFrom(b: Buf, name: Int, line: Int) -> Buf =
     b.text("\n  called from ").zeroText(name).text(" at line ").int(line)
@@ -13323,6 +15338,28 @@ pub extern effect fn wasiEnd(status: Int64) as "qkWasiEnd" {
     flush()
     procExit(status)
 }
+
+// ---- a process with pipes: none in WebAssembly ----
+pub extern effect fn wasiStartProcess(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let m = malloc(200)
+    let _ = bufAt(m, 200).text("cannot run ").zeroText(name).text(": WebAssembly runs no other programs")
+    setWord(out, 1, m)
+    let _ = args + count
+    1
+}
+
+// ---- TLS: none in WebAssembly (WASI has no TLS, and no system library to take it from) ----
+pub extern effect fn wasiTlsNew(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    let _ = bufAt(why, 256).text("WebAssembly has no TLS")
+    0
+}
+
+pub extern effect fn wasiTlsWork(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" = -1
+
+pub extern effect fn wasiTlsSeal(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" =
+    -1
+
+pub extern effect fn wasiTlsEnd(t: Int64) as "qkosTlsEnd" {}
 """ + "\n"
     }
     if name == "wasimath" {
@@ -14047,6 +16084,7 @@ pub extern fn wasiPow(x: Float64, y: Float64) -> Float64 as "pow" {
 // are UTF-8 in the runtime and UTF-16 here: Windows' wide functions take any name, its ANSI ones only the code
 // page's.
 use base
+use io
 use start
 use host
 
@@ -15506,6 +17544,440 @@ pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalO
     }
     free(t)
     offset
+}
+
+// ---- a process with pipes (startProcess): its input, output and errors this program's to use ----
+extern effect fn terminateProcess(h: Int64, code: UInt32) -> Int32 as "TerminateProcess"
+
+pub extern effect fn osStartProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let n = strlen(name)
+    for i in 0..n {
+        if byte(name, i) == '/' {
+            setByte(name, i, '\\')
+        }
+    }
+    var line = Line(malloc(256), 0, 256).quoted(name, n)
+    for i in 0..count {
+        line = line.add(' ').quoted(word(args, 2 * i), word(args, 2 * i + 1))
+    }
+    let wline = wideOf(line.p, line.n)
+    free(line.p)
+    let sa = calloc(1, 24)
+    setInt32(sa, 0, 24)
+    setInt32(sa, 4, 1)
+    let hs = calloc(6, 8) // input (read, write), output (read, write), errors (read, write)
+    for k in 0..3 {
+        if createPipe(hs + 16 * k, hs + 16 * k + 8, sa, 0) == 0 {
+            let e = getLastError()
+            for i in 0..2 * k {
+                let _ = closeHandle(word(hs, i))
+            }
+            free(wline)
+            return cannotRun(out, name, e)
+        }
+    }
+    // this program's ends: not given to the process
+    let _ = setHandleInformation(word(hs, 1), 1, 0)
+    let _ = setHandleInformation(word(hs, 2), 1, 0)
+    let _ = setHandleInformation(word(hs, 4), 1, 0)
+    let si = calloc(1, 104)
+    setInt32(si, 0, 104)
+    setInt32(si, 15, 256) // STARTF_USESTDHANDLES
+    setWord(si, 10, word(hs, 0))
+    setWord(si, 11, word(hs, 3))
+    setWord(si, 12, word(hs, 5))
+    let pi = calloc(1, 24)
+    let started = createProcessW(0, wline, 0, 0, 1, 0, 0, 0, si, pi)
+    let startError = getLastError()
+    free(wline)
+    let _ = closeHandle(word(hs, 0))
+    let _ = closeHandle(word(hs, 3))
+    let _ = closeHandle(word(hs, 5))
+    if started == 0 {
+        let _ = closeHandle(word(hs, 1))
+        let _ = closeHandle(word(hs, 2))
+        let _ = closeHandle(word(hs, 4))
+        return cannotRun(out, name, startError)
+    }
+    let _ = closeHandle(word(pi, 1)) // its thread
+    setWord(out, 0, word(pi, 0))
+    setWord(out, 1, word(hs, 1))
+    setWord(out, 2, word(hs, 2))
+    setWord(out, 3, word(hs, 4))
+    free(hs)
+    free(sa)
+    free(si)
+    free(pi)
+    0
+}
+
+pub extern effect fn osPipeReadImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" {
+    let got = calloc(1, 8)
+    let ok = winReadFile(h, p, if n > 1073741824 { 1073741824 } else { n }, got, 0)
+    let k = int32At(got, 0)
+    free(got)
+    if ok != 0 {
+        k
+    } else if getLastError() == 109 {
+        0 // ERROR_BROKEN_PIPE: its end
+    } else {
+        -1
+    }
+}
+
+pub extern effect fn osPipeWriteImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" {
+    let done = calloc(1, 8)
+    let ok = winWriteFile(h, p, if n > 1073741824 { 1073741824 } else { n }, done, 0)
+    let k = int32At(done, 0)
+    free(done)
+    if ok != 0 { k } else { -1 }
+}
+
+pub extern effect fn osPipeCloseImpl(h: Int64) as "qkosPipeClose" {
+    let _ = closeHandle(h)
+}
+
+pub extern effect fn osProcessWaitImpl(h: Int64) -> Int64 as "qkosProcessWait" {
+    let _ = waitForSingleObject(h, 4294967295)
+    let code = calloc(1, 8)
+    let _ = getExitCodeProcess(h, code)
+    let status = int32At(code, 0)
+    free(code)
+    let _ = closeHandle(h)
+    status
+}
+
+pub extern effect fn osProcessKillImpl(h: Int64) as "qkosProcessKill" {
+    let _ = terminateProcess(h, 1)
+}
+
+// ---- TLS: Schannel, from secur32.dll (loaded the first time TLS is used), each function found by its name ----
+// io.qk's words first (tOut ... tIn), then these
+const wCred = 12 // its credentials' handle (two words)
+const wCtx = 14 // its context's handle (two words)
+const wHasCtx = 16
+const wHeader = 17 // a message's parts: its header's size, its trailer's, the most it holds
+const wTrailer = 18
+const wMost = 19
+const wTarget = 20 // the server's name, UTF-16
+const wWords = 21
+const secMask = 0xFFFFFFFF
+const secIncomplete = 0x80090318 // SEC_E_INCOMPLETE_MESSAGE: more is needed
+const secContinue = 0x00090312 // SEC_I_CONTINUE_NEEDED
+const secRenegotiate = 0x00090321 // SEC_I_RENEGOTIATE: messages of the handshake's after it (TLS 1.3's)
+const secExpired = 0x00090317 // SEC_I_CONTEXT_EXPIRED: the server ended it
+const iscFlags = 0xC11C // sequence and replay detection, confidentiality, extended errors, memory allocated, a stream
+
+fn secur32() -> Int {
+    let have = gGet(gTlsLibrary)
+    if have != 0 {
+        return have
+    }
+    let w = wide(textAt("secur32.dll\0"))
+    let m = loadLibraryW(w)
+    free(w)
+    gSet(gTlsLibrary, m)
+    m
+}
+
+extern effect fn findAcquireCredentials(
+    m: Int64,
+    name: Int64,
+) -> (extern (Int64, Int64, UInt32, Int64, Int64, Int64, Int64, Int64, Int64) -> Int32)? as "GetProcAddress"
+
+fn acquireCredentials(package: Int, data: Int, cred: Int, expiry: Int) -> Int = match findAcquireCredentials(
+    secur32(),
+    textAt("AcquireCredentialsHandleW\0"),
+) {
+    Some(f) => f(0, package, 2, 0, data, 0, 0, cred, expiry)
+    // SECPKG_CRED_OUTBOUND
+    None => -1
+}
+
+extern effect fn findInitializeContext(
+    m: Int64,
+    name: Int64,
+) -> (extern (Int64, Int64, Int64, UInt32, UInt32, UInt32, Int64, UInt32, Int64, Int64, Int64, Int64) -> Int32)? as "GetProcAddress"
+
+fn initializeContext(t: Int, first: Bool, input: Int, output: Int) -> Int {
+    let attrs = calloc(1, 16)
+    let ctx = t + 8 * wCtx
+    let r = match findInitializeContext(secur32(), textAt("InitializeSecurityContextW\0")) {
+        Some(f) => f(
+            t + 8 * wCred,
+            if first { 0 } else { ctx },
+            word(t, wTarget),
+            iscFlags,
+            0,
+            0,
+            input,
+            0,
+            ctx,
+            output,
+            attrs,
+            attrs + 8,
+        )
+        None => -1
+    }
+    free(attrs)
+    r & secMask
+}
+
+extern effect fn findQueryContext(m: Int64, name: Int64) -> (extern (Int64, UInt32, Int64) -> Int32)? as "GetProcAddress"
+extern effect fn findEncrypt(m: Int64, name: Int64) -> (extern (Int64, UInt32, Int64, UInt32) -> Int32)? as "GetProcAddress"
+extern effect fn findDecrypt(m: Int64, name: Int64) -> (extern (Int64, Int64, UInt32, Int64) -> Int32)? as "GetProcAddress"
+extern effect fn findApplyToken(m: Int64, name: Int64) -> (extern (Int64, Int64) -> Int32)? as "GetProcAddress"
+extern effect fn findOfOne(m: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "GetProcAddress"
+
+// FreeContextBuffer, DeleteSecurityContext, FreeCredentialsHandle
+fn secCall(name: Text, p: Int) = match findOfOne(secur32(), textAt(name)) {
+    Some(f) => {
+        let _ = f(p)
+    }
+    None => {}
+}
+
+// a SecBufferDesc of n SecBuffers (each: its size, its kind, its place)
+fn secBuffers(n: Int) -> Int {
+    let d = calloc(1, 16 + 16 * n)
+    setInt32(d, 1, n)
+    setWord(d, 1, d + 16)
+    d
+}
+
+fn setSecBuffer(d: Int, i: Int, size: Int, kind: Int, p: Int) {
+    setInt32(d + 16 + 16 * i, 0, size)
+    setInt32(d + 16 + 16 * i, 1, kind)
+    setWord(d + 16 + 16 * i, 1, p)
+}
+
+fn secSize(d: Int, i: Int) -> Int = int32At(d + 16 + 16 * i, 0) & secMask
+
+fn secKind(d: Int, i: Int) -> Int = int32At(d + 16 + 16 * i, 1) & secMask
+
+fn secPlace(d: Int, i: Int) -> Int = word(d + 16 + 16 * i, 1)
+
+// the system's words for a status ("The certificate chain was issued by an authority that is not trusted")
+fn secWhy(why: Int, s: Int) {
+    let m = calloc(1, 300)
+    let _ = formatMessageA(4096 | 512, 0, s, 0, m, 300, 0)
+    var k = strlen(m)
+    while k > 0 and (byte(m, k - 1) == '\r' or byte(m, k - 1) == '\n' or byte(m, k - 1) == '.' or byte(m, k - 1) == ' ') {
+        k -= 1
+        setByte(m, k, 0)
+    }
+    let b = bufAt(why, 256)
+    let _ = if k == 0 {
+        b.text("Schannel's status 0x").hex(s)
+    } else {
+        b.zeroText(m)
+    }
+    free(m)
+}
+
+pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    if secur32() == 0 {
+        let _ = bufAt(why, 256).text("cannot load secur32.dll")
+        return 0
+    }
+    let t = calloc(wWords, 8)
+    let package = wide(textAt("Microsoft Unified Security Protocol Provider\0"))
+    let expiry = calloc(1, 16)
+    let flags = 0x20 | 0x10 | 0x400000 // the server's certificate checked, no certificate of this side's, strong ciphers
+    // SCH_CREDENTIALS (TLS 1.3 where the system has it), else SCHANNEL_CRED (before Windows 10 1809)
+    let cred = calloc(1, 80)
+    setInt32(cred, 0, 5)
+    setInt32(cred, 13, flags)
+    var s = acquireCredentials(package, cred, t + 8 * wCred, expiry) & secMask
+    if s != 0 {
+        zeroBytes(cred, 80)
+        setInt32(cred, 0, 4)
+        setInt32(cred, 18, flags)
+        s = acquireCredentials(package, cred, t + 8 * wCred, expiry) & secMask
+    }
+    free(cred)
+    free(expiry)
+    free(package)
+    if s != 0 {
+        secWhy(why, s)
+        free(t)
+        return 0
+    }
+    setWord(t, wTarget, wide(host))
+    if handshake(t, why) != 0 {
+        osTlsEndImpl(t)
+        heldFree(t, tOut)
+        free(t)
+        return 0
+    }
+    t
+}
+
+// the handshake as far as what came goes (the first call: the hello); 0, or -1 with why
+fn handshake(t: Int, why: Int) -> Int {
+    while true {
+        let first = word(t, wHasCtx) == 0
+        let n = word(t, tIn + 1)
+        if not first and n == 0 {
+            return 0
+        }
+        let input = secBuffers(2)
+        setSecBuffer(input, 0, n, 2, word(t, tIn)) // SECBUFFER_TOKEN
+        let output = secBuffers(1)
+        setSecBuffer(output, 0, 0, 2, 0)
+        let s = initializeContext(t, first, if first { 0 } else { input }, output)
+        let made = secPlace(output, 0)
+        if made != 0 {
+            heldAppend(t, tOut, made, secSize(output, 0))
+            secCall("FreeContextBuffer\0", made)
+        }
+        let extra = if secKind(input, 1) == 5 {
+            secSize(input, 1) // SECBUFFER_EXTRA: not used yet
+        } else {
+            0
+        }
+        free(input)
+        free(output)
+        if s == secIncomplete {
+            return 0
+        }
+        if s != 0 and s != secContinue {
+            secWhy(why, s)
+            return -1
+        }
+        setWord(t, wHasCtx, 1)
+        heldDrop(t, tIn, n - extra)
+        if s == 0 {
+            let sizes = calloc(1, 32)
+            let _ = match findQueryContext(secur32(), textAt("QueryContextAttributesW\0")) {
+                Some(f) => f(t + 8 * wCtx, 4, sizes)
+                // SECPKG_ATTR_STREAM_SIZES
+                None => -1
+            }
+            setWord(t, wHeader, int32At(sizes, 0) & secMask)
+            setWord(t, wTrailer, int32At(sizes, 1) & secMask)
+            setWord(t, wMost, int32At(sizes, 2) & secMask)
+            free(sizes)
+            setWord(t, tState, 1)
+            return decrypt(t, why)
+        }
+        if word(t, tIn + 1) == 0 {
+            return 0
+        }
+    }
+    0
+}
+
+// what came, decrypted as far as it is whole; 0, or -1 with why
+fn decrypt(t: Int, why: Int) -> Int {
+    while word(t, tIn + 1) > 0 and word(t, tState) == 1 {
+        let n = word(t, tIn + 1)
+        let d = secBuffers(4)
+        setSecBuffer(d, 0, n, 1, word(t, tIn)) // SECBUFFER_DATA: decrypted in place
+        let s = match findDecrypt(secur32(), textAt("DecryptMessage\0")) {
+            Some(f) => f(t + 8 * wCtx, d, 0, 0) & secMask
+            None => secMask
+        }
+        if s == secIncomplete {
+            free(d)
+            return 0
+        }
+        if s != 0 and s != secRenegotiate and s != secExpired {
+            free(d)
+            secWhy(why, s)
+            return -1
+        }
+        // decrypted, the parts are the header, the data, the trailer and what is left (the next message's: the last
+        // bytes of what came)
+        if secKind(d, 1) == 1 {
+            heldAppend(t, tPlain, secPlace(d, 1), secSize(d, 1))
+        }
+        let extra = if secKind(d, 3) == 5 { secSize(d, 3) } else { 0 }
+        free(d)
+        heldDrop(t, tIn, n - extra)
+        if s == secExpired {
+            setWord(t, tState, 2)
+        } else if s == secRenegotiate {
+            setWord(t, tState, 0)
+            return handshake(t, why)
+        }
+    }
+    0
+}
+
+pub extern effect fn osTlsWorkImpl(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" = if word(t, tState) == 0 {
+    handshake(t, why)
+} else if word(t, tState) == 1 {
+    decrypt(t, why)
+} else {
+    0
+}
+
+pub extern effect fn osTlsSealImpl(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" {
+    let h = word(t, wHeader)
+    let tr = word(t, wTrailer)
+    let most = word(t, wMost)
+    let room = malloc(h + most + tr)
+    var at = 0
+    while at < n {
+        let k = if n - at < most { n - at } else { most }
+        copyBytes(room + h, p + at, k)
+        let d = secBuffers(4)
+        setSecBuffer(d, 0, h, 7, room) // SECBUFFER_STREAM_HEADER
+        setSecBuffer(d, 1, k, 1, room + h)
+        setSecBuffer(d, 2, tr, 6, room + h + k) // SECBUFFER_STREAM_TRAILER
+        let s = match findEncrypt(secur32(), textAt("EncryptMessage\0")) {
+            Some(f) => f(t + 8 * wCtx, 0, d, 0) & secMask
+            None => secMask
+        }
+        if s != 0 {
+            free(d)
+            free(room)
+            secWhy(why, s)
+            return -1
+        }
+        heldAppend(t, tOut, room, secSize(d, 0) + secSize(d, 1) + secSize(d, 2))
+        free(d)
+        at += k
+    }
+    free(room)
+    0
+}
+
+pub extern effect fn osTlsEndImpl(t: Int64) as "qkosTlsEnd" {
+    if word(t, wHasCtx) != 0 {
+        if word(t, tState) == 1 {
+            // close_notify: the shutdown token applied, then what the context makes of it
+            let token = calloc(1, 8)
+            setInt32(token, 0, 1) // SCHANNEL_SHUTDOWN
+            let d = secBuffers(1)
+            setSecBuffer(d, 0, 4, 2, token)
+            let applied = match findApplyToken(secur32(), textAt("ApplyControlToken\0")) {
+                Some(f) => f(t + 8 * wCtx, d) & secMask
+                None => secMask
+            }
+            if applied == 0 {
+                let output = secBuffers(1)
+                setSecBuffer(output, 0, 0, 2, 0)
+                let _ = initializeContext(t, false, 0, output)
+                let made = secPlace(output, 0)
+                if made != 0 {
+                    heldAppend(t, tOut, made, secSize(output, 0))
+                    secCall("FreeContextBuffer\0", made)
+                }
+                free(output)
+            }
+            free(d)
+            free(token)
+        }
+        secCall("DeleteSecurityContext\0", t + 8 * wCtx)
+        setWord(t, wHasCtx, 0)
+    }
+    if word(t, wTarget) != 0 {
+        secCall("FreeCredentialsHandle\0", t + 8 * wCred)
+        free(word(t, wTarget))
+        setWord(t, wTarget, 0)
+    }
 }
 """ + "\n"
     }

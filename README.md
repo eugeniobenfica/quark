@@ -164,6 +164,9 @@ docs/                the language, the tour, embedding, stability, memory, boots
 | :--- | :--- |
 | [A tour of Quark](docs/TUTORIAL.md) | From a first program to a server, in ten steps. |
 | [The language](docs/LANGUAGE.md) | Everything: types, built-ins, the standard library, C, memory, tasks, the tools. |
+| [Coming from Go, Rust or Python](docs/COMING-FROM.md) | What carries over, what does not, and the Quark way of each. |
+| [Servers](docs/SERVERS.md) | Handlers, JSON, shared state, calling other services, tests, shipping. |
+| [The prelude](docs/PRELUDE.md) | Every built-in the prelude declares, made by `quark doc` from its source. |
 | [Embedding](docs/EMBEDDING.md) | Quark inside a C or C++ program: `quark.h` and libquark. |
 | [Stability](docs/STABILITY.md) | What is promised to keep working, and how things change. |
 | [Memory](docs/MEMORY.md) | The arena, the loops' collection, and why not reference counting. |

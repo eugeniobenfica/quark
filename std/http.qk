@@ -1,6 +1,7 @@
-// HTTP/1.1 without TLS (http://, not https://): a server that runs each connection in a task of its own, and a
-// client. A request's and a response's body is read by its Content-Length (a chunked body, as servers send without
-// one, is read to the end of the connection); each connection serves one request (Connection: close).
+// HTTP/1.1: a server that runs each connection in a task of its own, and a client. A request's and a response's body
+// is read by its Content-Length (a chunked body, as servers send without one, is read to the end of the connection);
+// each connection serves one request (Connection: close). The client takes https:// too, over TLS (std.net's
+// connectTls); the server speaks plain HTTP (TLS before it is a proxy's).
 //
 //     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
 //     fn main() {
@@ -165,15 +166,13 @@ pub fn serve(host: Text, port: Int, handler: effect (Request) -> Response) -> Un
     Ok(())
 }
 
-// http://host[:port]/path?query: (host, port, the path with its query)
+// http://host[:port]/path?query (https://: over TLS): (host, port, the path with its query)
 pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
-    if url.startsWith("https://") {
-        return Err("https is not supported (no TLS): {url}")
+    let secure = url.startsWith("https://")
+    if not secure and not url.startsWith("http://") {
+        return Err("not an http:// or https:// URL: {url}")
     }
-    if not url.startsWith("http://") {
-        return Err("not an http:// URL: {url}")
-    }
-    let rest = url[7..]
+    let rest = url[(if secure { 8 } else { 7 })..]
     let slash = rest.indexOf("/")
     let authority = if slash is Some(i) { rest[..i] } else { rest }
     let target = if slash is Some(i) { rest[i..] } else { "/" }
@@ -182,16 +181,24 @@ pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
         let port = authority[i + 1..].parseInt().mapErr(why => "the port: {why}")?
         return Ok((authority[..i], port, target))
     }
-    Ok((authority, 80, target))
+    Ok((authority, if secure { 443 } else { 80 }, target))
 }
 
 // a request to url: its method, its headers (names in lower case) and its body; the response
 pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
     let (host, port, target) = parseUrl(url)?
-    let socket = connect(host, port)?
-    let c = conn(socket)
+    let secure = url.startsWith("https://")
+    let c = if secure {
+        connectTls(host, port)?
+    } else {
+        conn(connect(host, port)?)
+    }
     var all = headers
-    all["host"] = if port == 80 { host } else { "{host}:{port}" }
+    all["host"] = if port == (if secure { 443 } else { 80 }) {
+        host
+    } else {
+        "{host}:{port}"
+    }
     let sent = c.writeBytes(head("{method} {target} HTTP/1.1", all, body))
     if sent is Err(why) {
         c.close()

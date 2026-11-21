@@ -226,6 +226,20 @@ fn readCommand(p: Int, cap: Int) -> Bool {
 
 fn isWord(p: Int, n: Int, w: Text) -> Bool = n == len(w) and sameBytes(p, textAt(w), n)
 
+// quark test --coverage: a line of the program's file runs
+pub const coverRoom = 1 << 20 // lines
+
+pub extern effect fn rtCoverLine(line: Int64) as "qk_coverLine" {
+    var map = gGet(gCover)
+    if map == 0 {
+        map = calloc(coverRoom, 1)
+        gSet(gCover, map)
+    }
+    if line > 0 and line < coverRoom {
+        setByte(map, line, 1)
+    }
+}
+
 // a statement starts: stop when it is a breakpoint, or the debugger is stepping; then read commands
 pub extern effect fn rtDebugLine(line: Int64) as "qk_debugLine" {
     let d = state()

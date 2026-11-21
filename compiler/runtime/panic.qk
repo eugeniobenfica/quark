@@ -17,7 +17,16 @@ fn named() -> Buf {
     if path != 0 { b.zeroText(path) } else { b.text("program") }
 }
 
-fn at(line: Int) -> Buf = named().text(":").int(lineOf(line)).text(": ")
+// where a panic is: the file of its code (another file's than the program's, std/testing.qk say) and the line
+fn at(line: Int) -> Buf {
+    let file = panicFile(line >> 32)
+    let b = if file != 0 {
+        bufAt(panicText(), panicTextSize).zeroText(file)
+    } else {
+        named()
+    }
+    b.text(":").int(lineOf(line)).text(": ")
+}
 
 pub extern effect fn rtPanic(code: Int64, line: Int64, a: Int64, b: Int64) as "qk_panic" {
     let m = match code {

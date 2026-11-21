@@ -1,10 +1,13 @@
 // A language server: an editor talks to it over the standard input and output (the Language Server Protocol), as
 // `quark lsp [--prelude P]`. It checks every open file as it changes and reports the errors where they are; formats
 // a file into its one canonical text; tells the type of the name under the cursor; goes to where a name was made;
-// lists a file's declarations; finds a name's uses and renames it; shows the types Quark worked out; helps with a
-// call's values; offers names to complete (after a dot: fields, cases, a type's functions; in a call: the names of
-// its values); offers the fixes the errors' messages ask for. Each request checks the text afresh, so nothing is
-// kept between requests but the files' texts.
+// lists a file's declarations; finds a name's uses and renames it, in every file the program reads that is not the
+// standard library's or a package's; goes to the implementations of an interface (the types that fit it) and of its
+// functions; shows the types Quark worked out, and on a function the effects it reaches; helps with a call's values;
+// offers names to complete (after a dot: fields, cases, a type's functions; in a call: the names of its values);
+// offers the fixes the errors' messages ask for. Changes come as edits of parts of a file; an open file's text, saved
+// or not, is the one the files that use it see, and they are checked again when it changes. A file's check is kept
+// until any file changes.
 use source
 use ast
 use types
@@ -25,7 +28,17 @@ type Problem { line: Int, col: Int, message: Text, here: Bool }
 
 // a file analyzed: the program (checked or not), the errors, whether it parsed
 type Analysis { p: Program, problems: [Problem], ok: Bool }
-type Server { docs: [Doc] = [], prelude: Source? = None, down: Bool = false }
+
+// a file's check, and the text it was of
+type KeptCheck { text: Text, a: Analysis }
+
+type Server {
+    docs: [Doc] = []
+    prelude: Source? = None
+    down: Bool = false
+    checked: [Text: KeptCheck] = [:] // each open file's check, by URI, until a file changes
+    reads: [Text: [Text]] = [:] // the files each open file's program reads (their paths), from its last check
+}
 
 pub fn serveLsp(preludePath: Text) -> Int {
     var s = Server()
@@ -81,7 +94,7 @@ fn Server.handle(var self, m: Json) -> Bool {
     if name == "initialize" {
         respond(
             id,
-            "\{\"capabilities\": \{\"textDocumentSync\": 1, \"hoverProvider\": true, \"definitionProvider\": true, "
+            "\{\"capabilities\": \{\"textDocumentSync\": \{\"openClose\": true, \"change\": 2\}, \"hoverProvider\": true, \"definitionProvider\": true, \"implementationProvider\": true, "
                 + "\"documentSymbolProvider\": true, \"documentFormattingProvider\": true, \"completionProvider\": \{\"triggerCharacters\": [\".\"]\}, "
                 + "\"codeActionProvider\": \{\"codeActionKinds\": [\"quickfix\"]\}, "
                 + "\"referencesProvider\": true, \"renameProvider\": true, \"inlayHintProvider\": true, "
@@ -99,23 +112,37 @@ fn Server.handle(var self, m: Json) -> Bool {
         return false
     }
     if name == "textDocument/didOpen" or name == "textDocument/didChange" {
+        // the whole text (didOpen), or edits of parts of it in order (a change without a range: the whole text)
         var text = m.text(m.get(textDoc, "text"))
-        let changes = m.items(m.get(params, "contentChanges"))
-        if text == None and len(changes) > 0 {
-            text = m.text(m.get(changes[len(changes) - 1], "text"))
+        if text == None {
+            var t = if at >= 0 { self.docs[at].text } else { "" }
+            for c in m.items(m.get(params, "contentChanges")) {
+                let range = m.get(c, "range")
+                let put = m.text(m.get(c, "text")) ?? ""
+                t = if range < 0 {
+                    put
+                } else {
+                    let start = m.get(range, "start")
+                    let end = m.get(range, "end")
+                    let from = offsetAt(t, m.int(m.get(start, "line"), 0), m.int(m.get(start, "character"), 0))
+                    let to = offsetAt(t, m.int(m.get(end, "line"), 0), m.int(m.get(end, "character"), 0))
+                    t[..from] + put + t[(if to > from { to } else { from })..]
+                }
+            }
+            text = t
         }
         if uri is Some(u) and text is Some(t) {
-            let i = self.findDoc(u)
-            if i < 0 {
+            if at < 0 {
                 self.docs.push(Doc(u, t))
             } else {
-                self.docs[i] = Doc(u, t)
+                self.docs[at] = Doc(u, t)
             }
-            self.publish(Doc(u, t))
+            self.changed(u)
         }
         return true
     }
     if name == "textDocument/didClose" {
+        self.checked = [:]
         if at >= 0 {
             var kept: [Doc] = []
             for (i, x) in self.docs.enumerate() {
@@ -127,7 +154,7 @@ fn Server.handle(var self, m: Json) -> Bool {
         }
         return true
     }
-    let known = name is "textDocument/hover" | "textDocument/definition" | "textDocument/documentSymbol" | "textDocument/formatting" | "textDocument/references" | "textDocument/rename" | "textDocument/signatureHelp" | "textDocument/inlayHint" | "textDocument/completion" | "textDocument/codeAction"
+    let known = name is "textDocument/hover" | "textDocument/definition" | "textDocument/implementation" | "textDocument/documentSymbol" | "textDocument/formatting" | "textDocument/references" | "textDocument/rename" | "textDocument/signatureHelp" | "textDocument/inlayHint" | "textDocument/completion" | "textDocument/codeAction"
     if not known {
         if idAt >= 0 and name != "" {
             send("\{\"jsonrpc\": \"2.0\", \"id\": {id}, \"error\": \{\"code\": -32601, \"message\": \"not handled\"}}")
@@ -135,7 +162,7 @@ fn Server.handle(var self, m: Json) -> Bool {
         return true
     }
     if at < 0 {
-        let none = if name is "textDocument/documentSymbol" | "textDocument/inlayHint" | "textDocument/completion" | "textDocument/codeAction" {
+        let none = if name is "textDocument/documentSymbol" | "textDocument/inlayHint" | "textDocument/completion" | "textDocument/codeAction" | "textDocument/implementation" {
             "[]"
         } else {
             "null"
@@ -144,12 +171,16 @@ fn Server.handle(var self, m: Json) -> Bool {
         return true
     }
     let d = self.docs[at]
+    if not self.checked.contains(d.uri) {
+        self.checked[d.uri] = KeptCheck(d.text, self.analyze(d, true))
+    }
     let pos = m.get(params, "position")
     let line = m.int(m.get(pos, "line"), 0) + 1
     let col = byteColumn(d.text, line, m.int(m.get(pos, "character"), 0))
     let result = match name {
         "textDocument/hover" => self.hover(d, line, col)
         "textDocument/definition" => self.definition(d, line, col)
+        "textDocument/implementation" => self.implementations(d, line, col)
         "textDocument/documentSymbol" => self.symbols(d)
         "textDocument/formatting" => formatting(d)
         "textDocument/references" => self.references(d, line, col)
@@ -237,6 +268,21 @@ fn rangeAt(text: Text, line: Int, col: Int) -> Text {
 fn location(d: Doc, line: Int, col: Int) -> Text =
     "\{\"uri\": {jsonString(d.uri)}, \"range\": {rangeAt(d.text, line, col)}}"
 
+// the byte a position (a line from 0, UTF-16 units into it) is at
+fn offsetAt(text: Text, line: Int, units: Int) -> Int {
+    let start = lineStart(text, line + 1)
+    if start >= len(text) {
+        return len(text)
+    }
+    start + byteColumn(text, line + 1, units) - 1
+}
+
+// a path as a URI: file:///C:/x/a.qk, file:///home/x/a.qk
+fn pathUri(path: Text) -> Text {
+    let p = path.replace("\\", "/").replace("%", "%25").replace(" ", "%20")
+    if p.startsWith("/") { "file://" + p } else { "file:///" + p }
+}
+
 // ---- checking a file -------------------------------------------------------------------------------------------
 // file:///C:/x/a.qk (or file:///home/x/a.qk) as a path, for the files its uses name
 fn uriPath(uri: Text) -> Text {
@@ -319,12 +365,21 @@ fn problemOf(shown: Text, uri: Text) -> Problem {
 
 // The file parsed (and checked, when it parses and check): its problems. ok: it parsed.
 fn Server.analyze(self, d: Doc, check: Bool) -> Analysis {
+    if check and self.checked[d.uri] is Some(kept) and kept.text == d.text {
+        return kept.a
+    }
     let src = Source(d.uri, d.text)
     let first = parse(src)
     if not first.ok {
         return Analysis(newProgram(first.ast, []), first.errors.map(e => problemOf(e, d.uri)).toArray(), false)
     }
-    let loaded = loadProgram(src, self.prelude, at: uriPath(d.uri))
+    var open: [Text: Text] = [:]
+    for o in self.docs {
+        if o.uri != d.uri {
+            open[uriPath(o.uri)] = o.text
+        }
+    }
+    let loaded = loadProgram(src, self.prelude, at: uriPath(d.uri), open: open)
     var p = loaded.program
     var errors = loaded.errors
     if check and len(p.modules) > 0 {
@@ -341,8 +396,21 @@ fn diagnostic(d: Doc, p: Problem) -> Text {
     "\{\"range\": {rangeAt(d.text, line, col)}, \"severity\": 1, \"source\": \"quark\", \"message\": {jsonString(p.message)}}"
 }
 
-fn Server.publish(self, d: Doc) {
+// a file changed: every check let go of; its problems said again, and those of the open files whose programs read it
+fn Server.changed(var self, uri: Text) {
+    self.checked = [:]
+    let path = uriPath(uri)
+    for d in self.docs {
+        if d.uri == uri or (self.reads[d.uri] ?? []).contains(path) {
+            self.publish(d)
+        }
+    }
+}
+
+fn Server.publish(var self, d: Doc) {
     let a = self.analyze(d, true)
+    self.checked[d.uri] = KeptCheck(d.text, a)
+    self.reads[d.uri] = a.p.modules.map(m => m.path).toArray()
     var out = "\{\"jsonrpc\": \"2.0\", \"method\": \"textDocument/publishDiagnostics\", \"params\": \{\"uri\": {jsonString(d.uri)}, \"diagnostics\": ["
     for (i, pr) in a.problems.enumerate() {
         if i > 0 {
@@ -486,7 +554,7 @@ fn find(p: Program, line: Int, col: Int) -> Found {
     var f = Found(line, col)
     for d in p.decls {
         let x = p.ast.decls[d]
-        if x.fromPrelude or x.templateOf >= 0 or x.lifted {
+        if x.fromPrelude or x.templateOf >= 0 or x.lifted or x.module != 0 {
             continue
         }
         if covers(line, col, x.name, x.line, nameColumn(x)) {
@@ -622,7 +690,224 @@ fn Server.hover(self, d: Doc, line: Int, col: Int) -> Text {
     if text == "" {
         return "null"
     }
+    // a function's effects: what it reaches, itself or through what it calls
+    let fnAt = if f.expr >= 0 and p.ast.exprs[f.expr].decl >= 0 {
+        p.ast.exprs[f.expr].decl
+    } else if f.expr < 0 and f.decl >= 0 {
+        f.decl
+    } else {
+        -1
+    }
+    if fnAt >= 0 and p.ast.decls[fnAt].kind == DeclKind.Fn {
+        let x = p.ast.decls[fnAt]
+        var ef = Effects()
+        ef.inDecl(p, fnAt)
+        if len(ef.groups) > 0 {
+            text += "\n// effects: " + ef.groups.sorted().join(", ")
+        } else if x.isEffect {
+            text += "\n// effects: an effect (it changes or reads the world)"
+        } else {
+            text += "\n// no effects: the same values give the same result"
+        }
+    }
     "\{\"contents\": \{\"kind\": \"markdown\", \"value\": {jsonString("```quark\n" + text + "\n```")}}}"
+}
+
+// the effects a function reaches: the groups of the built-ins it calls (print, files, net...), and the C functions,
+// through every function it calls
+type Effects { seen: Set<Int> = [], groups: [Text] = [] }
+
+fn Effects.add(var self, g: Text) {
+    if g != "" and not self.groups.contains(g) {
+        self.groups.push(g)
+    }
+}
+
+fn Effects.inDecl(var self, p: Program, d: Int) {
+    if d < 0 or self.seen.contains(d) {
+        return
+    }
+    self.seen.add(d)
+    let x = p.ast.decls[d]
+    if x.kind != DeclKind.Fn {
+        return
+    }
+    if isCFunction(x) {
+        self.add("C (" + (if x.externSymbol != "" { x.externSymbol } else { x.name }) + ")")
+        return
+    }
+    if x.builtin
+        and x.body >= 0
+        and p.ast.exprs[x.body].node is Call(name, _, args, _, _, _)
+        and name is "runtime" | "runtimeLine" {
+        if len(args) > 0 and p.ast.exprs[args[0]].node is TextLit(group, _, _) {
+            self.add(group)
+        }
+        return
+    }
+    for k in x.params {
+        self.inExpr(p, p.ast.params[k].fallback)
+    }
+    self.inExpr(p, x.body)
+}
+
+fn Effects.inExpr(var self, p: Program, e: Int) {
+    if e < 0 {
+        return
+    }
+    let x = p.ast.exprs[e]
+    self.add(builtinGroup(x.builtin))
+    if x.decl >= 0 {
+        self.inDecl(p, x.decl)
+    }
+    if isLambda(p.ast, e) and x.sugar >= 0 {
+        self.inExpr(p, x.sugar)
+        return
+    }
+    let ps = parts(p.ast, e)
+    for c in ps.exprs {
+        self.inExpr(p, c)
+    }
+    for arm in ps.arms {
+        self.inExpr(p, p.ast.arms[arm].guard)
+        self.inExpr(p, p.ast.arms[arm].body)
+    }
+    for b in ps.blocks {
+        self.inBlock(p, b)
+    }
+}
+
+fn Effects.inBlock(var self, p: Program, b: Int) {
+    if b < 0 {
+        return
+    }
+    for s in p.ast.blocks[b].stmts {
+        let ps = stmtParts(p.ast, s)
+        for c in ps.exprs {
+            self.inExpr(p, c)
+        }
+        for k in ps.blocks {
+            self.inBlock(p, k)
+        }
+    }
+}
+
+// ---- the implementations of an interface, or of one of its functions ---------------------------------------------
+fn Server.implementations(self, d: Doc, line: Int, col: Int) -> Text {
+    let a = self.analyze(d, true)
+    if not a.ok {
+        return "[]"
+    }
+    let p = a.p
+    var iface = -1
+    var member = ""
+    let t = targetAt(p, line, col)
+    if t.decl >= 0 and p.ast.decls[t.decl].isInterface {
+        iface = t.decl
+    } else {
+        let f = find(p, line, col)
+        if f.param >= 0 {
+            for w in p.decls {
+                if p.ast.decls[w].isInterface and p.ast.decls[w].params.contains(f.param) {
+                    iface = w
+                    member = p.ast.params[f.param].name
+                }
+            }
+        } else if f.expr >= 0 and p.ast.exprs[f.expr].node is Call(name, _, args, _, true, _) and len(args) > 0 {
+            let ty = p.ast.exprs[args[0]].ty
+            if ty >= 0 and p.types[ty].decl >= 0 and p.ast.decls[p.types[ty].decl].isInterface {
+                iface = p.types[ty].decl
+                let pieces = name.split(".")
+                member = pieces[len(pieces) - 1]
+            }
+        }
+    }
+    if iface < 0 {
+        // a type's name where it is written (s: Shape)
+        let word = nameAt(d.text, line, col)
+        for w in p.decls {
+            if p.ast.decls[w].isInterface and p.ast.decls[w].name == word {
+                iface = w
+            }
+        }
+    }
+    if iface < 0 {
+        return "[]"
+    }
+    // the types that fit it: each of its functions without a default theirs
+    let w = p.ast.decls[iface]
+    var fns: [Text: Int] = [:]
+    for k in p.decls {
+        let x = p.ast.decls[k]
+        if x.kind == DeclKind.Fn and x.name.contains(".") and x.templateOf < 0 and not x.fromDefault {
+            fns[x.name] = k
+        }
+    }
+    var out: [Text] = []
+    for k in p.decls {
+        let x = p.ast.decls[k]
+        if not x.kind is Type | Enum or x.isInterface or x.fromPrelude or x.templateOf >= 0 {
+            continue
+        }
+        if not w.params.all(m => p.ast.params[m].fallback >= 0 or fns.contains(x.name + "." + p.ast.params[m].name)) {
+            continue
+        }
+        let at = if member == "" { k } else { fns[x.name + "." + member] ?? -1 }
+        if at >= 0 {
+            let y = p.ast.decls[at]
+            let column = nameColumn(y) + (if member == "" {
+                0 // Square.area: at area
+            } else {
+                len(x.name) + 1
+            })
+            out.push(self.locationIn(d, p, y.module, y.line, column))
+        }
+    }
+    "[" + out.join(", ") + "]"
+}
+
+// the name at Quark's (line, col) in a text
+fn nameAt(text: Text, line: Int, col: Int) -> Text {
+    let b = text.bytes()
+    let p = lineStart(text, line)
+    var from = p + col - 1
+    var to = from
+    while from > p and isNameChar(byteAt(b, from - 1)) {
+        from -= 1
+    }
+    while isNameChar(byteAt(b, to)) {
+        to += 1
+    }
+    text[from..to]
+}
+
+// where a place in a file of the program is: the open file's URI for it, else its path's
+fn Server.locationIn(self, d: Doc, p: Program, module: Int, line: Int, col: Int) -> Text {
+    let (uri, text) = self.fileOf(d, p, module)
+    "\{\"uri\": {jsonString(uri)}, \"range\": {rangeAt(text, line, col)}}"
+}
+
+fn Server.fileOf(self, d: Doc, p: Program, module: Int) -> (Text, Text) {
+    if module == 0 {
+        return (d.uri, d.text)
+    }
+    let path = p.modules[module].path
+    for o in self.docs {
+        if uriPath(o.uri) == path {
+            return (o.uri, o.text)
+        }
+    }
+    (pathUri(path), p.modules[module].src.text)
+}
+
+// a file whose names a rename may change: the program's own, not the standard library's, the language's or a
+// package's
+fn ownFile(p: Program, module: Int) -> Bool {
+    let path = p.modules[module].path.replace("\\", "/")
+    not (path.startsWith("std/")
+        or path.startsWith("<")
+        or path.contains("/.quark/pkg/")
+        or path.startsWith(".quark/pkg/"))
 }
 
 fn Server.definition(self, d: Doc, line: Int, col: Int) -> Text {
@@ -685,11 +970,11 @@ fn targetAt(p: Program, line: Int, col: Int) -> Target {
     Target(decl: f.decl)
 }
 
-type Refs { t: Target, at: [(Int, Int)] = [] }
+type Refs { t: Target, module: Int = 0, at: [(Int, Int, Int)] = [] }
 
 fn Refs.add(var self, line: Int, col: Int) {
-    if not self.at.contains((line, col)) {
-        self.at.push((line, col))
+    if not self.at.contains((self.module, line, col)) {
+        self.at.push((self.module, line, col))
     }
 }
 
@@ -743,23 +1028,30 @@ fn Refs.inBlock(var self, p: Program, b: Int) {
     }
 }
 
-// every place the target's name is written in the file: its declaration first
-fn references(p: Program, t: Target) -> [(Int, Int)] {
+// every place the target's name is written, as (file, line, column), in the program's own files (a binding's: in the
+// file): its declaration first
+fn references(p: Program, t: Target) -> [(Int, Int, Int)] {
     var r = Refs(t)
     if t.decl >= 0 {
         let x = p.ast.decls[t.decl]
-        if not x.fromPrelude and x.module == 0 {
+        if not x.fromPrelude and ownFile(p, x.module) {
+            r.module = x.module
             r.add(x.line, nameColumn(x))
         }
     }
     if t.binding >= 0 and p.bindings[t.binding].line != 0 {
+        r.module = 0
         r.add(p.bindings[t.binding].line, p.bindings[t.binding].col)
     }
     for d in p.decls {
         let x = p.ast.decls[d]
-        if x.fromPrelude or x.templateOf >= 0 or x.lifted or x.module != 0 {
+        if x.fromPrelude or x.templateOf >= 0 or x.lifted or x.fromDefault or not ownFile(p, x.module) {
             continue
         }
+        if t.binding >= 0 and x.module != 0 {
+            continue
+        }
+        r.module = x.module
         for k in x.params {
             r.inExpr(p, p.ast.params[k].fallback)
         }
@@ -776,8 +1068,8 @@ fn Server.references(self, d: Doc, line: Int, col: Int) -> Text {
         return "[]"
     }
     var out = "["
-    for (i, (l, c)) in references(a.p, targetAt(a.p, line, col)).enumerate() {
-        out += (if i > 0 { ", " } else { "" }) + location(d, l, c)
+    for (i, (k, l, c)) in references(a.p, targetAt(a.p, line, col)).enumerate() {
+        out += (if i > 0 { ", " } else { "" }) + self.locationIn(d, a.p, k, l, c)
     }
     out + "]"
 }
@@ -800,11 +1092,31 @@ fn Server.rename(self, d: Doc, line: Int, col: Int, to: Text) -> Text {
     if not fine or t.decl >= 0 and p.ast.decls[t.decl].owner != "" {
         return "null" // a name of the wrong case, or a type's own function (its type's part stays)
     }
-    var out = "\{\"changes\": \{{jsonString(d.uri)}: ["
-    for (i, (l, c)) in references(p, t).enumerate() {
-        out += (if i > 0 { ", " } else { "" }) + "\{\"range\": {rangeAt(d.text, l, c)}, \"newText\": {jsonString(to)}}"
+    if t.decl >= 0 and (p.ast.decls[t.decl].fromPrelude or not ownFile(p, p.ast.decls[t.decl].module)) {
+        return "null" // the standard library's, the language's or a package's: not this project's to rename
     }
-    out + "]\}\}"
+    // the edits, file by file
+    var files: [Int] = []
+    for (k, _, _) in references(p, t) {
+        if not files.contains(k) {
+            files.push(k)
+        }
+    }
+    var out = "\{\"changes\": \{"
+    for (j, k) in files.enumerate() {
+        let (uri, text) = self.fileOf(d, p, k)
+        out += (if j > 0 { ", " } else { "" }) + jsonString(uri) + ": ["
+        var first = true
+        for (m, l, c) in references(p, t) {
+            if m == k {
+                out += (if first { "" } else { ", " })
+                    + "\{\"range\": {rangeAt(text, l, c)}, \"newText\": {jsonString(to)}}"
+                first = false
+            }
+        }
+        out += "]"
+    }
+    out + "\}\}"
 }
 
 // the types Quark worked out, shown after the names that do not write them: let total: Int = ...

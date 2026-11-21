@@ -12,7 +12,7 @@ Q=${1:-build/quark.exe}
 tmp=$(mktemp -d)
 checked=0
 failed=0
-for doc in docs/LANGUAGE.md docs/EMBEDDING.md docs/TUTORIAL.md README.md; do
+for doc in docs/LANGUAGE.md docs/EMBEDDING.md docs/TUTORIAL.md docs/COMING-FROM.md docs/SERVERS.md README.md; do
     dir="$tmp/$(basename "$doc" .md)"
     mkdir -p "$dir"
     # each block as a file (k.qk, or the name its first line gives), and a list of them with the doc's line

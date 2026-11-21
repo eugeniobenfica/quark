@@ -87,6 +87,9 @@ pub type Checker {
     methods: Set<Text> = []
     changers: Set<Text> = []
     selfMarker: Int = -1 // what Self is in an interface's functions: the type that fits it (fitsMember puts it in)
+    jsonCallModule: Int = 0
+    jsonCallAt: Int = -1 // the template call being made an instance of (what jsonNot points at)
+    jsonSelf: Int = -1 // std.json's jsonOf or fromJson made for a record or an enum: Self is that type (jsonBody)
 }
 
 // A checked program, and the errors said (with those said before: errors).
@@ -484,6 +487,9 @@ fn startsLower(name: Text) -> Bool = len(name) > 0 and name.bytes()[0] is 'a'..=
 fn startsUpper(name: Text) -> Bool = len(name) > 0 and name.bytes()[0] is 'A'..='Z'
 
 fn Checker.findDecl(var self, name: Text) -> Int {
+    if name == "Self" and self.jsonSelf >= 0 {
+        return self.jsonSelf
+    }
     if name == "Self" {
         // Self(x: 1), Self.Leaf: the type the function belongs to
         let f = self.selfOf()
@@ -826,27 +832,31 @@ fn Checker.newExpr(var self, node: ExprNode, line: Int, col: Int) -> Int =
     self.p.ast.expr(node, line, col)
 
 // ---- types as written --------------------------------------------------------------------------------------------
+// T where a type is written: what it stands for in the declaration being checked, or (in a lambda) in the one
+// around it
 fn Checker.typeArgOf(self, name: Text) -> Int {
-    let owner = self.c.typing
-    if owner < 0 {
-        return -1
-    }
-    let args = if self.c.view {
-        self.c.viewArgs
-    } else {
-        self.p.ast.decls[owner].typeArgs
-    }
-    if len(args) == 0 {
-        return -1
-    }
-    for (i, tp) in self.p.ast.decls[owner].typeParams.enumerate() {
-        if tp == name and i < len(args) {
-            return if args[i] >= 0 {
-                args[i] // T: what it stands for
-            } else {
-                tyError
+    var k = -1
+    var steps = 0
+    while steps < 10000 {
+        steps += 1
+        let c = if k < 0 { self.c } else { self.saved[k] }
+        let owner = c.typing
+        if owner >= 0 {
+            let args = if c.view { c.viewArgs } else { self.p.ast.decls[owner].typeArgs }
+            for (i, tp) in self.p.ast.decls[owner].typeParams.enumerate() {
+                if tp == name and i < len(args) {
+                    return if args[i] >= 0 {
+                        args[i] // T: what it stands for
+                    } else {
+                        tyError
+                    }
+                }
             }
         }
+        if c.outer < 0 {
+            return -1
+        }
+        k = c.outer
     }
     -1
 }
@@ -1036,6 +1046,9 @@ fn Checker.resolveNamed(var self, te: Int, name: Text, args: [Int], line: Int, c
     }
     if name == "Task" and len(args) == 0 {
         return tyTask
+    }
+    if name == "Self" and len(args) == 0 and self.jsonSelf >= 0 {
+        return self.p.ast.decls[self.jsonSelf].ty
     }
     if name == "Self" and len(args) == 0 {
         if self.c.typing >= 0 and self.p.ast.decls[self.c.typing].isInterface {
@@ -2705,7 +2718,7 @@ fn Checker.namedBuiltinArgs(var self, e: Int) -> Bool {
 }
 
 // the group a built-in that reaches outside the program belongs to ("" none)
-fn builtinGroup(b: Int) -> Text = if b == bPrint or b == bPrintErr { "print" } else { "" }
+pub fn builtinGroup(b: Int) -> Text = if b == bPrint or b == bPrintErr { "print" } else { "" }
 
 // coerce each of a call's values from `from` to `to` (their checks first)
 // runtime(group, name, values...), the body of a built-in written in compiler/prelude.qk: the runtime's function
@@ -3947,8 +3960,50 @@ fn Checker.instantiate(var self, d: Int, bound: [Int], lambdas: [Int], takesFn: 
         name += "#{len(self.p.ast.decls[d].instances) + 1}"
     }
     inst.name = name
+    // std.json's jsonOf and fromJson: a body made for the type (Self that type, when it is a record or an enum)
+    let template = self.p.ast.decls[d]
+    let jsonFn = len(bound) == 1
+        and template.name is "jsonOf" | "fromJson"
+        and self.p.modules[template.module].path == "std/json.qk"
+    var selfFor = -1
+    if jsonFn {
+        let t = bound[0]
+        let text = if template.name == "jsonOf" {
+            self.jsonWriting(t)
+        } else {
+            self.jsonReading(t)
+        }
+        if text != "" {
+            let header = if template.name == "jsonOf" {
+                "fn jsonMade(value: Int) -> Int "
+            } else {
+                "fn jsonMade(j: Int) -> Int "
+            }
+            let before = len(self.p.ast.decls)
+            let closing = self.p.ast.closingComment
+            let parsed = parseInto(
+                self.p.ast,
+                Source("{template.name}<{self.tname(t)}> (std.json's, made for the type)", header + text + "\n"),
+            )
+            self.p.ast = parsed.ast
+            self.p.ast.closingComment = closing
+            for e in parsed.errors {
+                self.errors.add(Source("", ""), template.line, template.col, e)
+            }
+            if len(self.p.ast.decls) > before {
+                inst.body = self.p.ast.decls[before].body
+            }
+            if self.kindOf(t) is Record | Enum
+                and self.p.ast.decls[self.declOf(t)].optionOf < 0
+                and not self.p.ast.decls[self.declOf(t)].isTuple {
+                selfFor = self.declOf(t)
+            }
+        }
+    }
     let at = self.addDecl(inst)
     self.p.ast.decls[d].instances.push(at)
+    let savedSelf = self.jsonSelf
+    self.jsonSelf = selfFor
     self.enter(Ctx(module: inst.module, typing: at))
     for (f, prm) in inst.params.enumerate() {
         let x = self.p.ast.params[prm]
@@ -3967,7 +4022,225 @@ fn Checker.instantiate(var self, d: Int, bound: [Int], lambdas: [Int], takesFn: 
     self.checkFnBody(at)
     self.instantiating -= 1
     self.leave()
+    self.jsonSelf = savedSelf
     at
+}
+
+// ---- std.json's jsonOf and fromJson, made for each type (their bodies, as Quark) ----
+// A record is an object of its fields, an enum's case its name (with data: an object of one entry, the name and an
+// object of its fields), an array a list, a map from Text or Int an object, an optional null when None, a tuple a
+// list; Int, Float, Bool and Text themselves. "" when the type is none of these (the template's own body stays: an
+// error at run time would be wrong, so the checker says it).
+fn Checker.jsonWriting(var self, t: Int) -> Text {
+    let k = self.kindOf(t)
+    let nl = "\n"
+    match k {
+        Int => "= Json.Integer(value)"
+        Float => "= Json.Num(value)"
+        Bool => "= Json.Bool(value)"
+        Text => "= Json.Str(value)"
+        Array => "= Json.List(value.map(x => jsonOf(x)).toArray())"
+        Map => {
+            let key = self.kindOf(self.keyOf(t))
+            if key == Kind.Text {
+                "\{"
+                    + nl
+                    + "var out: [Text: Json] = [:]"
+                    + nl
+                    + "for (k, v) in value \{"
+                    + nl
+                    + "out[k] = jsonOf(v)"
+                    + nl
+                    + "\}"
+                    + nl
+                    + "Json.Object(out)"
+                    + nl
+                    + "\}"
+            } else if key == Kind.Int {
+                "\{"
+                    + nl
+                    + "var out: [Text: Json] = [:]"
+                    + nl
+                    + "for (k, v) in value \{"
+                    + nl
+                    + "out[\"\{k\}\"] = jsonOf(v)"
+                    + nl
+                    + "\}"
+                    + nl
+                    + "Json.Object(out)"
+                    + nl
+                    + "\}"
+            } else {
+                self.jsonNot(t, "a map's keys are Text or Int in JSON")
+            }
+        }
+        Record | Enum => {
+            let d = self.declOf(t)
+            let x = self.p.ast.decls[d]
+            if x.optionOf >= 0 {
+                return "= match value \{" + nl + "Some(x) => jsonOf(x)" + nl + "None => Json.Null" + nl + "\}"
+            }
+            if x.isTuple {
+                var items: [Text] = []
+                for i in 0..len(x.params) {
+                    items.push("jsonOf(value.{i})")
+                }
+                return "= Json.List([" + items.join(", ") + "])"
+            }
+            if k == Kind.Record {
+                if len(x.params) == 0 {
+                    return "\{" + nl + "let none: [Text: Json] = [:]" + nl + "Json.Object(none)" + nl + "\}"
+                }
+                var fields: [Text] = []
+                for prm in x.params {
+                    let name = self.p.ast.params[prm].name
+                    fields.push("\"{name}\": jsonOf(value.{name})")
+                }
+                return "= Json.Object([" + fields.join(", ") + "])"
+            }
+            var arms: [Text] = []
+            for (i, case) in x.cases.enumerate() {
+                let fs = x.caseFields.get(i) ?? []
+                if len(fs) == 0 {
+                    arms.push("{case} => Json.Str(\"{case}\")")
+                } else {
+                    var binds: [Text] = []
+                    var fields: [Text] = []
+                    for (j, prm) in fs.enumerate() {
+                        binds.push("f{j}")
+                        fields.push("\"{self.p.ast.params[prm].name}\": jsonOf(f{j})")
+                    }
+                    arms.push(
+                        "{case}("
+                            + binds.join(", ")
+                            + ") => Json.Object([\"{case}\": Json.Object(["
+                            + fields.join(", ")
+                            + "])])",
+                    )
+                }
+            }
+            "= match value \{" + nl + arms.join(nl) + nl + "\}"
+        }
+        _ => self.jsonNot(t, "only data is JSON: numbers, Bool, Text, arrays, maps, optionals, tuples, records, enums")
+    }
+}
+
+fn Checker.jsonReading(var self, t: Int) -> Text {
+    let k = self.kindOf(t)
+    let nl = "\n"
+    match k {
+        Int => "= intOfJson(j)"
+        Float => "= floatOfJson(j)"
+        Bool => "= boolOfJson(j)"
+        Text => "= textOfJson(j)"
+        Array => "\{" + nl + "let out: T = []" + nl + "listFromJson(j, out)" + nl + "\}"
+        Map => {
+            let key = self.kindOf(self.keyOf(t))
+            if key == Kind.Text {
+                "\{" + nl + "let out: T = [:]" + nl + "mapFromJson(j, out)" + nl + "\}"
+            } else if key == Kind.Int {
+                "\{" + nl + "let out: T = [:]" + nl + "intMapFromJson(j, out)" + nl + "\}"
+            } else {
+                self.jsonNot(t, "a map's keys are Text or Int in JSON")
+            }
+        }
+        Record | Enum => {
+            let d = self.declOf(t)
+            let x = self.p.ast.decls[d]
+            let name = self.tname(t)
+            if x.optionOf >= 0 {
+                return "\{" + nl + "let none: T = None" + nl + "optionFromJson(j, none)" + nl + "\}"
+            }
+            if x.isTuple {
+                var items: [Text] = []
+                for i in 0..len(x.params) {
+                    items.push("itemFromJson(items, {i})?")
+                }
+                return "\{"
+                    + nl
+                    + "let items = j.items() ?? return Err(\"JSON: a tuple is a list, not \{j.kindName()\}\")"
+                    + nl
+                    + "let r: T = ("
+                    + items.join(", ")
+                    + ")"
+                    + nl
+                    + "r"
+                    + nl
+                    + "\}"
+            }
+            if k == Kind.Record {
+                var given: [Text] = []
+                var later: [Text] = []
+                for prm in x.params {
+                    let q = self.p.ast.params[prm]
+                    let ft = self.paramType(prm)
+                    let optional = self.kindOf(ft) == Kind.Enum and self.p.ast.decls[self.declOf(ft)].optionOf >= 0
+                    let read = if optional {
+                        "optionFieldFromJson(f, \"{q.name}\", None)?" // (None tells the inner type: Pet, of a Pet?)
+                    } else {
+                        "fieldFromJson(f, \"{q.name}\")?"
+                    }
+                    if q.fallback >= 0 {
+                        later.push("if f.contains(\"{q.name}\") \{" + nl + "r.{q.name} = {read}" + nl + "\}")
+                    } else {
+                        given.push("{q.name}: {read}")
+                    }
+                }
+                return "\{"
+                    + nl
+                    + "let f = j.fields() ?? return Err(\"JSON: a {name} is an object, not \{j.kindName()\}\")"
+                    + nl
+                    + "var r = Self("
+                    + given.join(", ")
+                    + ")"
+                    + nl
+                    + later.join(nl)
+                    + nl
+                    + "r"
+                    + nl
+                    + "\}"
+            }
+            var tests: [Text] = []
+            for (i, case) in x.cases.enumerate() {
+                let fs = x.caseFields.get(i) ?? []
+                var made = "Self.{case}"
+                if len(fs) > 0 {
+                    var fields: [Text] = []
+                    for prm in fs {
+                        let n = self.p.ast.params[prm].name
+                        let ft = self.paramType(prm)
+                        let optional = self.kindOf(ft) == Kind.Enum and self.p.ast.decls[self.declOf(ft)].optionOf >= 0
+                        fields.push(if optional {
+                            "{n}: optionFieldFromJson(f, \"{n}\", None)?"
+                        } else {
+                            "{n}: fieldFromJson(f, \"{n}\")?"
+                        })
+                    }
+                    made += "(" + fields.join(", ") + ")"
+                }
+                tests.push("if name == \"{case}\" \{" + nl + "return {made}" + nl + "\}")
+            }
+            "\{"
+                + nl
+                + "let (name, f) = caseOfJson(j, \"{name}\")?"
+                + nl
+                + tests.join(nl)
+                + nl
+                + "Err(\"JSON: \{name\} is not a case of {name}\")"
+                + nl
+                + "\}"
+        }
+        _ => self.jsonNot(t, "only data is JSON: numbers, Bool, Text, arrays, maps, optionals, tuples, records, enums")
+    }
+}
+
+// the type is not JSON: said where the call is, and the template's own body kept
+fn Checker.jsonNot(var self, t: Int, why: Text) -> Text {
+    if self.jsonCallAt >= 0 {
+        let x = self.p.ast.exprs[self.jsonCallAt]
+        self.errors.add(self.p.modules[self.jsonCallModule].src, x.line, x.col, "{self.tname(t)} is not JSON: {why}")
+    }
+    ""
 }
 
 // A call to a template: its types from the values given, its lambdas checked where they are written; then the
@@ -4200,6 +4473,10 @@ fn Checker.checkTemplateCall(var self, e: Int, d: Int, hint: Int) -> Int {
         }
     }
     if inst < 0 {
+        if self.p.modules[self.c.module].path != "std/json.qk" {
+            self.jsonCallAt = e // (the program's call, not std.json's own inside it)
+            self.jsonCallModule = self.c.module
+        }
         inst = self.instantiate(d, bound, lambdas, takesFn)
     }
     let iparams = self.p.ast.decls[inst].params
@@ -4355,6 +4632,25 @@ fn Checker.instanceType(var self, d: Int, args: [Int]) -> Int {
     t
 }
 
+// inside a template being checked before it has types (its lambdas too)
+fn Checker.inTemplate(self) -> Bool {
+    var k = -1
+    var steps = 0
+    while steps < 10000 {
+        steps += 1
+        let c = if k < 0 { self.c } else { self.saved[k] }
+        if c.typing >= 0 and self.p.ast.decls[c.typing].isTemplate
+            or c.fnDecl >= 0 and self.p.ast.decls[c.fnDecl].isTemplate {
+            return true
+        }
+        if c.outer < 0 {
+            return false
+        }
+        k = c.outer
+    }
+    false
+}
+
 // A call that makes a generic record or case: its types from the values given (each checked once here).
 fn Checker.inferInstance(var self, e: Int, d: Int, fields: [Int], hint: Int) -> Int {
     if hint >= 0 and self.declOf(hint) >= 0 and self.p.ast.decls[self.declOf(hint)].templateOf == d {
@@ -4386,6 +4682,9 @@ fn Checker.inferInstance(var self, e: Int, d: Int, fields: [Int], hint: Int) -> 
     let dname = self.declName(d)
     for (k, t) in bound.enumerate() {
         if t < 0 {
+            if self.inTemplate() {
+                return -1 // a template's, checked before it has types: its instances will tell
+            }
             self.sayAt(
                 e,
                 "{dname}: what {self.p.ast.decls[d].typeParams[k]} is cannot be told from the values: write the type where it goes, let x: {dname}<...> = ...",
@@ -6410,7 +6709,11 @@ fn Checker.checkAssign(var self, s: Int, target: Int, op: Op, value: Int) {
     } else {
         -1
     })
+    if op == Op.Assign {
+        self.hintLiteral(value, tt) // r.port = fromJson(j)?: the place's type
+    }
     let vt = self.checkExpr(value, true)
+    self.c.hint = -1
     let tk = self.kindOf(tt)
     if op is PercentEq | AmpEq | PipeEq | CaretEq | ShlEq | ShrEq | PlusWrapEq | MinusWrapEq | StarWrapEq
         or op == Op.PlusEq and tk is Text | Bytes | Array {
@@ -8513,6 +8816,13 @@ fn Checker.hintLiteral(var self, value: Int, want: Int) {
     }
     let node = self.p.ast.exprs[value].node
     if node is ArrayLit(_) | MapLit(_) or node is Call(name, _, _, _, _, _) and name == "(,)" {
+        self.setHint(want)
+        return
+    }
+    // a call (or call?) of a template whose T only its result tells (fromJson(j), fieldFromJson(f, "a")?): the type the
+    // value goes into
+    let inner = if node is Try(v) { self.p.ast.exprs[v].node } else { node }
+    if inner is Call(name, _, _, _, _, dotted) and not dotted and name != "(,)" {
         self.setHint(want)
     }
 }

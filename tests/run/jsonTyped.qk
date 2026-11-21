@@ -1,0 +1,50 @@
+// Typed JSON: a program's records, enums, arrays, maps, optionals and tuples written as JSON and read back by their
+// types (std.json's encode and decode, made for each type).
+use std.json
+
+type Box<T> { value: T, label: Text }
+enum Shape { Dot, Circle(radius: Float), Rect(w: Int, h: Int) }
+type Pet { name: Text, age: Int }
+
+type Person {
+    name: Text
+    age: Int
+    tags: [Text]
+    pet: Pet?
+    shapes: [Shape]
+    scores: [Text: Int]
+    port: Int = 8080
+    pair: (Int, Text)
+    ok: Bool
+}
+
+fn main() {
+    let p = Person(
+        "Ana",
+        34,
+        ["x", "y"],
+        Some(Pet("Rex", 3)),
+        [.Dot, .Circle(1.5), .Rect(2, 3)],
+        ["a": 1],
+        9,
+        (7, "z"),
+        true,
+    )
+    let text = encode(p)
+    print(text)
+    let back: Person = decode(text)?
+    print(back == p, back)
+    let short: Person = decode(
+        "\{\"name\":\"Bo\",\"age\":5,\"tags\":[],\"shapes\":[\"Dot\"],\"scores\":\{\},\"pair\":[1,\"a\"],\"ok\":false\}",
+    )?
+    print(short.port, short.pet)
+    let bad: Person! = decode("\{\"name\":\"Bo\",\"age\":\"five\"\}")
+    print(bad)
+    let xs: [Int] = decode("[1, 2, 3]")?
+    print(xs, encode([1.5, 2.0]), encode(["k": [true]]))
+    let b: Box<Int> = decode(encode(Box(3, "n")))?
+    let m: [Int: [Box<Text>]] = decode("\{\"1\": [\{\"value\": \"a\", \"label\": \"l\"\}]\}")?
+    print(b, m)
+    let wrong: [Shape]! = decode("[\"Dot\", \"Hexagon\"]")
+    print(wrong)
+}

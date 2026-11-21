@@ -46,6 +46,7 @@ pub type RunOptions {
     breaks: [Int] = []
     programArgs: [Text] = []
     filter: Text = "" // quark test --filter part: only the tests whose name has it
+    coverage: Bool = false // quark test --coverage: which lines of the file the tests ran
 }
 
 // a program compiled: its IR, machine code, data and inlined calls; its tests (each function's name and the test's)
@@ -178,6 +179,7 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
             sysv: sysv,
             debug: debug,
             debugKeys: keys,
+            coverage: o.coverage and not runtime,
             runtimeUsed: purpose.used,
         ),
     )
@@ -943,11 +945,18 @@ pub fn Mapped.load(self, c: Compiled, mc: MachineCode, entry: Int, fuel: Int, me
         }
         return 0
     }
-    // its trace: what a panic says of the calls it went through
-    let t = malloc(8 * 8)
+    // its trace: what a panic says of the calls it went through, and in which file (0: the program's own)
+    let t = malloc(9 * 8)
     var names: [Int] = []
+    var files: [Int] = []
+    let fileOf = (k: Int) => if k > 0 and k < len(c.prog.files) {
+        cText(c.prog.files[k])
+    } else {
+        0
+    }
     for f in c.prog.fns {
         names.push(cText(f.name))
+        files.push(fileOf(f.file))
     }
     pokeWord(t, 0, len(c.prog.fns))
     pokeWord(t, 1, wordsInC(names))
@@ -961,9 +970,10 @@ pub fn Mapped.load(self, c: Compiled, mc: MachineCode, entry: Int, fuel: Int, me
     pokeWord(t, 5, len(c.inlines))
     var inlines: [Int] = []
     for x in c.inlines {
-        inlines += [x.parent, x.line, cText(x.callee)]
+        inlines += [x.parent, x.line, cText(x.callee), fileOf(x.file)]
     }
     pokeWord(t, 6, wordsInC(inlines))
+    pokeWord(t, 7, wordsInC(files))
     let _ = self.call("qkHostTrace", l, t, 0, 0)
     l
 }
@@ -1261,8 +1271,39 @@ pub fn runTests(host: Host, m: Mapped, c: Compiled, o: RunOptions) -> Int {
         m.flush()
     }
     m.out("{passed} passed, {failed} failed\n")
+    if o.coverage {
+        m.out(coverageReport(o.path, c.prog.coverLines.sorted(), m.call("qkHostCoverage", 0, 0, 0, 0)))
+    }
     m.flush()
     if failed > 0 { 1 } else { 0 }
+}
+
+// the lines of the file that can run, and of those the ones the tests ran (map: a byte a line, 1 when run; 0 none
+// ran): how many, and the ones not run, in runs (12, 20-23)
+fn coverageReport(path: Text, lines: [Int], map: Int) -> Text {
+    var run = 0
+    var missed: [Text] = []
+    var i = 0
+    while i < len(lines) {
+        if map != 0 and Pointer<UInt8>(map)[lines[i]] != 0 {
+            run += 1
+            i += 1
+            continue
+        }
+        var j = i
+        while j + 1 < len(lines) and not (map != 0 and Pointer<UInt8>(map)[lines[j + 1]] != 0) {
+            j += 1
+        }
+        missed.push(if j > i { "{lines[i]}-{lines[j]}" } else { "{lines[i]}" })
+        i = j + 1
+    }
+    let share = if len(lines) == 0 {
+        100.0
+    } else {
+        100.0 * toFloat(run) / toFloat(len(lines))
+    }
+    let rest = if len(missed) == 0 { "" } else { "; not run: " + missed.join(", ") }
+    "coverage of {path}: {run} of {len(lines)} lines run ({fixed(share, 1)}%){rest}\n"
 }
 
 // ---- quark build ----

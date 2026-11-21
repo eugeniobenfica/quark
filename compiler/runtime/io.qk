@@ -26,6 +26,14 @@ extern effect fn osCloseSocket(s: Int64) as "qkosCloseSocket"
 extern effect fn osLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" // seconds east of UTC, then
 extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 
+// TLS, the system's (windows.qk: Schannel; linux.qk: OpenSSL; macos.qk: SecureTransport): a state of a block that
+// starts with the words below (calloc'd by the system's layer, which keeps its own after them). Bytes from the server
+// go into tIn; work turns them into what to send it (tOut) and what it said (tPlain)
+extern effect fn osTlsNew(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" // the block, the hello in tOut; or 0
+extern effect fn osTlsWork(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" // tIn used as far as it goes: 0, or -1
+extern effect fn osTlsSeal(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" // into tOut: 0, -1
+extern effect fn osTlsEnd(t: Int64) as "qkosTlsEnd" // the end's notice into tOut; the system's state let go of
+
 // the job of a connect or a listen (tasks.qk offThread): host, port, why, then the socket made
 fn connectJob(j: Int) -> Int {
     jobBegins(j)
@@ -214,3 +222,136 @@ pub extern effect fn rtCloseSocket(s: Int64) as "qk_closeSocket" = osCloseSocket
 // localOffset(seconds) -> Int: the local time's offset from UTC at that moment, in seconds (east positive)
 pub extern effect fn rtLocalOffset(seconds: Float64) -> Int64 as "qk_localOffset" =
     osLocalOffset(seconds)
+
+// ---- TLS over a socket: the handshake, then reads and writes through the system's library (osTls*) ----
+pub const tOut = 0 // (place, length, capacity): what to send the server
+pub const tPlain = 3 // what the server said, decrypted, not read yet
+pub const tState = 6 // 0 the handshake, 1 open, 2 the server ended it
+pub const tSocket = 7
+pub const tIn = 8 // what came from the server, not used yet
+pub const tWords = 12 // the system's words from here
+
+// every byte of tOut sent (the task waits while the system's buffer is full); false with why
+fn tlsSend(t: Int, w: Int) -> Bool {
+    let p = word(t, tOut)
+    let n = word(t, tOut + 1)
+    var at = 0
+    while at < n {
+        let k = osSend(word(t, tSocket), p + at, n - at, w)
+        if k == -2 {
+            return false
+        }
+        if k < 0 {
+            waitSocket(word(t, tSocket), true)
+        } else {
+            at += k
+        }
+    }
+    setWord(t, tOut + 1, 0)
+    true
+}
+
+// more from the server into tIn, then worked on; 0, 1 when it closed the connection, -1 with why
+fn tlsReceive(t: Int, w: Int) -> Int {
+    let room = malloc(16384)
+    var n = -1
+    while n == -1 {
+        n = osRecv(word(t, tSocket), room, 16384, w)
+        if n == -1 {
+            waitSocket(word(t, tSocket), false)
+        }
+    }
+    if n > 0 {
+        heldAppend(t, tIn, room, n)
+    }
+    free(room)
+    if n == -2 {
+        return -1
+    }
+    if n == 0 {
+        return 1
+    }
+    osTlsWork(t, w)
+}
+
+fn tlsFree(t: Int) {
+    heldFree(t, tOut)
+    heldFree(t, tPlain)
+    heldFree(t, tIn)
+    free(t)
+}
+
+// tlsConnect(socket, serverName) -> Tls!: the handshake over a connected socket, the server's certificate checked
+// for that name by the system's trust
+pub extern effect fn rtTlsConnect(s: Int64, host: Int64, hostLen: Int64) -> Int64 as "qk_tlsConnect" {
+    let w = why()
+    let name = cString(host, hostLen)
+    let t = osTlsNew(name, w)
+    if t == 0 {
+        return errResult(message().text("TLS with ").zeroText(name).text(": ").zeroText(w))
+    }
+    setWord(t, tSocket, s)
+    while true {
+        if not tlsSend(t, w) {
+            break
+        }
+        if word(t, tState) != 0 {
+            return okResult(t, 0)
+        }
+        let r = tlsReceive(t, w)
+        if r == 1 {
+            let _ = bufAt(w, 256).text("the server closed the connection during the handshake")
+        }
+        if r != 0 {
+            break
+        }
+    }
+    osTlsEnd(t)
+    tlsFree(t)
+    errResult(message().text("TLS with ").zeroText(name).text(": ").zeroText(w))
+}
+
+// readTls(t, most) -> Bytes!: what the server said, up to most bytes (the task waits for some); none: it ended
+pub extern effect fn rtReadTls(t: Int64, most: Int64) -> Int64 as "qk_readTls" {
+    let w = why()
+    while true {
+        let have = word(t, tPlain + 1)
+        if have > 0 or word(t, tState) == 2 or most <= 0 {
+            let k = if have < most { have } else { most }
+            let p = allocRaw(if k > 0 { k } else { 1 }, 1)
+            copyBytes(p, word(t, tPlain), k)
+            heldDrop(t, tPlain, k)
+            return okResult(p, k)
+        }
+        if not tlsSend(t, w) {
+            return failed("cannot write to the socket", w)
+        }
+        let r = tlsReceive(t, w)
+        if r == 1 {
+            setWord(t, tState, 2) // closed without TLS's notice: its end all the same
+        } else if r != 0 {
+            return failed("TLS", w)
+        }
+    }
+    0
+}
+
+// writeTls(t, bytes) -> Unit!: every byte sent, encrypted
+pub extern effect fn rtWriteTls(t: Int64, p: Int64, n: Int64) -> Int64 as "qk_writeTls" {
+    let w = why()
+    if osTlsSeal(t, p, n, w) != 0 {
+        return failed("TLS", w)
+    }
+    if not tlsSend(t, w) {
+        return failed("cannot write to the socket", w)
+    }
+    okResult(0, 0)
+}
+
+// closeTls(t): the end's notice sent (as far as it goes), the socket closed
+pub extern effect fn rtCloseTls(t: Int64) as "qk_closeTls" {
+    osTlsEnd(t)
+    let _ = tlsSend(t, why())
+    osCloseSocket(word(t, tSocket))
+    tlsFree(t)
+}

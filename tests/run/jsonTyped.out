@@ -1,0 +1,7 @@
+{"name":"Ana","age":34,"tags":["x","y"],"pet":{"name":"Rex","age":3},"shapes":["Dot",{"Circle":{"radius":1.5}},{"Rect":{"w":2,"h":3}}],"scores":{"a":1},"port":9,"pair":[7,"z"],"ok":true}
+true Person(name: Ana, age: 34, tags: [x, y], pet: Some(Pet(name: Rex, age: 3)), shapes: [Shape.Dot, Shape.Circle(radius: 1.5), Shape.Rect(w: 2, h: 3)], scores: [a: 1], port: 9, pair: (7, z), ok: true)
+8080 None
+Err(age: JSON: an Int, not a text)
+[1, 2, 3] [1.5,2] {"k":[true]}
+Box(value: 3, label: n) [1: [Box(value: a, label: l)]]
+Err([1]: JSON: Hexagon is not a case of Shape)

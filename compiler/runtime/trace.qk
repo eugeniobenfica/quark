@@ -14,7 +14,10 @@ pub const trFnAt = 2 // each function's offset in the code
 pub const trSiteCount = 3
 pub const trSites = 4 // each call's 5 words: where it returns to, its line, caller, callee, inlined call
 pub const trInlineCount = 5
-pub const trInlines = 6 // each inlined call's 3 words: the one it is in (0: the function), its line, the callee's name
+pub const trInlines = 6 // each inlined call's 4 words: the one it is in (0: the function), its line, the callee's
+
+// name, its file (0: the program's)
+pub const trFiles = 7 // each function's file, zero-ended (0: the program's)
 
 fn functionAt(t: Int, offset: Int) -> Int {
     for i in 0..word(t, trFnCount) {
@@ -27,7 +30,37 @@ fn functionAt(t: Int, offset: Int) -> Int {
 
 fn fnName(t: Int, i: Int) -> Int = word(word(t, trNames), i)
 
-fn inlineAt(t: Int, i: Int) -> Int = word(t, trInlines) + 24 * i
+fn inlineAt(t: Int, i: Int) -> Int = word(t, trInlines) + 32 * i
+
+// the file of the code a panic is in (inl: the inlined calls it is in), zero-ended; 0 the program's, or not known
+pub fn panicFile(inl: Int) -> Int {
+    let c = ctx()
+    let l = word(c, ctxRunning)
+    if l == 0 or word(l, lTrace) == 0 {
+        return 0
+    }
+    let t = word(l, lTrace)
+    if inl > 0 and inl < word(t, trInlineCount) {
+        return word(inlineAt(t, inl), 3)
+    }
+    // the function it stopped in: the callee of the call its frame returns through, else the one the call began with
+    var f = functionAt(t, word(c, ctxRunningEntry))
+    let frame = word(c, ctxPanicFrame)
+    if frame != 0 {
+        let ret = word(frame, 1)
+        for i in 0..word(t, trSiteCount) {
+            let s = word(t, trSites) + 40 * i
+            if word(s, 0) == ret - word(l, 0) {
+                f = word(s, 3)
+            }
+        }
+    }
+    if f >= 0 and f < word(t, trFnCount) {
+        word(word(t, trFiles), f)
+    } else {
+        0
+    }
+}
 
 fn calledFrom(b: Buf, name: Int, line: Int) -> Buf =
     b.text("\n  called from ").zeroText(name).text(" at line ").int(line)

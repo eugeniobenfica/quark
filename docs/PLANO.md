@@ -640,8 +640,24 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 
 > **Feito em 19/11/2026:** `std.csv`, `walkFiles` no `std.files`, `quark test --filter`, e o tutorial
 > ([TUTORIAL.md](TUTORIAL.md), dez passos, seus exemplos verificados pela suíte). Antes disso já tinham entrado
-> `std.encoding`, `std.hash`, `std.args`, `std.files`, `std.net` e `std.http`. Faltam: TLS, JSON tipado,
-> subprocessos em fluxo, fusos nomeados, registro de pacotes, LSP (renomear, efeitos ao passar o mouse).
+> `std.encoding`, `std.hash`, `std.args`, `std.files`, `std.net` e `std.http`.
+>
+> **E concluída em 20/11/2026:**
+> - **TLS** pela biblioteca do sistema, num motor de bytes por sistema dentro do runtime (que já é compilado por
+>   alvo): Schannel no Windows, OpenSSL carregada ao primeiro uso no Linux (BIOs de memória), SecureTransport no
+>   macOS. O std vê quatro funções (`tlsConnect`, `readTls`, `writeTls`, `closeTls`); `connectTls` em std.net e
+>   `https://` em std.http. O caminho OpenSSL foi testado também no Windows, com a libssl do msys64.
+> - **JSON tipado**: `encode`/`decode` feitos pelo checker para cada tipo usado.
+> - **Subprocessos em fluxo**: `startProcess`, `writeProcess`, `readProcess`, `waitProcess`, `killProcess`.
+> - **Fusos com nome**: os TZif do sistema, ou a regra de hoje de cada zona (std.zones, do tzdata), conferidos
+>   contra o zoneinfo do Python (960 de 960).
+> - **Pacotes**: versões semânticas com seleção mínima de versões, e registro (um repositório git com `index.toml`).
+> - **LSP**: renomear e referências entre arquivos, ir para implementações, efeitos no hover, edições por trecho,
+>   textos abertos vistos pelos outros arquivos, verificação guardada.
+> - **Testes**: `quark test --coverage`; `forAll` e geradores com redução em std.testing.
+> - **Guias** (Go, Rust, Python; servidores) e a referência do prelúdio gerada por `quark doc`.
+> - De passagem: um nome de tipo dentro de uma lambda de uma função genérica (`T`), e o arquivo certo num pânico em
+>   código de outro arquivo (um `assert` da std dizia o caminho do programa).
 
 - **std:** TLS por `quark bind` de biblioteca do sistema (Schannel, Security.framework, OpenSSL) atrás de uma
   interface única; `std.json` tipado (de e para records, gerado em tempo de compilação por B2); CSV; diretórios

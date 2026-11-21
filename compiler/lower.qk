@@ -25,14 +25,16 @@ pub type LowerOptions {
     sysv: Bool = false
     debug: Bool = false
     debugKeys: [Int: Text] = [:]
+    coverage: Bool = false // quark test --coverage: each statement of the program's own file marks its line run
     runtimeUsed: [Bool] = [] // the runtime for one program: the functions of its table it calls (empty: every one)
 }
 
 // the IR, the program's data (texts, constant arrays, interface tables), and where inlined code came from
 pub type Lowered { program: IrProgram, data: Bytes, inlines: [InlineCall] }
 
-// inlined code: callee, inlined at line of the code around it (parent, or the function)
-pub type InlineCall { parent: Int, callee: Text, line: Int }
+// inlined code: callee, inlined at line of the code around it (parent, or the function); file: the callee's (its
+// module's number)
+pub type InlineCall { parent: Int, callee: Text, line: Int, file: Int = 0 }
 
 // the runtime functions: their numbers
 const rtPrintInt = 1
@@ -118,6 +120,7 @@ const rtCaptureEnd = 79
 const rtDebugEnter = 80
 const rtDebugLeave = 81
 const rtDebugLine = 82
+const rtCoverLine = 137
 const rtDebugValue = 83
 const rtCodePointCount = 84
 const rtJoinTask = 85
@@ -5304,7 +5307,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
                 self.callerLine = x.line
             }
         } else {
-            let call = InlineCall(savedInl, self.shownName(d), x.line)
+            let call = InlineCall(savedInl, self.shownName(d), x.line, file: dx.module)
             if len(self.inlines) == 0 {
                 self.inlines.push(call)
             }
@@ -5316,6 +5319,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
         self.inlining.push(Frame(d, end, result, outerCaller: savedCaller))
         let savedBreak = self.userBreak
         let savedContinue = self.userContinue
+        self.coverExpr(dx.body)
         let v = if self.isBlockExpr(dx.body) {
             self.lowerBlock(self.blockOfExpr(dx.body), dx.retType)
         } else {
@@ -5907,6 +5911,7 @@ fn Lower.lowerMatch(var self, e: Int) -> [Int] {
             self.jz(g, next)
         }
         let body = a.body
+        self.coverExpr(body)
         let v = if self.isBlockExpr(body) {
             self.lowerBlock(self.blockOfExpr(body), if value { x.ty } else { tyVoid })
         } else {
@@ -6437,6 +6442,7 @@ fn Lower.lowerBlock(var self, b: Int, t: Int) -> [Int] {
         let st = self.p.ast.stmts[s]
         if value and i == len(stmts) - 1 and st.node is ExprStmt(v0) {
             self.debugLine(st.line) // the block's value: a line of its own too
+            self.coverLine(st.line)
             var v = if self.endsHere(b, v0) and len(self.defers) == mark {
                 self.lowerExpr(v0)
             } else {
@@ -7206,8 +7212,36 @@ fn Lower.debugLine(var self, line: Int) {
     }
 }
 
+// quark test --coverage: the line marked run, when it is the program's file's (inlined code: its function's file)
+fn Lower.coverLine(var self, line: Int) {
+    if not self.opts.coverage or line <= 0 {
+        return
+    }
+    let d = if len(self.inlining) > 0 {
+        self.inlining[len(self.inlining) - 1].d
+    } else {
+        self.current
+    }
+    if d < 0 or self.p.ast.decls[d].module != 0 or self.p.ast.decls[d].fromDefault {
+        return
+    }
+    if not self.out.coverLines.contains(line) {
+        self.out.coverLines.push(line)
+    }
+    let x = self.iconst(line)
+    self.rtv(rtCoverLine, [x], line)
+}
+
+// a function's or an arm's body that is not a block: its line marked run
+fn Lower.coverExpr(var self, e: Int) {
+    if self.opts.coverage and e >= 0 and not self.isBlockExpr(e) {
+        self.coverLine(self.p.ast.exprs[e].line)
+    }
+}
+
 fn Lower.lowerStmt(var self, s: Int) {
     self.debugLine(self.p.ast.stmts[s].line)
+    self.coverLine(self.p.ast.stmts[s].line)
     let depth = self.branchDepth
     self.branchDepth = 0
     self.lowerStmtInner(s)
@@ -7487,6 +7521,7 @@ fn Lower.lowerFn(var self, d: Int, index: Int) {
         self.emit(.Nop, -1, -1, -1)
     }
     self.fuel(x.line)
+    self.coverExpr(x.body)
     let v = if self.isBlockExpr(x.body) {
         self.lowerBlock(self.blockOfExpr(x.body), ret)
     } else {

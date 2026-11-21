@@ -17,8 +17,15 @@ pub type Loaded { program: Program, errors: Errors, ok: Bool }
 // The program in a file's text, after the host's declarations (prelude), with the files its uses name. at: where
 // the file is, when its name is not its path (the language server's file:///... texts); "": src.path. hostFiles: the
 // texts of the files a host gives (qkModuleReader, compiler/api.qk): then every file the program uses but the
-// standard library's comes from them, none from the disk.
-pub fn loadProgram(src: Source, prelude: Source?, at: Text = "", hostFiles: [Text: Text]? = None) -> Loaded {
+// standard library's comes from them, none from the disk. open: texts that stand for files on the disk (an editor's,
+// not saved yet: the language server's), by path.
+pub fn loadProgram(
+    src: Source,
+    prelude: Source?,
+    at: Text = "",
+    hostFiles: [Text: Text]? = None,
+    open: [Text: Text] = [:],
+) -> Loaded {
     var errors = Errors()
     let first = parse(src)
     errors.shown += first.errors
@@ -80,7 +87,7 @@ pub fn loadProgram(src: Source, prelude: Source?, at: Text = "", hostFiles: [Tex
                 continue
             }
             if found < 0 {
-                let Some(text) = readModule(file, std, hostFiles) else {
+                let Some(text) = (if std { None } else { open[file] }) ?? readModule(file, std, hostFiles) else {
                     errors.add(from, d.line, d.col, "use {d.name}: cannot read {file}")
                     ok = false
                     continue

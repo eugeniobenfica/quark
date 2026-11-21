@@ -4,6 +4,7 @@
 // from its file. Code made while running goes into MAP_JIT memory, writable on this thread until it is protected.
 use std.machine as machine
 use base
+use io
 use start
 use host
 
@@ -320,6 +321,117 @@ pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, ou
     setWord(out, 3, word(bufs, 3))
     setWord(out, 4, word(bufs, 4))
     0
+}
+
+// ---- a process with pipes (startProcess): its input, output and errors this program's to use ----
+extern effect fn cKill(pid: Int32, sig: Int32) -> Int32 as "kill"
+extern effect fn cSignal(sig: Int32, handler: Int64) -> Int64 as "signal"
+
+fn closeAll(fds: Int, n: Int) {
+    for i in 0..n {
+        let _ = cClose(int32At(fds, i))
+    }
+}
+
+pub extern effect fn osStartProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let _ = cSignal(13, 1) // SIGPIPE ignored: a write to a process that ended fails instead of ending this one
+    let argv = calloc(count + 2, 8)
+    setWord(argv, 0, name)
+    for i in 0..count {
+        let n = word(args, 2 * i + 1)
+        let s = calloc(n + 1, 1)
+        copyBytes(s, word(args, 2 * i), n)
+        setWord(argv, i + 1, s)
+    }
+    let fds = calloc(4, 8) // input (read, write), output, errors, exec's failure: each (read end, write end)
+    for k in 0..4 {
+        if pipe(fds + 8 * k) != 0 {
+            let e = errno()
+            closeAll(fds, 2 * k)
+            return cannotRun(out, name, e)
+        }
+    }
+    for i in [1, 2, 4, 6, 7] {
+        let _ = fcntl(int32At(fds, i), 2, 1) // FD_CLOEXEC: this program's ends, kept from the process and from others
+    }
+    let pid = fork()
+    if pid < 0 {
+        let e = errno()
+        closeAll(fds, 8)
+        return cannotRun(out, name, e)
+    }
+    if pid == 0 {
+        // the child: the pipes its input, output and errors
+        let _ = dup2(int32At(fds, 0), 0) + dup2(int32At(fds, 3), 1) + dup2(int32At(fds, 5), 2)
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5))
+        let _ = execvp(name, argv)
+        let e = calloc(1, 8)
+        setInt32(e, 0, errno())
+        let _ = cWrite(int32At(fds, 7), e, 4)
+        cExitNow(127)
+    }
+    let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5)) + cClose(int32At(fds, 7))
+    let execError = calloc(1, 8)
+    var got = cRead(int32At(fds, 6), execError, 4)
+    while got < 0 and errno() == eintr {
+        got = cRead(int32At(fds, 6), execError, 4)
+    }
+    let _ = cClose(int32At(fds, 6))
+    if got == 4 {
+        let ws = calloc(1, 8)
+        while waitpid(pid, ws, 0) < 0 and errno() == eintr {}
+        let _ = cClose(int32At(fds, 1)) + cClose(int32At(fds, 2)) + cClose(int32At(fds, 4))
+        return cannotRun(out, name, int32At(execError, 0))
+    }
+    setWord(out, 0, pid)
+    setWord(out, 1, int32At(fds, 1))
+    setWord(out, 2, int32At(fds, 2))
+    setWord(out, 3, int32At(fds, 4))
+    0
+}
+
+pub extern effect fn osPipeReadImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" {
+    while true {
+        let k = cRead(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeWriteImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" {
+    while true {
+        let k = cWrite(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeCloseImpl(h: Int64) as "qkosPipeClose" {
+    let _ = cClose(h)
+}
+
+pub extern effect fn osProcessWaitImpl(h: Int64) -> Int64 as "qkosProcessWait" {
+    let ws = calloc(1, 8)
+    while waitpid(h, ws, 0) < 0 and errno() == eintr {}
+    let s = int32At(ws, 0)
+    free(ws)
+    if s & 127 == 0 {
+        s >> 8 & 255
+    } else if s & 127 != 127 {
+        128 + s & 127
+    } else {
+        -1
+    }
+}
+
+pub extern effect fn osProcessKillImpl(h: Int64) as "qkosProcessKill" {
+    let _ = cKill(h, 9)
 }
 
 // ---- code in memory, the stack, C's libraries, threads ----
@@ -741,4 +853,183 @@ pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalO
     }
     free(t)
     offset
+}
+
+// ---- TLS: SecureTransport (Security.framework, loaded the first time TLS is used), each function found by its
+// name; its reads and writes are of io.qk's buffers (tIn, tOut), its sockets carry the bytes ----
+// io.qk's words first (tOut ... tIn), then this
+const mCtx = 12
+const mWords = 13
+const stWouldBlock = -9803 // errSSLWouldBlock: more from the server first
+const stClosed = -9805 // errSSLClosedGraceful
+const stAborted = -9806 // errSSLClosedAbort
+
+fn security() -> Int {
+    let have = gGet(gTlsLibrary)
+    if have != 0 {
+        return have
+    }
+    let h = dlopen(textAt("/System/Library/Frameworks/Security.framework/Security\0"), 2)
+    gSet(gTlsLibrary, h)
+    h
+}
+
+extern effect fn findSt1(h: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "dlsym"
+extern effect fn findSt2(h: Int64, name: Int64) -> (extern (Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSt3(h: Int64, name: Int64) -> (extern (Int64, Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSt4(h: Int64, name: Int64) -> (extern (Int64, Int64, Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findStCreate(h: Int64, name: Int64) -> (extern (Int64, Int32, Int32) -> Int64)? as "dlsym"
+extern fn ioAddress(f: extern (Int64, Int64, Int64) -> Int64) -> Int64 as "qkTextAddress"
+
+fn st1(name: Text, a: Int) -> Int = match findSt1(security(), textAt(name)) {
+    Some(f) => f(a)
+    None => -1
+}
+
+fn st3(name: Text, a: Int, b: Int, c: Int) -> Int = match findSt3(security(), textAt(name)) {
+    Some(f) => f(a, b, c)
+    None => -1
+}
+
+fn st4(name: Text, a: Int, b: Int, c: Int, d: Int) -> Int = match findSt4(security(), textAt(name)) {
+    Some(f) => f(a, b, c, d)
+    None => -1
+}
+
+// SecureTransport's read: what came from the server (connection: the block); errSSLWouldBlock when it wants more
+fn stRead(t: Int, data: Int, length: Int) -> Int {
+    let want = word(length, 0)
+    let have = word(t, tIn + 1)
+    let k = if have < want { have } else { want }
+    copyBytes(data, word(t, tIn), k)
+    heldDrop(t, tIn, k)
+    setWord(length, 0, k)
+    if k < want { stWouldBlock } else { 0 }
+}
+
+// its write: kept to send
+fn stWrite(t: Int, data: Int, length: Int) -> Int {
+    heldAppend(t, tOut, data, word(length, 0))
+    0
+}
+
+fn stWhy(why: Int, s: Int) {
+    let m = match s {
+        -9807 => "the server's certificate chain is not valid"
+        -9808 => "the server's certificate is bad"
+        -9812 => "the server's certificate's root is not known"
+        -9813 => "the server's certificate has no root that is trusted"
+        -9814 => "the server's certificate has expired"
+        -9815 => "the server's certificate is not valid yet"
+        -9843 => "the server's certificate is for another name"
+        -9806 => "the server closed the connection"
+        _ => ""
+    }
+    let b = bufAt(why, 256)
+    let _ = if m != "" {
+        b.text(m)
+    } else {
+        b.text("SecureTransport's status ").int(s)
+    }
+}
+
+pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    if security() == 0 {
+        let _ = bufAt(why, 256).text("cannot load Security.framework")
+        return 0
+    }
+    let ctx = match findStCreate(security(), textAt("SSLCreateContext\0")) {
+        Some(f) => f(0, 1, 0)
+        // kSSLClientSide, kSSLStreamType
+        None => 0
+    }
+    if ctx == 0 {
+        let _ = bufAt(why, 256).text("SecureTransport made no context")
+        return 0
+    }
+    let t = calloc(mWords, 8)
+    setWord(t, mCtx, ctx)
+    let _ = st3(
+        "SSLSetIOFuncs\0",
+        ctx,
+        ioAddress((c, d, n) => stRead(c, d, n)),
+        ioAddress((c, d, n) => stWrite(c, d, n)),
+    )
+    let _ = match findSt2(security(), textAt("SSLSetConnection\0")) {
+        Some(f) => f(ctx, t)
+        None => -1
+    }
+    let _ = st3("SSLSetPeerDomainName\0", ctx, host, strlen(host)) // the hello's name, and the certificate's
+    if osTlsWorkImpl(t, why) != 0 {
+        osTlsEndImpl(t)
+        heldFree(t, tOut)
+        free(t)
+        return 0
+    }
+    t
+}
+
+pub extern effect fn osTlsWorkImpl(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" {
+    let ctx = word(t, mCtx)
+    if word(t, tState) == 0 {
+        let s = st1("SSLHandshake\0", ctx)
+        if s == stWouldBlock {
+            return 0
+        }
+        if s != 0 {
+            stWhy(why, s)
+            return -1
+        }
+        setWord(t, tState, 1)
+    }
+    if word(t, tState) == 1 {
+        let room = malloc(16384)
+        let done = calloc(1, 8)
+        while true {
+            setWord(done, 0, 0)
+            let s = st4("SSLRead\0", ctx, room, 16384, done)
+            let k = word(done, 0)
+            if k > 0 {
+                heldAppend(t, tPlain, room, k)
+            }
+            if s == stClosed or s == stAborted {
+                setWord(t, tState, 2)
+                break
+            }
+            if s != 0 and s != stWouldBlock {
+                free(room)
+                free(done)
+                stWhy(why, s)
+                return -1
+            }
+            if s == stWouldBlock or k == 0 {
+                break
+            }
+        }
+        free(room)
+        free(done)
+    }
+    0
+}
+
+pub extern effect fn osTlsSealImpl(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" {
+    let done = calloc(1, 8)
+    let s = st4("SSLWrite\0", word(t, mCtx), p, n, done) // (its write takes everything at once)
+    free(done)
+    if s != 0 {
+        stWhy(why, s)
+        return -1
+    }
+    0
+}
+
+pub extern effect fn osTlsEndImpl(t: Int64) as "qkosTlsEnd" {
+    let ctx = word(t, mCtx)
+    if ctx != 0 {
+        if word(t, tState) == 1 {
+            let _ = st1("SSLClose\0", ctx) // close_notify
+        }
+        let _ = st1("CFRelease\0", ctx)
+        setWord(t, mCtx, 0)
+    }
 }

@@ -87,14 +87,25 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
 
 - [x] `std.csv`, `walkFiles`, `quark test --filter`, o tutorial
 - [x] `std.encoding`, `std.hash`, `std.args`, `std.files`, `std.net`, `std.http`
-- [ ] TLS (por `quark bind` da biblioteca do sistema)
-- [ ] JSON tipado (de e para records)
-- [ ] subprocessos com entrada e saída em fluxo
-- [ ] fusos horários com nome
-- [ ] pacotes: registro, versões semânticas
-- [ ] LSP: renomear, ir para implementações, tipos e efeitos ao passar o mouse
-- [ ] testes: cobertura, testes de propriedade
-- [ ] guias (vindo de Go, Rust, Python; servidores)
+- [x] TLS pela biblioteca do sistema (Schannel, OpenSSL carregada ao primeiro uso, SecureTransport) atrás de um motor
+  de bytes por sistema no runtime: `tlsConnect`, `readTls`, `writeTls`, `closeTls`; `connectTls` em std.net, `https://`
+  em std.http
+- [x] JSON tipado: `encode(v)` e `decode(text)` por tipo (records, enums, arrays, mapas, opcionais, tuplas; padrões dos
+  campos), feitos para cada tipo pelo checker quando usados
+- [x] subprocessos com entrada e saída em fluxo: `startProcess`, `writeProcess`, `readProcess(Errors)`,
+  `closeProcessInput`, `waitProcess`, `killProcess` (cooperativos em tarefas)
+- [x] fusos horários com nome: `zone("Europe/Lisbon")` em std.time, pelos arquivos TZif do sistema (toda a
+  história) ou pela regra de hoje de cada zona em std.zones (gerado do tzdata por `tools/zones.py`)
+- [x] pacotes: versões semânticas (seleção mínima de versões, como a do Go: a mais nova das mínimas pedidas, uma
+  major) e registro (um repositório git com `index.toml`; `registry =` ou `QUARK_REGISTRY`), `quark get` com hash
+- [x] LSP: renomear e referências em todos os arquivos do programa, ir para implementações, tipos e efeitos ao passar
+  o mouse, diagnósticos incrementais (edições por trecho, textos abertos vistos pelos outros arquivos, quem usa o
+  arquivo verificado de novo, verificação guardada entre pedidos)
+- [x] testes: `quark test --coverage` (as linhas que os testes rodaram), propriedades em std.testing (`forAll`,
+  geradores, redução ao menor valor que falha); o arquivo certo num pânico em código de outro arquivo
+- [x] guias: [vindo de Go, Rust, Python](COMING-FROM.md), [servidores](SERVERS.md) (seus exemplos verificados pela
+  suíte); a [referência do prelúdio](PRELUDE.md) gerada por `quark doc` (seções do arquivo como títulos), conferida
+  pela suíte
 
 ## Desempenho contra C (gcc -O2)
 

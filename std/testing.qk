@@ -45,3 +45,206 @@ pub fn assertErr<T>(result: T!, part: Text = "", what: Text = "") {
 }
 
 fn named(what: Text) -> Text = if what == "" { "" } else { "{what}: " }
+
+// ---- properties: what holds for every value a generator makes; when one fails, the smallest value found that fails --
+//
+//     test "reversing twice gives the array back" {
+//         forAll(arrays(ints()), xs => xs.reversed().reversed() == xs)
+//     }
+// values of T: one made from a seed and a size (0 to 99: how big it may be; small ones come first), and the values
+// smaller than one, simplest first (tried when a property fails, to find the smallest value that fails it)
+pub type Gen<T> { make: (Int, Int) -> T, smaller: (T) -> [T] }
+
+// the property holds for runs values of gen, or stop, saying the smallest value found that it does not hold for. The
+// values are the same each time (another seed gives others).
+pub fn forAll<T>(gen: Gen<T>, property: (T) -> Bool, runs: Int = 100, seed: Int = 1) {
+    for run in 0..runs {
+        let value = gen.make(mixed(seed *% 1_000_003 +% run), run * 100 / max(runs, 1))
+        if property(value) {
+            continue
+        }
+        var least = value
+        var steps = 0
+        var smaller = true
+        while smaller and steps < 1000 {
+            smaller = false
+            for candidate in gen.smaller(least) {
+                if not property(candidate) {
+                    least = candidate
+                    steps += 1
+                    smaller = true
+                    break
+                }
+            }
+        }
+        printErr("forAll: the property does not hold for:", least)
+        if steps > 0 {
+            printErr("        made smaller {steps} times from:", value)
+        }
+        assert(false, "forAll: the property does not hold (value {run + 1} of {runs}, seed {seed})")
+    }
+}
+
+// Ints from lo to hi, both in: near 0 (or the end of the range nearest it) first, then from all of it
+pub fn ints(lo: Int = -1000, hi: Int = 1000) -> Gen<Int> = Gen((seed, size) => {
+    let center = clamped(0, lo, hi)
+    let reach = max(1, (hi - lo) / 100 * (size + 1) + size)
+    between(seed, max(lo, center - reach), min(hi, center + reach))
+}, x => {
+    let center = clamped(0, lo, hi)
+    var out: [Int] = []
+    for c in [center, x - (x - center) / 2, if x > center { x - 1 } else { x + 1 }] {
+        if c != x and c >= lo and c <= hi and not out.contains(c) and abs(c - center) < abs(x - center) {
+            out.push(c)
+        }
+    }
+    out
+})
+
+// Floats from lo to hi
+pub fn floats(lo: Float = -1000.0, hi: Float = 1000.0) -> Gen<Float> = Gen((seed, size) => {
+    let unit = toFloat(seed & (1 << 53 - 1)) / 9007199254740992.0
+    let center = min(max(0.0, lo), hi)
+    let reach = (hi - lo) * toFloat(size + 1) / 100.0
+    min(hi, max(lo, center - reach + 2.0 * reach * unit))
+}, x => {
+    let center = min(max(0.0, lo), hi)
+    var out: [Float] = []
+    for c in [center, toFloat(round(x)), (x + center) / 2.0] {
+        if c != x and c >= lo and c <= hi and not out.contains(c) and abs(c - center) < abs(x - center) {
+            out.push(c)
+        }
+    }
+    out
+})
+
+// true or false; false is the smaller
+pub fn bools() -> Gen<Bool> = Gen((seed, size) => seed & 1 == 1, b => if b { [false] } else { [] })
+
+// texts of up to most characters from those of alphabet
+pub fn texts(most: Int = 20, alphabet: Text = "abcdefghijklmnopqrstuvwxyz ABC0123,.é😀") -> Gen<Text> {
+    let chars = textChars(alphabet)
+    Gen((seed, size) => {
+        let n = between(seed, 0, min(most, size / 4 + 1))
+        var t = ""
+        for i in 0..n {
+            t += chars[between(mixed(seed +% i +% 1), 0, len(chars) - 1)]
+        }
+        t
+    }, t => {
+        let cs = textChars(t)
+        var out: [Text] = []
+        if len(cs) > 0 {
+            out.push("")
+            out.push(cs[..len(cs) / 2].join(""))
+            out.push(cs[len(cs) / 2..].join(""))
+        }
+        for i in 0..min(len(cs), 20) {
+            out.push(cs[..i].join("") + cs[i + 1..].join(""))
+            if cs[i] != chars[0] {
+                out.push(cs[..i].join("") + chars[0] + cs[i + 1..].join(""))
+            }
+        }
+        out.filter(s => s != t).toArray()
+    })
+}
+
+// arrays of up to most values of of
+pub fn arrays<T>(of: Gen<T>, most: Int = 20) -> Gen<[T]> {
+    let g: Gen<[T]> = Gen((seed, size) => {
+        let n = between(seed, 0, min(most, size / 4 + 1))
+        var xs: [T] = []
+        for i in 0..n {
+            xs.push(of.make(mixed(seed +% i +% 1), size))
+        }
+        xs
+    }, xs => {
+        var out: [[T]] = []
+        if len(xs) > 0 {
+            out.push([])
+        }
+        if len(xs) > 1 {
+            out.push(xs[..len(xs) / 2])
+            out.push(xs[len(xs) / 2..])
+        }
+        for i in 0..min(len(xs), 20) {
+            out.push(xs[..i] + xs[i + 1..]) // one fewer
+        }
+        for i in 0..min(len(xs), 20) {
+            for s in of.smaller(xs[i]) {
+                var ys = xs
+                ys[i] = s // one smaller
+                out.push(ys)
+            }
+        }
+        out
+    })
+    g
+}
+
+// pairs of a value of a and one of b
+pub fn pairs<A, B>(a: Gen<A>, b: Gen<B>) -> Gen<(A, B)> {
+    let g: Gen<(A, B)> = Gen((seed, size) => (a.make(mixed(seed), size), b.make(mixed(seed +% 1), size)), p => {
+        let (x, y) = p
+        var out: [(A, B)] = []
+        for s in a.smaller(x) {
+            out.push((s, y))
+        }
+        for s in b.smaller(y) {
+            out.push((x, s))
+        }
+        out
+    })
+    g
+}
+
+// one of the values (the ones before it are the smaller)
+pub fn oneOf<T>(values: [T]) -> Gen<T> {
+    let g: Gen<T> = Gen((seed, size) => values[between(seed, 0, len(values) - 1)], v => {
+        var out: [T] = []
+        for x in values {
+            if x == v {
+                break
+            }
+            out.push(x)
+        }
+        out
+    })
+    g
+}
+
+// values of gen made into others by f (a record of them, say); f has no way back, so none is smaller
+pub fn mapGen<A, B>(gen: Gen<A>, f: (A) -> B) -> Gen<B> {
+    let by = Mapping(f) // (a lambda keeps a record of functions, not a function given to the one around it)
+    let g: Gen<B> = Gen((seed, size) => by.made(gen.make(seed, size)), b => [])
+    g
+}
+
+type Mapping<A, B> { made: (A) -> B }
+
+// a text's characters, each a text
+fn textChars(t: Text) -> [Text] {
+    var out: [Text] = []
+    for c in t.codePoints() {
+        out.push(char(c))
+    }
+    out
+}
+
+// from lo to hi, both in, as the seed says
+fn between(seed: Int, lo: Int, hi: Int) -> Int =
+    if hi <= lo { lo } else { lo + seed & intMaxBits % (hi - lo + 1) }
+
+const intMaxBits = 1 << 62 - 1 + 1 << 62
+
+fn clamped(x: Int, lo: Int, hi: Int) -> Int = min(max(x, lo), hi)
+
+// a seed's bits mixed (SplitMix64's): a new seed for each value, each part of a value
+fn mixed(x: Int) -> Int {
+    var z = x +% -7046029254386353131
+    z = (z ^ shiftedDown(z, 30)) *% -4658895280553007687
+    z = (z ^ shiftedDown(z, 27)) *% -7723592293110705685
+    z ^ shiftedDown(z, 31)
+}
+
+fn shiftedDown(x: Int, n: Int) -> Int = x >> n & (1 << (64 - n)) - 1

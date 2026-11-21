@@ -41,6 +41,36 @@ pub type Process { status: Int, out: Text, err: Text }
 pub effect fn runProcess(program: Text, args: [Text]) -> Process! =
     runtime("process", "runProcess", program, args)
 
+// a program running beside this one, its input, output and errors in pipes (startProcess)
+pub type Subprocess { handle: Int }
+
+// program started with args: what it reads, writes and leaves are this program's to give and take as it runs
+// (writeProcess, readProcess, readProcessErrors, closeProcessInput, waitProcess, killProcess). A read, a write or the
+// wait that would wait gives a task's turn back.
+pub effect fn startProcess(program: Text, args: [Text]) -> Subprocess! =
+    runtime("process", "startProcess", program, args)
+
+// bytes to the process's input (every one: the task waits while the pipe is full)
+pub effect fn writeProcess(p: Subprocess, bytes: Bytes) -> Unit! =
+    runtime("process", "processWrite", p, bytes)
+
+// the process's input ended: it reads its end (a program that reads to the end of its input goes on)
+pub effect fn closeProcessInput(p: Subprocess) = runtime("process", "processCloseInput", p)
+
+// up to most bytes of what the process wrote to its output, as they come; none: it ended its output
+pub effect fn readProcess(p: Subprocess, most: Int) -> Bytes! =
+    runtime("process", "processRead", p, most, 0)
+
+// the same of its errors
+pub effect fn readProcessErrors(p: Subprocess, most: Int) -> Bytes! =
+    runtime("process", "processRead", p, most, 1)
+
+// its end waited for: its exit status (its input closed first; what it still writes is not read)
+pub effect fn waitProcess(p: Subprocess) -> Int! = runtime("process", "processWait", p)
+
+// stopped now (waitProcess then gives the status it stopped with)
+pub effect fn killProcess(p: Subprocess) = runtime("process", "processKill", p)
+
 // an environment variable's value
 pub effect fn env(name: Text) -> Text? = runtime("env", "env", name)
 
@@ -97,6 +127,23 @@ pub effect fn writeSocket(socket: Socket, bytes: Bytes) -> Unit! =
     runtime("net", "writeSocket", socket, bytes)
 
 pub effect fn closeSocket(socket: Socket) = runtime("net", "closeSocket", socket)
+
+// TLS over a connected socket, by the system's library (Schannel, OpenSSL, SecureTransport): the server's certificate
+// checked for serverName by the system's trust (std.net's connectTls and std.http's https:// use it)
+pub type Tls { handle: Int }
+
+// the handshake with the server at the other end of the socket
+pub effect fn tlsConnect(socket: Socket, serverName: Text) -> Tls! =
+    runtime("net", "tlsConnect", socket, serverName)
+
+// what the server said, decrypted, up to most bytes; none when it ended the connection
+pub effect fn readTls(t: Tls, most: Int) -> Bytes! = runtime("net", "readTls", t, most)
+
+// every byte sent, encrypted
+pub effect fn writeTls(t: Tls, bytes: Bytes) -> Unit! = runtime("net", "writeTls", t, bytes)
+
+// the end sent, and the socket closed
+pub effect fn closeTls(t: Tls) = runtime("net", "closeTls", t)
 
 // ---- tasks: functions run a step at a time (runtime/tasks.qk) ----
 // a task of f: step runs it until it gives its turn back

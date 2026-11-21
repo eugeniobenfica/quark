@@ -5,6 +5,7 @@
 // are UTF-8 in the runtime and UTF-16 here: Windows' wide functions take any name, its ANSI ones only the code
 // page's.
 use base
+use io
 use start
 use host
 
@@ -1464,4 +1465,438 @@ pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalO
     }
     free(t)
     offset
+}
+
+// ---- a process with pipes (startProcess): its input, output and errors this program's to use ----
+extern effect fn terminateProcess(h: Int64, code: UInt32) -> Int32 as "TerminateProcess"
+
+pub extern effect fn osStartProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let n = strlen(name)
+    for i in 0..n {
+        if byte(name, i) == '/' {
+            setByte(name, i, '\\')
+        }
+    }
+    var line = Line(malloc(256), 0, 256).quoted(name, n)
+    for i in 0..count {
+        line = line.add(' ').quoted(word(args, 2 * i), word(args, 2 * i + 1))
+    }
+    let wline = wideOf(line.p, line.n)
+    free(line.p)
+    let sa = calloc(1, 24)
+    setInt32(sa, 0, 24)
+    setInt32(sa, 4, 1)
+    let hs = calloc(6, 8) // input (read, write), output (read, write), errors (read, write)
+    for k in 0..3 {
+        if createPipe(hs + 16 * k, hs + 16 * k + 8, sa, 0) == 0 {
+            let e = getLastError()
+            for i in 0..2 * k {
+                let _ = closeHandle(word(hs, i))
+            }
+            free(wline)
+            return cannotRun(out, name, e)
+        }
+    }
+    // this program's ends: not given to the process
+    let _ = setHandleInformation(word(hs, 1), 1, 0)
+    let _ = setHandleInformation(word(hs, 2), 1, 0)
+    let _ = setHandleInformation(word(hs, 4), 1, 0)
+    let si = calloc(1, 104)
+    setInt32(si, 0, 104)
+    setInt32(si, 15, 256) // STARTF_USESTDHANDLES
+    setWord(si, 10, word(hs, 0))
+    setWord(si, 11, word(hs, 3))
+    setWord(si, 12, word(hs, 5))
+    let pi = calloc(1, 24)
+    let started = createProcessW(0, wline, 0, 0, 1, 0, 0, 0, si, pi)
+    let startError = getLastError()
+    free(wline)
+    let _ = closeHandle(word(hs, 0))
+    let _ = closeHandle(word(hs, 3))
+    let _ = closeHandle(word(hs, 5))
+    if started == 0 {
+        let _ = closeHandle(word(hs, 1))
+        let _ = closeHandle(word(hs, 2))
+        let _ = closeHandle(word(hs, 4))
+        return cannotRun(out, name, startError)
+    }
+    let _ = closeHandle(word(pi, 1)) // its thread
+    setWord(out, 0, word(pi, 0))
+    setWord(out, 1, word(hs, 1))
+    setWord(out, 2, word(hs, 2))
+    setWord(out, 3, word(hs, 4))
+    free(hs)
+    free(sa)
+    free(si)
+    free(pi)
+    0
+}
+
+pub extern effect fn osPipeReadImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" {
+    let got = calloc(1, 8)
+    let ok = winReadFile(h, p, if n > 1073741824 { 1073741824 } else { n }, got, 0)
+    let k = int32At(got, 0)
+    free(got)
+    if ok != 0 {
+        k
+    } else if getLastError() == 109 {
+        0 // ERROR_BROKEN_PIPE: its end
+    } else {
+        -1
+    }
+}
+
+pub extern effect fn osPipeWriteImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" {
+    let done = calloc(1, 8)
+    let ok = winWriteFile(h, p, if n > 1073741824 { 1073741824 } else { n }, done, 0)
+    let k = int32At(done, 0)
+    free(done)
+    if ok != 0 { k } else { -1 }
+}
+
+pub extern effect fn osPipeCloseImpl(h: Int64) as "qkosPipeClose" {
+    let _ = closeHandle(h)
+}
+
+pub extern effect fn osProcessWaitImpl(h: Int64) -> Int64 as "qkosProcessWait" {
+    let _ = waitForSingleObject(h, 4294967295)
+    let code = calloc(1, 8)
+    let _ = getExitCodeProcess(h, code)
+    let status = int32At(code, 0)
+    free(code)
+    let _ = closeHandle(h)
+    status
+}
+
+pub extern effect fn osProcessKillImpl(h: Int64) as "qkosProcessKill" {
+    let _ = terminateProcess(h, 1)
+}
+
+// ---- TLS: Schannel, from secur32.dll (loaded the first time TLS is used), each function found by its name ----
+// io.qk's words first (tOut ... tIn), then these
+const wCred = 12 // its credentials' handle (two words)
+const wCtx = 14 // its context's handle (two words)
+const wHasCtx = 16
+const wHeader = 17 // a message's parts: its header's size, its trailer's, the most it holds
+const wTrailer = 18
+const wMost = 19
+const wTarget = 20 // the server's name, UTF-16
+const wWords = 21
+const secMask = 0xFFFFFFFF
+const secIncomplete = 0x80090318 // SEC_E_INCOMPLETE_MESSAGE: more is needed
+const secContinue = 0x00090312 // SEC_I_CONTINUE_NEEDED
+const secRenegotiate = 0x00090321 // SEC_I_RENEGOTIATE: messages of the handshake's after it (TLS 1.3's)
+const secExpired = 0x00090317 // SEC_I_CONTEXT_EXPIRED: the server ended it
+const iscFlags = 0xC11C // sequence and replay detection, confidentiality, extended errors, memory allocated, a stream
+
+fn secur32() -> Int {
+    let have = gGet(gTlsLibrary)
+    if have != 0 {
+        return have
+    }
+    let w = wide(textAt("secur32.dll\0"))
+    let m = loadLibraryW(w)
+    free(w)
+    gSet(gTlsLibrary, m)
+    m
+}
+
+extern effect fn findAcquireCredentials(
+    m: Int64,
+    name: Int64,
+) -> (extern (Int64, Int64, UInt32, Int64, Int64, Int64, Int64, Int64, Int64) -> Int32)? as "GetProcAddress"
+
+fn acquireCredentials(package: Int, data: Int, cred: Int, expiry: Int) -> Int = match findAcquireCredentials(
+    secur32(),
+    textAt("AcquireCredentialsHandleW\0"),
+) {
+    Some(f) => f(0, package, 2, 0, data, 0, 0, cred, expiry)
+    // SECPKG_CRED_OUTBOUND
+    None => -1
+}
+
+extern effect fn findInitializeContext(
+    m: Int64,
+    name: Int64,
+) -> (extern (Int64, Int64, Int64, UInt32, UInt32, UInt32, Int64, UInt32, Int64, Int64, Int64, Int64) -> Int32)? as "GetProcAddress"
+
+fn initializeContext(t: Int, first: Bool, input: Int, output: Int) -> Int {
+    let attrs = calloc(1, 16)
+    let ctx = t + 8 * wCtx
+    let r = match findInitializeContext(secur32(), textAt("InitializeSecurityContextW\0")) {
+        Some(f) => f(
+            t + 8 * wCred,
+            if first { 0 } else { ctx },
+            word(t, wTarget),
+            iscFlags,
+            0,
+            0,
+            input,
+            0,
+            ctx,
+            output,
+            attrs,
+            attrs + 8,
+        )
+        None => -1
+    }
+    free(attrs)
+    r & secMask
+}
+
+extern effect fn findQueryContext(m: Int64, name: Int64) -> (extern (Int64, UInt32, Int64) -> Int32)? as "GetProcAddress"
+extern effect fn findEncrypt(m: Int64, name: Int64) -> (extern (Int64, UInt32, Int64, UInt32) -> Int32)? as "GetProcAddress"
+extern effect fn findDecrypt(m: Int64, name: Int64) -> (extern (Int64, Int64, UInt32, Int64) -> Int32)? as "GetProcAddress"
+extern effect fn findApplyToken(m: Int64, name: Int64) -> (extern (Int64, Int64) -> Int32)? as "GetProcAddress"
+extern effect fn findOfOne(m: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "GetProcAddress"
+
+// FreeContextBuffer, DeleteSecurityContext, FreeCredentialsHandle
+fn secCall(name: Text, p: Int) = match findOfOne(secur32(), textAt(name)) {
+    Some(f) => {
+        let _ = f(p)
+    }
+    None => {}
+}
+
+// a SecBufferDesc of n SecBuffers (each: its size, its kind, its place)
+fn secBuffers(n: Int) -> Int {
+    let d = calloc(1, 16 + 16 * n)
+    setInt32(d, 1, n)
+    setWord(d, 1, d + 16)
+    d
+}
+
+fn setSecBuffer(d: Int, i: Int, size: Int, kind: Int, p: Int) {
+    setInt32(d + 16 + 16 * i, 0, size)
+    setInt32(d + 16 + 16 * i, 1, kind)
+    setWord(d + 16 + 16 * i, 1, p)
+}
+
+fn secSize(d: Int, i: Int) -> Int = int32At(d + 16 + 16 * i, 0) & secMask
+
+fn secKind(d: Int, i: Int) -> Int = int32At(d + 16 + 16 * i, 1) & secMask
+
+fn secPlace(d: Int, i: Int) -> Int = word(d + 16 + 16 * i, 1)
+
+// the system's words for a status ("The certificate chain was issued by an authority that is not trusted")
+fn secWhy(why: Int, s: Int) {
+    let m = calloc(1, 300)
+    let _ = formatMessageA(4096 | 512, 0, s, 0, m, 300, 0)
+    var k = strlen(m)
+    while k > 0 and (byte(m, k - 1) == '\r' or byte(m, k - 1) == '\n' or byte(m, k - 1) == '.' or byte(m, k - 1) == ' ') {
+        k -= 1
+        setByte(m, k, 0)
+    }
+    let b = bufAt(why, 256)
+    let _ = if k == 0 {
+        b.text("Schannel's status 0x").hex(s)
+    } else {
+        b.zeroText(m)
+    }
+    free(m)
+}
+
+pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    if secur32() == 0 {
+        let _ = bufAt(why, 256).text("cannot load secur32.dll")
+        return 0
+    }
+    let t = calloc(wWords, 8)
+    let package = wide(textAt("Microsoft Unified Security Protocol Provider\0"))
+    let expiry = calloc(1, 16)
+    let flags = 0x20 | 0x10 | 0x400000 // the server's certificate checked, no certificate of this side's, strong ciphers
+    // SCH_CREDENTIALS (TLS 1.3 where the system has it), else SCHANNEL_CRED (before Windows 10 1809)
+    let cred = calloc(1, 80)
+    setInt32(cred, 0, 5)
+    setInt32(cred, 13, flags)
+    var s = acquireCredentials(package, cred, t + 8 * wCred, expiry) & secMask
+    if s != 0 {
+        zeroBytes(cred, 80)
+        setInt32(cred, 0, 4)
+        setInt32(cred, 18, flags)
+        s = acquireCredentials(package, cred, t + 8 * wCred, expiry) & secMask
+    }
+    free(cred)
+    free(expiry)
+    free(package)
+    if s != 0 {
+        secWhy(why, s)
+        free(t)
+        return 0
+    }
+    setWord(t, wTarget, wide(host))
+    if handshake(t, why) != 0 {
+        osTlsEndImpl(t)
+        heldFree(t, tOut)
+        free(t)
+        return 0
+    }
+    t
+}
+
+// the handshake as far as what came goes (the first call: the hello); 0, or -1 with why
+fn handshake(t: Int, why: Int) -> Int {
+    while true {
+        let first = word(t, wHasCtx) == 0
+        let n = word(t, tIn + 1)
+        if not first and n == 0 {
+            return 0
+        }
+        let input = secBuffers(2)
+        setSecBuffer(input, 0, n, 2, word(t, tIn)) // SECBUFFER_TOKEN
+        let output = secBuffers(1)
+        setSecBuffer(output, 0, 0, 2, 0)
+        let s = initializeContext(t, first, if first { 0 } else { input }, output)
+        let made = secPlace(output, 0)
+        if made != 0 {
+            heldAppend(t, tOut, made, secSize(output, 0))
+            secCall("FreeContextBuffer\0", made)
+        }
+        let extra = if secKind(input, 1) == 5 {
+            secSize(input, 1) // SECBUFFER_EXTRA: not used yet
+        } else {
+            0
+        }
+        free(input)
+        free(output)
+        if s == secIncomplete {
+            return 0
+        }
+        if s != 0 and s != secContinue {
+            secWhy(why, s)
+            return -1
+        }
+        setWord(t, wHasCtx, 1)
+        heldDrop(t, tIn, n - extra)
+        if s == 0 {
+            let sizes = calloc(1, 32)
+            let _ = match findQueryContext(secur32(), textAt("QueryContextAttributesW\0")) {
+                Some(f) => f(t + 8 * wCtx, 4, sizes)
+                // SECPKG_ATTR_STREAM_SIZES
+                None => -1
+            }
+            setWord(t, wHeader, int32At(sizes, 0) & secMask)
+            setWord(t, wTrailer, int32At(sizes, 1) & secMask)
+            setWord(t, wMost, int32At(sizes, 2) & secMask)
+            free(sizes)
+            setWord(t, tState, 1)
+            return decrypt(t, why)
+        }
+        if word(t, tIn + 1) == 0 {
+            return 0
+        }
+    }
+    0
+}
+
+// what came, decrypted as far as it is whole; 0, or -1 with why
+fn decrypt(t: Int, why: Int) -> Int {
+    while word(t, tIn + 1) > 0 and word(t, tState) == 1 {
+        let n = word(t, tIn + 1)
+        let d = secBuffers(4)
+        setSecBuffer(d, 0, n, 1, word(t, tIn)) // SECBUFFER_DATA: decrypted in place
+        let s = match findDecrypt(secur32(), textAt("DecryptMessage\0")) {
+            Some(f) => f(t + 8 * wCtx, d, 0, 0) & secMask
+            None => secMask
+        }
+        if s == secIncomplete {
+            free(d)
+            return 0
+        }
+        if s != 0 and s != secRenegotiate and s != secExpired {
+            free(d)
+            secWhy(why, s)
+            return -1
+        }
+        // decrypted, the parts are the header, the data, the trailer and what is left (the next message's: the last
+        // bytes of what came)
+        if secKind(d, 1) == 1 {
+            heldAppend(t, tPlain, secPlace(d, 1), secSize(d, 1))
+        }
+        let extra = if secKind(d, 3) == 5 { secSize(d, 3) } else { 0 }
+        free(d)
+        heldDrop(t, tIn, n - extra)
+        if s == secExpired {
+            setWord(t, tState, 2)
+        } else if s == secRenegotiate {
+            setWord(t, tState, 0)
+            return handshake(t, why)
+        }
+    }
+    0
+}
+
+pub extern effect fn osTlsWorkImpl(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" = if word(t, tState) == 0 {
+    handshake(t, why)
+} else if word(t, tState) == 1 {
+    decrypt(t, why)
+} else {
+    0
+}
+
+pub extern effect fn osTlsSealImpl(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" {
+    let h = word(t, wHeader)
+    let tr = word(t, wTrailer)
+    let most = word(t, wMost)
+    let room = malloc(h + most + tr)
+    var at = 0
+    while at < n {
+        let k = if n - at < most { n - at } else { most }
+        copyBytes(room + h, p + at, k)
+        let d = secBuffers(4)
+        setSecBuffer(d, 0, h, 7, room) // SECBUFFER_STREAM_HEADER
+        setSecBuffer(d, 1, k, 1, room + h)
+        setSecBuffer(d, 2, tr, 6, room + h + k) // SECBUFFER_STREAM_TRAILER
+        let s = match findEncrypt(secur32(), textAt("EncryptMessage\0")) {
+            Some(f) => f(t + 8 * wCtx, 0, d, 0) & secMask
+            None => secMask
+        }
+        if s != 0 {
+            free(d)
+            free(room)
+            secWhy(why, s)
+            return -1
+        }
+        heldAppend(t, tOut, room, secSize(d, 0) + secSize(d, 1) + secSize(d, 2))
+        free(d)
+        at += k
+    }
+    free(room)
+    0
+}
+
+pub extern effect fn osTlsEndImpl(t: Int64) as "qkosTlsEnd" {
+    if word(t, wHasCtx) != 0 {
+        if word(t, tState) == 1 {
+            // close_notify: the shutdown token applied, then what the context makes of it
+            let token = calloc(1, 8)
+            setInt32(token, 0, 1) // SCHANNEL_SHUTDOWN
+            let d = secBuffers(1)
+            setSecBuffer(d, 0, 4, 2, token)
+            let applied = match findApplyToken(secur32(), textAt("ApplyControlToken\0")) {
+                Some(f) => f(t + 8 * wCtx, d) & secMask
+                None => secMask
+            }
+            if applied == 0 {
+                let output = secBuffers(1)
+                setSecBuffer(output, 0, 0, 2, 0)
+                let _ = initializeContext(t, false, 0, output)
+                let made = secPlace(output, 0)
+                if made != 0 {
+                    heldAppend(t, tOut, made, secSize(output, 0))
+                    secCall("FreeContextBuffer\0", made)
+                }
+                free(output)
+            }
+            free(d)
+            free(token)
+        }
+        secCall("DeleteSecurityContext\0", t + 8 * wCtx)
+        setWord(t, wHasCtx, 0)
+    }
+    if word(t, wTarget) != 0 {
+        secCall("FreeCredentialsHandle\0", t + 8 * wCred)
+        free(word(t, wTarget))
+        setWord(t, wTarget, 0)
+    }
 }

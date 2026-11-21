@@ -116,6 +116,15 @@ pub extern effect fn rtAppendFile(path: Int64, pathLen: Int64, text: Int64, n: I
 
 extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 
+// a process started with pipes: 0 and (its handle, the input's write end, the output's and the errors' read ends) in
+// out; 1 and the message (malloc'd) in out[1]
+extern effect fn osStartProcess(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess"
+extern effect fn osPipeRead(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" // bytes read, 0 at the end, -1
+extern effect fn osPipeWrite(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" // bytes written, or -1
+extern effect fn osPipeClose(h: Int64) as "qkosPipeClose"
+extern effect fn osProcessWait(h: Int64) -> Int64 as "qkosProcessWait" // its exit status (the handle let go of)
+extern effect fn osProcessKill(h: Int64) as "qkosProcessKill"
+
 // The calls that wait for the input or a process, on a thread of their own in a task (tasks.qk offThread): the
 // others go on meanwhile. Their jobs: what the call takes, then what it gives.
 fn readInJob(j: Int) -> Int {
@@ -139,6 +148,27 @@ fn runProcessJob(j: Int) -> Int {
         jobArgs + 4,
         osRunProcess(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2), word(j, jobArgs + 3)),
     )
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn pipeReadJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 3, osPipeRead(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn pipeWriteJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 3, osPipeWrite(word(j, jobArgs), word(j, jobArgs + 1), word(j, jobArgs + 2)))
+    setWord(j, jobDone, 1)
+    0
+}
+
+fn processWaitJob(j: Int) -> Int {
+    jobBegins(j)
+    setWord(j, jobArgs + 1, osProcessWait(word(j, jobArgs)))
     setWord(j, jobDone, 1)
     0
 }
@@ -373,4 +403,111 @@ pub extern effect fn rtRunProcess(prog: Int64, progLen: Int64, args: Int64, coun
     free(word(out, 1))
     free(word(out, 3))
     p
+}
+
+// ---- a process running beside this one (startProcess): its words ----
+const spHandle = 0
+const spIn = 1 // -1 once closed
+const spOut = 2
+const spErr = 3
+const spEnded = 4 // waited for: 1, and its status then
+const spStatus = 5
+
+pub extern effect fn rtStartProcess(prog: Int64, progLen: Int64, args: Int64, count: Int64) -> Int64 as "qk_startProcess" {
+    let name = cString(prog, progLen)
+    flush() // what was printed before comes first
+    let out = calloc(5, 8)
+    if osStartProcess(name, args, count, out) != 0 {
+        let m = word(out, 1)
+        let r = errResult(message().zeroText(m))
+        free(m)
+        free(out)
+        return r
+    }
+    let p = calloc(6, 8) // (malloc'd: a process may outlive the arena it was started in)
+    for i in 0..4 {
+        setWord(p, i, word(out, i))
+    }
+    free(out)
+    okResult(p, 0)
+}
+
+pub extern effect fn rtProcessWrite(p: Int64, bytes: Int64, n: Int64) -> Int64 as "qk_processWrite" {
+    if word(p, spIn) == -1 or word(p, spEnded) != 0 {
+        return errResult(message().text("writeProcess: the process's input is closed"))
+    }
+    var at = 0
+    while at < n {
+        let j = calloc(jobArgs + 4, 8)
+        setWord(j, jobArgs, word(p, spIn))
+        setWord(j, jobArgs + 1, bytes + at)
+        setWord(j, jobArgs + 2, n - at)
+        if not offThread(jobAddress(x => pipeWriteJob(x)), j) {
+            let _ = pipeWriteJob(j)
+        }
+        let k = jobGives(j, 3)
+        if k <= 0 {
+            return errResult(message().text("writeProcess: the process no longer reads its input"))
+        }
+        at += k
+    }
+    okResult(0, 0)
+}
+
+pub extern effect fn rtProcessCloseInput(p: Int64) as "qk_processCloseInput" {
+    if word(p, spIn) != -1 {
+        osPipeClose(word(p, spIn))
+        setWord(p, spIn, -1)
+    }
+}
+
+pub extern effect fn rtProcessRead(p: Int64, most: Int64, errors: Int64) -> Int64 as "qk_processRead" {
+    let h = word(p, if errors != 0 { spErr } else { spOut })
+    let room = allocRaw(if most > 0 { most } else { 1 }, 1)
+    if h == -1 or most <= 0 {
+        return okResult(room, 0)
+    }
+    let j = calloc(jobArgs + 4, 8)
+    setWord(j, jobArgs, h)
+    setWord(j, jobArgs + 1, room)
+    setWord(j, jobArgs + 2, most)
+    if not offThread(jobAddress(x => pipeReadJob(x)), j) {
+        let _ = pipeReadJob(j)
+    }
+    let k = jobGives(j, 3)
+    if k < 0 {
+        return errResult(message().text("readProcess: the process's output cannot be read"))
+    }
+    if k == 0 {
+        // its end: the pipe let go of
+        osPipeClose(h)
+        setWord(p, if errors != 0 { spErr } else { spOut }, -1)
+    }
+    okResult(room, k)
+}
+
+pub extern effect fn rtProcessWait(p: Int64) -> Int64 as "qk_processWait" {
+    if word(p, spEnded) == 0 {
+        rtProcessCloseInput(p)
+        let j = calloc(jobArgs + 2, 8)
+        setWord(j, jobArgs, word(p, spHandle))
+        if not offThread(jobAddress(x => processWaitJob(x)), j) {
+            let _ = processWaitJob(j)
+        }
+        setWord(p, spStatus, jobGives(j, 1))
+        setWord(p, spEnded, 1)
+        for at in [spOut, spErr] {
+            if word(p, at) != -1 {
+                osPipeClose(word(p, at))
+                setWord(p, at, -1)
+            }
+        }
+    }
+    okResult(word(p, spStatus), 0)
+}
+
+pub extern effect fn rtProcessKill(p: Int64) as "qk_processKill" {
+    if word(p, spEnded) == 0 {
+        osProcessKill(word(p, spHandle))
+    }
 }

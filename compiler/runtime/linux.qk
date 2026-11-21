@@ -1,6 +1,7 @@
 // The runtime's system calls on Linux: the C library (glibc: POSIX, pthreads, dlopen), each behind a symbol of the
 // runtime's own (qkos*, C's calls; windows.qk gives the same ones), and the executable's entry, main.
 use base
+use io
 use start
 use host
 
@@ -309,6 +310,117 @@ pub extern effect fn osRunProcessImpl(name: Int64, args: Int64, count: Int64, ou
     setWord(out, 3, word(bufs, 3))
     setWord(out, 4, word(bufs, 4))
     0
+}
+
+// ---- a process with pipes (startProcess): its input, output and errors this program's to use ----
+extern effect fn cKill(pid: Int32, sig: Int32) -> Int32 as "kill"
+extern effect fn cSignal(sig: Int32, handler: Int64) -> Int64 as "signal"
+
+fn closeAll(fds: Int, n: Int) {
+    for i in 0..n {
+        let _ = cClose(int32At(fds, i))
+    }
+}
+
+pub extern effect fn osStartProcessImpl(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let _ = cSignal(13, 1) // SIGPIPE ignored: a write to a process that ended fails instead of ending this one
+    let argv = calloc(count + 2, 8)
+    setWord(argv, 0, name)
+    for i in 0..count {
+        let n = word(args, 2 * i + 1)
+        let s = calloc(n + 1, 1)
+        copyBytes(s, word(args, 2 * i), n)
+        setWord(argv, i + 1, s)
+    }
+    let fds = calloc(4, 8) // input (read, write), output, errors, exec's failure: each (read end, write end)
+    for k in 0..4 {
+        if pipe(fds + 8 * k) != 0 {
+            let e = errno()
+            closeAll(fds, 2 * k)
+            return cannotRun(out, name, e)
+        }
+    }
+    for i in [1, 2, 4, 6, 7] {
+        let _ = fcntl(int32At(fds, i), 2, 1) // FD_CLOEXEC: this program's ends, kept from the process and from others
+    }
+    let pid = fork()
+    if pid < 0 {
+        let e = errno()
+        closeAll(fds, 8)
+        return cannotRun(out, name, e)
+    }
+    if pid == 0 {
+        // the child: the pipes its input, output and errors
+        let _ = dup2(int32At(fds, 0), 0) + dup2(int32At(fds, 3), 1) + dup2(int32At(fds, 5), 2)
+        let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5))
+        let _ = execvp(name, argv)
+        let e = calloc(1, 8)
+        setInt32(e, 0, errno())
+        let _ = cWrite(int32At(fds, 7), e, 4)
+        cExitNow(127)
+    }
+    let _ = cClose(int32At(fds, 0)) + cClose(int32At(fds, 3)) + cClose(int32At(fds, 5)) + cClose(int32At(fds, 7))
+    let execError = calloc(1, 8)
+    var got = cRead(int32At(fds, 6), execError, 4)
+    while got < 0 and errno() == eintr {
+        got = cRead(int32At(fds, 6), execError, 4)
+    }
+    let _ = cClose(int32At(fds, 6))
+    if got == 4 {
+        let ws = calloc(1, 8)
+        while waitpid(pid, ws, 0) < 0 and errno() == eintr {}
+        let _ = cClose(int32At(fds, 1)) + cClose(int32At(fds, 2)) + cClose(int32At(fds, 4))
+        return cannotRun(out, name, int32At(execError, 0))
+    }
+    setWord(out, 0, pid)
+    setWord(out, 1, int32At(fds, 1))
+    setWord(out, 2, int32At(fds, 2))
+    setWord(out, 3, int32At(fds, 4))
+    0
+}
+
+pub extern effect fn osPipeReadImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeRead" {
+    while true {
+        let k = cRead(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeWriteImpl(h: Int64, p: Int64, n: Int64) -> Int64 as "qkosPipeWrite" {
+    while true {
+        let k = cWrite(h, p, n)
+        if k < 0 and errno() == eintr {
+            continue
+        }
+        return if k < 0 { -1 } else { k }
+    }
+    -1
+}
+
+pub extern effect fn osPipeCloseImpl(h: Int64) as "qkosPipeClose" {
+    let _ = cClose(h)
+}
+
+pub extern effect fn osProcessWaitImpl(h: Int64) -> Int64 as "qkosProcessWait" {
+    let ws = calloc(1, 8)
+    while waitpid(h, ws, 0) < 0 and errno() == eintr {}
+    let s = int32At(ws, 0)
+    free(ws)
+    if s & 127 == 0 {
+        s >> 8 & 255
+    } else if s & 127 != 127 {
+        128 + s & 127
+    } else {
+        -1
+    }
+}
+
+pub extern effect fn osProcessKillImpl(h: Int64) as "qkosProcessKill" {
+    let _ = cKill(h, 9)
 }
 
 // ---- code in memory, the stack, C's libraries, threads ----
@@ -731,4 +843,212 @@ pub extern effect fn osLocalOffsetImpl(seconds: Float64) -> Int64 as "qkosLocalO
     }
     free(t)
     offset
+}
+
+// ---- TLS: OpenSSL (libssl, loaded the first time TLS is used), each function found by its name; the bytes go
+// through two memory BIOs, io.qk's sockets carry them ----
+// io.qk's words first (tOut ... tIn), then these
+const lSsl = 12
+const lIn = 13 // the BIO the server's bytes go into
+const lOut = 14 // the BIO what to send it comes out of
+const lWords = 15
+
+fn openssl() -> Int {
+    let have = gGet(gTlsLibrary)
+    if have != 0 {
+        return have
+    }
+    var h = 0
+    for name in ["libssl.so.3\0", "libssl.so\0", "libssl.so.1.1\0"] {
+        if h == 0 {
+            h = dlopen(textAt(name), 258)
+        }
+    }
+    gSet(gTlsLibrary, h)
+    h
+}
+
+extern effect fn findSsl0(h: Int64, name: Int64) -> (extern () -> Int64)? as "dlsym"
+extern effect fn findSsl1(h: Int64, name: Int64) -> (extern (Int64) -> Int64)? as "dlsym"
+extern effect fn findSsl1i(h: Int64, name: Int64) -> (extern (Int64) -> Int32)? as "dlsym"
+extern effect fn findSsl2i(h: Int64, name: Int64) -> (extern (Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSslError(h: Int64, name: Int64) -> (extern (Int64, Int32) -> Int32)? as "dlsym"
+extern effect fn findSsl3(h: Int64, name: Int64) -> (extern (Int64, Int64, Int64) -> Int32)? as "dlsym"
+extern effect fn findSslVerify(h: Int64, name: Int64) -> (extern (Int64, Int32, Int64) -> Int32)? as "dlsym"
+extern effect fn findSslIo(h: Int64, name: Int64) -> (extern (Int64, Int64, Int32) -> Int32)? as "dlsym"
+extern effect fn findSslCtrl(h: Int64, name: Int64) -> (extern (Int64, Int32, Int64, Int64) -> Int64)? as "dlsym"
+
+fn ssl0(name: Text) -> Int = match findSsl0(openssl(), textAt(name)) {
+    Some(f) => f()
+    None => 0
+}
+
+fn ssl1(name: Text, a: Int) -> Int = match findSsl1(openssl(), textAt(name)) {
+    Some(f) => f(a)
+    None => 0
+}
+
+fn ssl1i(name: Text, a: Int) -> Int = match findSsl1i(openssl(), textAt(name)) {
+    Some(f) => f(a)
+    None => -1
+}
+
+fn sslIo(name: Text, a: Int, p: Int, n: Int) -> Int = match findSslIo(openssl(), textAt(name)) {
+    Some(f) => f(a, p, n)
+    None => -1
+}
+
+fn sslError(ssl: Int, r: Int) -> Int = match findSslError(openssl(), textAt("SSL_get_error\0")) {
+    Some(f) => f(ssl, r)
+    None => 1
+}
+
+// OpenSSL's words for what went wrong: the certificate's check, else its error queue's first
+fn sslWhy(t: Int, why: Int) {
+    let b = bufAt(why, 256)
+    let v = ssl1("SSL_get_verify_result\0", word(t, lSsl))
+    if v != 0 {
+        let _ = b.text("the server's certificate: ").zeroText(ssl1("X509_verify_cert_error_string\0", v))
+        return
+    }
+    let e = ssl0("ERR_get_error\0")
+    if e != 0 {
+        match findSsl3(openssl(), textAt("ERR_error_string_n\0")) {
+            Some(f) => {
+                let _ = f(e, why, 256)
+            }
+            None => {}
+        }
+    } else {
+        let _ = b.text("OpenSSL's handshake failed")
+    }
+}
+
+// what OpenSSL made to send, into tOut
+fn sslDrain(t: Int) {
+    let room = malloc(16384)
+    while true {
+        let n = sslIo("BIO_read\0", word(t, lOut), room, 16384)
+        if n <= 0 {
+            break
+        }
+        heldAppend(t, tOut, room, n)
+    }
+    free(room)
+}
+
+pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    if openssl() == 0 {
+        let _ = bufAt(why, 256).text("cannot load OpenSSL (libssl.so.3)")
+        return 0
+    }
+    let ctx = ssl1("SSL_CTX_new\0", ssl0("TLS_client_method\0"))
+    if ctx == 0 {
+        let _ = bufAt(why, 256).text("OpenSSL made no context")
+        return 0
+    }
+    let _ = ssl1i("SSL_CTX_set_default_verify_paths\0", ctx) // the system's trusted certificates
+    let _ = match findSslVerify(openssl(), textAt("SSL_CTX_set_verify\0")) {
+        Some(f) => f(ctx, 1, 0)
+        // SSL_VERIFY_PEER
+        None => 0
+    }
+    let ssl = ssl1("SSL_new\0", ctx)
+    let _ = ssl1i("SSL_CTX_free\0", ctx) // (the SSL holds it)
+    let t = calloc(lWords, 8)
+    setWord(t, lSsl, ssl)
+    setWord(t, lIn, ssl1("BIO_new\0", ssl0("BIO_s_mem\0")))
+    setWord(t, lOut, ssl1("BIO_new\0", ssl0("BIO_s_mem\0")))
+    let _ = match findSsl3(openssl(), textAt("SSL_set_bio\0")) {
+        Some(f) => f(ssl, word(t, lIn), word(t, lOut))
+        None => 0
+    }
+    let _ = match findSslCtrl(openssl(), textAt("SSL_ctrl\0")) {
+        Some(f) => f(ssl, 55, 0, host)
+        // SSL_CTRL_SET_TLSEXT_HOSTNAME: the server's name, said in the hello
+        None => 0
+    }
+    let _ = match findSsl2i(openssl(), textAt("SSL_set1_host\0")) {
+        Some(f) => f(ssl, host)
+        // the name its certificate must have
+        None => 0
+    }
+    let _ = ssl1i("SSL_set_connect_state\0", ssl)
+    if osTlsWorkImpl(t, why) != 0 {
+        osTlsEndImpl(t)
+        heldFree(t, tOut)
+        free(t)
+        return 0
+    }
+    t
+}
+
+pub extern effect fn osTlsWorkImpl(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" {
+    let ssl = word(t, lSsl)
+    let n = word(t, tIn + 1)
+    if n > 0 {
+        let k = sslIo("BIO_write\0", word(t, lIn), word(t, tIn), n) // (a memory BIO takes it all)
+        heldDrop(t, tIn, if k > 0 { k } else { 0 })
+    }
+    if word(t, tState) == 0 {
+        let r = ssl1i("SSL_do_handshake\0", ssl)
+        sslDrain(t)
+        if r != 1 {
+            let e = sslError(ssl, r)
+            if e == 2 or e == 3 {
+                return 0 // SSL_ERROR_WANT_READ, _WRITE: more from the server first
+            }
+            sslWhy(t, why)
+            return -1
+        }
+        setWord(t, tState, 1)
+    }
+    if word(t, tState) == 1 {
+        let room = malloc(16384)
+        while true {
+            let k = sslIo("SSL_read\0", ssl, room, 16384)
+            if k > 0 {
+                heldAppend(t, tPlain, room, k)
+            } else {
+                let e = sslError(ssl, k)
+                if e == 6 {
+                    setWord(t, tState, 2) // SSL_ERROR_ZERO_RETURN: the server's close_notify
+                } else if e != 2 and e != 3 {
+                    free(room)
+                    sslWhy(t, why)
+                    return -1
+                }
+                break
+            }
+        }
+        free(room)
+        sslDrain(t)
+    }
+    0
+}
+
+pub extern effect fn osTlsSealImpl(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" {
+    var at = 0
+    while at < n {
+        let k = sslIo("SSL_write\0", word(t, lSsl), p + at, if n - at < 1 << 30 { n - at } else { 1 << 30 })
+        if k <= 0 {
+            sslWhy(t, why)
+            return -1
+        }
+        at += k
+        sslDrain(t)
+    }
+    0
+}
+
+pub extern effect fn osTlsEndImpl(t: Int64) as "qkosTlsEnd" {
+    let ssl = word(t, lSsl)
+    if ssl != 0 {
+        if word(t, tState) == 1 {
+            let _ = ssl1i("SSL_shutdown\0", ssl) // close_notify
+            sslDrain(t)
+        }
+        let _ = ssl1i("SSL_free\0", ssl) // (and its BIOs)
+        setWord(t, lSsl, 0)
+    }
 }

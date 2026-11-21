@@ -1,6 +1,8 @@
 // Dates and times in UTC, on the Gregorian calendar: from and to the seconds unixTime() gives, weekdays, days
 // added, and ISO 8601 text both ways (2026-11-13, 2026-11-13T09:30:05.250Z); and the local time, by the system's
-// time zone (localOffset).
+// time zone (localOffset); and time zones by name (zone("Europe/Lisbon")).
+use std.zones
+
 pub type Date { year: Int, month: Int, day: Int }
 
 // a moment to the millisecond, in UTC
@@ -112,6 +114,17 @@ pub fn DateTime.toIso(self) -> Text {
         ".{padded(self.millisecond, 3)}"
     }
     "{self.date().toIso()}T{padded(self.hour, 2)}:{padded(self.minute, 2)}:{padded(self.second, 2)}{ms}Z"
+}
+
+// as ISO 8601 for clocks that many seconds east of UTC: 2026-11-13T10:30:05+01:00 (Z when 0)
+pub fn DateTime.toIsoOffset(self, offset: Int) -> Text {
+    let t = self.toIso()
+    if offset == 0 {
+        return t
+    }
+    let sign = if offset < 0 { "-" } else { "+" }
+    let a = abs(offset) / 60
+    "{t[..len(t) - 1]}{sign}{padded(a / 60, 2)}:{padded(a % 60, 2)}"
 }
 
 // an ISO 8601 date, YYYY-MM-DD, or why it is not one
@@ -247,3 +260,355 @@ pub fn local(seconds: Float) -> DateTime = utc(seconds + toFloat(localOffset(sec
 
 // now, in local time
 pub fn localNow() -> DateTime = local(unixTime())
+
+// ---- time zones by name (the IANA database's: "Europe/Lisbon", "America/Sao_Paulo", "UTC") ----
+// A zone's offsets from UTC over time: from the system's zone files where it has them (Linux, macOS: their whole
+// history, TZif), else from the rule of each zone now that std.zones keeps (Windows, WebAssembly).
+pub type Zone {
+    name: Text
+    times: [Int] = [] // the moments its offset changed (seconds since 1970), in order
+    kinds: [Int] = [] // the kind in force from each
+    offsets: [Int] = [] // each kind's offset (seconds east of UTC), whether it is summer time, its abbreviation
+    summer: [Bool] = []
+    abbreviations: [Text] = []
+    rule: Text = "" // after the last change: a POSIX TZ rule ("WET0WEST,M3.5.0/1,M10.5.0")
+}
+
+// the zone of this name, or why there is none
+pub fn zone(name: Text) -> Zone! {
+    if name == "" or name.startsWith("/") or name.contains("..") or name.bytes().any(c => not isZoneChar(c)) {
+        return Err("time zone {name}: not a zone's name")
+    }
+    for root in zoneRoots() {
+        if readBytes("{root}/{name}") is Ok(b) and len(b) > 44 and b[..4] == "TZif".bytes() {
+            return readTzif(name, b)
+        }
+    }
+    let rule = ruleOf(name) ?? return Err("time zone {name}: no such zone")
+    let _ = ruleOffsets(rule)?
+    Zone(name, rule: rule)
+}
+
+fn isZoneChar(c: Int) -> Bool = c is 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '-' | '+'
+
+fn zoneRoots() -> [Text] {
+    var roots: [Text] = []
+    if env("ZONEINFO") is Some(z) {
+        roots.push(z)
+    }
+    roots + ["/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo"]
+}
+
+// the zones std.zones knows by name
+pub fn zoneNames() -> [Text] = zoneRules.map(l => l.split(" ")[0]).toArray()
+
+fn ruleOf(name: Text) -> Text? {
+    for line in zoneRules {
+        let at = line.indexOf(" ") ?? continue
+        if line[..at] == name {
+            return line[at + 1..]
+        }
+    }
+    None
+}
+
+// a zone's offset from UTC at that moment, in seconds east (summer time counted)
+pub fn Zone.offsetAt(self, seconds: Float) -> Int = self.kindAt(toInt(floor(seconds))).0
+
+// whether that moment is in the zone's summer time
+pub fn Zone.isSummerAt(self, seconds: Float) -> Bool = self.kindAt(toInt(floor(seconds))).1
+
+// the zone's abbreviation then ("WEST", "-03")
+pub fn Zone.abbreviationAt(self, seconds: Float) -> Text = self.kindAt(toInt(floor(seconds))).2
+
+// the date and time on the zone's clocks at that moment
+pub fn Zone.at(self, seconds: Float) -> DateTime = utc(seconds + toFloat(self.offsetAt(seconds)))
+
+// that moment as ISO 8601 on the zone's clocks, with its offset: 2026-07-01T13:00:00+01:00
+pub fn Zone.isoAt(self, seconds: Float) -> Text =
+    self.at(seconds).toIsoOffset(self.offsetAt(seconds))
+
+// the moment the zone's clocks show that date and time: of two (the hour clocks go back), the first; in a gap
+// (the hour they skip), as many seconds after it as into it
+pub fn Zone.moment(self, local: DateTime) -> Float {
+    let wall = local.seconds()
+    var best = -1.0
+    var found = false
+    for d in [-86400.0, 0.0, 86400.0] {
+        let off = toFloat(self.offsetAt(wall + d))
+        let t = wall - off
+        if toFloat(self.offsetAt(t)) == off and (not found or t < best) {
+            best = t
+            found = true
+        }
+    }
+    if found {
+        best
+    } else {
+        wall - toFloat(self.offsetAt(wall - 86400.0))
+    }
+}
+
+// now, on the zone's clocks
+pub fn Zone.now(self) -> DateTime = self.at(unixTime())
+
+// (offset, summer, abbreviation) at moment t
+fn Zone.kindAt(self, t: Int) -> (Int, Bool, Text) {
+    let n = len(self.times)
+    if n > 0 and t >= self.times[0] and (t < self.times[n - 1] or self.rule == "") {
+        // the last change at or before t
+        var lo = 0
+        var hi = n - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if self.times[mid] <= t {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        let k = self.kinds[lo]
+        return (self.offsets[k], self.summer[k], self.abbreviations[k])
+    }
+    if n > 0 and t < self.times[0] or self.rule == "" {
+        // before the first change: the first kind that is not summer time
+        for (k, s) in self.summer.enumerate() {
+            if not s {
+                return (self.offsets[k], false, self.abbreviations[k])
+            }
+        }
+        if len(self.offsets) > 0 {
+            return (self.offsets[0], self.summer[0], self.abbreviations[0])
+        }
+        return (0, false, "UTC")
+    }
+    ruleAt(self.rule, t)
+}
+
+// ---- TZif (RFC 8536): version 2 and on, its 64-bit part ----
+fn bigEndian(b: Bytes, at: Int, n: Int) -> Int {
+    var v = 0
+    for i in 0..n {
+        v = v << 8 | b[at + i]
+    }
+    if n < 8 and v >= 1 << (8 * n - 1) { v - 1 << (8 * n) } else { v }
+}
+
+fn readTzif(name: Text, b: Bytes) -> Zone! {
+    let bad = "time zone {name}: its file is not TZif"
+    var at = 0
+    var wide = false
+    if b[4] >= '2' {
+        // past the version 1 part: its counts say how long it is
+        let counts = (0..6).map(i => bigEndian(b, 20 + 4 * i, 4)).toArray()
+        at = 44 + counts[3] * 5 + counts[4] * 6 + counts[5] + counts[2] * 8 + counts[1] + counts[0]
+        wide = true
+        if at + 44 > len(b) or b[at..at + 4] != "TZif".bytes() {
+            return Err(bad)
+        }
+    }
+    let c = (0..6).map(i => bigEndian(b, at + 20 + 4 * i, 4)).toArray()
+    let isut = c[0]
+    let isstd = c[1]
+    let leap = c[2]
+    let timecnt = c[3]
+    let typecnt = c[4]
+    let charcnt = c[5]
+    let tsize = if wide { 8 } else { 4 }
+    var p = at + 44
+    let need = p + timecnt * (tsize + 1) + typecnt * 6 + charcnt + leap * (tsize + 4) + isstd + isut
+    if need > len(b) or typecnt == 0 {
+        return Err(bad)
+    }
+    var z = Zone(name)
+    for i in 0..timecnt {
+        z.times.push(bigEndian(b, p + tsize * i, tsize))
+    }
+    p += timecnt * tsize
+    for i in 0..timecnt {
+        z.kinds.push(b[p + i])
+    }
+    p += timecnt
+    let chars = p + typecnt * 6
+    for i in 0..typecnt {
+        z.offsets.push(bigEndian(b, p + 6 * i, 4))
+        z.summer.push(b[p + 6 * i + 4] != 0)
+        let from = chars + b[p + 6 * i + 5]
+        var to = from
+        while to < chars + charcnt and b[to] != 0 {
+            to += 1
+        }
+        z.abbreviations.push(Text(b[from..to]) ?? "")
+    }
+    p = need
+    if wide and p < len(b) and b[p] == '\n' {
+        var e = p + 1
+        while e < len(b) and b[e] != '\n' {
+            e += 1
+        }
+        z.rule = Text(b[p + 1..e]) ?? ""
+        if z.rule != "" {
+            let _ = ruleOffsets(z.rule)?
+        }
+    }
+    z
+}
+
+// ---- POSIX TZ rules: "EST5EDT,M3.2.0,M11.1.0", "<-03>3", "WET0WEST,M3.5.0/1,M10.5.0" ----
+type Rule {
+    std: Text
+    stdOffset: Int // seconds east of UTC
+    dst: Text = ""
+    dstOffset: Int = 0
+    start: Text = "" // Mm.w.d, Jn or n, and the time (seconds) on the clocks then
+    startTime: Int = 7200
+    end: Text = ""
+    endTime: Int = 7200
+}
+
+type RuleReader { t: Bytes, at: Int = 0 }
+
+fn RuleReader.name(var self) -> Text! {
+    let b = self.t
+    if self.at < len(b) and b[self.at] == '<' {
+        let from = self.at + 1
+        while self.at < len(b) and b[self.at] != '>' {
+            self.at += 1
+        }
+        if self.at >= len(b) {
+            return Err("an abbreviation's < has no >")
+        }
+        self.at += 1
+        return Text(b[from..self.at - 1]) ?? ""
+    }
+    let from = self.at
+    while self.at < len(b) and b[self.at] is 'a'..='z' | 'A'..='Z' {
+        self.at += 1
+    }
+    if self.at - from < 3 {
+        return Err("an abbreviation of 3 letters or more")
+    }
+    Text(b[from..self.at]) ?? ""
+}
+
+// [+-]hh[:mm[:ss]] as seconds
+fn RuleReader.time(var self) -> Int! {
+    let b = self.t
+    var sign = 1
+    if self.at < len(b) and b[self.at] is '+' | '-' {
+        sign = if b[self.at] == '-' { -1 } else { 1 }
+        self.at += 1
+    }
+    var parts = [0, 0, 0]
+    for k in 0..3 {
+        if k > 0 {
+            if self.at >= len(b) or b[self.at] != ':' {
+                break
+            }
+            self.at += 1
+        }
+        let from = self.at
+        while self.at < len(b) and b[self.at] is '0'..='9' {
+            parts[k] = parts[k] * 10 + b[self.at] - '0'
+            self.at += 1
+        }
+        if self.at == from {
+            return Err("a time (hh[:mm[:ss]])")
+        }
+    }
+    sign * (parts[0] * 3600 + parts[1] * 60 + parts[2])
+}
+
+fn RuleReader.date(var self) -> Text {
+    let b = self.t
+    let from = self.at
+    while self.at < len(b) and b[self.at] != ',' and b[self.at] != '/' {
+        self.at += 1
+    }
+    Text(b[from..self.at]) ?? ""
+}
+
+fn parseRule(text: Text) -> Rule! {
+    var r = RuleReader(text.bytes())
+    let std = r.name()?
+    var rule = Rule(std, -r.time()?)
+    if r.at >= len(r.t) {
+        return rule
+    }
+    rule.dst = r.name()?
+    rule.dstOffset = rule.stdOffset + 3600
+    if r.at < len(r.t) and r.t[r.at] != ',' {
+        rule.dstOffset = -r.time()?
+    }
+    if r.at >= len(r.t) {
+        rule.start = "M3.2.0" // a summer time with no dates: the United States' (POSIX's default)
+        rule.end = "M11.1.0"
+        return rule
+    }
+    r.at += 1
+    rule.start = r.date()
+    if r.at < len(r.t) and r.t[r.at] == '/' {
+        r.at += 1
+        rule.startTime = r.time()?
+    }
+    if r.at >= len(r.t) or r.t[r.at] != ',' {
+        return Err("the summer time's end")
+    }
+    r.at += 1
+    rule.end = r.date()
+    if r.at < len(r.t) and r.t[r.at] == '/' {
+        r.at += 1
+        rule.endTime = r.time()?
+    }
+    rule
+}
+
+// the rule read, or why it is not one (a zone checks its rule once, when made)
+fn ruleOffsets(text: Text) -> Rule! = parseRule(text).mapErr(why => "time zone rule {text}: {why}")
+
+// the day (since 1970) a rule's date names in year y: Mm.w.d (the d-th weekday, Sunday 0, of week w, 5 the last, of
+// month m), Jn (day n of 365, February 29 never counted), n (day n from 0, February 29 counted)
+fn ruleDay(date: Text, y: Int) -> Int {
+    let jan1 = Date(y, 1, 1).days()
+    if date.startsWith("M") {
+        let parts = date[1..].split(".").map(p => p.parseInt() ?? 0).toArray()
+        let m = parts.get(0) ?? 1
+        let w = parts.get(1) ?? 1
+        let d = parts.get(2) ?? 0
+        let first = Date(y, m, 1).days()
+        let wd = (first + 4) % 7 // 1970-01-01 was a Thursday
+        var day = 1 + (d - wd + 7) % 7 + 7 * (w - 1)
+        while day > daysInMonth(y, m) {
+            day -= 7
+        }
+        return first + day - 1
+    }
+    if date.startsWith("J") {
+        let n = date[1..].parseInt() ?? 1
+        return jan1 + n - 1 + (if isLeapYear(y) and n >= 60 { 1 } else { 0 })
+    }
+    jan1 + (date.parseInt() ?? 0)
+}
+
+fn ruleAt(text: Text, t: Int) -> (Int, Bool, Text) {
+    let Ok(r) = parseRule(text) else {
+        return (0, false, "UTC")
+    }
+    if r.dst == "" {
+        return (r.stdOffset, false, r.std)
+    }
+    let y = utc(toFloat(t + r.stdOffset)).year
+    // the summer's start on the standard clocks, its end on the summer ones
+    let start = ruleDay(r.start, y) * 86400 + r.startTime - r.stdOffset
+    let end = ruleDay(r.end, y) * 86400 + r.endTime - r.dstOffset
+    let summer = if start < end {
+        t >= start and t < end
+    } else {
+        not (t >= end and t < start)
+    }
+    if summer {
+        (r.dstOffset, true, r.dst)
+    } else {
+        (r.stdOffset, false, r.std)
+    }
+}

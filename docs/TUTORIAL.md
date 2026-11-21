@@ -215,6 +215,9 @@ program back, and `quark diff` and `quark merge` compare and combine versions by
 ## Where to go next
 
 - [LANGUAGE.md](LANGUAGE.md): the whole language, the built-ins, the standard library, C, memory.
+- [COMING-FROM.md](COMING-FROM.md): Quark for people who know Go, Rust or Python.
+- [SERVERS.md](SERVERS.md): network services: handlers, JSON, shared state, tests, shipping.
+- [PRELUDE.md](PRELUDE.md): the prelude's built-ins, made from its source by `quark doc`.
 - [EMBEDDING.md](EMBEDDING.md): Quark inside a C or C++ program.
 - `quark fmt --write`: the one way each thing is written; `quark check`: errors only; `quark test`: the
   `test "..." { }` blocks of a file; `quark lsp`: an editor's language server.

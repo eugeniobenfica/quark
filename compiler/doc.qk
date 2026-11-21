@@ -107,12 +107,33 @@ fn comment(text: Text, asHtml: Bool) -> Text {
 fn entry(p: Program, at: Int, asHtml: Bool, level: Int) -> Text {
     let d = p.ast.decls[at]
     let sig = signature(p, at)
+    let own = parted(d.leading).own
     if asHtml {
         return "<section class=\"decl\" id=\"{anchor(d.name)}\">\n<h{level}><span class=\"kind\">{kindWord(d)}</span> {html(d.name)}</h{level}>\n<pre><code>{html(sig)}</code></pre>\n"
-            + comment(d.leading, true)
+            + comment(own, true)
             + "</section>\n"
     }
-    "#" * level + " {kindWord(d)} {d.name}\n\n```quark\n{sig}\n```\n\n" + comment(d.leading, false)
+    "#" * level + " {kindWord(d)} {d.name}\n\n```quark\n{sig}\n```\n\n" + comment(own, false)
+}
+
+// A comment above a declaration, in its parts: what comes before a section's title (the file's own words, above
+// its first declaration), the title (a line "---- files ----"), and the declaration's own words after it.
+type Parted { before: Text = "", section: Text = "", own: Text = "" }
+
+fn parted(text: Text) -> Parted {
+    let lines = text.split("\n")
+    var at = -1
+    for (i, l) in lines.enumerate() {
+        let t = l.trim()
+        if t.startsWith("---- ") and t.endsWith(" ----") and len(t) > 10 {
+            at = i
+        }
+    }
+    if at < 0 {
+        return Parted(own: text)
+    }
+    let title = lines[at].trim()
+    Parted(lines[..at].join("\n").trim(), title[5..len(title) - 5], lines[at + 1..].join("\n").trim())
 }
 
 fn shown(d: Decl) -> Bool =
@@ -166,10 +187,30 @@ pub fn docOf(p: Program, asHtml: Bool) -> Text {
         } else {
             "## {path}\n\n"
         }
+        // a file in sections ("---- files ----" above a declaration): each a heading, its declarations under it
+        let sectioned = p.decls.any(
+            at => p.ast.decls[at].module == m
+                and shown(p.ast.decls[at])
+                and parted(p.ast.decls[at].leading).section != "",
+        )
+        let level = if sectioned { 4 } else { 3 }
+        var first = true
         for at in p.decls {
             let d = p.ast.decls[at]
             if not shown(d) or d.module != m {
                 continue
+            }
+            let parts = parted(d.leading)
+            if first and parts.before != "" {
+                out += comment(parts.before, asHtml) // the file's own words
+            }
+            first = false
+            if parts.section != "" {
+                out += if asHtml {
+                    "<h3 class=\"section\">{html(parts.section)}</h3>\n"
+                } else {
+                    "### {parts.section}\n\n"
+                }
             }
             // a type's function goes under its type, when the type is shown
             if d.owner != ""
@@ -178,7 +219,7 @@ pub fn docOf(p: Program, asHtml: Bool) -> Text {
                 ) {
                 continue
             }
-            out += entry(p, at, asHtml, 3)
+            out += entry(p, at, asHtml, level)
             if d.kind == DeclKind.Fn {
                 continue
             }
@@ -192,7 +233,7 @@ pub fn docOf(p: Program, asHtml: Bool) -> Text {
                     out += "<div class=\"methods\">\n"
                 }
                 any = true
-                out += entry(p, k, asHtml, 4)
+                out += entry(p, k, asHtml, level + 1)
             }
             if asHtml and any {
                 out += "</div>\n"

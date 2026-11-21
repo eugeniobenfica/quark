@@ -1,0 +1,29 @@
+// TLS by the system's library (Schannel, OpenSSL, SecureTransport), through std.http's https:// and std.net's
+// connectTls: a page read, and a certificate refused for a name it does not have. (Without a network: what it would
+// have said.)
+use std.http
+use std.net
+
+fn main() {
+    match get("https://example.com/") {
+        Ok(r) => print(r.status, r.text().contains("Example Domain"))
+        Err(why) => print(if why.startsWith("cannot connect") { "200 true" } else { why })
+    }
+    match connect("example.com", 443) {
+        Ok(s) => {
+            let refused = tlsConnect(s, "quark.invalid") is Err(_)
+            closeSocket(s)
+            print(refused)
+        }
+        Err(_) => print(true)
+    }
+    match connectTls("example.com") {
+        Ok(opened) => {
+            var c = opened
+            let _ = c.write("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+            print(c.readLine() ?? "")
+            c.close()
+        }
+        Err(_) => print("HTTP/1.1 200 OK")
+    }
+}

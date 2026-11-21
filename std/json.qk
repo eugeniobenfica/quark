@@ -58,6 +58,182 @@ pub fn Json.text(self) -> Text? = match self {
     _ => None
 }
 
+// ---- a program's values as JSON, and back, by their types ----
+// jsonOf and fromJson are made for each type they are used with (compiler/check.qk's jsonBody): a record is an
+// object of its fields; an enum's case without data its name, one with data an object of one entry, its name and an
+// object of its fields; an array a list; a map from Text (or Int, as text) an object; an optional null when None; a
+// tuple a list; Int, Float, Bool and Text themselves. A field missing from an object takes its default, and an
+// optional one None.
+//   let text = encode(Person("Ana", 34, ["x"]))       // {"name":"Ana","age":34,"tags":["x"]}
+//   let p: Person = decode(text)?
+// v as JSON
+pub fn jsonOf<T>(value: T) -> Json = Json.Null
+
+// the T this JSON is, or why it is not one
+pub fn fromJson<T>(j: Json) -> T! = Err("JSON: no reading for this type")
+
+// v as JSON text, on one line
+pub fn encode<T>(value: T) -> Text = toJson(jsonOf(value))
+
+// the T this JSON text is, or why it is not one
+pub fn decode<T>(text: Text) -> T! {
+    let got: T! = fromJson(parseJson(text)?)
+    got
+}
+
+// what kind of JSON value this is, for a message
+pub fn Json.kindName(self) -> Text = match self {
+    Null => "null"
+    Bool(_) => "a boolean"
+    Num(_) | Integer(_) | NumberText(_) => "a number"
+    Str(_) => "a text"
+    List(_) => "a list"
+    Object(_) => "an object"
+}
+
+// an object's fields, or None
+pub fn Json.fields(self) -> [Text: Json]? = match self {
+    Object(fields) => Some(fields)
+    _ => None
+}
+
+// a list's items, or None
+pub fn Json.items(self) -> [Json]? = match self {
+    List(items) => Some(items)
+    _ => None
+}
+
+pub fn intOfJson(j: Json) -> Int! {
+    if j.integer() is Some(n) {
+        return n
+    }
+    if j.number() is Some(x) and x == floor(x) and abs(x) < 9007199254740992.0 {
+        return toInt(x)
+    }
+    Err("JSON: an Int, not {j.kindName()}")
+}
+
+pub fn floatOfJson(j: Json) -> Float! =
+    j.number() ?? return Err("JSON: a number, not {j.kindName()}")
+
+pub fn boolOfJson(j: Json) -> Bool! = match j {
+    Bool(b) => b
+    _ => Err("JSON: true or false, not {j.kindName()}")
+}
+
+pub fn textOfJson(j: Json) -> Text! = j.text() ?? return Err("JSON: a text, not {j.kindName()}")
+
+// field name of an object as a T: its error said with its name
+pub fn fieldFromJson<T>(fields: [Text: Json], name: Text) -> T! {
+    let got: T! = fromJson(fields[name] ?? Json.Null)
+    match got {
+        Ok(v) => v
+        Err(why) => Err("{name}: {why}")
+    }
+}
+
+// an optional field: None when it is missing or null (none: None, which tells E)
+pub fn optionFieldFromJson<E>(fields: [Text: Json], name: Text, none: E?) -> E?! {
+    let j = fields[name] ?? Json.Null
+    if j == Json.Null {
+        return Ok(none)
+    }
+    let got: E! = fromJson(j)
+    match got {
+        Ok(v) => Ok(Some(v))
+        Err(why) => Err("{name}: {why}")
+    }
+}
+
+// a list as [E] (out: an empty one, of the type)
+pub fn listFromJson<E>(j: Json, out: [E]) -> [E]! {
+    let items = j.items() ?? return Err("JSON: a list, not {j.kindName()}")
+    var r = out
+    for (i, x) in items.enumerate() {
+        let got: E! = fromJson(x)
+        match got {
+            Ok(v) => r.push(v)
+            Err(why) => return Err("[{i}]: {why}")
+        }
+    }
+    r
+}
+
+// an object as [Text: V]
+pub fn mapFromJson<V>(j: Json, out: [Text: V]) -> [Text: V]! {
+    let fields = j.fields() ?? return Err("JSON: an object, not {j.kindName()}")
+    var r = out
+    for (k, x) in fields {
+        let got: V! = fromJson(x)
+        match got {
+            Ok(v) => {
+                r[k] = v
+            }
+            Err(why) => return Err("{k}: {why}")
+        }
+    }
+    r
+}
+
+// an object as [Int: V]: its keys whole numbers
+pub fn intMapFromJson<V>(j: Json, out: [Int: V]) -> [Int: V]! {
+    let fields = j.fields() ?? return Err("JSON: an object, not {j.kindName()}")
+    var r = out
+    for (k, x) in fields {
+        let n = k.parseInt() ?? return Err("JSON: the key {k} is not an Int")
+        let got: V! = fromJson(x)
+        match got {
+            Ok(v) => {
+                r[n] = v
+            }
+            Err(why) => return Err("{k}: {why}")
+        }
+    }
+    r
+}
+
+// null as None, anything else as Some
+pub fn optionFromJson<E>(j: Json, none: E?) -> E?! {
+    if j == Json.Null {
+        return Ok(none)
+    }
+    let got: E! = fromJson(j)
+    match got {
+        Ok(v) => Ok(Some(v))
+        Err(why) => Err(why)
+    }
+}
+
+// a tuple's item i
+pub fn itemFromJson<E>(items: [Json], i: Int) -> E! {
+    let got: E! = fromJson(items.get(i) ?? return Err("JSON: the tuple has no item {i}"))
+    match got {
+        Ok(v) => v
+        Err(why) => Err("[{i}]: {why}")
+    }
+}
+
+// an enum's case in JSON: its name, and the object of its fields ({} for a case without data)
+pub fn caseOfJson(j: Json, typeName: Text) -> (Text, [Text: Json])! {
+    let none: [Text: Json] = [:]
+    match j {
+        Str(name) => (name, none)
+        Object(fields) => {
+            if len(fields) != 1 {
+                return Err("JSON: a {typeName} is a case's name, or an object of one case")
+            }
+            for (name, inner) in fields {
+                let f = inner.fields() ?? return Err(
+                    "JSON: case {name} of {typeName}: an object of its fields, not {inner.kindName()}",
+                )
+                return (name, f)
+            }
+            Err("JSON: no case")
+        }
+        _ => Err("JSON: a {typeName} is a case's name, or an object of one case, not {j.kindName()}")
+    }
+}
+
 // a text in quotes, with what JSON escapes escaped (every piece between them goes in whole)
 fn quote(s: Text) -> Text {
     var out = "\""

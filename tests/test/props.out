@@ -1,0 +1,12 @@
+ok    a clamped value is in its range
+ok    reversing twice gives the array back
+ok    one of the values, a Bool, a Float
+ok    made from another generator
+forAll: the property does not hold for: [10, 20]
+        made smaller 7 times from: [-8, 16, 15, 20, 2, 19, 0, -18]
+FAIL  a property that does not hold: the smallest value that fails it
+      std/testing.qk:84: forAll: the property does not hold (value 30 of 100, seed 1)
+  in forAll
+  called from test "a property that does not hold: the smallest value that fails it" at line 41
+4 passed, 1 failed
+coverage of tests/test/props.qk: 11 of 13 lines run (84.6%); not run: 16-17

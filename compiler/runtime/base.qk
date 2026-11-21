@@ -334,7 +334,9 @@ pub const gTaskSpareCount = 36
 pub const gScopes = 37 // scope()'s: (open, tasks alive) pairs, by number
 pub const gScopeCount = 38
 pub const gScopeCap = 39
-pub const gWords = 40
+pub const gTlsLibrary = 40 // the system's TLS library, loaded the first time it is used (its handle; 0 not yet)
+pub const gCover = 41 // quark test --coverage: a byte for each line of the program's file, 1 once run (0: none yet)
+pub const gWords = 42
 
 pub fn globals() -> Int = word(ctx(), ctxGlobals)
 
@@ -342,6 +344,41 @@ pub fn gGet(i: Int) -> Int = word(globals(), i)
 
 pub fn gSet(i: Int, v: Int) {
     setWord(globals(), i, v)
+}
+
+// ---- bytes kept in malloc'd memory that grows: (place, length, capacity) in the words at, at + 1, at + 2 of a block ----
+pub fn heldAppend(block: Int, at: Int, p: Int, n: Int) {
+    if n <= 0 {
+        return
+    }
+    let have = word(block, at + 1)
+    var cap = word(block, at + 2)
+    if have + n > cap {
+        cap = if cap == 0 { 16384 } else { cap }
+        while have + n > cap {
+            cap *= 2
+        }
+        setWord(block, at, realloc(word(block, at), cap))
+        setWord(block, at + 2, cap)
+    }
+    copyBytes(word(block, at) + have, p, n)
+    setWord(block, at + 1, have + n)
+}
+
+// the first k of them let go of
+pub fn heldDrop(block: Int, at: Int, k: Int) {
+    let rest = word(block, at + 1) - k
+    if rest > 0 {
+        moveBytes(word(block, at), word(block, at) + k, rest)
+    }
+    setWord(block, at + 1, if rest > 0 { rest } else { 0 })
+}
+
+pub fn heldFree(block: Int, at: Int) {
+    free(word(block, at))
+    setWord(block, at, 0)
+    setWord(block, at + 1, 0)
+    setWord(block, at + 2, 0)
 }
 
 // ---- a message, built in place: bytes at p, room for cap (one kept for the zero) ----

@@ -9,20 +9,46 @@
 //         }
 //     })
 //     runTasks()
+//
+// connectTls(host) is a connection over TLS (the system's: Schannel, OpenSSL, SecureTransport), read and written as
+// any other.
 const part = 16384
 
-// a socket read with what came and was not used yet kept. closed: the other end closed it; error: why a read
-// stopped early ("" when none did)
-pub type Conn { socket: Socket, buffer: Bytes = [], closed: Bool = false, error: Text = "" }
+// a socket read with what came and was not used yet kept (through TLS when tls is there). closed: the other end
+// closed it; error: why a read stopped early ("" when none did)
+pub type Conn {
+    socket: Socket
+    tls: Tls? = None
+    buffer: Bytes = []
+    closed: Bool = false
+    error: Text = ""
+}
 
 pub fn conn(socket: Socket) -> Conn = Conn(socket)
+
+// a connection to host:port over TLS, the server's certificate checked for host by the system's trust
+pub fn connectTls(host: Text, port: Int = 443) -> Conn! {
+    let socket = connect(host, port)?
+    match tlsConnect(socket, host) {
+        Ok(t) => Ok(Conn(socket, tls: Some(t)))
+        Err(why) => {
+            closeSocket(socket)
+            Err(why)
+        }
+    }
+}
 
 // more bytes into the buffer; false when there will be no more (closed, or an error)
 fn Conn.fill(var self) -> Bool {
     if self.closed or self.error != "" {
         return false
     }
-    match readSocket(self.socket, part) {
+    let got = if self.tls is Some(t) {
+        readTls(t, part)
+    } else {
+        readSocket(self.socket, part)
+    }
+    match got {
         Ok(more) => {
             if len(more) == 0 {
                 self.closed = true
@@ -100,8 +126,16 @@ pub fn Conn.readAll(var self) -> Bytes! {
     Ok(got)
 }
 
-pub fn Conn.write(self, text: Text) -> Unit! = writeSocket(self.socket, text.bytes())
+pub fn Conn.write(self, text: Text) -> Unit! = self.writeBytes(text.bytes())
 
-pub fn Conn.writeBytes(self, bytes: Bytes) -> Unit! = writeSocket(self.socket, bytes)
+pub fn Conn.writeBytes(self, bytes: Bytes) -> Unit! = if self.tls is Some(t) {
+    writeTls(t, bytes)
+} else {
+    writeSocket(self.socket, bytes)
+}
 
-pub fn Conn.close(self) = closeSocket(self.socket)
+pub fn Conn.close(self) = if self.tls is Some(t) {
+    closeTls(t)
+} else {
+    closeSocket(self.socket)
+}

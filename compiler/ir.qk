@@ -136,7 +136,9 @@ pub const runtimeNames = [
     "makeDir", "removePath", "runProcess", "arrayAppend", "sort", "cText", "textOfC", "printPointer", "parallelFold",
     "joinInt", "openFile", "readChunk", "writeChunk", "seekFile", "closeFile", "listen", "connect", "accept",
     "readSocket", "writeSocket", "closeSocket", "go", "runTasks", "channel", "send", "receive", "closeChannel",
-    "localOffset", "cancel", "interp", "scopeOpen", "scopeStart", "scopeClose",
+    "localOffset", "cancel", "interp", "scopeOpen", "scopeStart", "scopeClose", "startProcess", "processWrite",
+    "processCloseInput", "processRead", "processWait", "processKill", "tlsConnect", "readTls", "writeTls", "closeTls",
+    "coverLine",
 ]
 
 // the runtime's functions that make nothing in the arena: a loop's turn that calls only these (and pushes onto vars
@@ -308,6 +310,7 @@ pub type IrProgram {
     tables: [IrTable] = []
     cSigs: [IrExtern] = [] // the C functions called through an address (HostCall with a: the address): their slots
     files: [Text] = [] // its modules' paths, by number (IrFn.file)
+    coverLines: [Int] = [] // quark test --coverage: the lines of the program's file that mark themselves run
 }
 
 // ---- a program's functions, only those it reaches ----

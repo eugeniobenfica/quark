@@ -73,5 +73,34 @@ app/main.qk:3:1: use util: util is both the package util and the file app/util.q
   ^
 $ a cycle: util needs app
 quark get: a cycle of packages: app -> util -> app
+$ versions: each asks for the least it wants; the newest of those is taken
+shape            1.1.0        0a98487fa0b9
+lib              0.1.0        74b7ea9c09ed
+proj 0.1.0: 2 packages locked
+name = "shape"
+git = "../shape"
+version = "1.1.0"
+1.1.0 1.1.0
+$ the project asks for 1.2: newer than the lock
+proj/main.qk:1:1: use shape: proj/quark.toml asks for shape 1.2.0, quark.lock has 1.1.0: run quark get
+  use shape
+  ^
+shape            1.2.0        bca1eb623ded
+lib              0.1.0        74b7ea9c09ed
+proj 0.1.0: 2 packages locked
+1.2.0 1.2.0
+$ 2.0 against lib's 1.1
+quark get: shape is asked for as 2.x by proj and as 1.x by lib: no version is both
+$ a version with no tag
+quark get: shape: no version 1.7.0 (a tag v1.7.0) in ../shape
+quark get: proj/quark.toml:6: a version is major.minor.patch (or major.minor, or major): 1.4.2
+$ by version alone: the git URL from a registry
+lib              0.1.0        74b7ea9c09ed
+shape            1.2.0        bca1eb623ded
+proj2 0.2.0: 2 packages locked
+1.2.0 1.2.0
+$ a name the registry lacks, and no registry
+quark get: other is not in the registry ../registry
+quark get: lib is asked for by version alone, and there is no registry (registry = in [package], or QUARK_REGISTRY)
 $ a manifest with a mistake
 quark get: app/quark.toml:3: expected a string in quotes

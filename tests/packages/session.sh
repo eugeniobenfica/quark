@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Packages: quark get from git repositories this script makes (no network), use pkg.module, quark.lock, and
-# the errors: not fetched, hash mismatch, a cycle, a package asked for twice, a missing tag.
+# the errors: not fetched, hash mismatch, a cycle, a package asked for twice, a missing tag; semantic versions
+# (minimal version selection) and a registry.
 #   tests/packages/session.sh path/to/quark.exe     (its output is tests/packages/session.out)
 Q=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 # sed in place, the same with GNU's sed and BSD's (macOS)
@@ -107,6 +108,52 @@ commit util two
 (cd app && git init -q -b main && git add -A && git commit -q -m app && git tag v1)
 sedIn "s/rev = \"$rev\"/rev = \"$(git -C util rev-parse --short=10 HEAD)\"/" app/quark.toml
 quark get app
+
+say "versions: each asks for the least it wants; the newest of those is taken"
+repo shape
+for v in 1.0.0 1.1.0 1.2.0 2.0.0; do
+    printf '[package]\nname = "shape"\nversion = "%s"\n' "$v" > shape/quark.toml
+    printf 'pub fn sides() -> Text = "%s"\n' "$v" > shape/shape.qk
+    commit shape "$v" && git -C shape tag "v$v"
+done
+repo lib
+printf '[package]\nname = "lib"\nversion = "0.1.0"\n\n[dependencies]\nshape = { git = "../shape", version = "1.1" }\n' > lib/quark.toml
+printf 'use shape\n\npub fn libSides() -> Text = sides()\n' > lib/lib.qk
+commit lib one && git -C lib tag v0.1.0
+mkdir proj
+printf '[package]\nname = "proj"\nversion = "0.1.0"\n\n[dependencies]\nshape = { git = "../shape", version = "1.0" }\nlib = { git = "../lib", version = "0.1" }\n' > proj/quark.toml
+printf 'use shape\nuse lib\n\nfn main() {\n    print(sides(), libSides())\n}\n' > proj/main.qk
+quark get proj
+grep -A2 'name = "shape"' proj/quark.lock
+quark run proj/main.qk
+say "the project asks for 1.2: newer than the lock"
+sedIn 's/version = "1.0"/version = "1.2"/' proj/quark.toml
+quark run proj/main.qk
+quark get proj
+quark run proj/main.qk
+say "2.0 against lib's 1.1"
+sedIn 's/version = "1.2"/version = "2.0"/' proj/quark.toml
+quark get proj
+say "a version with no tag"
+sedIn 's/version = "2.0"/version = "1.7"/' proj/quark.toml
+quark get proj
+sedIn 's/version = "1.7"/version = "x.1"/' proj/quark.toml
+quark get proj
+
+say "by version alone: the git URL from a registry"
+repo registry
+printf '# what each name is\n[packages]\nshape = "../shape"\nlib = "../lib"\n' > registry/index.toml
+commit registry one
+mkdir proj2
+printf '[package]\nname = "proj2"\nversion = "0.2.0"\nregistry = "../registry"\n\n[dependencies]\nlib = "0.1"\nshape = "1.2.0"\n' > proj2/quark.toml
+cp proj/main.qk proj2/main.qk
+quark get proj2
+quark run proj2/main.qk
+say "a name the registry lacks, and no registry"
+printf 'other = "1.0"\n' >> proj2/quark.toml
+quark get proj2
+sedIn '/^registry/d' proj2/quark.toml
+quark get proj2
 
 say "a manifest with a mistake"
 printf '[package]\nname = "bad"\nversion = 1\n' > app/quark.toml

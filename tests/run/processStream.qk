@@ -1,0 +1,26 @@
+// A process beside this one: its input written and closed, its output and errors read as they come, its status;
+// another stopped.
+fn readAll(p: Subprocess, errors: Bool) -> Text! {
+    var got: Bytes = []
+    while true {
+        let part = if errors { readProcessErrors(p, 7)? } else { readProcess(p, 7)? }
+        if len(part) == 0 {
+            break
+        }
+        got += part
+    }
+    Text(got)?
+}
+
+fn main() -> Unit! {
+    let p = startProcess("build/quark.exe", ["run", "tests/process/upper.qk"])?
+    writeProcess(p, "ação\nquark\n".bytes())?
+    closeProcessInput(p)
+    let out = readAll(p, false)?
+    let err = readAll(p, true)?
+    print(out.replace("\r", "").trim(), "|", err.replace("\r", "").trim(), "|", waitProcess(p)?)
+    let q = startProcess("build/quark.exe", ["run", "tests/process/upper.qk"])?
+    killProcess(q)
+    print(waitProcess(q)? != 0)
+    print(startProcess("no-such-program-here", []) is Err(_))
+}

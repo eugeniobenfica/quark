@@ -11,3 +11,5 @@ tests/panics/cCallback.qk C's library (qsort)
 tests/panics/scopeTask.qk tasks on stacks of their own
 tests/panics/stack.qk the engine's own stack: too deep a recursion traps there (wasmtime: call stack exhausted)
 tests/panics/trace.qk the calls a panic went through: read from the machine's frames, which wasm does not show
+tests/run/processStream.qk other programs (WASI has none)
+tests/run/tls.qk TLS (WASI has none)

@@ -713,3 +713,25 @@ pub extern effect fn wasiEnd(status: Int64) as "qkWasiEnd" {
     flush()
     procExit(status)
 }
+
+// ---- a process with pipes: none in WebAssembly ----
+pub extern effect fn wasiStartProcess(name: Int64, args: Int64, count: Int64, out: Int64) -> Int64 as "qkosStartProcess" {
+    let m = malloc(200)
+    let _ = bufAt(m, 200).text("cannot run ").zeroText(name).text(": WebAssembly runs no other programs")
+    setWord(out, 1, m)
+    let _ = args + count
+    1
+}
+
+// ---- TLS: none in WebAssembly (WASI has no TLS, and no system library to take it from) ----
+pub extern effect fn wasiTlsNew(host: Int64, why: Int64) -> Int64 as "qkosTlsNew" {
+    let _ = bufAt(why, 256).text("WebAssembly has no TLS")
+    0
+}
+
+pub extern effect fn wasiTlsWork(t: Int64, why: Int64) -> Int64 as "qkosTlsWork" = -1
+
+pub extern effect fn wasiTlsSeal(t: Int64, p: Int64, n: Int64, why: Int64) -> Int64 as "qkosTlsSeal" =
+    -1
+
+pub extern effect fn wasiTlsEnd(t: Int64) as "qkosTlsEnd" {}

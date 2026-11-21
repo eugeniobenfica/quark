@@ -96,7 +96,7 @@ type X64 {
     code: Bytes = []
     lines: [Int] = [] // -g: MachineCode.lines, frames
     frames: [Int] = []
-    lineAt: [Int] = [] // where a line is written in the code (8 bytes: line | inlined call << 32)
+    lineAt: [Int] = [] // each line written in the code: its patch's index (8 bytes: line | inlined call << 32)
     lastLine: Int = -1
     patches: [Patch] = []
     relocs: [Reloc] = []
@@ -156,6 +156,99 @@ pub fn genX64Parts(
     partsOf(fns).parallelMap(part => x64Part(target, runtime, externs, sigs, part, quick))
 } else {
     [x64Part(target, runtime, externs, sigs, fns, quick)]
+}
+
+// ---- a part's functions, each a part of its own; and their lines moved (B13: code kept from an earlier build) ----
+// part's functions, each its own part (its code from 0): joined in the same order, the same bytes
+pub fn splitPart(p: CodePart) -> [CodePart] {
+    var out: [CodePart] = []
+    for k in 0..len(p.fnAt) {
+        let from = p.fnAt[k]
+        let to = if k + 1 < len(p.fnAt) { p.fnAt[k + 1] } else { len(p.code) }
+        let inside = (at: Int) => at >= from and at < to
+        var patches: [Patch] = []
+        var lineAt: [Int] = []
+        var lineSet: Set<Int> = []
+        for i in p.lineAt {
+            lineSet.add(i)
+        }
+        for (i, x) in p.patches.enumerate() {
+            if inside(x.at) {
+                if lineSet.contains(i) {
+                    lineAt.push(len(patches))
+                }
+                patches.push(Patch(x.at - from, x.value, x.width))
+            }
+        }
+        var lines: [Int] = []
+        var i = 0
+        while i + 1 < len(p.lines) {
+            if inside(p.lines[i]) {
+                lines.push(p.lines[i] - from)
+                lines.push(p.lines[i + 1])
+            }
+            i += 2
+        }
+        out.push(CodePart(p.code[from..to], patches, p.relocs
+            .filter(x => inside(x.at))
+            .map(x => Reloc(x.at - from, x.kind, x.target))
+            .toArray(), p.sites
+            .filter(x => x.ret > from and x.ret <= to)
+            .map(x => x with { ret: x.ret - from })
+            .toArray(), p.callFixups
+            .filter(x => inside(x.at))
+            .map(x => Fixup(x.at - from, x.target))
+            .toArray(), p.rtFixups
+            .filter(x => inside(x.at))
+            .map(x => Fixup(x.at - from, x.target))
+            .toArray(), lines, p.frames.filter(x => inside(x)).map(x => x - from).toArray(), [0], lineAt, [p.numbers[k]]))
+    }
+    out
+}
+
+// the part with each line moved by its frame's delta (by the inlined call it is in, 0 the function's own): in the
+// code, its calls' sites and its -g lines (a line of 0, no line, stays)
+pub fn CodePart.rebased(self, delta: (Int) -> Int) -> CodePart {
+    var p = self
+    for i in p.lineAt {
+        p.patches[i].value = movedLine(p.patches[i].value, delta)
+    }
+    for (k, s) in p.sites.enumerate() {
+        if s.line > 0 {
+            p.sites[k].line = s.line + delta(s.inl)
+        }
+    }
+    var i = 1
+    while i < len(p.lines) {
+        p.lines[i] = movedLine(p.lines[i], delta)
+        i += 2
+    }
+    p
+}
+
+// line | inlined call << 32, its line moved by that call's delta
+pub fn movedLine(v: Int, delta: (Int) -> Int) -> Int {
+    let line = v & 0xFFFFFFFF
+    if line == 0 {
+        return v
+    }
+    let inl = v >> 32
+    line + delta(inl) | inl << 32
+}
+
+// the parts as B13's proofs want them (ir.qk: rebaseTest, splitTest): split, their lines moved back by shift
+pub fn genX64Proved(parts: [CodePart], shift: Int) -> [CodePart] {
+    var out = parts
+    if splitTest() {
+        out = []
+        for p in parts {
+            out += splitPart(p)
+        }
+    }
+    if shift != 0 {
+        out = out.map(p => p.rebased(inl => -shift)).toArray()
+    }
+    out
 }
 
 // the parts joined, in order: count functions in all
@@ -828,8 +921,9 @@ fn X64.emitCold(var self) {
         }
         self.byte(0xE8) // call the panic
         self.i32(thunk - (self.here() + 4))
-        self.lineAt.push(self.here())
-        self.i64(c.line | c.inl << 32)
+        self.lineAt.push(len(self.patches))
+        self.patches.push(Patch(self.here(), c.line | c.inl << 32, 8))
+        self.i64(0)
         self.byte(c.code)
     }
 }
@@ -1606,8 +1700,9 @@ fn X64.genConst(var self, ins: IrIns) {
         // a line: mov rax, imm64, always 8 bytes of it (lineAt)
         self.rex(true, 0, 0, rax)
         self.byte(0xB8)
-        self.lineAt.push(self.here())
-        self.i64(ins.imm)
+        self.lineAt.push(len(self.patches))
+        self.patches.push(Patch(self.here(), ins.imm, 8))
+        self.i64(0)
     } else if self.inReg(ins.dst) and not self.isFloat(ins.dst) {
         self.movImm(self.gprOf(ins.dst), ins.imm)
         return

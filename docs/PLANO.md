@@ -645,6 +645,21 @@ fatos dos chamados (o que um `var self` muda, se um resultado é todo seu, o tam
   guarda a sua. O `build.sh` roda o estágio 1 com `QUARK_IMAGES=off`: ele tem o runtime do compilador que o construiu.
   Dois processos que gravam a mesma imagem ao mesmo tempo podem estragá-la (o runtime não tem como renomear um
   arquivo); uma lida no meio de uma gravação falha com segurança.
+- **Etapa 1, fechada:**
+  - uma linha no código é escrita como zeros e um remendo (`Patch`, que a junção já aplica; no ARM64, um para cada
+    uma das quatro instruções), e o índice do remendo fica em `lineAt`;
+  - `splitPart` corta uma parte em uma por função; `CodePart.rebased(delta)` move cada linha pelo deslocamento do seu
+    quadro (a função ou a chamada embutida onde está), no código, nas chamadas registradas e nas linhas do `-g`;
+  - provado na suíte: juntar uma parte por função, e baixar com as linhas K mais abaixo e movê-las de volta
+    (`QUARK_SPLIT_PARTS=1`, `QUARK_REBASE_TEST=K`), dão os mesmos bytes, no x86-64 e no ARM64; o compilador inteiro
+    também, com e sem `-g`;
+  - **a parte 1b (referências por símbolo e um linker) caiu:** ela servia para reaproveitar código entre builds
+    cujos números mudam. Partindo da imagem do build anterior, os números das funções, dos dados e dos auxiliares
+    ficam estáveis e o build só acrescenta: o que sobra para reaproveitar o código de uma função é a linha.
+- **Incremento 1 da etapa 2, feito:** a imagem guarda também o build inteiro (o IR resumido, os dados, as chamadas
+  embutidas e o código de máquina), com a chave do que ele foi feito para (o alvo e as opções). Quando os arquivos e
+  as opções são os mesmos, o build sai dela: o rebuild do compilador em 65 ms (sobrescrever um executável recém-escrito
+  custa ~0,9 s a mais no Windows, fora do compilador).
 - **A ordem daqui em diante:** as etapas 2 e 3b viram uma só, o build incremental sobre a imagem do build anterior
   inteiro (o programa, as tabelas do lowering e o código de cada função). Partindo dela, um build só acrescenta: as
   funções que não mudaram guardam seus números e deslocamentos, e o código delas vale como está, com as linhas

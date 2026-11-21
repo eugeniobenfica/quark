@@ -420,6 +420,29 @@ pub fn partsOf(fns: [(Int, IrFn)]) -> [[(Int, IrFn)]] {
     out
 }
 
+// B13's proofs, which must leave the executable as it was: QUARK_SPLIT_PARTS=1 joins a part for each function
+// (splitPart); QUARK_REBASE_TEST=K lowers every line K further down and moves them back before the join (rebased)
+pub fn rebaseTest() -> Int = (env("QUARK_REBASE_TEST") ?? "0").parseInt() ?? 0
+
+pub fn splitTest() -> Bool = env("QUARK_SPLIT_PARTS") == Some("1")
+
+// the function with every line k further (the code's, and the lines it writes into it: Const with c = 3)
+pub fn IrFn.linesMoved(self, k: Int) -> IrFn {
+    var g = self
+    if g.line > 0 {
+        g.line += k
+    }
+    for (i, ins) in g.code.enumerate() {
+        if ins.line > 0 {
+            g.code[i].line = ins.line + k
+        }
+        if ins.op == Op.Const and ins.c == 3 and ins.imm & 0xFFFFFFFF > 0 {
+            g.code[i].imm = ins.imm + k
+        }
+    }
+    g
+}
+
 // each function with its number
 pub fn numbered(fns: [IrFn]) -> [(Int, IrFn)] {
     var out: [(Int, IrFn)] = []

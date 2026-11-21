@@ -405,6 +405,7 @@ const streamBatch = 2000000
 
 // lowered in batches, each one's machine code made on the threads (compileText)
 fn Lower.streamX64(var self, target: Target) -> MachineCode {
+    let shift = rebaseTest()
     var parts = genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, [], true)
     var batch: [(Int, IrFn)] = []
     var made = 0
@@ -412,20 +413,29 @@ fn Lower.streamX64(var self, target: Target) -> MachineCode {
     while not self.allLowered() {
         if self.lowerNext() is Some(f) {
             made += len(f.1.code)
-            batch.push(f)
+            batch.push(if shift != 0 { (f.0, f.1.linesMoved(shift)) } else { f })
         }
         if made >= streamBatch or self.allLowered() {
-            parts += genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, batch, true)
+            parts += genX64Proved(
+                genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, batch, true),
+                shift,
+            )
             batch = []
             made = 0
         }
     }
     let rest = self.lowerRest()
-    parts += genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest, true)
+    let rest2 = if shift != 0 {
+        rest.map(f => (f.0, f.1.linesMoved(shift))).toArray()
+    } else {
+        rest
+    }
+    parts += genX64Proved(genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest2, true), shift)
     genX64Join(target, self.out.runtime, self.out.externs, self.out.cSigs, len(self.fns), parts)
 }
 
 fn Lower.streamArm64(var self, target: Target) -> MachineCode {
+    let shift = rebaseTest()
     var parts = genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, [], true)
     var batch: [(Int, IrFn)] = []
     var made = 0
@@ -433,16 +443,27 @@ fn Lower.streamArm64(var self, target: Target) -> MachineCode {
     while not self.allLowered() {
         if self.lowerNext() is Some(f) {
             made += len(f.1.code)
-            batch.push(f)
+            batch.push(if shift != 0 { (f.0, f.1.linesMoved(shift)) } else { f })
         }
         if made >= streamBatch or self.allLowered() {
-            parts += genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, batch, true)
+            parts += genArm64Proved(
+                genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, batch, true),
+                shift,
+            )
             batch = []
             made = 0
         }
     }
     let rest = self.lowerRest()
-    parts += genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest, true)
+    let rest2 = if shift != 0 {
+        rest.map(f => (f.0, f.1.linesMoved(shift))).toArray()
+    } else {
+        rest
+    }
+    parts += genArm64Proved(
+        genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest2, true),
+        shift,
+    )
     genArm64Join(target, self.out.runtime, self.out.externs, self.out.cSigs, len(self.fns), parts)
 }
 

@@ -85,7 +85,7 @@ type Arm64 {
     out: Int = 0 // bytes of the outgoing area at sp
     lines: [Int] = [] // -g: MachineCode.lines, frames
     frames: [Int] = []
-    lineAt: [Int] = [] // where a line is written in the code (movz, movk, movk, movk: line | inlined call << 32)
+    lineAt: [Int] = [] // each line written in the code: the first of its four patches' indices (movz, movk x 3)
     lastLine: Int = -1
     frame: Int = 0 // bytes below x29
     labelAt: [Int] = []
@@ -120,6 +120,103 @@ pub fn genArm64Parts(
     partsOf(fns).parallelMap(part => arm64Part(target, runtime, externs, sigs, part, quick))
 } else {
     [arm64Part(target, runtime, externs, sigs, fns, quick)]
+}
+
+// ---- a part's functions, each a part of its own; and their lines moved (B13: code kept from an earlier build) ----
+// part's functions, each its own part (its code from 0): joined in the same order, the same bytes
+pub fn splitPart(p: CodePart) -> [CodePart] {
+    var out: [CodePart] = []
+    for k in 0..len(p.fnAt) {
+        let from = p.fnAt[k]
+        let to = if k + 1 < len(p.fnAt) { p.fnAt[k + 1] } else { len(p.code) }
+        let inside = (at: Int) => at >= from and at < to
+        var patches: [Patch] = []
+        var lineAt: [Int] = []
+        var lineSet: Set<Int> = []
+        for i in p.lineAt {
+            lineSet.add(i)
+        }
+        for (i, x) in p.patches.enumerate() {
+            if inside(x.at) {
+                if lineSet.contains(i) {
+                    lineAt.push(len(patches))
+                }
+                patches.push(Patch(x.at - from, x.value, x.width))
+            }
+        }
+        var lines: [Int] = []
+        var i = 0
+        while i + 1 < len(p.lines) {
+            if inside(p.lines[i]) {
+                lines.push(p.lines[i] - from)
+                lines.push(p.lines[i + 1])
+            }
+            i += 2
+        }
+        out.push(CodePart(p.code[from..to], patches, p.relocs
+            .filter(x => inside(x.at))
+            .map(x => Reloc(x.at - from, x.kind, x.target))
+            .toArray(), p.sites
+            .filter(x => x.ret > from and x.ret <= to)
+            .map(x => x with { ret: x.ret - from })
+            .toArray(), p.callFixups
+            .filter(x => inside(x.at))
+            .map(x => Fixup(x.at - from, x.target, x.kind))
+            .toArray(), lines, p.frames.filter(x => inside(x)).map(x => x - from).toArray(), [0], lineAt, [p.numbers[k]]))
+    }
+    out
+}
+
+// the part with each line moved by its frame's delta (by the inlined call it is in, 0 the function's own): in the
+// code (its four patches), its calls' sites and its -g lines (a line of 0, no line, stays)
+pub fn CodePart.rebased(self, delta: (Int) -> Int) -> CodePart {
+    var p = self
+    for i in p.lineAt {
+        var v = 0
+        for k in 0..4 {
+            v = v | p.patches[i + k].value >> 5 & 0xFFFF << (16 * k)
+        }
+        let moved = movedLine(v, delta)
+        for k in 0..4 {
+            p.patches[i + k].value = lineBits(moved, k)
+        }
+    }
+    for (k, s) in p.sites.enumerate() {
+        if s.line > 0 {
+            p.sites[k].line = s.line + delta(s.inl)
+        }
+    }
+    var i = 1
+    while i < len(p.lines) {
+        p.lines[i] = movedLine(p.lines[i], delta)
+        i += 2
+    }
+    p
+}
+
+// line | inlined call << 32, its line moved by that call's delta
+fn movedLine(v: Int, delta: (Int) -> Int) -> Int {
+    let line = v & 0xFFFFFFFF
+    if line == 0 {
+        return v
+    }
+    let inl = v >> 32
+    line + delta(inl) | inl << 32
+}
+
+// the parts as B13's proofs want them (ir.qk: rebaseTest, splitTest): split, their lines moved back by shift
+pub fn genArm64Proved(parts: [CodePart], shift: Int) -> [CodePart] {
+    var out = parts
+    if splitTest() {
+        out = []
+        for p in parts {
+            out += splitPart(p)
+        }
+    }
+    if shift != 0 {
+        out = out.map(p => p.rebased(inl => -shift)).toArray()
+    }
+    out
 }
 
 // the parts joined, in order: count functions in all
@@ -616,12 +713,16 @@ fn Arm64.coldWord(var self, w: Int, code: Int, line: Int, a: Int, b: Int) {
 // x2, x3 hold what it reports: rtPanic(code, line, x2, x3), the Quark way (in x0-x3), never back
 // a line into reg in four instructions whatever its value, noted (lineAt)
 fn Arm64.movLine(var self, reg: Int, v: Int) {
-    self.lineAt.push(self.here())
-    self.ins(0xD2800000 | v & 0xFFFF << 5 | reg) // movz reg, bits 0-15
-    self.ins(0xF2A00000 | v >> 16 & 0xFFFF << 5 | reg) // movk reg, bits 16-31, lsl 16
-    self.ins(0xF2C00000 | v >> 32 & 0xFFFF << 5 | reg) // movk reg, bits 32-47, lsl 32
-    self.ins(0xF2E00000 | v >> 48 & 0xFFFF << 5 | reg) // movk reg, bits 48-63, lsl 48
+    self.lineAt.push(len(self.patches))
+    for (k, op) in [0xD2800000, 0xF2A00000, 0xF2C00000, 0xF2E00000].enumerate() {
+        // movz reg, bits 0-15; movk reg, bits 16-31, lsl 16; ... 48-63, lsl 48: each one's 16 bits a patch
+        self.patch(self.here(), lineBits(v, k))
+        self.ins(op | reg)
+    }
 }
+
+// the k-th 16 bits of a line's value, where a movz or movk takes them
+fn lineBits(v: Int, k: Int) -> Int = v >> (16 * k) & 0xFFFF << 5
 
 fn Arm64.panicCall(var self, code: Int, line: Int) {
     self.markPanicFrame()

@@ -360,6 +360,25 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 >   na arena que a alocação no código use como um bloco comum, e que os laços de dentro da chamada marquem e coletem
 >   sem confundi-la com os blocos da arena. As formas limitadas que pesei arriscam memória sem limite, quando a função
 >   chamada tem um laço longo próprio. Fica como próximo passo, com esse desenho.
+>
+> **Rodada de 21/11/2026: medido por dentro, 1,61× → ~1,52× o C** (o melhor de 20 execuções alternadas, num núcleo:
+> C 65 ms, `records` 99 ms).
+> - **Sem coleta nenhuma: 72 ms** (1,07× o C). A coleta custa ~28 ms.
+> - **O programa inteiro tem seis coletas:** uma completa copia 39 MB, e cinco menores copiam 64 MB, quase tudo os
+>   `args` novos achados pelos cartões dos arrays velhos (`lookAgain`).
+> - **Experimento: não copiar de novo o que os laços de fora já copiaram.** O que é achado por um recipiente velho
+>   foi para um bloco que nenhuma coleta vê como novo (de propósito vazando, só para medir). Ganhou 2,5%. O custo não é
+>   a cópia repetida entre níveis: é a primeira cópia do que sobrevive.
+> - **Feito:**
+>   - a barreira de escrita (`remember`) lembra a última entrada, e uma escrita de novo no mesmo array só carimba o
+>     cartão (sem a busca na tabela);
+>   - a cópia de um array pequeno de valores simples aloca na hora no sobrevivente e copia palavra por palavra (sem
+>     `survive` nem `memcpy`).
+>   - Juntos, ~2–3%.
+> - **O que falta para 1,5× com folga** é tirar a primeira cópia. Para isso, o que um laço guarda num recipiente velho
+>   precisa ser alocado já na área do laço ativo mais de fora (a pré-promoção por chamada). Isso pede marcar cada saída
+>   de laço no lowering (`break`, `return`, `?`, pânico), para o runtime saber quais laços estão ativos. Sem isso, o
+>   lixo no que é mais velho que todos os laços ativos nunca seria coletado. É o desenho acima, ainda não feito.
 
 ### B8. O grafo sem JSON por dentro
 

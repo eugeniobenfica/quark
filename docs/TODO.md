@@ -49,7 +49,8 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [x] coletas completas que esperam conforme o lixo que acham; valores pequenos copiados sem a tabela: `records`
     de 1,95× para 1,6× o C
   - [ ] pré-promoção por chamada (o que `build()` faz vai para fora do laço): uma região guardada na arena (medido
-    em 21/11: `records` a ~1,65× o C; a coleta de laço é 37% do tempo)
+    em 21/11: `records` a ~1,52× o C, 72 ms sem coleta; a barreira e a cópia pequena ficaram mais baratas; falta
+    marcar as saídas de laço para alocar já fora)
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)

@@ -2890,7 +2890,13 @@ fn Lower.newMap(var self, t: Int, line: Int) -> [Int] {
     [self.rtcall(rtMapNew, [d], 'I', line)]
 }
 
-fn Lower.lineHere(var self, line: Int) -> Int = self.iconst(line | self.inl << 32)
+// a line where the code is (and the inlined call it is in), for a panic: a constant of its own (c = 3), written by the
+// backends at a fixed width and noted, so that machine code kept from an earlier build can have it rewritten
+fn Lower.lineHere(var self, line: Int) -> Int {
+    let r = self.newReg('I')
+    self.emit(.Const, r, -1, -1, imm: line | self.inl << 32, c: 3)
+    r
+}
 
 fn Lower.mapSet(var self, m: [Int], k: [Int], key: Int, v: [Int], line: Int) {
     let where = self.lineHere(line)
@@ -3260,7 +3266,7 @@ fn Lower.lowerParallelMap(var self, e: Int) -> [Int] {
     let ft = self.ty(self.arg(e, 1))
     let s1 = self.iconst(self.slots(self.p.types[ft].params[0]))
     let s2 = self.iconst(self.slots(self.elemOf(ft)))
-    let ln = self.iconst(self.lineOf(e))
+    let ln = self.lineHere(self.lineOf(e))
     // results that hold memory: their array's description, to copy them out of each thread's memory (else 0)
     let desc = if self.own.holdsMemory(self.elemOf(ft)) {
         self.descAddress(self.ty(e))
@@ -3298,7 +3304,7 @@ fn Lower.lowerParallelFold(var self, e: Int) -> [Int] {
         arr[1],
         self.iconst(inSlots),
         self.iconst(accSlots),
-        self.iconst(line),
+        self.lineHere(line),
     ]
     self.storeSlots(b, z, 8, 0, words)
     self.storeSlots(b, z, 8, 72, start)
@@ -3405,7 +3411,7 @@ fn Lower.lowerRuntimeCall(var self, e: Int, a: [Int], t: Int, line: Int) -> [Int
         _ => false
     }
     if withLine {
-        args.push(self.iconst(at))
+        args.push(self.lineHere(at))
     }
     let k = self.tk(t)
     if k is Void | Never {

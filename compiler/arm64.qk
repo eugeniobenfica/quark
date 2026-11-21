@@ -85,6 +85,7 @@ type Arm64 {
     out: Int = 0 // bytes of the outgoing area at sp
     lines: [Int] = [] // -g: MachineCode.lines, frames
     frames: [Int] = []
+    lineAt: [Int] = [] // where a line is written in the code (movz, movk, movk, movk: line | inlined call << 32)
     lastLine: Int = -1
     frame: Int = 0 // bytes below x29
     labelAt: [Int] = []
@@ -173,6 +174,7 @@ pub type CodePart {
     lines: [Int]
     frames: [Int]
     fnAt: [Int]
+    lineAt: [Int]
     numbers: [Int] // each function's number, as fnAt has them
 }
 
@@ -201,7 +203,7 @@ fn arm64Part(
             g.genFn(f)
         }
     }
-    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt, numbers)
+    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt, g.lineAt, numbers)
 }
 
 // -g: where ins's code starts, when its line is another than the last one's
@@ -612,10 +614,19 @@ fn Arm64.coldWord(var self, w: Int, code: Int, line: Int, a: Int, b: Int) {
 }
 
 // x2, x3 hold what it reports: rtPanic(code, line, x2, x3), the Quark way (in x0-x3), never back
+// a line into reg in four instructions whatever its value, noted (lineAt)
+fn Arm64.movLine(var self, reg: Int, v: Int) {
+    self.lineAt.push(self.here())
+    self.ins(0xD2800000 | (v & 0xFFFF) << 5 | reg) // movz reg, bits 0-15
+    self.ins(0xF2A00000 | (v >> 16 & 0xFFFF) << 5 | reg) // movk reg, bits 16-31, lsl 16
+    self.ins(0xF2C00000 | (v >> 32 & 0xFFFF) << 5 | reg) // movk reg, bits 32-47, lsl 32
+    self.ins(0xF2E00000 | (v >> 48 & 0xFFFF) << 5 | reg) // movk reg, bits 48-63, lsl 48
+}
+
 fn Arm64.panicCall(var self, code: Int, line: Int) {
     self.markPanicFrame()
     self.movImm(x0, code)
-    self.movImm(x1, line)
+    self.movLine(x1, line)
     self.callRuntime(rtPanic)
 }
 
@@ -865,6 +876,9 @@ fn Arm64.genIns(var self, ins: IrIns) {
             }
             if ins.c == 1 {
                 self.movReloc(x0, relocData, ins.imm)
+                self.storeBits(ins.dst, x0)
+            } else if ins.c == 3 {
+                self.movLine(x0, ins.imm)
                 self.storeBits(ins.dst, x0)
             } else if ins.c == 2 {
                 // a function kept as a value: its distance from here (code may be past adr's megabyte)

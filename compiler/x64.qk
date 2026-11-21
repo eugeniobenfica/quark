@@ -96,6 +96,7 @@ type X64 {
     code: Bytes = []
     lines: [Int] = [] // -g: MachineCode.lines, frames
     frames: [Int] = []
+    lineAt: [Int] = [] // where a line is written in the code (8 bytes: line | inlined call << 32)
     lastLine: Int = -1
     patches: [Patch] = []
     relocs: [Reloc] = []
@@ -219,6 +220,7 @@ pub type CodePart {
     lines: [Int]
     frames: [Int]
     fnAt: [Int]
+    lineAt: [Int]
     numbers: [Int] // each function's number, as fnAt has them
 }
 
@@ -248,7 +250,7 @@ fn x64Part(
             g.genFn(f)
         }
     }
-    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.rtFixups, g.lines, g.frames, fnAt, numbers)
+    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.rtFixups, g.lines, g.frames, fnAt, g.lineAt, numbers)
 }
 
 // -g: where ins's code starts, when its line is another than the last one's
@@ -826,6 +828,7 @@ fn X64.emitCold(var self) {
         }
         self.byte(0xE8) // call the panic
         self.i32(thunk - (self.here() + 4))
+        self.lineAt.push(self.here())
         self.i64(c.line | c.inl << 32)
         self.byte(c.code)
     }
@@ -1599,6 +1602,12 @@ fn X64.genConst(var self, ins: IrIns) {
         self.bytes([0x48, 0x8D, 0x05])
         self.callFixups.push(Fixup(self.here(), ins.imm))
         self.i32(0)
+    } else if ins.c == 3 {
+        // a line: mov rax, imm64, always 8 bytes of it (lineAt)
+        self.rex(true, 0, 0, rax)
+        self.byte(0xB8)
+        self.lineAt.push(self.here())
+        self.i64(ins.imm)
     } else if self.inReg(ins.dst) and not self.isFloat(ins.dst) {
         self.movImm(self.gprOf(ins.dst), ins.imm)
         return

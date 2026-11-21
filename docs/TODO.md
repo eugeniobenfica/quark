@@ -60,6 +60,8 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
     arredondar; instruções afundadas no ramo que as usa: `records` 1,66× → 1,46× o C (o melhor de três), `json` −6%
   - [-] pré-promoção por chamada: não foi preciso para a meta (o desenho segue no plano)
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
+- [ ] B11 a memória de uma chamada devolvida na volta (desenhada: uma coleta de laço de uma volta só, com o resultado
+  por raiz, para funções sem `var self` nem `owned`; medições que decidem e passos no plano)
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
@@ -77,7 +79,7 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
   - [x] arrays grandes crescem no lugar (reserva de endereços, páginas conforme crescem): sem cópia e sem bloco velho
     (50 milhões de Ints: 897 → 375 MB, 2× mais rápido)
   - [ ] devolver ao fim de uma fase o que ela fez e não guardou (a arena só devolve em coletas de laço): o que sobra
-    dos 3 GB do compilador
+    dos 3 GB do compilador. Desenhado: B11 no [PLANO.md](PLANO.md) (a coleta na volta)
   - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 
 ### C. A linguagem

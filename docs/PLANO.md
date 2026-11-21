@@ -591,6 +591,72 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 >   do modelo de memória (uma coleta na volta de uma função, ou uma região por chamada), não de cópia, e pede um
 >   desenho próprio.
 
+### B11. A memória de uma chamada: devolvida na volta
+
+> **Desenho de 21/11/2026; ainda não implementado.**
+
+**Hoje:** a arena só devolve memória nas coletas de laço. O que uma função faz fora de laços fica até o fim do
+programa (ou da chamada do host). O compilador é o caso extremo: cada fase roda fora de laços, e os arrays de trabalho
+de cada uma (por ligação, por expressão, os da análise de memória) somam a maior parte dos ~3 GB de pico, com ~1 s de
+CPU no kernel só em falhas de página. Nenhum programa longo feito de fases escapa disso.
+
+**Proposta: uma coleta na volta.** Uma função é um laço que roda uma vez. Na entrada, ela anota onde a arena está; na
+volta, se fez muito desde então, o que o resultado alcança do que ela fez é copiado para fora, e o resto vai de uma
+vez. É a coleta de laço que já existe (`loops.qk`: as regiões jovens, os sobreviventes, os blocos grandes mantidos no
+lugar, a tabela de espaço), com uma única raiz: o valor devolvido.
+
+**Por que é segura sem barreira de escrita.** A barreira (`remember`) só fica ligada com uma marca de laço ativa, e
+ligá-la a cada chamada custaria caro. Ela é desnecessária para uma função que não pode guardar um valor novo em
+memória mais velha do que a sua entrada:
+- os parâmetros não mudam (semântica de valores), e não há estado global mutável;
+- o que vai para um canal ou para uma tarefa é copiado para a memória deles;
+- só um `var self` ou um parâmetro `owned` muda memória que veio de fora. Essas funções ficam de fora.
+
+Então, para as outras, tudo o que ela fez e ainda vive depois da volta está no resultado. A coleta copia o que é jovem
+nele (o que já existia antes da entrada fica onde está) e devolve o resto.
+
+**Quando roda:**
+- **Na entrada:** de uma função que não é embutida e que pode alocar, quatro leituras: o bloco atual da arena, o
+  quanto dele está usado, o relógio e o total feito (a mesma leitura da checagem de turno dos laços).
+- **Na volta:** uma comparação, o total feito agora contra o da entrada. Abaixo do limite, nada mais acontece.
+- **O limite:** 16 MB feitos desde a entrada, e adaptativo como nos laços. Uma volta que guardou quase tudo o que fez
+  dobra o limite daquela função (o custo da cópia é o que fica; nunca passa do que foi feito).
+
+**Com o resto do runtime:**
+- os laços dentro da função já terminaram na volta;
+- um laço de fora vê os sobreviventes como jovens seus, como já vê os de um laço de dentro;
+- cada tarefa tem a sua arena, e uma chamada do host já devolve tudo ao fim;
+- um resultado que contém funções (o ambiente de uma lambda) ou valores de interface precisa ser copiável pelo
+  copiador. O que ele ainda não copiar fica de fora da regra, nunca errado.
+
+**Onde paga no compilador:** nas fases que devolvem um valor (`loadProgram`, `checkProgram`, `lowerProgram`,
+`genX64`). A coleta guarda o que a fase entrega e devolve os arrays de trabalho. Fases escritas como `var self`
+(`lowerFrom`, `runConsts`, `optimize`) ficam de fora, e passam a pagar quando reescritas como funções que devolvem o
+resultado.
+
+**O que foi pesado e deixado de lado:**
+- **Regiões escritas pelo programador** (`region { ... }`): resolve o mesmo com uma palavra a mais em cada lugar, e
+  o programador teria de saber onde o lixo está. A coleta na volta é automática.
+- **Cada fase numa tarefa** (`spawn`, cuja arena some no fim): já funciona hoje, mas copia o resultado inteiro, não
+  só o que é novo, e pede reescrever o código como tarefas.
+- **Contagem de referências:** medida antes e rejeitada (B4).
+- **Barreira de escrita sempre ligada,** para cobrir também `var self` e `owned`: o custo cairia sobre todo programa.
+
+**Medições que decidem** (antes de ligar por padrão):
+- **Custo nos benchmarks:** no máximo 1%, que é o custo das leituras na entrada e da comparação na volta.
+- **O pico do compilador:** de ~3,1 GB para menos da metade, e o tempo de relógio do rebuild igual ou menor.
+- **Correção:**
+  - um modo de validação (como `QK_CHECK_LOOPS`) que confere, depois de cada coleta na volta, que nada vivo aponta
+    para o que foi devolvido;
+  - a suíte inteira e o teste diferencial, com o limite em 0 (toda volta coleta).
+
+**Passos:**
+1. **O runtime:** `rtReturnCollect(marca, raízes, descrição)` sobre o copiador dos laços.
+2. **O lowering:** quais funções coletam, a anotação na entrada, a comparação e a coleta na volta.
+3. **O modo de validação e o limite em 0**, para testar.
+4. **Medir:** benchmarks e compilador.
+5. **Reescrever as fases do compilador** como funções que devolvem o resultado, onde pagar.
+
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 
 > **Decidido e feito em 19/11/2026**, pela regra "uma forma canônica para cada coisa; inferência quando não custa

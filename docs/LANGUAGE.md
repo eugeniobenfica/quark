@@ -749,7 +749,7 @@ an effect type, `effect (Text) -> Int`, and calling it is an effect. In a graph,
 value typed into a pin, as a function given to `map` is. A lambda whose parameters say their types
 needs no type written: `let f = (x: Int) => x * k`, and its effects are its body's
 (`let log = (t: Text) => print(t)` is an `effect (Text) -> nothing`). A function a value gives is called directly:
-`adder(2)(3)`.
+`adder(2)(3)`. `b.onPress(9)` calls the field, even where a function or a value named `onPress` is in reach.
 
 **Closures.** A lambda kept as a value takes the values of the names around it that it uses, as they
 are where it is made. Values never change behind your back, so this is exactly what it means: a later
@@ -1952,4 +1952,4 @@ executable with no `qkModuleStatic`; its loops never collect (the runtime is the
 ## Not yet
 
 - SIMD outside `--release`.
-- libquark (the C API) on macOS.
+- TLS on a server's side: a Quark server speaks plain HTTP, with TLS in a proxy before it ([SERVERS.md](SERVERS.md)).

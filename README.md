@@ -37,7 +37,7 @@ nodes and back into text, so tools can read, edit, compare and merge it by node 
 > **Made for** programs that want to be fast and small without ceremony: command-line tools, servers, data
 > processing, scripts embedded in a C or C++ application.<br>
 > **Not** a garbage-collected VM, a JavaScript target or a 1.0 yet: the language is settling
-> ([what stays stable](docs/STABILITY.md)), and no TLS for `https://` yet.
+> ([what stays stable](docs/STABILITY.md)).
 
 <div align="center">
 <br>

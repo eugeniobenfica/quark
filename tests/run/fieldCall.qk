@@ -1,0 +1,19 @@
+// A field that holds a function, called as r.f(x): the field, even with a value named f in reach (a parameter of
+// the function around it), in a generic function too.
+type Box { f: (Int) -> Int }
+
+fn apply(f: (Int) -> Int, x: Int) -> Int {
+    let by = Box(f)
+    by.f(x)
+}
+
+type Gen<A> { f: (A) -> A }
+
+fn twice<A>(f: (A) -> A, x: A) -> A {
+    let by = Gen(f)
+    by.f(by.f(x))
+}
+
+fn main() {
+    print(apply(n => n + 1, 1), twice(n => n * 3, 2))
+}

@@ -3974,7 +3974,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "3650074383-2418922"
+pub const compilerSources = "2751047718-2420359"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -8524,6 +8524,22 @@ fn sslWhy(t: Int, why: Int) {
     }
 }
 
+// an IP address (1.2.3.4, or IPv6's with a colon), not a name
+fn isAddress(host: Int) -> Bool {
+    let n = strlen(host)
+    var digitsAndDots = n > 0
+    for i in 0..n {
+        let c = byte(host, i)
+        if c == ':' {
+            return true
+        }
+        if not (c >= '0' and c <= '9' or c == '.') {
+            digitsAndDots = false
+        }
+    }
+    digitsAndDots
+}
+
 // what OpenSSL made to send, into tOut
 fn sslDrain(t: Int) {
     let room = malloc(16384)
@@ -8563,15 +8579,23 @@ pub extern effect fn osTlsNewImpl(host: Int64, why: Int64) -> Int64 as "qkosTlsN
         Some(f) => f(ssl, word(t, lIn), word(t, lOut))
         None => 0
     }
-    let _ = match findSslCtrl(openssl(), textAt("SSL_ctrl\0")) {
-        Some(f) => f(ssl, 55, 0, host)
-        // SSL_CTRL_SET_TLSEXT_HOSTNAME: the server's name, said in the hello
-        None => 0
-    }
-    let _ = match findSsl2i(openssl(), textAt("SSL_set1_host\0")) {
-        Some(f) => f(ssl, host)
-        // the name its certificate must have
-        None => 0
+    if isAddress(host) {
+        // an IP address: the one its certificate must have (and no name said in the hello)
+        let _ = match findSsl2i(openssl(), textAt("X509_VERIFY_PARAM_set1_ip_asc\0")) {
+            Some(f) => f(ssl1("SSL_get0_param\0", ssl), host)
+            None => 0
+        }
+    } else {
+        let _ = match findSslCtrl(openssl(), textAt("SSL_ctrl\0")) {
+            Some(f) => f(ssl, 55, 0, host)
+            // SSL_CTRL_SET_TLSEXT_HOSTNAME: the server's name, said in the hello
+            None => 0
+        }
+        let _ = match findSsl2i(openssl(), textAt("SSL_set1_host\0")) {
+            Some(f) => f(ssl, host)
+            // the name its certificate must have
+            None => 0
+        }
     }
     let _ = ssl1i("SSL_set_connect_state\0", ssl)
     if osTlsWorkImpl(t, why) != 0 {

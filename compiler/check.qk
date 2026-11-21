@@ -5096,7 +5096,23 @@ fn Checker.checkCall(var self, e: Int) -> Int {
         self.p.ast.exprs[e].ordered = args
         return t
     }
-    let fb = if qualifier != "" { -1 } else { self.lookupOrCapture(-1, name) }
+    var fb = if qualifier != "" { -1 } else { self.lookupOrCapture(-1, name) }
+    if fb >= 0 and method and len(args) > 0 and nameAt(names, 0) == "" {
+        // by.f(x) with a field f holding a function: the field, not a value named f around it
+        let t = self.checkExpr(args[0], true)
+        self.p.ast.exprs[args[0]].typed = true
+        if self.fnField(t, name) {
+            fb = -1
+        } else if self.isErr(t) and self.inTemplate() {
+            // a template's, checked before it has types: which f it is, its instances tell
+            for i in 1..len(args) {
+                if not self.p.ast.exprs[args[i]].node is Lambda(_, _) {
+                    self.checkExpr(args[i], true)
+                }
+            }
+            return tyError
+        }
+    }
     if name == "()" and len(args) > 0 {
         // pick(true)(5): the function a value gives, called
         let ft = self.checkExpr(args[0], true)

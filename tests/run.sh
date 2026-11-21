@@ -541,10 +541,19 @@ fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> = Pair(p.second, p.first)
 ' > "$tmp/pair.qk"
 if "$Q" catalog "$tmp/pair.qk" | grep -qF '"returns": "Pair<B, A>", "result": {"kind": "named", "name": "Pair", "args": [{"kind": "param", "name": "B"}, {"kind": "param", "name": "A"}]}'; then ok; else bad "catalog pins (a program's)"; fi
 # kept code (docs/PLANO.md B13): each function's own part, and its lines moved and moved back, give the same bytes
-QUARK_IMAGES=off "$Q" build tests/run/language.qk -o "$tmp/parts0.exe" > /dev/null 2>&1
-QUARK_IMAGES=off QUARK_SPLIT_PARTS=1 QUARK_REBASE_TEST=333 "$Q" build tests/run/language.qk -o "$tmp/parts1.exe" > /dev/null 2>&1
-QUARK_IMAGES=off "$Q" build tests/run/language.qk --target arm64-linux -o "$tmp/parts2" > /dev/null 2>&1
-QUARK_IMAGES=off QUARK_SPLIT_PARTS=1 QUARK_REBASE_TEST=333 "$Q" build tests/run/language.qk --target arm64-linux -o "$tmp/parts3" > /dev/null 2>&1
+# (each written under one name and moved: macOS signs an executable with its file's name)
+parts() { # parts OUT [--target T]: language.qk built, with the proofs when PROVE is set
+    if [ -n "$PROVE" ]; then
+        QUARK_IMAGES=off QUARK_SPLIT_PARTS=1 QUARK_REBASE_TEST=333 "$Q" build tests/run/language.qk $2 -o "$tmp/parts" > /dev/null 2>&1
+    else
+        QUARK_IMAGES=off "$Q" build tests/run/language.qk $2 -o "$tmp/parts" > /dev/null 2>&1
+    fi
+    mv -f "$tmp/parts" "$tmp/$1"
+}
+PROVE= parts parts0.exe
+PROVE=1 parts parts1.exe
+PROVE= parts parts2 "--target arm64-linux"
+PROVE=1 parts parts3 "--target arm64-linux"
 if [ -s "$tmp/parts0.exe" ] && cmp -s "$tmp/parts0.exe" "$tmp/parts1.exe" && [ -s "$tmp/parts2" ] && cmp -s "$tmp/parts2" "$tmp/parts3"; then ok; else bad "kept code: a part per function, lines moved back"; fi
 # the docs' examples compile, in canonical form (tests/docs.sh)
 if bash tests/docs.sh "$Q" > "$tmp/docs.txt" 2>&1; then ok; else bad "the docs' examples"; grep -v '^docs:' "$tmp/docs.txt" | head -10; fi

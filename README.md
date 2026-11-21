@@ -8,7 +8,7 @@
 
 <p><b>Text and graph. Native code. Nothing else.</b></p>
 
-<a href="https://github.com/eugeniobenfica/quark/releases/latest"><img src="https://img.shields.io/badge/version-0.12.0-14B8A6?style=flat-square&labelColor=141417" alt="Version 0.12.0"></a>
+<a href="https://github.com/eugeniobenfica/quark/releases/latest"><img src="https://img.shields.io/badge/version-0.12.1-14B8A6?style=flat-square&labelColor=141417" alt="Version 0.12.1"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-14B8A6?style=flat-square&labelColor=141417" alt="MIT license"></a>
 <a href="#principles"><img src="https://img.shields.io/badge/written_in-Quark,_no_dependencies-14B8A6?style=flat-square&labelColor=141417" alt="Written in Quark, no dependencies"></a>
 <br>

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.1
+
+What the next compiler builds on (it is built by this one, with this one's standard library and runtime).
+
+- **Images** (`std.machine`, the runtime's own): `saveImage(value, path)` writes a value with all it holds as its
+  memory is, at a fixed place of addresses, and `loadImage(path)` reads it back there at once (44 MB in 9 ms). The
+  compiler will keep its checked programs in them.
+- **A task's stack** is 64 MB on Linux and macOS (memory taken as it is touched), 8 MB on Windows: checking a large
+  program in a task needs more than 8 MB on ARM64.
+- **A line in machine code** is written at a fixed width, and where it is noted: kept code can have it rewritten.
+- **Panics from `runtimeLine` calls** say the file of the inlined call they are in.
+
 ## 0.12.0
 
 ### Changed: the freeze review

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.12 (not yet released)
+## 0.12.0
 
 ### Changed: the freeze review
 

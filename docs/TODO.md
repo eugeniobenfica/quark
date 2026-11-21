@@ -74,6 +74,10 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
   - [~] menos cópias e menos memória: registros com `[v] * n`, registros e `var self` entregues no último uso (todo
     programa); o pico do compilador continua ~3,1 GB, porque cada fase guarda o programa recebido numa `var` (o
     [PLANO.md](PLANO.md) diz o que falta decidir)
+  - [x] arrays grandes crescem no lugar (reserva de endereços, páginas conforme crescem): sem cópia e sem bloco velho
+    (50 milhões de Ints: 897 → 375 MB, 2× mais rápido)
+  - [ ] devolver ao fim de uma fase o que ela fez e não guardou (a arena só devolve em coletas de laço): o que sobra
+    dos 3 GB do compilador
   - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 
 ### C. A linguagem

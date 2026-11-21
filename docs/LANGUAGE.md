@@ -1438,6 +1438,12 @@ into a `var` from before them that they change no other way (`xs[i] = v` aside):
 as it moves to more room is less than what it holds. A loop of three million turns that builds a text, a map
 and a list each turn stays at about 10 MB, where it would need over 300 MB without it.
 
+An array that **grows past 1 MB** (by `push`, `+=`, or a pipeline's `toArray`) is given a block that holds far
+more addresses than memory: the system gives it pages as it grows, and it never moves again. So it is not copied as
+it grows, and leaves no old block behind (an array of 50 million Ints built by `push`: 375 MB at most, where moving
+to twice the room each time needed 900 MB, and twice as fast). With a memory limit (`--memory`), and in WebAssembly,
+it moves as before.
+
 Collections have **generations**. What one collection kept is old to the next, which copies only what the turns
 made since (and what old values were changed to hold, as above): a loop that builds something big a turn at a
 time copies each piece about once, not again at every collection. When what these collections kept since the

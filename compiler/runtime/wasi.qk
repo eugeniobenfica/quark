@@ -735,3 +735,10 @@ pub extern effect fn wasiTlsSeal(t: Int64, p: Int64, n: Int64, why: Int64) -> In
     -1
 
 pub extern effect fn wasiTlsEnd(t: Int64) as "qkosTlsEnd" {}
+
+// ---- blocks that grow where they are: none in WebAssembly's one memory (arena.qk moves its arrays instead) ----
+pub extern effect fn wasiReserve(n: Int64) -> Int64 as "qkosReserve" = 0
+
+pub extern effect fn wasiCommit(p: Int64, n: Int64) -> Int64 as "qkosCommit" = 0
+
+pub extern effect fn wasiRelease(p: Int64, n: Int64) as "qkosRelease" {}

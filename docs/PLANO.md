@@ -576,6 +576,20 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 >   ~3,05 GB, e o tempo ficou igual. Os blocos grandes que sobram são, pelos tamanhos que dobram (40, 80 MB), as
 >   versões velhas dos arrays da árvore quando crescem, não cópias do programa. E usar a palavra nas fontes do
 >   compilador pede uma versão publicada que a conheça (a CI começa da 0.9.2): fica para depois da próxima versão.
+>
+> **Arrays grandes que crescem no lugar (21/11/2026).**
+> - **O que é:** um array que cresce além de 1 MB (por `push`, `+=` ou o `toArray` de um pipeline) ganha um bloco
+>   reservado de 64 GB de endereços. O sistema dá as páginas conforme ele cresce, e ele nunca mais se move: não é
+>   copiado ao crescer e não deixa o bloco velho para trás. Uma fatia guardada antes continua apontando para memória
+>   válida. Com `--memory`, ou no WebAssembly (sem reserva), ele se move como antes.
+> - **Medido:** 50 milhões de Ints por `push`: pico de 897 → 375 MB e 140 → 79 ms. Um `filter(...).toArray()` de 60
+>   milhões: 101 → 53 ms. Os benchmarks ficaram iguais.
+> - **No compilador, quase nada** (3,09 → 3,05 GB). Os blocos grandes dele não são arrays crescendo: são os arrays de
+>   trabalho de cada fase (por ligação e por expressão: `regs`, `bound`, os da análise de memória), que ficam até o fim
+>   porque a arena só devolve memória nas coletas de laço, e cada fase roda fora de laços.
+> - **O que falta para a memória do compilador:** devolver o que uma fase fez e não guardou, ao fim dela. É uma questão
+>   do modelo de memória (uma coleta na volta de uma função, ou uma região por chamada), não de cópia, e pede um
+>   desenho próprio.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

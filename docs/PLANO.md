@@ -593,7 +593,8 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 
 ### B11. A memória de uma chamada: devolvida na volta
 
-> **Desenho de 21/11/2026; ainda não implementado.**
+> **Feita, medida e desfeita (21/11/2026).** Funcionou e passou a suíte inteira com toda volta coletando, mas o pico do
+> compilador caiu só 5%. O pico é a soma das fases, não o lixo entre duas delas (o resultado está no fim desta seção).
 
 **Hoje:** a arena só devolve memória nas coletas de laço. O que uma função faz fora de laços fica até o fim do
 programa (ou da chamada do host). O compilador é o caso extremo: cada fase roda fora de laços, e os arrays de trabalho
@@ -656,6 +657,63 @@ resultado.
 3. **O modo de validação e o limite em 0**, para testar.
 4. **Medir:** benchmarks e compilador.
 5. **Reescrever as fases do compilador** como funções que devolvem o resultado, onde pagar.
+
+**Resultado (21/11/2026): feita, medida, desfeita.**
+- **O que funcionou:**
+  - Ponto fixo, também com a coleta em toda volta (`QK_RETURN_COLLECT=all`).
+  - A suíte inteira nesse modo: 1192 passaram, 0 falharam.
+  - Os benchmarks dentro do ruído.
+- **O que a implementação ensinou (para uma próxima vez):**
+  - A entrada avança o relógio da arena, como o começo de um laço; senão um bloco grande feito antes conta como novo.
+  - A entrada esquece o último texto (`aLastText`): `s + t` estende no lugar o texto do topo, e um texto velho seria
+    estendido para dentro da memória devolvida.
+  - O resultado vai para registradores novos antes da checagem: quando a função não aloca, a checagem vira Nop.
+  - Ficam de fora as funções com parâmetros que podem mudar memória mais velha: funções (as caixas que capturam),
+    interfaces, laços preguiçosos, handles, ponteiros.
+- **Por que não pagou no compilador:**
+  - Só funções sem `var self` coletam, e as fases pesadas (`lowerFrom`, `optimize`) são `var self`.
+  - As que coletam e são pequenas (`lowerProgram`) são embutidas no chamador. Coletar também nos sítios embutidos
+    custou +9% de código e dobrou o tempo do lowering (copiar os 382 MB do IR na volta), para um pico de 2,78 GB.
+- **Onde está o pico** (memória máxima a cada fase, `quark build compiler/main.qk`):
+
+  | fase | memória |
+  |---|---|
+  | carga | 54 → 403 MB |
+  | check | → 1,03 GB |
+  | constantes | → 1,19 GB |
+  | lowering das funções | 1,27 → 1,72 GB |
+  | fim do lowering | → 1,97 GB |
+  | otimização (threads) | → 2,68 GB |
+  | código de máquina (threads) | → **3,02 GB** |
+
+  Cada fase soma ao que veio antes. Do check, ~1,1 GB é lixo (ele guarda ~57 MB), e o IR inteiro do programa ocupa
+  ~380 MB antes da otimização, que faz outra cópia.
+- **Também medidos e desfeitos:**
+  - **Copiar de uma `var` funda só os caminhos que ela muda** (`var l = Lower(p, ...)` não copia o programa): tira
+    duas cópias do array de expressões (38 MB cada), −75 MB, mas a análise custa 150 ms.
+  - **Adotar a memória dos workers do `parallelMap`** em vez de copiar os resultados: correto, ganho não mensurável no
+    pico.
+- **O que de fato cortaria o pico:** não ter o programa inteiro em cada forma ao mesmo tempo. Ver B12.
+
+### B12. A compilação em fluxo
+
+> **Proposta de 21/11/2026; não começada.**
+
+**Hoje:** o lowering faz o IR de todas as funções, a otimização faz outra cópia de todas, e só então sai o código de
+máquina. O IR de 25 mil funções (~380 MB, duas vezes) e o lixo de cada fase ficam vivos até o fim.
+
+**Proposta:** em lotes de funções, cada lote baixado, otimizado e feito código de máquina, nas threads. Só o código
+de cada lote fica; o IR dele vira lixo de um laço, devolvido pela coleta do laço que já existe. Cada função já é
+otimizada e gerada sozinha (as tabelas só são lidas), e as chamadas entre funções se resolvem por índice na junção.
+
+**O que pede cuidado:**
+- os auxiliares e as funções tardias (`helpers`, `lates`), feitos depois de todas as outras;
+- o runtime, que só guarda o que o programa alcança (`keepReachable` precisa do programa inteiro);
+- o cache de funções otimizadas do `--release` (já é por função);
+- o backend de wasm, que monta o módulo a partir do IR inteiro.
+
+**Medição que decide:** o pico do compilador abaixo de 2 GB (o check e as constantes, ~1,2 GB, mais um lote), com o
+tempo do rebuild igual ou menor.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

@@ -60,8 +60,10 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
     arredondar; instruções afundadas no ramo que as usa: `records` 1,66× → 1,46× o C (o melhor de três), `json` −6%
   - [-] pré-promoção por chamada: não foi preciso para a meta (o desenho segue no plano)
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
-- [ ] B11 a memória de uma chamada devolvida na volta (desenhada: uma coleta de laço de uma volta só, com o resultado
-  por raiz, para funções sem `var self` nem `owned`; medições que decidem e passos no plano)
+- [-] B11 a memória de uma chamada devolvida na volta: feita (a suíte passa com toda volta coletando), medida e
+  desfeita: o pico do compilador caiu só 5%. O pico é a soma das fases (o [PLANO.md](PLANO.md) tem a tabela)
+- [ ] B12 a compilação em fluxo: lotes de funções baixados, otimizados e feitos código, só o código guardado (o IR
+  inteiro, ~380 MB duas vezes, deixa de existir de uma vez; proposta no plano)
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
   - [x] tudo o que espera, cooperativo (`connect`, nomes, `runProcess`, o teclado: numa thread própria)
@@ -78,8 +80,8 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
     [PLANO.md](PLANO.md) diz o que falta decidir)
   - [x] arrays grandes crescem no lugar (reserva de endereços, páginas conforme crescem): sem cópia e sem bloco velho
     (50 milhões de Ints: 897 → 375 MB, 2× mais rápido)
-  - [ ] devolver ao fim de uma fase o que ela fez e não guardou (a arena só devolve em coletas de laço): o que sobra
-    dos 3 GB do compilador. Desenhado: B11 no [PLANO.md](PLANO.md) (a coleta na volta)
+  - [-] devolver ao fim de uma fase o que ela fez e não guardou: a B11, medida e desfeita (−5% do pico). O pico é a
+    soma das fases (carga 0,4 GB, check 0,6, lowering 0,8, otimização 0,7, código 0,35): a B12 ataca isso
   - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 
 ### C. A linguagem

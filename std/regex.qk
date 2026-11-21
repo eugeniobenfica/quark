@@ -5,7 +5,7 @@
 // keeps, and (?: ) that keeps none. A character is a code point: . and a class match one, however many
 // bytes it takes. The first match is the leftmost, and among those the one the pattern prefers. A search
 // takes time in step with the text's length times the pattern's, never more.
-pub type Regex { pattern: Text, groups: Int, prog: [Inst] }
+pub opaque type Regex { pub pattern: Text, pub groups: Int, prog: [Inst] }
 
 // where a match is (bytes, as t[start..end] slices it), its text, and each group's ("" when it took no part)
 pub type Match { start: Int, end: Int, text: Text, groups: [Text] }

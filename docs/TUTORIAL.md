@@ -189,7 +189,7 @@ fn page(r: Request) -> Response = match r.path {
 }
 
 fn main() {
-    serve("127.0.0.1", 8080, page)?
+    serveHttp("127.0.0.1", 8080, page)?
 }
 ```
 

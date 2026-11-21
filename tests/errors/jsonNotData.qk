@@ -4,5 +4,5 @@ use std.json
 type H { f: (Int) -> Int }
 
 fn main() {
-    print(encode(H(x => x)))
+    print(encodeJson(H(x => x)))
 }

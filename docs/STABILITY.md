@@ -33,6 +33,19 @@ The compiler's version is `major.minor.patch`:
 | The command line | commands, options and their exit statuses (`0` success, `1` the program's or the input's fault, `2` usage) | compiler major |
 | Packages | `quark.toml` and `quark.lock` fields | compiler major |
 
+### The standard library's names
+
+Reviewed before the freeze, so that what 1.0 keeps is consistent:
+
+- **A name says what it is about without its module.** `use std.http` brings `httpGet`, not `get`: a file sees
+  the `pub` names of every module it uses, side by side with its own.
+- **A function that gives a new value is named by what it gives**, as the built-ins are (`sorted`,
+  `reversed`): `q.withBack(x)`, `h.withoutTop()`, `d.plusDays(n)`. One that changes a `var` in place is named by
+  what it does (`push`, `pop`).
+- **A type whose parts are its own business is opaque** (`Queue`, `Heap`, `Regex`): it is made by its functions
+  (`emptyQueue()`, `queueOf(xs)`, `regex(pattern)`), and its representation can change in a minor version.
+- **A value with named parts is a record, not a tuple:** `parseUrl(url) -> Url!`.
+
 ## What is not
 
 These may change in any version, without notice:
@@ -47,6 +60,8 @@ These may change in any version, without notice:
   remove them (`quark clean` does).
 - **Experimental features**, named as such in the documentation: `QUARK_COUNTED=1` (the counted heap) and
   `QUARK_VALIDATE=1`. They may change or go away in a minor version.
+- **`std.machine`**, the backend's own functions that the runtime written in Quark calls, and the data in
+  `std.zones` (`zoneRules`: what `std.time` reads; its `tzdataVersion` names the tzdata it was made from).
 - **Undocumented behavior.** What the documentation does not say a program does is not promised, even when a
   version happens to do it.
 

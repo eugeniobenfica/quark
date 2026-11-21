@@ -49,10 +49,12 @@ typedef union QkValue {
     const void* p;
 } QkValue;
 
+/* The texts are the machine's, valid until its next call; none is NULL. */
 typedef struct QkDiagnostic {
-    int line, col;     /* in the text compiled (for a graph: its canonical text) */
-    char key[96];      /* the graph node at that place, when the text came from a graph ("update/speed") */
-    char message[320];
+    const char* file;    /* the file it is in ("" when none: a message of the machine's own) */
+    int line, col;       /* in that file's text (for a graph: its canonical text) */
+    const char* key;     /* the graph node at that place, when the text came from a graph ("update/speed"); else "" */
+    const char* message; /* "file:line:col: what is wrong", as the compiler says it */
 } QkDiagnostic;
 
 /* ---- the machine ---------------------------------------------------------------------------------- */

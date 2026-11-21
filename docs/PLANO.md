@@ -948,6 +948,26 @@ C (linguagem) em paralelo com B1; B6 (layout) depois de B3; B9, B10, D, E indepe
 | **0.12** | B6, B7, B10, D | `records` abaixo de 1,5× o C; ARM64 em paridade; rebuild abaixo de 0,5 s |
 | **1.0** | Fase E, congelamento | STABILITY.md vale; nenhuma mudança de layout ou de sintaxe pendente |
 
+### A revisão para o congelamento (21/11/2026)
+
+Feita antes da 0.12, para que o 1.0 não guarde nada que se queira mudar. As regras ficaram no
+[STABILITY.md](STABILITY.md#the-standard-librarys-names); as mudanças, no [CHANGELOG.md](../CHANGELOG.md).
+
+- **A std, como API pública:**
+  - nomes que dizem do que tratam sem o módulo (`use std.http` traz os nomes ao lado dos do arquivo, e um `pub`
+    que encontra outro de mesmo nome é erro): `httpGet`, `normalizePath`, `encodeJson`, `utcNow`, `argsUsage`...;
+  - a regra da própria linguagem: o que dá um valor novo leva o nome do que dá (`withBack`, `plusDays`, `merged`);
+  - representações escondidas (`Queue`, `Heap`, `Regex` opacos; os auxiliares do JSON gerado sem `pub`);
+  - um registro onde havia uma tupla (`parseUrl -> Url`).
+- **O prelúdio:** `tlsConnect` virou `startTls` (`connectTls` é o de `std.net`, que conecta e começa o TLS).
+- **As funções embutidas:** seguem a regra (`push`, `pop`, `add`, `remove` mudam no lugar; `sorted`, `upper`, `keys`
+  dão valores). Fica `replace`, a exceção conhecida: renomeá-la custaria a todo programa, e o compilador, que a
+  usa, é construído pela 0.9.2.
+- **A API C:** o `QkDiagnostic` guarda os textos como ponteiros (antes, cortados a 96 e 320 bytes) e diz o arquivo.
+  O resto do cabeçalho já era de tamanhos fixos e versionado (`QUARK_VERSION`, o `magic` do programa estático).
+- **A sintaxe:** nenhuma forma provisória no parser nem no `canon.qk`; as 28 palavras e as formas canônicas ficam.
+- **Fora da promessa, ditos no STABILITY.md:** `std.machine` (do runtime) e os dados de `std.zones`.
+
 ## 8. O que eu não faria
 
 - **Voltar à contagem de referências** como modelo geral: a medição já respondeu.

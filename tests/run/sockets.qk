@@ -48,20 +48,20 @@ fn main() {
     go(() => {
         for _ in 0..4 {
             let s = accept(web) ?? panic("accept")
-            go(() => handleConnection(s, route))
+            go(() => serveConnection(s, route))
         }
     })
     let out: Channel<Text> = channel()
     for path in ["/hello?name=Ana%20Lu", "/hello", "/x"] {
         go(() => {
-            send(out, match get("http://127.0.0.1:47912{path}") {
+            send(out, match httpGet("http://127.0.0.1:47912{path}") {
                 Ok(r) => "{r.status} {r.headers["content-type"] ?? "?"} {r.text()}"
                 Err(why) => "error: {why}"
             })
         })
     }
     go(() => {
-        send(out, match post("http://127.0.0.1:47912/echo", "a body".bytes(), contentType: "text/plain") {
+        send(out, match httpPost("http://127.0.0.1:47912/echo", "a body".bytes(), contentType: "text/plain") {
             Ok(r) => "{r.status} {r.text()}"
             Err(why) => "error: {why}"
         })
@@ -85,11 +85,11 @@ fn main() {
             "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;x=1\r\nhello\r\nB\r\n, in chunks\r\n0\r\nx-end: 1\r\n\r\n",
         )
         c.close()
-        handleConnection(accept(raw) ?? panic("accept"), route)
+        serveConnection(accept(raw) ?? panic("accept"), route)
     })
     let chunked: Channel<Text> = channel()
     go(() => {
-        send(chunked, match get("http://127.0.0.1:47914/") {
+        send(chunked, match httpGet("http://127.0.0.1:47914/") {
             Ok(r) => "{r.status} {r.text()}"
             Err(why) => "error: {why}"
         })
@@ -109,7 +109,7 @@ fn main() {
     }
     print(
         parseUrl("https://example.com"),
-        get("ftp://example.com") is Err(_),
+        httpGet("ftp://example.com") is Err(_),
         parseUrl("http://h:8080/a?b=1"),
         connect("127.0.0.1", 47913) is Err(_),
     )

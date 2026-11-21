@@ -139,7 +139,7 @@ pub effect fn closeSocket(socket: Socket) = runtime("net", "closeSocket", socket
 pub type Tls { handle: Int }
 
 // the handshake with the server at the other end of the socket
-pub effect fn tlsConnect(socket: Socket, serverName: Text) -> Tls! =
+pub effect fn startTls(socket: Socket, serverName: Text) -> Tls! =
     runtime("net", "tlsConnect", socket, serverName)
 
 // what the server said, decrypted, up to most bytes; none when it ended the connection
@@ -366,7 +366,7 @@ pub fn parseArgs(given: [Text], spec: [Arg]) -> Args! {
 }
 
 // the usage text: the program's line, then each flag and option with its help
-pub fn usage(program: Text, spec: [Arg], positional: Text = "") -> Text {
+pub fn argsUsage(program: Text, spec: [Arg], positional: Text = "") -> Text {
     var out = "usage: {program}" + (if len(spec) > 0 { " [options]" } else { "" })
     if positional != "" {
         out += " " + positional
@@ -399,10 +399,13 @@ pub fn usage(program: Text, spec: [Arg], positional: Text = "") -> Text {
         return r"""
 // Collections that are values: Queue (a double-ended queue) and Heap (a priority queue). A change gives a
 // new collection and leaves the old one as it was; the two share what they hold.
-pub enum Queue<T> { Empty, Items(front: Chain<T>, back: Chain<T>, size: Int) }
+// What they hold is theirs alone (opaque): emptyQueue(), queueOf(xs), emptyHeap(), heapOf(xs) make them.
+pub opaque type Queue<T> { rep: Deque<T> }
 
 // a min-heap: top() is the smallest by <, so T is a number, a text, or a type with compare
-pub enum Heap<T> { Empty, Node(size: Int, rank: Int, top: T, left: Heap<T>, right: Heap<T>) }
+pub opaque type Heap<T> { rep: Leftist<T> }
+enum Deque<T> { Empty, Items(front: Chain<T>, back: Chain<T>, size: Int) }
+enum Leftist<T> { Empty, Node(size: Int, rank: Int, top: T, left: Leftist<T>, right: Leftist<T>) }
 
 // a value ordered by its key alone, for a heap that ranks values by something else: Keyed(priority, job)
 pub type Keyed<K, V> { key: K, value: V }
@@ -414,96 +417,99 @@ pub fn Keyed.compare(self, b: Self) -> Int {
     if b.key < self.key { 1 } else { 0 }
 }
 
-// the values in order, first to last
-pub fn queueOf<T>(xs: [T]) -> Queue<T> = balance(chainOf(xs), .End, len(xs))
+// a queue with nothing in it
+pub fn emptyQueue<T>() -> Queue<T> = Queue(.Empty)
 
-pub fn Queue.size(self) -> Int = match self {
+// the values in order, first to last
+pub fn queueOf<T>(xs: [T]) -> Queue<T> = Queue(balance(chainOf(xs), .End, len(xs)))
+
+pub fn Queue.size(self) -> Int = match self.rep {
     Empty => 0
     Items(_, _, n) => n
 }
 
-pub fn Queue.isEmpty(self) -> Bool = self is Empty
+pub fn Queue.isEmpty(self) -> Bool = self.rep is Empty
 
 // the first value, or None
-pub fn Queue.front(self) -> T? = match self {
+pub fn Queue.front(self) -> T? = match self.rep {
     Empty => None
     Items(f, b, _) => if f.isEnd() { b.head() } else { f.head() }
 }
 
 // the last value, or None
-pub fn Queue.back(self) -> T? = match self {
+pub fn Queue.back(self) -> T? = match self.rep {
     Empty => None
     Items(f, b, _) => if b.isEnd() { f.head() } else { b.head() }
 }
 
 // the queue with x after the last
-pub fn Queue.pushBack(self, x: T) -> Self = match self {
+pub fn Queue.withBack(self, x: T) -> Self = Queue(match self.rep {
     Empty => .Items(.End, .Link(x, .End), 1)
     Items(f, b, n) => balance(f, .Link(x, b), n + 1)
-}
+})
 
 // the queue with x before the first
-pub fn Queue.pushFront(self, x: T) -> Self = match self {
+pub fn Queue.withFront(self, x: T) -> Self = Queue(match self.rep {
     Empty => .Items(.Link(x, .End), .End, 1)
     Items(f, b, n) => balance(.Link(x, f), b, n + 1)
-}
+})
 
 // the queue without its first value (an empty one stays empty)
-pub fn Queue.popFront(self) -> Self = match self {
-    Empty => self
+pub fn Queue.withoutFront(self) -> Self = Queue(match self.rep {
+    Empty => self.rep
     Items(f, b, n) => if f.isEnd() { .Empty } else { balance(f.tail(), b, n - 1) }
-}
+})
 
 // the queue without its last value (an empty one stays empty)
-pub fn Queue.popBack(self) -> Self = match self {
-    Empty => self
+pub fn Queue.withoutBack(self) -> Self = Queue(match self.rep {
+    Empty => self.rep
     Items(f, b, n) => if b.isEnd() { .Empty } else { balance(f, b.tail(), n - 1) }
-}
+})
 
 // the values, first to last
-pub fn Queue.toArray(self) -> [T] = match self {
+pub fn Queue.toArray(self) -> [T] = match self.rep {
     Empty => []
     Items(f, b, _) => f.toArray() + b.toArray().reversed()
 }
 
+// a heap with nothing in it
+pub fn emptyHeap<T>() -> Heap<T> = Heap(.Empty)
+
 // the values in a heap, smallest on top
 pub fn heapOf<T>(xs: [T]) -> Heap<T> {
-    var h: Heap<T> = .Empty
+    var h: Leftist<T> = .Empty
     for x in xs {
-        h = h.push(x)
+        h = meld(h, .Node(1, 1, x, .Empty, .Empty))
     }
-    h
+    Heap(h)
 }
 
-pub fn Heap.size(self) -> Int = match self {
-    Empty => 0
-    Node(n, _, _, _, _) => n
-}
+pub fn Heap.size(self) -> Int = self.rep.size()
 
-pub fn Heap.isEmpty(self) -> Bool = self is Empty
+pub fn Heap.isEmpty(self) -> Bool = self.rep is Empty
 
 // the smallest value, or None
-pub fn Heap.top(self) -> T? = match self {
+pub fn Heap.top(self) -> T? = match self.rep {
     Empty => None
     Node(_, _, x, _, _) => x
 }
 
 // the heap with x in it
-pub fn Heap.push(self, x: T) -> Self = meld(self, .Node(1, 1, x, .Empty, .Empty))
+pub fn Heap.added(self, x: T) -> Self = Heap(meld(self.rep, .Node(1, 1, x, .Empty, .Empty)))
 
 // the heap without its smallest value (an empty one stays empty)
-pub fn Heap.pop(self) -> Self = match self {
+pub fn Heap.withoutTop(self) -> Self = match self.rep {
     Empty => self
-    Node(_, _, _, l, r) => meld(l, r)
+    Node(_, _, _, l, r) => Heap(meld(l, r))
 }
 
 // both heaps' values in one
-pub fn Heap.merge(self, b: Self) -> Self = meld(self, b)
+pub fn Heap.merged(self, b: Self) -> Self = Heap(meld(self.rep, b.rep))
 
 // the values, smallest first
 pub fn Heap.toArray(self) -> [T] {
     var out: [T] = []
-    var h = self
+    var h = self.rep
     while h is Node(_, _, x, l, r) {
         out.push(x)
         h = meld(l, r)
@@ -546,7 +552,7 @@ fn Chain.toArray(self) -> [T] {
 
 // a queue whose sides are both full once it holds two values, so its two ends are each a step away: when
 // one side runs out, it takes half the other's (a cost spread over the steps that emptied it)
-fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Queue<T> {
+fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Deque<T> {
     if n == 0 {
         return .Empty
     }
@@ -557,13 +563,18 @@ fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Queue<T> {
     .Items(chainOf(xs[..n / 2]), chainOf(xs[n / 2..].reversed()), n)
 }
 
-fn rank<T>(h: Heap<T>) -> Int = match h {
+fn Leftist.size(self) -> Int = match self {
+    Empty => 0
+    Node(n, _, _, _, _) => n
+}
+
+fn rank<T>(h: Leftist<T>) -> Int = match h {
     Empty => 0
     Node(_, r, _, _, _) => r
 }
 
 // a node over two heaps, the one of higher rank on the left (a leftist heap: its right spine is short)
-fn node<T>(x: T, a: Heap<T>, b: Heap<T>) -> Heap<T> {
+fn node<T>(x: T, a: Leftist<T>, b: Leftist<T>) -> Leftist<T> {
     let n = a.size() + b.size() + 1
     if rank(a) >= rank(b) {
         .Node(n, rank(b) + 1, x, a, b)
@@ -572,7 +583,7 @@ fn node<T>(x: T, a: Heap<T>, b: Heap<T>) -> Heap<T> {
     }
 }
 
-fn meld<T>(a: Heap<T>, b: Heap<T>) -> Heap<T> = match a {
+fn meld<T>(a: Leftist<T>, b: Leftist<T>) -> Leftist<T> = match a {
     Empty => b
     Node(_, _, x, al, ar) => match b {
         Empty => a
@@ -1291,7 +1302,7 @@ pub fn sha256Hex(text: Text) -> Text = hex(sha256(text.bytes()))
 //
 //     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
 //     fn main() {
-//         serve("127.0.0.1", 8080, hello)? // never returns: each request in a task of its own
+//         serveHttp("127.0.0.1", 8080, hello)? // never returns: each request in a task of its own
 //     }
 use std.net
 use std.encoding
@@ -1481,7 +1492,7 @@ pub fn writeResponse(c: Conn, r: Response) -> Unit! =
 
 // one connection: its request read, the handler's response written, the connection closed (a request that cannot
 // be read: 400)
-pub fn handleConnection(socket: Socket, handler: effect (Request) -> Response) {
+pub fn serveConnection(socket: Socket, handler: effect (Request) -> Response) {
     let c = conn(socket)
     match readRequest(c) {
         Ok((request, c2)) => {
@@ -1496,19 +1507,23 @@ pub fn handleConnection(socket: Socket, handler: effect (Request) -> Response) {
 
 // a server on host:port: each connection in a task of its own, the handler called for each request. It runs until
 // the program ends (Err when it cannot listen).
-pub fn serve(host: Text, port: Int, handler: effect (Request) -> Response) -> Unit! {
+pub fn serveHttp(host: Text, port: Int, handler: effect (Request) -> Response) -> Unit! {
     let server = listen(host, port)?
     go(() => {
         while accept(server) is Ok(socket) {
-            go(() => handleConnection(socket, handler))
+            go(() => serveConnection(socket, handler))
         }
     })
     runTasks()
     Ok(())
 }
 
-// http://host[:port]/path?query (https://: over TLS): (host, port, the path with its query)
-pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
+// a URL's parts: https:// (over TLS) or http://, the host, the port (443 or 80 when it says none), and the path
+// with its query ("/" when it has none)
+pub type Url { secure: Bool, host: Text, port: Int, path: Text }
+
+// http://host[:port]/path?query, or https://
+pub fn parseUrl(url: Text) -> Url! {
     let secure = url.startsWith("https://")
     if not secure and not url.startsWith("http://") {
         return Err("not an http:// or https:// URL: {url}")
@@ -1520,27 +1535,26 @@ pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
     let colon = authority.indexOf(":")
     if colon is Some(i) {
         let port = authority[i + 1..].parseInt().mapErr(why => "the port: {why}")?
-        return Ok((authority[..i], port, target))
+        return Ok(Url(secure, authority[..i], port, target))
     }
-    Ok((authority, if secure { 443 } else { 80 }, target))
+    Ok(Url(secure, authority, if secure { 443 } else { 80 }, target))
 }
 
 // a request to url: its method, its headers (names in lower case) and its body; the response
-pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
-    let (host, port, target) = parseUrl(url)?
-    let secure = url.startsWith("https://")
-    let c = if secure {
-        connectTls(host, port)?
+pub fn httpRequest(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
+    let u = parseUrl(url)?
+    let c = if u.secure {
+        connectTls(u.host, u.port)?
     } else {
-        conn(connect(host, port)?)
+        conn(connect(u.host, u.port)?)
     }
     var all = headers
-    all["host"] = if port == (if secure { 443 } else { 80 }) {
-        host
+    all["host"] = if u.port == (if u.secure { 443 } else { 80 }) {
+        u.host
     } else {
-        "{host}:{port}"
+        "{u.host}:{u.port}"
     }
-    let sent = c.writeBytes(head("{method} {target} HTTP/1.1", all, body))
+    let sent = c.writeBytes(head("{method} {u.path} HTTP/1.1", all, body))
     if sent is Err(why) {
         c.close()
         return Err(why)
@@ -1560,11 +1574,11 @@ pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] 
 }
 
 // GET url
-pub fn get(url: Text) -> Response! = request("GET", url)
+pub fn httpGet(url: Text) -> Response! = httpRequest("GET", url)
 
 // POST url with a body
-pub fn post(url: Text, body: Bytes, contentType: Text = "application/octet-stream") -> Response! =
-    request("POST", url, body, ["content-type": contentType])
+pub fn httpPost(url: Text, body: Bytes, contentType: Text = "application/octet-stream") -> Response! =
+    httpRequest("POST", url, body, ["content-type": contentType])
 """ + "\n"
     }
     if name == "json" {
@@ -1635,8 +1649,8 @@ pub fn Json.text(self) -> Text? = match self {
 // object of its fields; an array a list; a map from Text (or Int, as text) an object; an optional null when None; a
 // tuple a list; Int, Float, Bool and Text themselves. A field missing from an object takes its default, and an
 // optional one None.
-//   let text = encode(Person("Ana", 34, ["x"]))       // {"name":"Ana","age":34,"tags":["x"]}
-//   let p: Person = decode(text)?
+//   let text = encodeJson(Person("Ana", 34, ["x"]))       // {"name":"Ana","age":34,"tags":["x"]}
+//   let p: Person = decodeJson(text)?
 // v as JSON
 pub fn jsonOf<T>(value: T) -> Json = Json.Null
 
@@ -1644,10 +1658,10 @@ pub fn jsonOf<T>(value: T) -> Json = Json.Null
 pub fn fromJson<T>(j: Json) -> T! = Err("JSON: no reading for this type")
 
 // v as JSON text, on one line
-pub fn encode<T>(value: T) -> Text = toJson(jsonOf(value))
+pub fn encodeJson<T>(value: T) -> Text = toJson(jsonOf(value))
 
 // the T this JSON text is, or why it is not one
-pub fn decode<T>(text: Text) -> T! {
+pub fn decodeJson<T>(text: Text) -> T! {
     let got: T! = fromJson(parseJson(text)?)
     got
 }
@@ -1674,7 +1688,7 @@ pub fn Json.items(self) -> [Json]? = match self {
     _ => None
 }
 
-pub fn intOfJson(j: Json) -> Int! {
+fn intOfJson(j: Json) -> Int! {
     if j.integer() is Some(n) {
         return n
     }
@@ -1684,18 +1698,17 @@ pub fn intOfJson(j: Json) -> Int! {
     Err("JSON: an Int, not {j.kindName()}")
 }
 
-pub fn floatOfJson(j: Json) -> Float! =
-    j.number() ?? return Err("JSON: a number, not {j.kindName()}")
+fn floatOfJson(j: Json) -> Float! = j.number() ?? return Err("JSON: a number, not {j.kindName()}")
 
-pub fn boolOfJson(j: Json) -> Bool! = match j {
+fn boolOfJson(j: Json) -> Bool! = match j {
     Bool(b) => b
     _ => Err("JSON: true or false, not {j.kindName()}")
 }
 
-pub fn textOfJson(j: Json) -> Text! = j.text() ?? return Err("JSON: a text, not {j.kindName()}")
+fn textOfJson(j: Json) -> Text! = j.text() ?? return Err("JSON: a text, not {j.kindName()}")
 
 // field name of an object as a T: its error said with its name
-pub fn fieldFromJson<T>(fields: [Text: Json], name: Text) -> T! {
+fn fieldFromJson<T>(fields: [Text: Json], name: Text) -> T! {
     let got: T! = fromJson(fields[name] ?? Json.Null)
     match got {
         Ok(v) => v
@@ -1704,7 +1717,7 @@ pub fn fieldFromJson<T>(fields: [Text: Json], name: Text) -> T! {
 }
 
 // an optional field: None when it is missing or null (none: None, which tells E)
-pub fn optionFieldFromJson<E>(fields: [Text: Json], name: Text, none: E?) -> E?! {
+fn optionFieldFromJson<E>(fields: [Text: Json], name: Text, none: E?) -> E?! {
     let j = fields[name] ?? Json.Null
     if j == Json.Null {
         return Ok(none)
@@ -1717,7 +1730,7 @@ pub fn optionFieldFromJson<E>(fields: [Text: Json], name: Text, none: E?) -> E?!
 }
 
 // a list as [E] (out: an empty one, of the type)
-pub fn listFromJson<E>(j: Json, out: [E]) -> [E]! {
+fn listFromJson<E>(j: Json, out: [E]) -> [E]! {
     let items = j.items() ?? return Err("JSON: a list, not {j.kindName()}")
     var r = out
     for (i, x) in items.enumerate() {
@@ -1731,7 +1744,7 @@ pub fn listFromJson<E>(j: Json, out: [E]) -> [E]! {
 }
 
 // an object as [Text: V]
-pub fn mapFromJson<V>(j: Json, out: [Text: V]) -> [Text: V]! {
+fn mapFromJson<V>(j: Json, out: [Text: V]) -> [Text: V]! {
     let fields = j.fields() ?? return Err("JSON: an object, not {j.kindName()}")
     var r = out
     for (k, x) in fields {
@@ -1747,7 +1760,7 @@ pub fn mapFromJson<V>(j: Json, out: [Text: V]) -> [Text: V]! {
 }
 
 // an object as [Int: V]: its keys whole numbers
-pub fn intMapFromJson<V>(j: Json, out: [Int: V]) -> [Int: V]! {
+fn intMapFromJson<V>(j: Json, out: [Int: V]) -> [Int: V]! {
     let fields = j.fields() ?? return Err("JSON: an object, not {j.kindName()}")
     var r = out
     for (k, x) in fields {
@@ -1764,7 +1777,7 @@ pub fn intMapFromJson<V>(j: Json, out: [Int: V]) -> [Int: V]! {
 }
 
 // null as None, anything else as Some
-pub fn optionFromJson<E>(j: Json, none: E?) -> E?! {
+fn optionFromJson<E>(j: Json, none: E?) -> E?! {
     if j == Json.Null {
         return Ok(none)
     }
@@ -1776,7 +1789,7 @@ pub fn optionFromJson<E>(j: Json, none: E?) -> E?! {
 }
 
 // a tuple's item i
-pub fn itemFromJson<E>(items: [Json], i: Int) -> E! {
+fn itemFromJson<E>(items: [Json], i: Int) -> E! {
     let got: E! = fromJson(items.get(i) ?? return Err("JSON: the tuple has no item {i}"))
     match got {
         Ok(v) => v
@@ -1785,7 +1798,7 @@ pub fn itemFromJson<E>(items: [Json], i: Int) -> E! {
 }
 
 // an enum's case in JSON: its name, and the object of its fields ({} for a case without data)
-pub fn caseOfJson(j: Json, typeName: Text) -> (Text, [Text: Json])! {
+fn caseOfJson(j: Json, typeName: Text) -> (Text, [Text: Json])! {
     let none: [Text: Json] = [:]
     match j {
         Str(name) => (name, none)
@@ -2179,7 +2192,7 @@ pub fn conn(socket: Socket) -> Conn = Conn(socket)
 // a connection to host:port over TLS, the server's certificate checked for host by the system's trust
 pub fn connectTls(host: Text, port: Int = 443) -> Conn! {
     let socket = connect(host, port)?
-    match tlsConnect(socket, host) {
+    match startTls(socket, host) {
         Ok(t) => Ok(Conn(socket, tls: Some(t)))
         Err(why) => {
             closeSocket(socket)
@@ -2298,7 +2311,7 @@ pub fn Conn.close(self) = if self.tls is Some(t) {
 //
 // joinPath(a, b): b after a, with one separator between; an absolute b stands alone
 pub fn joinPath(a: Text, b: Text) -> Text {
-    if a == "" or isAbsolute(b) {
+    if a == "" or isAbsolutePath(b) {
         return b
     }
     if b == "" {
@@ -2309,7 +2322,7 @@ pub fn joinPath(a: Text, b: Text) -> Text {
 
 // the path without "." parts, separators doubled or at the end, or a part followed by ".." (at the root,
 // ".." stays there); "a/./b/../c/" is "a/c", and an empty path is "."
-pub fn normalize(path: Text) -> Text {
+pub fn normalizePath(path: Text) -> Text {
     let r = root(path)
     var parts: [Text] = []
     for p in partsOf(path[len(r)..]) {
@@ -2327,13 +2340,13 @@ pub fn normalize(path: Text) -> Text {
 
 // the parts after the root: "/usr/lib/" is ["usr", "lib"]
 pub fn pathParts(path: Text) -> [Text] {
-    let n = normalize(path)
+    let n = normalizePath(path)
     if n == "." { [] } else { partsOf(n[len(root(n))..]) }
 }
 
 // the folder the path is in: "a/b/c.txt" is "a/b", "c.txt" is ".", and a root is itself
-pub fn parent(path: Text) -> Text {
-    let n = normalize(path)
+pub fn parentPath(path: Text) -> Text {
+    let n = normalizePath(path)
     let r = root(n)
     let parts = partsOf(n[len(r)..])
     if len(parts) == 0 {
@@ -2353,24 +2366,24 @@ pub fn fileName(path: Text) -> Text {
 }
 
 // the file name's text after its last dot, without it: "a/b.tar.gz" is "gz"; ".profile" and "make" have none
-pub fn extension(path: Text) -> Text = splitName(fileName(path)).1
+pub fn fileExtension(path: Text) -> Text = splitName(fileName(path)).1
 
 // the file name without its extension: "a/b.tar.gz" is "b.tar"
-pub fn stem(path: Text) -> Text = splitName(fileName(path)).0
+pub fn fileStem(path: Text) -> Text = splitName(fileName(path)).0
 
 // the path with its file name's extension changed (or added, or taken away with "")
 pub fn withExtension(path: Text, ext: Text) -> Text {
     let old = fileName(path)
     if old == "" or old == ".." {
-        return normalize(path)
+        return normalizePath(path)
     }
-    let name = stem(path) + (if ext == "" { "" } else { "." + ext })
-    let up = parent(path)
+    let name = fileStem(path) + (if ext == "" { "" } else { "." + ext })
+    let up = parentPath(path)
     if up == "." { name } else { joinPath(up, name) }
 }
 
 // whether it starts at a root: "/x", "\x", "C:/x", "C:\x"
-pub fn isAbsolute(path: Text) -> Bool = root(path).endsWith("/")
+pub fn isAbsolutePath(path: Text) -> Bool = root(path).endsWith("/")
 
 // the path with \ between its parts, as Windows writes it
 pub fn windowsPath(path: Text) -> Text = path.replace("/", "\\")
@@ -2415,7 +2428,7 @@ fn partsOf(path: Text) -> [Text] =
 // keeps, and (?: ) that keeps none. A character is a code point: . and a class match one, however many
 // bytes it takes. The first match is the leftmost, and among those the one the pattern prefers. A search
 // takes time in step with the text's length times the pattern's, never more.
-pub type Regex { pattern: Text, groups: Int, prog: [Inst] }
+pub opaque type Regex { pub pattern: Text, pub groups: Int, prog: [Inst] }
 
 // where a match is (bytes, as t[start..end] slices it), its text, and each group's ("" when it took no part)
 pub type Match { start: Int, end: Int, text: Text, groups: [Text] }
@@ -3280,10 +3293,10 @@ pub fn Date.weekday(self) -> Weekday = match (self.days() + 3) % 7 {
 }
 
 // the date n days later (earlier, for n below 0)
-pub fn Date.addDays(self, n: Int) -> Self = dateOfDays(self.days() + n)
+pub fn Date.plusDays(self, n: Int) -> Self = dateOfDays(self.days() + n)
 
 // the same day n months later, or the month's last day when it has fewer: 01-31 plus a month is 02-28
-pub fn Date.addMonths(self, n: Int) -> Self {
+pub fn Date.plusMonths(self, n: Int) -> Self {
     let m = self.year * 12 + self.month - 1 + n
     let year = m / 12
     let month = m % 12 + 1
@@ -3307,10 +3320,10 @@ pub fn DateTime.seconds(self) -> Float = toFloat(self.milliseconds()) / 1000
 
 pub fn DateTime.weekday(self) -> Weekday = self.date().weekday()
 
-pub fn DateTime.addSeconds(self, s: Float) -> Self = utc(self.seconds() + s)
+pub fn DateTime.plusSeconds(self, s: Float) -> Self = utc(self.seconds() + s)
 
-pub fn DateTime.addDays(self, n: Int) -> Self {
-    let d = self.date().addDays(n)
+pub fn DateTime.plusDays(self, n: Int) -> Self {
+    let d = self.date().plusDays(n)
     self with { year: d.year, month: d.month, day: d.day }
 }
 
@@ -3408,7 +3421,7 @@ pub fn parseDateTime(text: Text) -> DateTime! {
             at + 5
         }
         if oh >= 0 and oh <= 23 and om >= 0 and om <= 59 and end == len(b) {
-            return moment.addSeconds(toFloat(-sign * (oh * 3600 + om * 60)))
+            return moment.plusSeconds(toFloat(-sign * (oh * 3600 + om * 60)))
         }
     }
     Err("date: \"{t[at..]}\" is not Z or an offset (+hh:mm) in \"{text}\"")
@@ -3463,7 +3476,7 @@ fn padded(n: Int, width: Int) -> Text {
 }
 
 // now, in UTC
-pub fn now() -> DateTime = utc(unixTime())
+pub fn utcNow() -> DateTime = utc(unixTime())
 
 // the local date and time at that moment, by the system's time zone (its daylight saving time too)
 pub fn local(seconds: Float) -> DateTime = utc(seconds + toFloat(localOffset(seconds)))
@@ -4027,7 +4040,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "4136957319-2459698"
+pub const compilerSources = "1774999424-2461166"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]

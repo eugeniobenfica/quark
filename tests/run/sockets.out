@@ -5,4 +5,4 @@
 404 text/plain; charset=utf-8 no page /x
 200 hello, in chunks
 POST 7 bytes: abcdefg
-Ok((example.com, 443, /)) true Ok((h, 8080, /a?b=1)) true
+Ok(Url(secure: true, host: example.com, port: 443, path: /)) true Ok(Url(secure: false, host: h, port: 8080, path: /a?b=1)) true

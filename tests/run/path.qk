@@ -10,11 +10,29 @@ fn main() {
         joinPath("", "z"),
     )
     for p in ["a/./b/../c/", "/../x//y/.", "../../a", "a/..", "", "C:\\Users\\..\\Temp\\", "C:x\\..\\..", "./"] {
-        print("\"{p}\" -> \"{normalize(p)}\"", pathParts(p))
+        print("\"{p}\" -> \"{normalizePath(p)}\"", pathParts(p))
     }
     for p in ["a/b/c.txt", "c.txt", "/", "/usr", "..", "C:\\docs\\é.tar.gz", ".profile", "make", "notes."] {
-        print(p, "|", parent(p), "|", fileName(p), "|", extension(p), "|", stem(p), "|", withExtension(p, "md"))
+        print(
+            p,
+            "|",
+            parentPath(p),
+            "|",
+            fileName(p),
+            "|",
+            fileExtension(p),
+            "|",
+            fileStem(p),
+            "|",
+            withExtension(p, "md"),
+        )
     }
-    print(isAbsolute("/x"), isAbsolute("\\x"), isAbsolute("C:/x"), isAbsolute("C:x"), isAbsolute("x/y"))
-    print(windowsPath(normalize("C:/a//b/./c")), withExtension("a/b.txt", ""))
+    print(
+        isAbsolutePath("/x"),
+        isAbsolutePath("\\x"),
+        isAbsolutePath("C:/x"),
+        isAbsolutePath("C:x"),
+        isAbsolutePath("x/y"),
+    )
+    print(windowsPath(normalizePath("C:/a//b/./c")), withExtension("a/b.txt", ""))
 }

@@ -25,5 +25,5 @@ fn main() {
     let c = parseArgs(["-ofile", "--count", "z"], spec)?
     print(c.value("out"), c.int("count"), c.has("verbose"), parseArgs([], spec)?.int("count"))
     print(parseArgs(["--nope"], spec), parseArgs(["-o"], spec), parseArgs(["--verbose=1"], spec))
-    print(usage("tool", spec, positional: "FILE..."))
+    print(argsUsage("tool", spec, positional: "FILE..."))
 }

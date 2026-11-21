@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.12 (not yet released)
+
+### Changed: the freeze review
+
+The standard library read once more as the API 1.0 will keep ([STABILITY.md](docs/STABILITY.md#the-standard-librarys-names)).
+These renames break programs that use the old names; each is the same function.
+
+- **A name says what it is about without its module** (`use std.http` brings its names in beside a file's own):
+  - `std.http`: `get`, `post`, `request`, `serve`, `handleConnection` are `httpGet`, `httpPost`, `httpRequest`,
+    `serveHttp`, `serveConnection`;
+  - `std.path`: `normalize`, `parent`, `extension`, `stem`, `isAbsolute` are `normalizePath`, `parentPath`,
+    `fileExtension`, `fileStem`, `isAbsolutePath`;
+  - `std.json`: `encode`, `decode` are `encodeJson`, `decodeJson`;
+  - `std.time`: `now()` is `utcNow()`; `std.args`: `usage` is `argsUsage`;
+  - the prelude: `tlsConnect(socket, serverName)` is `startTls` (it starts TLS on a socket already connected).
+- **A function that gives a new value is named by what it gives:** `Queue`'s `pushBack`, `pushFront`, `popFront`,
+  `popBack` are `withBack`, `withFront`, `withoutFront`, `withoutBack`; `Heap`'s `push`, `pop`, `merge` are
+  `added`, `withoutTop`, `merged`; `Date`'s and `DateTime`'s `addDays`, `addMonths`, `addSeconds` are `plusDays`,
+  `plusMonths`, `plusSeconds`.
+- **Opaque where the parts are the type's business:** `Queue`, `Heap` (made by `emptyQueue()`, `queueOf(xs)`,
+  `emptyHeap()`, `heapOf(xs)`; `Queue.Empty` and `Heap.Empty` are gone) and `Regex` (`r.pattern`, `r.groups`).
+- **`parseUrl(url)`** gives a `Url` (`secure`, `host`, `port`, `path`), not a tuple.
+- **`std.json`'s helpers** for the code made for each type (`intOfJson`, `fieldFromJson`...) are no longer `pub`.
+- **The C API:** `QkDiagnostic` holds its texts as pointers (valid until the machine's next call), no longer cut
+  at 96 and 320 bytes, and says the file the diagnostic is in (`file`). Code that reads `d->message` and
+  `d->key[0]` compiles as before.
+
+### Added
+
+- **TLS** through the system's library (Schannel, OpenSSL loaded on first use, SecureTransport): `startTls`,
+  `readTls`, `writeTls`, `closeTls`; `connectTls` in `std.net`; `https://` in `std.http`, a server by name or by IP
+  address.
+- **Typed JSON:** `encodeJson(value)` and `decodeJson(text)` for records, enums, arrays, maps, optionals and
+  tuples, made by the checker for each type used.
+- **HTTP:** bodies in chunks (`Transfer-Encoding: chunked`) read, client and server; a response with no length
+  read to the connection's end.
+- **Subprocesses as streams:** `startProcess`, `writeProcess`, `readProcess`, `readProcessErrors`,
+  `closeProcessInput`, `waitProcess`, `killProcess`.
+- **Time zones by name:** `zone("Europe/Lisbon")` in `std.time`, from the system's TZif files or `std.zones`.
+- **Concurrency:** `Channel<T>` of any type; everything that waits is cooperative (a system call that waits runs
+  on a thread of its own); `cancel`, `withTimeout`, `receiveWithin`; structured concurrency (`scope`, `s.start`).
+- **The language:** `?` converts errors; interfaces with `Self` and default implementations; `pub` per field of an
+  opaque type; `owned` parameters (the function keeps and changes the value with no copy).
+- **Packages:** semantic versions (minimal version selection) and a registry (`index.toml`), `quark get` with a
+  hash.
+- **Tools:** the LSP across files (rename, references, implementations, types and effects on hover, incremental
+  diagnostics); `quark test --coverage`; properties in `std.testing` (`forAll`, generators, shrinking); `-g` debug
+  information (DWARF 4, CodeView, gdb's JIT interface); `wasm32-wasi` with the suite green.
+- **Guides:** coming from Go, Rust and Python; servers; the prelude's reference made by `quark doc`.
+
+### Faster, smaller
+
+- `records` from 1.95x to 1.44x C (the loop collector); the quick tier's optimizing and machine code on threads;
+  `quark run` of a small program in 20 ms; constants kept by content between builds.
+- Executables hold only the runtime the program reaches (hello: 911 to 136 KB); the Windows runtime needs only
+  kernel32 and ntdll; Floats written and read without C.
+- Large arrays grow where they are (reserved addresses): no copy, no old block left behind.
+- The compiler lowers, optimizes and makes machine code in batches, keeping only the code: its own rebuild peaks
+  at 2.1 GB (was 3.1).
+
 ## 0.9.2
 
 - **System V (x86-64 Linux and macOS).** 0.9.1 brought xmm8-15 back after a call into C over the call's result when

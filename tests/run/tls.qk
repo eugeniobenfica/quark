@@ -5,13 +5,13 @@
 use std.http
 use std.net
 
-fn page() -> Text = match get("https://example.com/") {
+fn page() -> Text = match httpGet("https://example.com/") {
     Ok(r) => "{r.status} {r.text().contains("Example Domain")}"
     Err(why) => if why.startsWith("cannot connect") { "200 true" } else { why }
 }
 
 // a server reached by its IP address: its certificate checked for the address
-fn byAddress() -> Text = match get("https://1.1.1.1/") {
+fn byAddress() -> Text = match httpGet("https://1.1.1.1/") {
     Ok(r) => "by address: {r.status < 500}"
     Err(why) => if why.startsWith("cannot connect") {
         "by address: true"
@@ -22,7 +22,7 @@ fn byAddress() -> Text = match get("https://1.1.1.1/") {
 
 fn refused() -> Text = match connect("example.com", 443) {
     Ok(s) => {
-        let no = tlsConnect(s, "quark.invalid") is Err(_)
+        let no = startTls(s, "quark.invalid") is Err(_)
         closeSocket(s)
         "{no}"
     }

@@ -29,7 +29,7 @@ pub fn conn(socket: Socket) -> Conn = Conn(socket)
 // a connection to host:port over TLS, the server's certificate checked for host by the system's trust
 pub fn connectTls(host: Text, port: Int = 443) -> Conn! {
     let socket = connect(host, port)?
-    match tlsConnect(socket, host) {
+    match startTls(socket, host) {
         Ok(t) => Ok(Conn(socket, tls: Some(t)))
         Err(why) => {
             closeSocket(socket)

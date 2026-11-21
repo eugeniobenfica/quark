@@ -70,7 +70,7 @@ says `implements`. An interface's function may have a default body, and an inter
 
 **What is not there:** `nil`, pointers, `panic`/`recover` as control flow (a panic stops the program, or in a host
 the call), `init()` functions, package-level mutable state (a `const` is computed when compiling, once), struct
-tags (typed JSON is made from the type itself: `encode(v)`, `let p: Person = decode(text)?`).
+tags (typed JSON is made from the type itself: `encodeJson(v)`, `let p: Person = decodeJson(text)?`).
 
 ## Coming from Rust
 

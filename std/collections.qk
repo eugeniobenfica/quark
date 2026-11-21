@@ -1,9 +1,12 @@
 // Collections that are values: Queue (a double-ended queue) and Heap (a priority queue). A change gives a
 // new collection and leaves the old one as it was; the two share what they hold.
-pub enum Queue<T> { Empty, Items(front: Chain<T>, back: Chain<T>, size: Int) }
+// What they hold is theirs alone (opaque): emptyQueue(), queueOf(xs), emptyHeap(), heapOf(xs) make them.
+pub opaque type Queue<T> { rep: Deque<T> }
 
 // a min-heap: top() is the smallest by <, so T is a number, a text, or a type with compare
-pub enum Heap<T> { Empty, Node(size: Int, rank: Int, top: T, left: Heap<T>, right: Heap<T>) }
+pub opaque type Heap<T> { rep: Leftist<T> }
+enum Deque<T> { Empty, Items(front: Chain<T>, back: Chain<T>, size: Int) }
+enum Leftist<T> { Empty, Node(size: Int, rank: Int, top: T, left: Leftist<T>, right: Leftist<T>) }
 
 // a value ordered by its key alone, for a heap that ranks values by something else: Keyed(priority, job)
 pub type Keyed<K, V> { key: K, value: V }
@@ -15,96 +18,99 @@ pub fn Keyed.compare(self, b: Self) -> Int {
     if b.key < self.key { 1 } else { 0 }
 }
 
-// the values in order, first to last
-pub fn queueOf<T>(xs: [T]) -> Queue<T> = balance(chainOf(xs), .End, len(xs))
+// a queue with nothing in it
+pub fn emptyQueue<T>() -> Queue<T> = Queue(.Empty)
 
-pub fn Queue.size(self) -> Int = match self {
+// the values in order, first to last
+pub fn queueOf<T>(xs: [T]) -> Queue<T> = Queue(balance(chainOf(xs), .End, len(xs)))
+
+pub fn Queue.size(self) -> Int = match self.rep {
     Empty => 0
     Items(_, _, n) => n
 }
 
-pub fn Queue.isEmpty(self) -> Bool = self is Empty
+pub fn Queue.isEmpty(self) -> Bool = self.rep is Empty
 
 // the first value, or None
-pub fn Queue.front(self) -> T? = match self {
+pub fn Queue.front(self) -> T? = match self.rep {
     Empty => None
     Items(f, b, _) => if f.isEnd() { b.head() } else { f.head() }
 }
 
 // the last value, or None
-pub fn Queue.back(self) -> T? = match self {
+pub fn Queue.back(self) -> T? = match self.rep {
     Empty => None
     Items(f, b, _) => if b.isEnd() { f.head() } else { b.head() }
 }
 
 // the queue with x after the last
-pub fn Queue.pushBack(self, x: T) -> Self = match self {
+pub fn Queue.withBack(self, x: T) -> Self = Queue(match self.rep {
     Empty => .Items(.End, .Link(x, .End), 1)
     Items(f, b, n) => balance(f, .Link(x, b), n + 1)
-}
+})
 
 // the queue with x before the first
-pub fn Queue.pushFront(self, x: T) -> Self = match self {
+pub fn Queue.withFront(self, x: T) -> Self = Queue(match self.rep {
     Empty => .Items(.Link(x, .End), .End, 1)
     Items(f, b, n) => balance(.Link(x, f), b, n + 1)
-}
+})
 
 // the queue without its first value (an empty one stays empty)
-pub fn Queue.popFront(self) -> Self = match self {
-    Empty => self
+pub fn Queue.withoutFront(self) -> Self = Queue(match self.rep {
+    Empty => self.rep
     Items(f, b, n) => if f.isEnd() { .Empty } else { balance(f.tail(), b, n - 1) }
-}
+})
 
 // the queue without its last value (an empty one stays empty)
-pub fn Queue.popBack(self) -> Self = match self {
-    Empty => self
+pub fn Queue.withoutBack(self) -> Self = Queue(match self.rep {
+    Empty => self.rep
     Items(f, b, n) => if b.isEnd() { .Empty } else { balance(f, b.tail(), n - 1) }
-}
+})
 
 // the values, first to last
-pub fn Queue.toArray(self) -> [T] = match self {
+pub fn Queue.toArray(self) -> [T] = match self.rep {
     Empty => []
     Items(f, b, _) => f.toArray() + b.toArray().reversed()
 }
 
+// a heap with nothing in it
+pub fn emptyHeap<T>() -> Heap<T> = Heap(.Empty)
+
 // the values in a heap, smallest on top
 pub fn heapOf<T>(xs: [T]) -> Heap<T> {
-    var h: Heap<T> = .Empty
+    var h: Leftist<T> = .Empty
     for x in xs {
-        h = h.push(x)
+        h = meld(h, .Node(1, 1, x, .Empty, .Empty))
     }
-    h
+    Heap(h)
 }
 
-pub fn Heap.size(self) -> Int = match self {
-    Empty => 0
-    Node(n, _, _, _, _) => n
-}
+pub fn Heap.size(self) -> Int = self.rep.size()
 
-pub fn Heap.isEmpty(self) -> Bool = self is Empty
+pub fn Heap.isEmpty(self) -> Bool = self.rep is Empty
 
 // the smallest value, or None
-pub fn Heap.top(self) -> T? = match self {
+pub fn Heap.top(self) -> T? = match self.rep {
     Empty => None
     Node(_, _, x, _, _) => x
 }
 
 // the heap with x in it
-pub fn Heap.push(self, x: T) -> Self = meld(self, .Node(1, 1, x, .Empty, .Empty))
+pub fn Heap.added(self, x: T) -> Self = Heap(meld(self.rep, .Node(1, 1, x, .Empty, .Empty)))
 
 // the heap without its smallest value (an empty one stays empty)
-pub fn Heap.pop(self) -> Self = match self {
+pub fn Heap.withoutTop(self) -> Self = match self.rep {
     Empty => self
-    Node(_, _, _, l, r) => meld(l, r)
+    Node(_, _, _, l, r) => Heap(meld(l, r))
 }
 
 // both heaps' values in one
-pub fn Heap.merge(self, b: Self) -> Self = meld(self, b)
+pub fn Heap.merged(self, b: Self) -> Self = Heap(meld(self.rep, b.rep))
 
 // the values, smallest first
 pub fn Heap.toArray(self) -> [T] {
     var out: [T] = []
-    var h = self
+    var h = self.rep
     while h is Node(_, _, x, l, r) {
         out.push(x)
         h = meld(l, r)
@@ -147,7 +153,7 @@ fn Chain.toArray(self) -> [T] {
 
 // a queue whose sides are both full once it holds two values, so its two ends are each a step away: when
 // one side runs out, it takes half the other's (a cost spread over the steps that emptied it)
-fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Queue<T> {
+fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Deque<T> {
     if n == 0 {
         return .Empty
     }
@@ -158,13 +164,18 @@ fn balance<T>(f: Chain<T>, b: Chain<T>, n: Int) -> Queue<T> {
     .Items(chainOf(xs[..n / 2]), chainOf(xs[n / 2..].reversed()), n)
 }
 
-fn rank<T>(h: Heap<T>) -> Int = match h {
+fn Leftist.size(self) -> Int = match self {
+    Empty => 0
+    Node(n, _, _, _, _) => n
+}
+
+fn rank<T>(h: Leftist<T>) -> Int = match h {
     Empty => 0
     Node(_, r, _, _, _) => r
 }
 
 // a node over two heaps, the one of higher rank on the left (a leftist heap: its right spine is short)
-fn node<T>(x: T, a: Heap<T>, b: Heap<T>) -> Heap<T> {
+fn node<T>(x: T, a: Leftist<T>, b: Leftist<T>) -> Leftist<T> {
     let n = a.size() + b.size() + 1
     if rank(a) >= rank(b) {
         .Node(n, rank(b) + 1, x, a, b)
@@ -173,7 +184,7 @@ fn node<T>(x: T, a: Heap<T>, b: Heap<T>) -> Heap<T> {
     }
 }
 
-fn meld<T>(a: Heap<T>, b: Heap<T>) -> Heap<T> = match a {
+fn meld<T>(a: Leftist<T>, b: Leftist<T>) -> Leftist<T> = match a {
     Empty => b
     Node(_, _, x, al, ar) => match b {
         Empty => a

@@ -30,21 +30,21 @@ fn main() {
         (7, "z"),
         true,
     )
-    let text = encode(p)
+    let text = encodeJson(p)
     print(text)
-    let back: Person = decode(text)?
+    let back: Person = decodeJson(text)?
     print(back == p, back)
-    let short: Person = decode(
+    let short: Person = decodeJson(
         "\{\"name\":\"Bo\",\"age\":5,\"tags\":[],\"shapes\":[\"Dot\"],\"scores\":\{\},\"pair\":[1,\"a\"],\"ok\":false\}",
     )?
     print(short.port, short.pet)
-    let bad: Person! = decode("\{\"name\":\"Bo\",\"age\":\"five\"\}")
+    let bad: Person! = decodeJson("\{\"name\":\"Bo\",\"age\":\"five\"\}")
     print(bad)
-    let xs: [Int] = decode("[1, 2, 3]")?
-    print(xs, encode([1.5, 2.0]), encode(["k": [true]]))
-    let b: Box<Int> = decode(encode(Box(3, "n")))?
-    let m: [Int: [Box<Text>]] = decode("\{\"1\": [\{\"value\": \"a\", \"label\": \"l\"\}]\}")?
+    let xs: [Int] = decodeJson("[1, 2, 3]")?
+    print(xs, encodeJson([1.5, 2.0]), encodeJson(["k": [true]]))
+    let b: Box<Int> = decodeJson(encodeJson(Box(3, "n")))?
+    let m: [Int: [Box<Text>]] = decodeJson("\{\"1\": [\{\"value\": \"a\", \"label\": \"l\"\}]\}")?
     print(b, m)
-    let wrong: [Shape]! = decode("[\"Dot\", \"Hexagon\"]")
+    let wrong: [Shape]! = decodeJson("[\"Dot\", \"Hexagon\"]")
     print(wrong)
 }

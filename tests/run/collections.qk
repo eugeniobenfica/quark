@@ -6,38 +6,38 @@ type Job { name: Text, cost: Int }
 fn Job.compare(self, b: Job) -> Int = self.cost - b.cost
 
 fn main() {
-    var q: Queue<Int> = .Empty
-    print(q.isEmpty(), q.front(), q.popFront().size())
+    var q: Queue<Int> = emptyQueue()
+    print(q.isEmpty(), q.front(), q.withoutFront().size())
     for i in 1..6 {
-        q = q.pushBack(i)
+        q = q.withBack(i)
     }
-    q = q.pushFront(0)
+    q = q.withFront(0)
     let before = q
-    q = q.popFront().popBack()
+    q = q.withoutFront().withoutBack()
     print(q.toArray(), q.front(), q.back(), q.size(), before.toArray())
     var drained: [Int] = []
-    var r = queueOf([10, 20, 30, 40, 50, 60, 70]).pushFront(5)
+    var r = queueOf([10, 20, 30, 40, 50, 60, 70]).withFront(5)
     while not r.isEmpty() {
         drained.push(r.back() ?? -1)
-        r = r.popBack()
+        r = r.withoutBack()
     }
     print(drained)
     var big = queueOf(["a"])
     for i in 0..100_000 {
-        big = big.pushBack("{i}").popFront()
+        big = big.withBack("{i}").withoutFront()
     }
     print(big.size(), big.front())
     let h = heapOf([5, 1, 4, 1, 3, 9, 2])
-    print(h.top(), h.size(), h.toArray(), h.pop().pop().top(), h.top())
-    print(heapOf(["pear", "fig", "apple"]).toArray(), h.merge(heapOf([0, 7])).toArray())
-    var jobs: Heap<Job> = .Empty
-    jobs = jobs.push(Job("build", 30)).push(Job("test", 10)).push(Job("ship", 50))
+    print(h.top(), h.size(), h.toArray(), h.withoutTop().withoutTop().top(), h.top())
+    print(heapOf(["pear", "fig", "apple"]).toArray(), h.merged(heapOf([0, 7])).toArray())
+    var jobs: Heap<Job> = emptyHeap()
+    jobs = jobs.added(Job("build", 30)).added(Job("test", 10)).added(Job("ship", 50))
     print((jobs.top() ?? Job("none", 0)).name, jobs.toArray().map(j => j.name))
     let ranked = heapOf([Keyed(3.5, "c"), Keyed(1.0, "a"), Keyed(2.0, "b")])
     print(ranked.toArray().map(k => k.value), (ranked.top() ?? Keyed(0.0, "")).value)
-    var many: Heap<Int> = .Empty
+    var many: Heap<Int> = emptyHeap()
     for i in 0..10_000 {
-        many = many.push(i * 7919 % 10_007)
+        many = many.added(i * 7919 % 10_007)
     }
     print(many.size(), many.top(), many.toArray()[..5])
 }

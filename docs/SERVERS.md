@@ -6,7 +6,7 @@ needs a framework.
 
 ## A handler is a function
 
-`serve(host, port, handler)` listens, and runs each connection in a task of its own: a slow request waits only
+`serveHttp(host, port, handler)` listens, and runs each connection in a task of its own: a slow request waits only
 itself, and when every task waits the process sleeps until a socket is ready, so idle connections cost nothing. The
 handler takes a `Request` (`method`, `path`, `query`, `headers` with lower-case names, `body`) and gives a
 `Response`.
@@ -21,7 +21,7 @@ fn page(r: Request) -> Response = match r.path {
 }
 
 fn main() {
-    serve("0.0.0.0", 8080, page)?
+    serveHttp("0.0.0.0", 8080, page)?
 }
 ```
 
@@ -30,7 +30,7 @@ with a part that varies is `r.path.split("/")`, matched as an array, or tested w
 
 ## JSON in and out
 
-`std.json`'s `encode(value)` writes any record, enum, array, map or optional as JSON, and `decode(text)` reads one
+`std.json`'s `encodeJson(value)` writes any record, enum, array, map or optional as JSON, and `decodeJson(text)` reads one
 back by the type it goes into, a field's default standing for one that is missing. An error says where it is
 (`title: JSON: a text, not a number`), so it can go back to the client as it is.
 
@@ -41,16 +41,16 @@ use std.json
 type Todo { id: Int, title: Text, done: Bool = false }
 
 fn added(r: Request) -> Response {
-    let todo: Todo! = decode(r.text())
+    let todo: Todo! = decodeJson(r.text())
     match todo {
-        Ok(t) => jsonResponse(encode(t), status: 201)
+        Ok(t) => jsonResponse(encodeJson(t), status: 201)
         Err(why) => textResponse("not a todo: {why}", status: 400)
     }
 }
 
 fn handle(r: Request) -> Response = match r.path {
     "/todos" if r.method == "POST" => added(r)
-    "/todos" => jsonResponse(encode([Todo(1, "write the guide")]))
+    "/todos" => jsonResponse(encodeJson([Todo(1, "write the guide")]))
     _ => textResponse("no such page", status: 404)
 }
 ```
@@ -93,7 +93,7 @@ fn handle(r: Request, commands: Channel<Command>) -> Response {
 fn main() {
     let commands: Channel<Command> = channel()
     go(() => store(commands))
-    serve("0.0.0.0", 8080, r => handle(r, commands))?
+    serveHttp("0.0.0.0", 8080, r => handle(r, commands))?
 }
 ```
 
@@ -101,7 +101,7 @@ A database is the same shape: one task (or a few) holds the connections, the han
 
 ## Calling other services
 
-`get(url)`, `post(url, body, contentType:)` and `request(method, url, body, headers)` are the client, for `http://`
+`httpGet(url)`, `httpPost(url, body, contentType:)` and `httpRequest(method, url, body, headers)` are the client, for `http://`
 and `https://` (TLS by the system's own library: Schannel, OpenSSL or SecureTransport, the server's certificate
 checked against the system's trust). A call waits only its task. `withTimeout(seconds, f)` gives up on a slow one,
 and `scope` runs several at once and waits for them all:
@@ -110,7 +110,7 @@ and `scope` runs several at once and waits for them all:
 ```quark
 use std.http
 
-fn status(url: Text) -> Text = match get(url) {
+fn status(url: Text) -> Text = match httpGet(url) {
     Ok(r) => "{url}: {r.status}"
     Err(why) => "{url}: {why}"
 }

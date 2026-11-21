@@ -69,9 +69,11 @@ const vDiagCap = 11
 const vLastError = 12 // errorBytes
 const vArena = 13
 const vmWords = 16
-const diagBytes = 424 // int line, col; char key[96], message[320]
-const diagKey = 8
-const diagMessage = 104
+const diagBytes = 32 // const char* file; int line, col; const char* key, message (each text C's, until the next call)
+const diagFile = 0
+const diagLine = 8
+const diagKey = 16
+const diagMessage = 24
 const errorBytes = 512
 
 // a module's words; each function's (name, signature, slot kinds, parameter slots, result slots, offset)
@@ -126,8 +128,19 @@ fn libraryArm() -> Bool = byte(fnAddress(() => 0), 0) != 0x55 // x86-64 code sta
 fn enter(vm: Int) {
     library()
     if vm != 0 {
-        setWord(vm, vDiagCount, 0)
+        clearDiagnostics(vm)
     }
+}
+
+// the diagnostics forgotten, and their texts given back
+fn clearDiagnostics(vm: Int) {
+    for i in 0..word(vm, vDiagCount) {
+        let d = word(vm, vDiags) + i * diagBytes
+        free(word(d + diagFile, 0))
+        free(word(d + diagKey, 0))
+        free(word(d + diagMessage, 0))
+    }
+    setWord(vm, vDiagCount, 0)
 }
 
 // ---- C's memory both ways ----
@@ -197,10 +210,10 @@ fn collect(vm: Int, said: Text) {
         }
         i += 1
     }
-    collectAt(vm, line, col, head)
+    collectAt(vm, if line > 0 { head[..i] } else { "" }, line, col, head)
 }
 
-fn collectAt(vm: Int, line: Int, col: Int, message: Text) {
+fn collectAt(vm: Int, file: Text, line: Int, col: Int, message: Text) {
     let count = word(vm, vDiagCount)
     if count == word(vm, vDiagCap) {
         let cap = if count > 0 { count * 2 } else { 8 }
@@ -209,9 +222,11 @@ fn collectAt(vm: Int, line: Int, col: Int, message: Text) {
     }
     let d = word(vm, vDiags) + count * diagBytes
     zeroBytes(d, diagBytes)
-    setInt32(d, 0, line)
-    setInt32(d, 1, col)
-    putText(d + diagMessage, 320, message)
+    setWord(d + diagFile, 0, cText(file))
+    setInt32(d + diagLine, 0, line)
+    setInt32(d + diagLine, 1, col)
+    setWord(d + diagKey, 0, cText(""))
+    setWord(d + diagMessage, 0, cText(message))
     setWord(vm, vDiagCount, count + 1)
 }
 
@@ -239,6 +254,7 @@ pub extern effect fn qkVmFree(vm: Int64) as "qkVmFree" {
         free(word(word(vm, vHosts), 2 * i))
     }
     free(word(vm, vHosts))
+    clearDiagnostics(vm)
     free(word(vm, vDiags))
     free(word(vm, vPrelude))
     free(word(vm, vCapabilities))
@@ -430,7 +446,7 @@ fn hostsFor(vm: Int, name: Text, p: Program, ir: IrProgram) -> Int {
             } else {
                 "extern fn {x.name} has no function in this host (qkVmHost), nor in the C library"
             }
-            collectAt(vm, line, col, "{name}:{line}:{col}: {message}")
+            collectAt(vm, name, line, col, "{name}:{line}:{col}: {message}")
         }
         setWord(hosts, i, f)
     }
@@ -497,7 +513,7 @@ fn compileNow(vm: Int, name: Int, text: Int, n: Int) -> Int {
     free(relocs)
     free(hosts)
     if l == 0 {
-        collectAt(vm, 0, 0, "quark:0:0: {path}: cannot get executable memory")
+        collectAt(vm, "", 0, 0, "quark:0:0: {path}: cannot get executable memory")
         return 0
     }
     // the module's functions: the IR's own, in the order lowering made them
@@ -558,8 +574,9 @@ fn compileGraphNow(vm: Int, name: Int, json: Int, n: Int) -> Int {
             let p = newProgram(parsed.ast, [])
             for i in 0..word(vm, vDiagCount) {
                 let d = word(vm, vDiags) + i * diagBytes
-                if keyAtLine(p, int32At(d, 0)) is Some(key) {
-                    putText(d + diagKey, 96, key)
+                if keyAtLine(p, int32At(d + diagLine, 0)) is Some(key) {
+                    free(word(d + diagKey, 0))
+                    setWord(d + diagKey, 0, cText(key))
                 }
             }
         }

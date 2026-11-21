@@ -115,7 +115,7 @@ pub fn parseArgs(given: [Text], spec: [Arg]) -> Args! {
 }
 
 // the usage text: the program's line, then each flag and option with its help
-pub fn usage(program: Text, spec: [Arg], positional: Text = "") -> Text {
+pub fn argsUsage(program: Text, spec: [Arg], positional: Text = "") -> Text {
     var out = "usage: {program}" + (if len(spec) > 0 { " [options]" } else { "" })
     if positional != "" {
         out += " " + positional

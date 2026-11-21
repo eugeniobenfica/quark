@@ -3,7 +3,7 @@
 //
 // joinPath(a, b): b after a, with one separator between; an absolute b stands alone
 pub fn joinPath(a: Text, b: Text) -> Text {
-    if a == "" or isAbsolute(b) {
+    if a == "" or isAbsolutePath(b) {
         return b
     }
     if b == "" {
@@ -14,7 +14,7 @@ pub fn joinPath(a: Text, b: Text) -> Text {
 
 // the path without "." parts, separators doubled or at the end, or a part followed by ".." (at the root,
 // ".." stays there); "a/./b/../c/" is "a/c", and an empty path is "."
-pub fn normalize(path: Text) -> Text {
+pub fn normalizePath(path: Text) -> Text {
     let r = root(path)
     var parts: [Text] = []
     for p in partsOf(path[len(r)..]) {
@@ -32,13 +32,13 @@ pub fn normalize(path: Text) -> Text {
 
 // the parts after the root: "/usr/lib/" is ["usr", "lib"]
 pub fn pathParts(path: Text) -> [Text] {
-    let n = normalize(path)
+    let n = normalizePath(path)
     if n == "." { [] } else { partsOf(n[len(root(n))..]) }
 }
 
 // the folder the path is in: "a/b/c.txt" is "a/b", "c.txt" is ".", and a root is itself
-pub fn parent(path: Text) -> Text {
-    let n = normalize(path)
+pub fn parentPath(path: Text) -> Text {
+    let n = normalizePath(path)
     let r = root(n)
     let parts = partsOf(n[len(r)..])
     if len(parts) == 0 {
@@ -58,24 +58,24 @@ pub fn fileName(path: Text) -> Text {
 }
 
 // the file name's text after its last dot, without it: "a/b.tar.gz" is "gz"; ".profile" and "make" have none
-pub fn extension(path: Text) -> Text = splitName(fileName(path)).1
+pub fn fileExtension(path: Text) -> Text = splitName(fileName(path)).1
 
 // the file name without its extension: "a/b.tar.gz" is "b.tar"
-pub fn stem(path: Text) -> Text = splitName(fileName(path)).0
+pub fn fileStem(path: Text) -> Text = splitName(fileName(path)).0
 
 // the path with its file name's extension changed (or added, or taken away with "")
 pub fn withExtension(path: Text, ext: Text) -> Text {
     let old = fileName(path)
     if old == "" or old == ".." {
-        return normalize(path)
+        return normalizePath(path)
     }
-    let name = stem(path) + (if ext == "" { "" } else { "." + ext })
-    let up = parent(path)
+    let name = fileStem(path) + (if ext == "" { "" } else { "." + ext })
+    let up = parentPath(path)
     if up == "." { name } else { joinPath(up, name) }
 }
 
 // whether it starts at a root: "/x", "\x", "C:/x", "C:\x"
-pub fn isAbsolute(path: Text) -> Bool = root(path).endsWith("/")
+pub fn isAbsolutePath(path: Text) -> Bool = root(path).endsWith("/")
 
 // the path with \ between its parts, as Windows writes it
 pub fn windowsPath(path: Text) -> Text = path.replace("/", "\\")

@@ -133,7 +133,7 @@ pub effect fn closeSocket(socket: Socket) = runtime("net", "closeSocket", socket
 pub type Tls { handle: Int }
 
 // the handshake with the server at the other end of the socket
-pub effect fn tlsConnect(socket: Socket, serverName: Text) -> Tls! =
+pub effect fn startTls(socket: Socket, serverName: Text) -> Tls! =
     runtime("net", "tlsConnect", socket, serverName)
 
 // what the server said, decrypted, up to most bytes; none when it ended the connection

@@ -311,10 +311,10 @@ pub type Tls { handle: Int }
 TLS over a connected socket, by the system's library (Schannel, OpenSSL, SecureTransport): the server's certificate
 checked for serverName by the system's trust (std.net's connectTls and std.http's https:// use it)
 
-#### fn tlsConnect
+#### fn startTls
 
 ```quark
-pub effect fn tlsConnect(socket: Socket, serverName: Text) -> Tls!
+pub effect fn startTls(socket: Socket, serverName: Text) -> Tls!
 ```
 
 the handshake with the server at the other end of the socket

@@ -10,11 +10,11 @@ fn main() {
     let epoch = utc(0)
     print(epoch.toIso(), epoch.weekday(), utc(1_700_000_000.25).toIso(), utc(-1).toIso())
     let d = Date(2024, 2, 28)
-    print(d.addDays(1).toIso(), d.addDays(2).toIso(), d.addDays(-59).toIso(), d.weekday(), d.days())
+    print(d.plusDays(1).toIso(), d.plusDays(2).toIso(), d.plusDays(-59).toIso(), d.weekday(), d.days())
     print(
-        Date(2026, 1, 31).addMonths(1).toIso(),
-        Date(2024, 1, 31).addMonths(1).toIso(),
-        Date(2026, 3, 15).addMonths(-15).toIso(),
+        Date(2026, 1, 31).plusMonths(1).toIso(),
+        Date(2024, 1, 31).plusMonths(1).toIso(),
+        Date(2026, 3, 15).plusMonths(-15).toIso(),
     )
     print(
         dateOfDays(0).toIso(),
@@ -24,9 +24,9 @@ fn main() {
         Date(1900, 2, 29).isValid(),
     )
     let t = Date(2026, 11, 13).at(9, 30, second: 5)
-    print(t.toIso(), t.seconds(), utc(t.seconds()) == t, t.addSeconds(86_399.5).toIso(), t.addDays(-365).toIso())
+    print(t.toIso(), t.seconds(), utc(t.seconds()) == t, t.plusSeconds(86_399.5).toIso(), t.plusDays(-365).toIso())
     print(
-        t < t.addSeconds(0.001),
+        t < t.plusSeconds(0.001),
         Date(2026, 1, 1) > Date(2025, 12, 31),
         [Date(2026, 5, 1), Date(1999, 9, 9), Date(2026, 4, 30)].sorted().map(x => x.toIso()),
     )

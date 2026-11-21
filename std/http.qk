@@ -5,7 +5,7 @@
 //
 //     fn hello(r: Request) -> Response = textResponse("hello from {r.path}")
 //     fn main() {
-//         serve("127.0.0.1", 8080, hello)? // never returns: each request in a task of its own
+//         serveHttp("127.0.0.1", 8080, hello)? // never returns: each request in a task of its own
 //     }
 use std.net
 use std.encoding
@@ -195,7 +195,7 @@ pub fn writeResponse(c: Conn, r: Response) -> Unit! =
 
 // one connection: its request read, the handler's response written, the connection closed (a request that cannot
 // be read: 400)
-pub fn handleConnection(socket: Socket, handler: effect (Request) -> Response) {
+pub fn serveConnection(socket: Socket, handler: effect (Request) -> Response) {
     let c = conn(socket)
     match readRequest(c) {
         Ok((request, c2)) => {
@@ -210,19 +210,23 @@ pub fn handleConnection(socket: Socket, handler: effect (Request) -> Response) {
 
 // a server on host:port: each connection in a task of its own, the handler called for each request. It runs until
 // the program ends (Err when it cannot listen).
-pub fn serve(host: Text, port: Int, handler: effect (Request) -> Response) -> Unit! {
+pub fn serveHttp(host: Text, port: Int, handler: effect (Request) -> Response) -> Unit! {
     let server = listen(host, port)?
     go(() => {
         while accept(server) is Ok(socket) {
-            go(() => handleConnection(socket, handler))
+            go(() => serveConnection(socket, handler))
         }
     })
     runTasks()
     Ok(())
 }
 
-// http://host[:port]/path?query (https://: over TLS): (host, port, the path with its query)
-pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
+// a URL's parts: https:// (over TLS) or http://, the host, the port (443 or 80 when it says none), and the path
+// with its query ("/" when it has none)
+pub type Url { secure: Bool, host: Text, port: Int, path: Text }
+
+// http://host[:port]/path?query, or https://
+pub fn parseUrl(url: Text) -> Url! {
     let secure = url.startsWith("https://")
     if not secure and not url.startsWith("http://") {
         return Err("not an http:// or https:// URL: {url}")
@@ -234,27 +238,26 @@ pub fn parseUrl(url: Text) -> (Text, Int, Text)! {
     let colon = authority.indexOf(":")
     if colon is Some(i) {
         let port = authority[i + 1..].parseInt().mapErr(why => "the port: {why}")?
-        return Ok((authority[..i], port, target))
+        return Ok(Url(secure, authority[..i], port, target))
     }
-    Ok((authority, if secure { 443 } else { 80 }, target))
+    Ok(Url(secure, authority, if secure { 443 } else { 80 }, target))
 }
 
 // a request to url: its method, its headers (names in lower case) and its body; the response
-pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
-    let (host, port, target) = parseUrl(url)?
-    let secure = url.startsWith("https://")
-    let c = if secure {
-        connectTls(host, port)?
+pub fn httpRequest(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] = [:]) -> Response! {
+    let u = parseUrl(url)?
+    let c = if u.secure {
+        connectTls(u.host, u.port)?
     } else {
-        conn(connect(host, port)?)
+        conn(connect(u.host, u.port)?)
     }
     var all = headers
-    all["host"] = if port == (if secure { 443 } else { 80 }) {
-        host
+    all["host"] = if u.port == (if u.secure { 443 } else { 80 }) {
+        u.host
     } else {
-        "{host}:{port}"
+        "{u.host}:{u.port}"
     }
-    let sent = c.writeBytes(head("{method} {target} HTTP/1.1", all, body))
+    let sent = c.writeBytes(head("{method} {u.path} HTTP/1.1", all, body))
     if sent is Err(why) {
         c.close()
         return Err(why)
@@ -274,8 +277,8 @@ pub fn request(method: Text, url: Text, body: Bytes = [], headers: [Text: Text] 
 }
 
 // GET url
-pub fn get(url: Text) -> Response! = request("GET", url)
+pub fn httpGet(url: Text) -> Response! = httpRequest("GET", url)
 
 // POST url with a body
-pub fn post(url: Text, body: Bytes, contentType: Text = "application/octet-stream") -> Response! =
-    request("POST", url, body, ["content-type": contentType])
+pub fn httpPost(url: Text, body: Bytes, contentType: Text = "application/octet-stream") -> Response! =
+    httpRequest("POST", url, body, ["content-type": contentType])

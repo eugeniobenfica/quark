@@ -664,6 +664,12 @@ pub fn Ownership.deepFresh(self, e: Int) -> Bool {
     if not self.holdsContainers(x.ty) {
         return true
     }
+    if self.taken(e) {
+        return true // a var's value at its last use, handed over (decideTakes)
+    }
+    if x.node is Binary(_, _, _) and x.builtin == bFill {
+        return self.isFresh(e) and self.tk(x.ty) == Kind.Array and not self.holdsContainers(self.elemOf(x.ty)) // [0] * n
+    }
     match x.node {
         ArrayLit(items) => items.all(i => self.deepFresh(i))
         MapLit(items) => items.all(i => self.deepFresh(i))
@@ -1179,7 +1185,10 @@ fn Ownership.aliasBlock(var self, b: Int) {
 // changes are not seen there. At its last use there are none: the value is handed over as it is. The last use is the
 // one mention of the var in the last statement of its block that mentions it, not under a loop or a lambda of that
 // statement (which could read it again), with no defer of the block, no lambda's copy of it and no lazy let (a loop
-// worked out where it is used) that reads it later.
+// worked out where it is used) that reads it later. A var given a whole new value (x = ...) ends a stretch: its last
+// mention before that is a last use too. A record (or a case) that holds arrays or maps is handed over the same way
+// when the var owns all it holds (a deep var: every value put in it copied all through); so is a function's var self,
+// whose value is its caller's var's.
 pub fn Ownership.decideTakes(var self) {
     self.takes = [false] * len(self.p.ast.exprs)
     if self.debug {
@@ -1198,16 +1207,52 @@ pub fn Ownership.decideTakes(var self) {
             let Let(mutable, _, _, _, pattern, _) = self.p.ast.stmts[s].node else {
                 continue
             }
-            if not mutable
-                or pattern >= 0
-                or bnd < 0
-                or captured.contains(bnd)
-                or self.p.bindings[bnd].lazy
-                or not self.tk(self.p.bindings[bnd].ty) is Array | Map {
+            if not mutable or pattern >= 0 or bnd < 0 or captured.contains(bnd) or self.p.bindings[bnd].lazy {
+                continue
+            }
+            if not self.handedOver(bnd) {
                 continue
             }
             self.takeLast(stmts[i + 1..], bnd)
         }
+    }
+    // a function's var self: in its body
+    for d in self.p.decls {
+        let x = self.p.ast.decls[d]
+        if x.kind != DeclKind.Fn or x.body < 0 or len(x.params) == 0 or x.isTemplate {
+            continue
+        }
+        let prm = self.p.ast.params[x.params[0]]
+        let bnd = prm.binding
+        if not prm.isVar or bnd < 0 or captured.contains(bnd) or not self.holdsContainers(self.p.bindings[bnd].ty) {
+            continue
+        }
+        if self.p.ast.exprs[x.body].node is BlockExpr(block, _) {
+            self.takeLast(self.p.ast.blocks[block].stmts, bnd)
+        }
+    }
+}
+
+// may a var's value be handed over at its last use: an array or a map; a value that holds them, when the var owns
+// them all (a deep var)
+fn Ownership.handedOver(self, bnd: Int) -> Bool {
+    let t = self.p.bindings[bnd].ty
+    self.tk(t) is Array | Map or self.holdsContainers(t) and self.p.bindings[bnd].deep
+}
+
+// is e a var's mention handed over all through (a taken name, or a field of one: k.p at k's last use), of a var that
+// owns all it holds (a deep var, or a function's var self)?
+pub fn Ownership.taken(self, e: Int) -> Bool {
+    if e < 0 {
+        return false
+    }
+    match self.p.ast.exprs[e].node {
+        Name(_) => {
+            let b = self.p.ast.exprs[e].binding
+            self.takes[e] and b >= 0 and (self.p.bindings[b].deep or self.p.bindings[b].isParam)
+        }
+        Field(target, _) => self.taken(target)
+        _ => false
     }
 }
 
@@ -1219,18 +1264,37 @@ fn Ownership.takeLast(var self, stmts: [Int], bnd: Int) {
     var last = Uses(bnd)
     var lastStmt = -1
     for s in stmts {
+        let later = self.p.ast.stmts[s]
+        if later.node is Assign(target, op, value)
+            and op == .Assign
+            and self.p.ast.exprs[target].node is Name(_)
+            and self.p.ast.exprs[target].binding == bnd {
+            var read = Uses(bnd)
+            read.expr(self, value, false)
+            if read.count == 0 {
+                // x = a new value: what came before is a stretch of its own
+                self.takeAt(last, lastStmt, bnd)
+                last = Uses(bnd)
+                lastStmt = -1
+                continue
+            }
+        }
         var u = Uses(bnd)
         u.stmt(self, s, false)
         if u.count == 0 {
             continue
         }
-        let later = self.p.ast.stmts[s]
         if later.node is Defer(_) or later.binding >= 0 and self.p.bindings[later.binding].lazy {
             return
         }
         last = u
         lastStmt = s
     }
+    self.takeAt(last, lastStmt, bnd)
+}
+
+// the last statement of a stretch that mentions bnd: its mention taken (or each branch's)
+fn Ownership.takeAt(var self, last: Uses, lastStmt: Int, bnd: Int) {
     if lastStmt < 0 {
         return
     }

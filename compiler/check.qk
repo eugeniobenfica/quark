@@ -162,11 +162,8 @@ fn Checker.addDefaults(var self) {
                     + exprText(self.p.ast, m.fallback, 0)
                     + "\n"
                 let before = len(self.p.ast.decls)
-                let closing = self.p.ast.closingComment
-                let parsed = parseInto(self.p.ast, Source("{iface.name}.{m.name} (its default, for {ty.name})", text))
-                self.p.ast = parsed.ast
-                self.p.ast.closingComment = closing
-                for e in parsed.errors {
+                let errors = self.parseMore(Source("{iface.name}.{m.name} (its default, for {ty.name})", text))
+                for e in errors {
                     self.errors.add(Source("", ""), iface.line, iface.col, e)
                 }
                 for at in before..len(self.p.ast.decls) {
@@ -3980,14 +3977,10 @@ fn Checker.instantiate(var self, d: Int, bound: [Int], lambdas: [Int], takesFn: 
                 "fn jsonMade(j: Int) -> Int "
             }
             let before = len(self.p.ast.decls)
-            let closing = self.p.ast.closingComment
-            let parsed = parseInto(
-                self.p.ast,
+            let errors = self.parseMore(
                 Source("{template.name}<{self.tname(t)}> (std.json's, made for the type)", header + text + "\n"),
             )
-            self.p.ast = parsed.ast
-            self.p.ast.closingComment = closing
-            for e in parsed.errors {
+            for e in errors {
                 self.errors.add(Source("", ""), template.line, template.col, e)
             }
             if len(self.p.ast.decls) > before {
@@ -4630,6 +4623,14 @@ fn Checker.instanceType(var self, d: Int, args: [Int]) -> Int {
     }
     self.leave()
     t
+}
+
+// Code the language makes while checking (an interface's default for a type, std.json's for a type), read on its own
+// and put after the program's tree: its errors. (Read into the program's tree itself, the whole tree would be copied.)
+fn Checker.parseMore(var self, src: Source) -> [Text] {
+    let parsed = parse(src)
+    self.p.ast.append(parsed.ast)
+    parsed.errors
 }
 
 // A lambda of a template checked before it has types (not checked itself then): the functions given to the template

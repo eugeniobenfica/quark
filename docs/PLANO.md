@@ -542,6 +542,28 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 >   para 3,9 GB e o kernel de 1,05 para 1,66 s de CPU, e numa máquina com menos núcleos o ganho é menor.
 > - **O que o faria valer:** o `Lower` ler o programa sem guardá-lo como valor seu (o contexto só de leitura passado à
 >   parte). É uma reforma do `lower.qk` inteiro, e vem depois de cortar a memória (passo 2), que barateia tudo.
+>
+> **A memória (21/11/2026): medida, três cópias cortadas na linguagem; o resto pede uma decisão.**
+> - **Onde está:** a arena do compilador termina com ~3,1 GB: 1,1 GB em blocos usados, 1,9 GB em blocos grandes. Dos
+>   grandes, ~540 MB são arrays de ~40 MB criados várias vezes: cópias inteiras do programa. Cada fase recebe o programa
+>   como parâmetro e o guarda numa `var` (`Checker(p)`, `Lower(p, Ownership(p))`), e a semântica de valores copia o
+>   que vem de fora; as versões anteriores seguem vivas.
+> - **Medido com programas pequenos** (um array de 80 MB num registro), três lacunas do compilador, corrigidas para todo
+>   programa:
+>   - um registro construído com `[v] * n` copiava o array numa `var` mudada no lugar (`deepFresh` não reconhecia o
+>     `[v] * n`, que `isFresh` já reconhecia);
+>   - a entrega no último uso valia só para `var`s de array ou mapa: agora vale para um registro que contém arrays,
+>     quando a `var` é dona de tudo o que guarda (`deep`), e para um campo dela (`k.p`);
+>   - o `var self` de um método é entregue no seu último uso (`Holder(self, 0)`), e uma atribuição inteira (`x = ...`)
+>     encerra um trecho, cujo último uso também entrega.
+>   - Resultado nos pequenos: mudar no lugar um registro feito de `make()`, ou passar o `var self` adiante, de 152–305 MB
+>     para 76 MB (o array, sem cópia).
+> - **Tentado e desfeito:** encadear as fases do compilador em `var`s (`Program.checked`, `Program.lowered`, o `Lower`
+>   lendo o programa só por `own.p`). O pico subiu de 3,1 para 3,5 GB: outras leituras passaram a copiar.
+> - **O que falta decidir:** guardar um parâmetro numa `var` sempre copia, e as fases são funções que recebem o programa.
+>   Cortar isso pede parâmetros que consomem (como o `consuming` do Swift ou o move do Rust), uma mudança de linguagem;
+>   ou fases escritas como métodos de `var self`, que a entrega do `var self` já cobre, com uma ferramenta que diga onde
+>   cada cópia acontece (o perfil mostra o tempo das cópias, não a memória que elas guardam).
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

@@ -1157,6 +1157,9 @@ fn Lower.stripImplicit(self, e: Int) -> Int {
 fn Lower.lowerStored(var self, e: Int) -> [Int] {
     let v = self.lowerExpr(e)
     let t = self.ty(e)
+    if self.own.taken(e) {
+        return v // a var's value at its last use, handed over (decideTakes)
+    }
     if self.holdsContainers(t) and self.own.aliasesDeep(e) {
         return self.deepCopy(v, t, self.lineOf(e))
     }

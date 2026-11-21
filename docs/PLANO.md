@@ -457,6 +457,17 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 > máquina 0,45 s). Mesmo com as 1.810 funções tiradas do cache de otimização, otimizar leva 0,6 s: cada acerto codifica
 > a função, a resume e decodifica o resultado. Chegar a 0,5 s pede guardar por módulo a leitura, a checagem e o
 > lowering, e a checagem hoje é do programa inteiro (genéricos instanciados entre módulos): um trabalho próprio.
+>
+> **21/11/2026: as partes por função em threads.** O otimizador rápido (`quickOptimize`) e o código de máquina
+> (x86-64 e ARM64) passaram a rodar nas threads do processador quando o programa tem 20.000 instruções ou mais.
+> - O código de máquina é feito em 16 partes, cada uma a partir do byte 0. Depois as partes são juntadas, com os
+>   deslocamentos de patches, relocações, chamadas, linhas e frames corrigidos. Os bytes saem iguais aos de antes: cada
+>   função continua na sua fronteira de 16 bytes, e o ponto fixo se mantém.
+> - O compilador compilando a si mesmo no tier rápido: otimizar de 524 para 180 ms, código de máquina de 450 para
+>   155 ms, o total de 2,4 para 1,75 s.
+> - O que sobra é ler e checar (0,6 s) e o lowering (0,8 s), que são do programa inteiro. Chegar a 0,5 s continua
+>   pedindo guardá-los por módulo. Isso é uma arquitetura nova: as instâncias de genéricos, os textos do bloco de dados
+>   e as decisões de inlining cruzam os módulos. Não foi feito.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 
@@ -529,6 +540,26 @@ Cada item é uma decisão que o 1.0 torna cara de mudar.
 
 - **Sem libc onde der:** Ryū para escrever `Float`, parser próprio para ler, memória direto do sistema. No Windows
   e no Linux o executável passa a depender só do kernel; no macOS a `libSystem` é obrigatória.
+
+> **Feito em 21/11/2026: sem libc onde dá.**
+> - **Todo sistema.** `{x:.2}` não usa mais o `printf` do C: `fixedText` (runtime/base.qk) arredonda a expansão
+>   decimal exata metade para o par, igual em todo sistema. Comparado com o Python em 3.000 valores e precisões de 0 a
+>   12, não houve diferença. `parseInt` é Quark (antes era `strtoll` com `errno`). O runtime não chama mais
+>   `snprintf`, `vsnprintf` nem `strtoll`.
+> - **Windows: só o kernel.** Um executável importa `kernel32.dll` e `ntdll.dll` (`memcpy`, `memmove`, `memset`,
+>   `memcmp`, `strlen`, as do próprio sistema), e nada mais:
+>   - o heap (`malloc`...) é o do processo (`HeapAlloc`);
+>   - os arquivos são `CreateFileW`/`ReadFile`/`WriteFile` (um `FILE*` é uma palavra do runtime);
+>   - o ambiente, a hora e o fuso vêm do kernel32 (`SystemTimeToTzSpecificLocalTime` resolve o horário de verão da
+>     data);
+>   - a linha de comando é lida pelas regras do `CommandLineToArgvW` (sem o shell32);
+>   - o Winsock é carregado no primeiro socket (`LoadLibraryW`, `GetProcAddress`), então um programa sem rede não o
+>     carrega.
+>   - Na libquark esses nomes C são do runtime e não são exportados: o host continua com a sua biblioteca C.
+> - **Linux: a libc fica.** Ficar sem ela pediria um resolvedor de DNS (`getaddrinfo`), a base de fusos (`localtime_r`
+>   lendo TZif), threads por `clone` com armazenamento por thread próprio, e perderia o `dlopen` que as chamadas a C
+>   de um programa usam. É desproporcional para o "onde der". O executável já pode usar a musl (`--libc musl`).
+> - **macOS:** a `libSystem` é obrigatória, como previsto.
 - **Informação de depuração padrão:** DWARF e PDB/CodeView, para depuradores e perfiladores externos.
 
 > **Feito em 21/11/2026: ARM64 em paridade.** As chamadas entre funções Quark passam os oito primeiros slots em x0–x7, como o x86-64 faz com cinco registradores.

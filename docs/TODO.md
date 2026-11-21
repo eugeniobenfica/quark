@@ -48,7 +48,8 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [-] barreira de escrita filtrada no código: as chamadas fazem trabalho real, sem ganho
   - [x] coletas completas que esperam conforme o lixo que acham; valores pequenos copiados sem a tabela: `records`
     de 1,95× para 1,6× o C
-  - [ ] pré-promoção por chamada (o que `build()` faz vai para fora do laço): uma região guardada na arena
+  - [ ] pré-promoção por chamada (o que `build()` faz vai para fora do laço): uma região guardada na arena (medido
+    em 21/11: `records` a ~1,65× o C; a coleta de laço é 37% do tempo)
 - [x] B8 o grafo sem JSON por dentro (os valores de `std.graph`; `collab.qk` sobre a árvore genérica, de propósito)
 - [x] B9 concorrência
   - [x] `Channel<T>` tipado (o `T` dito onde o valor vai: `let c: Channel<Int> = channel()`)
@@ -57,7 +58,9 @@ detalhes, as medições e os motivos ficam no plano, sob cada item; esta lista s
   - [x] concorrência estruturada (`scope`, `s.start`)
 - [~] B10 compilação incremental de ponta a ponta
   - [x] `quark run` de um programa pequeno abaixo de 30 ms (38,5 → 20,6 ms)
-  - [ ] rebuild do compilador abaixo de 0,5 s (hoje ~2,6 s): leitura, checagem e lowering guardados por módulo
+  - [x] otimizar e o código de máquina nas threads, em partes (o compilador no tier rápido: 2,4 → 1,75 s)
+  - [ ] rebuild do compilador abaixo de 0,5 s: leitura, checagem e lowering guardados por módulo (uma arquitetura nova:
+    genéricos, o bloco de dados e o inlining cruzam os módulos)
 
 ## C. A linguagem
 

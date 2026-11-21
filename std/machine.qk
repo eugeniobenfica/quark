@@ -25,3 +25,12 @@ pub extern effect fn fillRuntime(table: Pointer<Int64>)
 // Calls the C function at f with four integer arguments (the platform's C call), and gives its integer result: how
 // the runtime enters loaded code (its trampoline) and leaves it (the escape back to it).
 pub extern effect fn call(f: Pointer<UInt8>, a: Int64, b: Int64, c: Int64, d: Int64) -> Int64
+
+// The value, with all it holds, written to path as its memory is, so that loadImage gives it back at once: the
+// compiler's own cache. false when it could not be (no addresses at the places images take, or the file).
+pub effect fn saveImage<T>(value: T, path: Text) -> Bool =
+    runtime("files", "imageSave", value, path)
+
+// The value an image at path holds; None when there is none, it is another type's, or its addresses are taken (read
+// back where it was written, it stays in memory until the program ends).
+pub effect fn loadImage<T>(path: Text) -> T? = runtime("files", "imageLoad", path)

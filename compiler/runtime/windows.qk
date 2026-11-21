@@ -800,6 +800,10 @@ pub extern effect fn osUnmapCodeImpl(p: Int64, n: Int64) as "qkosUnmapCode" {
 // the heap's range (heap.qk): reserved (MEM_RESERVE, no access), committed as it is used (MEM_COMMIT, read and write)
 pub extern effect fn osReserveImpl(n: Int64) -> Int64 as "qkosReserve" = virtualAlloc(0, n, 8192, 1)
 
+// addresses at p (64 KB aligned), when they are free: p, else 0
+pub extern effect fn osReserveAtImpl(p: Int64, n: Int64) -> Int64 as "qkosReserveAt" =
+    virtualAlloc(p, n, 8192, 1)
+
 pub extern effect fn osCommitImpl(p: Int64, n: Int64) -> Int64 as "qkosCommit" =
     if virtualAlloc(p, n, 4096, 4) != 0 { 1 } else { 0 }
 

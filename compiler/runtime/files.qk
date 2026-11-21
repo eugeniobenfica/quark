@@ -6,6 +6,7 @@ use arena
 use text
 use print
 use tasks
+use loops
 
 extern effect fn fread(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
 extern effect fn fwrite(p: Int64, size: UInt64, n: UInt64, f: Int64) -> UInt64
@@ -113,6 +114,90 @@ pub extern effect fn rtWriteFile(path: Int64, pathLen: Int64, text: Int64, n: In
 
 pub extern effect fn rtAppendFile(path: Int64, pathLen: Int64, text: Int64, n: Int64) -> Int64 as "qk_appendFile" =
     writeWhole(path, pathLen, text, n, "ab\0", "append to")
+
+// ---- images: a value with all it holds, written so that it is read back at once (the compiler's cache) ----
+// The value is copied into a range of addresses reserved at a fixed place, and the range written as it is; read back
+// into the same addresses, every pointer in it holds as it was. Two places, taken in turn: a program that read an
+// image at one writes its next at the other. The file: the magic, the range's place and length, the slots' count,
+// the value's slots, then the range.
+const imageMagic = 0x31474D494B51 // "QKIMG1"
+const imageRoom = 17179869184 // 16 GB of addresses
+
+fn imagePlace(k: Int) -> Int = if k == 0 { 0x3A0000000000 } else { 0x3C0000000000 }
+
+// the value at slots (n of them; desc: an array of its type's description) written to path: 1, or 0
+pub extern effect fn rtImageSave(slots: Int64, desc: Int64, path: Int64, pathLen: Int64, n: Int64) -> Int64 as "qk_imageSave" {
+    var base = 0
+    for k in 0..2 {
+        if base == 0 and osReserveAt(imagePlace(k), imageRoom) == imagePlace(k) {
+            base = imagePlace(k)
+        }
+    }
+    if base == 0 {
+        return 0
+    }
+    let a = regionArena(base, imageRoom)
+    let c0 = ctx()
+    let was = word(c0, ctxArena)
+    setWord(c0, ctxArena, a)
+    let root = malloc(8 * n + 8)
+    copyBytes(root, slots, 8 * n)
+    let c = copierFresh(0)
+    copyValue(c, root, desc)
+    copierFreshDone(c)
+    freeCopier(c)
+    setWord(c0, ctxArena, was)
+    let used = word(a, aRegion) - base
+    var ok = word(a, aRegion) <= word(a, aRegionEnd)
+    let name = cString(path, pathLen)
+    let f = osOpen(name, textAt("wb\0"))
+    if f != 0 {
+        let head = malloc(32)
+        setWord(head, 0, imageMagic)
+        setWord(head, 1, base)
+        setWord(head, 2, used)
+        setWord(head, 3, n)
+        ok = ok and fwrite(head, 1, 32, f) == 32
+        ok = ok and fwrite(root, 1, 8 * n, f) == 8 * n
+        ok = ok and fwrite(base, 1, used, f) == used
+        free(head)
+        ok = fclose(f) == 0 and ok
+    } else {
+        ok = false
+    }
+    free(root)
+    regionArenaFree(a)
+    osReleaseRange(base, imageRoom)
+    if ok { 1 } else { 0 }
+}
+
+// path's image read back: [1][the value's slots] (n of them), or [0] when there is none, or it is not this
+// compiler's, or its place is taken. Its memory stays until the program ends.
+pub extern effect fn rtImageLoad(path: Int64, pathLen: Int64, optSlots: Int64) -> Int64 as "qk_imageLoad" {
+    let p = alloc(optSlots, 8)
+    let n = optSlots - 1
+    let name = cString(path, pathLen)
+    let f = osOpen(name, textAt("rb\0"))
+    if f == 0 {
+        return p
+    }
+    let head = malloc(32)
+    var ok = fread(head, 1, 32, f) == 32 and word(head, 0) == imageMagic and word(head, 3) == n
+    let base = word(head, 1)
+    let used = word(head, 2)
+    free(head)
+    ok = ok and used > 0 and used <= imageRoom and osReserveAt(base, imageRoom) == base
+    if ok {
+        let made = (used + 65535) & -65536
+        ok = osCommit(base, made) != 0 and fread(p + 8, 1, 8 * n, f) == 8 * n and fread(base, 1, used, f) == used
+        if not ok {
+            osReleaseRange(base, imageRoom)
+        }
+    }
+    let _ = fclose(f)
+    if ok { setWord(p, 0, 1) } else { zeroBytes(p, 8 * optSlots) }
+    p
+}
 
 extern fn jobAddress(f: extern (Int64) -> Int64) -> Int64 as "qkTextAddress"
 

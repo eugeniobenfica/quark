@@ -3405,6 +3405,13 @@ fn Lower.lowerRuntimeCall(var self, e: Int, a: [Int], t: Int, line: Int) -> [Int
         args = [args[0], self.spill(args[1..], line)]
     } else if name == "receive" {
         args.push(self.iconst(1 + self.slots(self.p.fallibleValue(t)))) // the T? it leaves: its case, then T's slots
+    } else if name == "imageSave" {
+        // the value whole, by the address of its slots, with its description; the path; its slots' count
+        let vt = self.ty(a[2])
+        let n = self.slots(vt)
+        args = [self.spill(args[..n], line), self.descAddress(self.p.arrayType(vt))] + args[n..] + [self.iconst(n)]
+    } else if name == "imageLoad" {
+        args.push(self.iconst(1 + self.slots(self.p.fallibleValue(t)))) // as receive's: [case][T's slots]
     }
     let withLine = match self.p.ast.exprs[e].node {
         Call(called, _, _, _, _, _) => called == "runtimeLine"

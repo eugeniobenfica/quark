@@ -445,6 +445,18 @@ pub extern effect fn osReserveImpl(n: Int64) -> Int64 as "qkosReserve" {
     if p == -1 { 0 } else { p }
 }
 
+// addresses at p, when they are free (MAP_FIXED_NOREPLACE; a kernel that ignores it puts them elsewhere): p, else 0
+pub extern effect fn osReserveAtImpl(p: Int64, n: Int64) -> Int64 as "qkosReserveAt" {
+    let got = mmap(p, n, 0, 16418 | 1048576, -1, 0)
+    if got == p {
+        return p
+    }
+    if got != -1 {
+        let _ = munmap(got, n)
+    }
+    0
+}
+
 pub extern effect fn osCommitImpl(p: Int64, n: Int64) -> Int64 as "qkosCommit" =
     if mprotect(p, n, 3) == 0 { 1 } else { 0 }
 

@@ -5400,7 +5400,10 @@ fn Checker.checkCall(var self, e: Int) -> Int {
             }
         }
     }
-    if name is "runtime" | "runtimeLine" and self.c.fnDecl >= 0 and self.p.ast.decls[self.c.fnDecl].builtin {
+    if name is "runtime" | "runtimeLine"
+        and self.c.fnDecl >= 0
+        and (self.p.ast.decls[self.c.fnDecl].builtin
+            or self.p.modules[self.p.ast.decls[self.c.fnDecl].module].path == "std/machine.qk") {
         return self.checkRuntimeCall(e, hint)
     }
     let b = self.builtinNamed(name)

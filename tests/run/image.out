@@ -1,0 +1,5 @@
+true
+true true
+20000 item 12345 [a7, b] 2.25 Some(19999)
+1000000 Some(label) [Shape.Dot, Shape.Circle(radius: 2.5), Shape.Named(name: n, parts: [Shape.Dot, Shape.Circle(radius: 1.0)])]
+20001 20000 Some(-1) None 42 0

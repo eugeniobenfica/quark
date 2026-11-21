@@ -1,0 +1,34 @@
+// std.machine's images: a value with all it holds written as its memory is, and read back at once (the compiler's
+// cache); what is read back is a value like any other (changed, it is its own)
+use std.machine as machine
+
+type Item { name: Text, tags: [Text], score: Float }
+enum Shape { Dot, Circle(radius: Float), Named(name: Text, parts: [Shape]) }
+type Big { items: [Item], index: [Text: Int], numbers: [Int], label: Text?, shapes: [Shape] }
+
+fn main() {
+    let path = "image.test.bin"
+    var b = Big([], [:], [], Some("label"), [.Dot, .Circle(2.5), .Named("n", [Shape.Dot, Shape.Circle(1.0)])])
+    for i in 0..20000 {
+        b.items.push(Item("item {i}", ["a{i}", "b"], toFloat(i) / 4.0))
+        b.index["k{i}"] = i
+        b.numbers.push(i * i)
+    }
+    print(machine.saveImage(b, path))
+    let got: Big? = machine.loadImage(path)
+    let missing: Big? = machine.loadImage("no such image.bin")
+    let other: [Int]? = machine.loadImage(path) // another type's (its slots' count differs)
+    let _ = removePath(path)
+    print(missing is None, other is None)
+    let Some(back) = got else {
+        print("no image")
+        return
+    }
+    print(len(back.items), back.items[12345].name, back.items[7].tags, back.items[9].score, back.index["k19999"])
+    print(back.numbers[1000], back.label, back.shapes)
+    var more = back
+    more.items.push(Item("new", [], 1.0))
+    more.index["new"] = -1
+    more.numbers[0] = 42
+    print(len(more.items), len(back.items), more.index["new"], back.index["new"], more.numbers[0], back.numbers[0])
+}

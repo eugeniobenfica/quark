@@ -6,8 +6,10 @@
 use base
 
 extern effect fn osReserve(n: Int64) -> Int64 as "qkosReserve" // addresses, no pages yet (0: none)
-extern effect fn osCommit(p: Int64, n: Int64) -> Int64 as "qkosCommit" // [p, p + n) given pages (zeroed): 1, else 0
+pub extern effect fn osCommit(p: Int64, n: Int64) -> Int64 as "qkosCommit" // [p, p + n) given pages (zeroed): 1, else 0
 extern effect fn osRelease(p: Int64, n: Int64) as "qkosRelease"
+pub extern effect fn osReserveAt(p: Int64, n: Int64) -> Int64 as "qkosReserveAt" // addresses at p: p, or 0
+pub extern effect fn osReleaseRange(p: Int64, n: Int64) as "qkosRelease"
 
 // an arena's words
 pub const aBlocks = 0
@@ -39,7 +41,10 @@ pub const aGrowingLog = 25 // the rooms added, in order, with the clock then: (a
 pub const aGrowingLogCount = 26 // how many (-1: more than the log holds: a collection looks through the table)
 pub const aGrowingLogCap = 27
 pub const aInPlace = 28 // the large blocks that grow where they are (reserved), the latest first (by bigInPlace)
-pub const arenaWords = 29
+pub const aRegion = 29 // an image's arena (runtime/files.qk): where its next memory goes in its reserved range (0: none)
+pub const aRegionEnd = 30
+pub const aRegionMade = 31 // the range's pages taken so far, up to here
+pub const arenaWords = 32
 
 // a block's words, then its bytes (16-aligned)
 pub const bNext = 0
@@ -73,6 +78,47 @@ const blockSize = 16777216
 const blockFirst = 65536 // an arena's first block (a new block: as large as all before it, up to blockSize)
 
 pub fn arena() -> Int = ctxGet(ctxArena)
+
+// bytes, zeroed: the system's, or the next of the arena's reserved range (its pages taken a megabyte at a time)
+fn arenaCalloc(a: Int, bytes: Int) -> Int {
+    let at = word(a, aRegion)
+    if at == 0 {
+        return calloc(1, bytes)
+    }
+    let start = align16(at)
+    let end = start + bytes
+    if end > word(a, aRegionEnd) {
+        return 0
+    }
+    let made = word(a, aRegionMade)
+    if end > made {
+        let upTo = min((end + 1048575) & -1048576, word(a, aRegionEnd))
+        if osCommit(made, upTo - made) == 0 {
+            return 0
+        }
+        setWord(a, aRegionMade, upTo)
+    }
+    setWord(a, aRegion, end)
+    start
+}
+
+// an arena that takes its memory from [base, base + room), reserved already: what an image is copied into
+pub fn regionArena(base: Int, room: Int) -> Int {
+    let a = arenaNew()
+    setWord(a, aRegion, base)
+    setWord(a, aRegionEnd, base + room)
+    setWord(a, aRegionMade, base)
+    a
+}
+
+// a region's arena let go of, but its memory (the range is the caller's)
+pub fn regionArenaFree(a: Int) {
+    rememberedFree(a)
+    free(word(a, aGrowing))
+    free(word(a, aGrowingLog))
+    free(word(a, aSide))
+    free(a)
+}
 
 pub fn arenaNew() -> Int {
     let a = calloc(1, 8 * arenaWords)
@@ -171,7 +217,7 @@ pub fn largeNew(a: Int, bytes: Int, time: Int) -> Int {
         }
     }
     if x == 0 {
-        x = calloc(1, bytes + bigHeader + 16)
+        x = arenaCalloc(a, bytes + bigHeader + 16)
     }
     if x == 0 {
         panicNow(panicSize, 0, bytes, 0)
@@ -274,7 +320,7 @@ fn allocSlow(count: Int, bytesEach: Int) -> Int {
             }
             size = bytes // the last room the limit leaves
         }
-        let blk = calloc(1, size + 64)
+        let blk = arenaCalloc(a, size + 64)
         if blk == 0 {
             panicNow(panicSize, 0, count, 0)
         }

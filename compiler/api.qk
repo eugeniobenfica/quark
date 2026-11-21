@@ -31,7 +31,8 @@ use qgn
 use collab
 use catalog
 
-extern effect fn fflush(f: Int64) -> Int32
+// the host's C library's (a parameter type of its own: never the runtime's fflush, which Windows' runtime makes)
+extern effect fn hostFlush(f: Pointer<UInt8>?) -> Int32 as "fflush"
 extern effect fn osLibraryStart() -> Int64 as "qkosLibraryStart" // the thread's context made findable; the system (0 Windows, 1 Linux, 2 macOS)
 extern fn fnAddress(f: extern () -> Int64) -> Int64 as "qkTextAddress"
 extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" // a C function, or 0 and why
@@ -641,7 +642,7 @@ fn stopped(vm: Int, m: Int, text: Int) {
 type Around { fuel: Int, arena: Int }
 
 fn around(vm: Int) -> Around {
-    let _ = fflush(0)
+    let _ = hostFlush(None)
     let was = Around(ctxGet(ctxFuel), ctxGet(ctxArena))
     if word(vm, vFuel) > 0 {
         ctxSet(ctxFuel, word(vm, vFuel))

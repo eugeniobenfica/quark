@@ -129,16 +129,36 @@ type X64 {
 
 // The machine code of a program: each function at a 16-byte boundary, then the trampoline (the way in from C)
 // and the escape (the way out of a panic).
+// A big program's functions are made in parts on the processor's threads, each part's code from 0, then joined (the
+// same bytes: each function at its 16-byte boundary either way).
 pub fn genX64(p: IrProgram) -> MachineCode {
     let sysv = p.target.sysv
+    let target = p.target
+    let runtime = p.runtime
+    let externs = p.externs
+    let sigs = p.cSigs
+    let parts = if p.instructions() >= threadsFrom {
+        partsOf(p.fns).parallelMap(part => x64Part(target, runtime, externs, sigs, part.0, part.1))
+    } else {
+        [x64Part(target, runtime, externs, sigs, 0, p.fns)]
+    }
     var g = X64(p.target, p.runtime, p.externs, sysv, if sysv { 8 } else { 6 })
     g.sigs = p.cSigs
     var fnAt: [Int] = []
-    for (i, f) in p.fns.enumerate() {
+    for part in parts {
         g.align(0xCC)
-        fnAt.push(g.here())
-        g.fnIndex = i
-        g.genFn(f)
+        let base = g.here()
+        g.code += part.code
+        g.patches += part.patches.map(x => Patch(x.at + base, x.value, x.width)).toArray()
+        g.relocs += part.relocs.map(x => Reloc(x.at + base, x.kind, x.target)).toArray()
+        g.sites += part.sites.map(x => x with { ret: x.ret + base }).toArray()
+        g.callFixups += part.callFixups.map(x => Fixup(x.at + base, x.target)).toArray()
+        g.rtFixups += part.rtFixups.map(x => Fixup(x.at + base, x.target)).toArray()
+        for (k, v) in part.lines.enumerate() {
+            g.lines.push(if k % 2 == 0 { v + base } else { v })
+        }
+        g.frames += part.frames.map(x => x + base).toArray()
+        fnAt += part.fnAt.map(x => x + base).toArray()
     }
     let (enter, escape) = g.genTrampoline()
     for fx in g.callFixups {
@@ -159,6 +179,40 @@ pub fn genX64(p: IrProgram) -> MachineCode {
         }
     }
     MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape, lines: g.lines, frames: g.frames)
+}
+
+// functions from number `from` on, made from offset 0: what genX64 joins
+type CodePart {
+    code: Bytes
+    patches: [Patch]
+    relocs: [Reloc]
+    sites: [CallSite]
+    callFixups: [Fixup]
+    rtFixups: [Fixup]
+    lines: [Int]
+    frames: [Int]
+    fnAt: [Int]
+}
+
+fn x64Part(
+    target: Target,
+    runtime: [RtSig],
+    externs: [IrExtern],
+    sigs: [IrExtern],
+    from: Int,
+    fns: [IrFn],
+) -> CodePart {
+    let sysv = target.sysv
+    var g = X64(target, runtime, externs, sysv, if sysv { 8 } else { 6 })
+    g.sigs = sigs
+    var fnAt: [Int] = []
+    for (k, f) in fns.enumerate() {
+        g.align(0xCC)
+        fnAt.push(g.here())
+        g.fnIndex = from + k
+        g.genFn(f)
+    }
+    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.rtFixups, g.lines, g.frames, fnAt)
 }
 
 // -g: where ins's code starts, when its line is another than the last one's

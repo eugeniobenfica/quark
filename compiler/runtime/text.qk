@@ -793,31 +793,37 @@ fn notANumber(why: Text, t: Int, n: Int) -> Int {
     errResult(if cut < n { m.text("…\"") } else { m.text("\"") })
 }
 
-fn numberCopy(t: Int, n: Int) -> Int {
-    let s = alloc(n + 1, 1)
-    copyBytes(s, t, n)
-    s
-}
-
-// the whole text is the number: no space first, no zero inside, the end where it ends
-fn wholeNumber(s: Int, n: Int, end: Int) -> Bool =
-    n != 0 and end == s + n and not isSpace(byte(s, 0)) and strlen(s) == n
-
+// the whole text is an Int: a sign or none, then decimal digits (as C's strtoll reads them, without spaces); past an
+// Int's limits, "too big" (counted negative, so the least Int fits)
 pub extern effect fn rtParseInt(t: Int64, n: Int64) -> Int64 as "qk_parseInt" {
-    let s = numberCopy(t, n)
-    let endAt = alloc(1, 8)
-    setWord(endAt, 0, s)
-    osSetErrno(0)
-    let v = if n != 0 { strtoll(s, endAt, 10) } else { 0 }
-    let number = wholeNumber(s, n, word(endAt, 0))
-    if not number {
+    var i = 0
+    let negative = n > 0 and byte(t, 0) == '-'
+    if n > 0 and (byte(t, 0) == '-' or byte(t, 0) == '+') {
+        i = 1
+    }
+    if i >= n {
         return notANumber("not a number", t, n)
     }
-    if osErrno() == 34 {
-        // ERANGE
+    var v = 0 // minus the number so far
+    var over = false
+    while i < n {
+        let c = byte(t, i)
+        if c < '0' or c > '9' {
+            return notANumber("not a number", t, n)
+        }
+        let d = c - '0'
+        if v < (intMin + d + 9) / 10 {
+            // (v * 10 - d would go past the least Int: / rounds down, so + 9 makes it the ceiling)
+            over = true
+        } else {
+            v = v * 10 - d
+        }
+        i += 1
+    }
+    if over or not negative and v == intMin {
         return notANumber("too big for an Int", t, n)
     }
-    okResult(v, 0)
+    okResult(if negative { v } else { -v }, 0)
 }
 
 pub extern effect fn rtParseFloat(t: Int64, n: Int64) -> Int64 as "qk_parseFloat" {

@@ -11,9 +11,14 @@ use imagecli
 use image
 use ir
 
-// the runtime's entries for executables and quarkimg run: not a library's
-const hidden = ["wmain", "main", "qkWinEntry", "qkMacMain", "qkMemoryMain", "qkStart", "qkStartMemory"]
+// the runtime's entries for executables and quarkimg run, and its own C library: not a library's
+const hidden = [
+    "wmain", "main", "qkWinEntry", "qkMacMain", "qkMemoryMain", "qkStart", "qkStartMemory", "malloc", "calloc",
+    "realloc", "free", "fread", "fwrite", "fclose", "ferror", "fflush", "fseek", "exit", "floor", "fabs", "time",
+    "strtoll", "strerror",
+]
 
+// what the runtime makes of C's library on Windows (runtime/windows.qk): its own, not the host's
 // C's variables: each one's name, and the text in the data that is its place (compiler/api.qk's cells)
 const variables = [
     ("qkAbi", "qkAbi=library-variable-cell-0001"),

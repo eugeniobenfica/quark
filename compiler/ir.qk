@@ -396,6 +396,26 @@ pub type MachineCode {
     frames: [Int] = [] // ... and where each frame's prologue starts (push rbp / stp x29, x30)
 }
 
+// a program this big (in instructions) or more has its functions made on the processor's threads, in parts (the
+// optimizers' and the backends'): a smaller one takes less than the threads take to start
+pub const threadsFrom = 20000
+
+// the parts of fns made apart: each its first function's number and its functions
+pub fn partsOf(fns: [IrFn]) -> [(Int, [IrFn])] {
+    let n = len(fns)
+    let count = 16
+    var out: [(Int, [IrFn])] = []
+    var from = 0
+    while from < n {
+        let to = min(n, from + (n + count - 1) / count)
+        out.push((from, fns[from..to]))
+        from = to
+    }
+    out
+}
+
+pub fn IrProgram.instructions(self) -> Int = self.fns.map(f => len(f.code)).sum()
+
 // A change to code already written: value's `width` low bytes ORed in at `at` (a jump's distance, once its target
 // is known). Writing them all at the end keeps the code a Bytes that only grows.
 pub type Patch { at: Int, value: Int, width: Int }

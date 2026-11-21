@@ -326,7 +326,8 @@ pub extern effect fn wasiSleep(ms: Int64) as "qkosSleep" {
     free(n)
 }
 
-pub extern effect fn wasiLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" = toInt(seconds - seconds) // UTC
+pub extern effect fn wasiLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOffset" =
+    toInt(seconds - seconds) // UTC
 
 pub extern effect fn wasiProcessors() -> Int64 as "qkosProcessors" = 1
 

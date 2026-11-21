@@ -94,15 +94,33 @@ type Arm64 {
     sigs: [IrExtern] = [] // the C functions called through an address (HostCall's a): their slots
 }
 
+// A big program's functions are made in parts on the processor's threads, then joined (as genX64 does).
 pub fn genArm64(p: IrProgram) -> MachineCode {
+    let target = p.target
+    let runtime = p.runtime
+    let externs = p.externs
+    let sigs = p.cSigs
+    let parts = if p.instructions() >= threadsFrom {
+        partsOf(p.fns).parallelMap(part => arm64Part(target, runtime, externs, sigs, part.0, part.1))
+    } else {
+        [arm64Part(target, runtime, externs, sigs, 0, p.fns)]
+    }
     var g = Arm64(p.target, p.runtime, p.externs)
     g.sigs = p.cSigs
     var fnAt: [Int] = []
-    for (i, f) in p.fns.enumerate() {
+    for part in parts {
         g.align()
-        fnAt.push(g.here())
-        g.fnIndex = i
-        g.genFn(f)
+        let base = g.here()
+        g.code += part.code
+        g.patches += part.patches.map(x => Patch(x.at + base, x.value, x.width)).toArray()
+        g.relocs += part.relocs.map(x => Reloc(x.at + base, x.kind, x.target)).toArray()
+        g.sites += part.sites.map(x => x with { ret: x.ret + base }).toArray()
+        g.callFixups += part.callFixups.map(x => Fixup(x.at + base, x.target, x.kind)).toArray()
+        for (k, v) in part.lines.enumerate() {
+            g.lines.push(if k % 2 == 0 { v + base } else { v })
+        }
+        g.frames += part.frames.map(x => x + base).toArray()
+        fnAt += part.fnAt.map(x => x + base).toArray()
     }
     let (enter, escape) = g.genTrampoline()
     for fx in g.callFixups {
@@ -116,6 +134,38 @@ pub fn genArm64(p: IrProgram) -> MachineCode {
         }
     }
     MachineCode(patched(g.code, g.patches), g.relocs, g.sites, fnAt, enter, escape, lines: g.lines, frames: g.frames)
+}
+
+// functions from number `from` on, made from offset 0: what genArm64 joins
+type CodePart {
+    code: Bytes
+    patches: [Patch]
+    relocs: [Reloc]
+    sites: [CallSite]
+    callFixups: [Fixup]
+    lines: [Int]
+    frames: [Int]
+    fnAt: [Int]
+}
+
+fn arm64Part(
+    target: Target,
+    runtime: [RtSig],
+    externs: [IrExtern],
+    sigs: [IrExtern],
+    from: Int,
+    fns: [IrFn],
+) -> CodePart {
+    var g = Arm64(target, runtime, externs)
+    g.sigs = sigs
+    var fnAt: [Int] = []
+    for (k, f) in fns.enumerate() {
+        g.align()
+        fnAt.push(g.here())
+        g.fnIndex = from + k
+        g.genFn(f)
+    }
+    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt)
 }
 
 // -g: where ins's code starts, when its line is another than the last one's

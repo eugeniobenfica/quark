@@ -55,6 +55,8 @@ pub fn IrProgram.optimize(var self, release: Bool) {
             }
         }
         self.target.lanes = lanes
+    } else if self.instructions() >= threadsFrom {
+        self.fns = self.fns.parallelMap(f => quickFn(f))
     } else {
         for i in 0..len(self.fns) {
             self.fns[i].quickOptimize()
@@ -62,12 +64,14 @@ pub fn IrProgram.optimize(var self, release: Bool) {
     }
 }
 
+fn quickFn(f: IrFn) -> IrFn {
+    var g = f
+    g.quickOptimize()
+    g
+}
+
 // the instructions a program's functions have
 pub fn IrProgram.size(self) -> Int = self.fns.map(f => len(f.code)).sum()
-
-// a program this big (in instructions) or more is optimized on the processor's threads: a smaller one takes less
-// than the threads take to start (each loads the compiler's code again)
-pub const threadsFrom = 20000
 
 fn releasedFn(f: IrFn, lanes: Int, fuel: Bool, tables: [IrTable], arch: Arch, sse42: Bool) -> IrFn {
     var g = f

@@ -14,8 +14,11 @@ passando.
 
 1. [~] **Fechar o marco 0.12: o rebuild do compilador abaixo de 0,5 s** (hoje ~1,7 s).
    - [ ] o cache por módulo: leitura, checagem e lowering guardados por módulo (o que leva de ~1,2 s a 0,5 s)
-2. [ ] **O tempo de volta da B12** (a carga e o check numa tarefa custam +5% de relógio): workers do `parallelMap`
-   que vivem entre chamadas; um canal que entrega o valor sem copiá-lo.
+2. [~] **O fim da B12:**
+   - [ ] no ARM64, a carga e o check numa tarefa esperam a próxima versão: as tarefas da 0.12.0 têm 8 MB de pilha,
+     pouco para checar o compilador ali (o `main` já dá 64 MB a uma tarefa no Linux e no macOS);
+   - [ ] o tempo de volta (a tarefa custa +5% de relógio): workers do `parallelMap` que vivem entre chamadas; um
+     canal que entrega o valor sem copiá-lo.
 3. [ ] **As ferramentas onde as pessoas estão.** Cada uma é pública: precisa do OK do dono.
    - uma extensão de editor (VS Code) que leve o `quark lsp` e o `quark dap`;
    - um registro de pacotes público (o repositório `index.toml`);

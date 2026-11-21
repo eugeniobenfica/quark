@@ -698,7 +698,9 @@ resultado.
 ### B12. A compilação em fluxo
 
 > **Feita (21/11/2026).** O pico do rebuild do compilador caiu de 3,1 GB para ~1,5 GB, com +5% de tempo de relógio.
-> A carga e o check numa tarefa esperaram a 0.12.0, de onde o CI agora parte (o resultado está no fim desta seção).
+> A carga e o check numa tarefa esperaram a 0.12.0, de onde o CI agora parte; no ARM64 esperam a próxima versão, porque
+> as tarefas da 0.12.0 têm 8 MB de pilha, pouco para checar o compilador ali (agora são 64 MB no Linux e no macOS,
+> onde a memória só é tomada quando tocada). O resultado está no fim desta seção.
 
 **Hoje:** o lowering faz o IR de todas as funções, a otimização faz outra cópia de todas, e só então sai o código de
 máquina. O IR de 25 mil funções (~380 MB, duas vezes) e o lixo de cada fase ficam vivos até o fim.

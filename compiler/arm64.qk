@@ -617,10 +617,10 @@ fn Arm64.coldWord(var self, w: Int, code: Int, line: Int, a: Int, b: Int) {
 // a line into reg in four instructions whatever its value, noted (lineAt)
 fn Arm64.movLine(var self, reg: Int, v: Int) {
     self.lineAt.push(self.here())
-    self.ins(0xD2800000 | (v & 0xFFFF) << 5 | reg) // movz reg, bits 0-15
-    self.ins(0xF2A00000 | (v >> 16 & 0xFFFF) << 5 | reg) // movk reg, bits 16-31, lsl 16
-    self.ins(0xF2C00000 | (v >> 32 & 0xFFFF) << 5 | reg) // movk reg, bits 32-47, lsl 32
-    self.ins(0xF2E00000 | (v >> 48 & 0xFFFF) << 5 | reg) // movk reg, bits 48-63, lsl 48
+    self.ins(0xD2800000 | v & 0xFFFF << 5 | reg) // movz reg, bits 0-15
+    self.ins(0xF2A00000 | v >> 16 & 0xFFFF << 5 | reg) // movk reg, bits 16-31, lsl 16
+    self.ins(0xF2C00000 | v >> 32 & 0xFFFF << 5 | reg) // movk reg, bits 32-47, lsl 32
+    self.ins(0xF2E00000 | v >> 48 & 0xFFFF << 5 | reg) // movk reg, bits 48-63, lsl 48
 }
 
 fn Arm64.panicCall(var self, code: Int, line: Int) {

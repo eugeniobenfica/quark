@@ -697,9 +697,8 @@ resultado.
 
 ### B12. A compilação em fluxo
 
-> **Feita em parte (21/11/2026).** Os lotes estão no compilador: o pico do rebuild caiu de 3,1 GB para ~2,1 GB, sem
-> mudar o tempo. A carga e o check numa tarefa (para ~1,5 GB) esperam uma release: o CI constrói o compilador com a
-> 0.9.2, que não tem canais tipados (o resultado está no fim desta seção).
+> **Feita (21/11/2026).** O pico do rebuild do compilador caiu de 3,1 GB para ~1,5 GB, com +5% de tempo de relógio.
+> A carga e o check numa tarefa esperaram a 0.12.0, de onde o CI agora parte (o resultado está no fim desta seção).
 
 **Hoje:** o lowering faz o IR de todas as funções, a otimização faz outra cópia de todas, e só então sai o código de
 máquina. O IR de 25 mil funções (~380 MB, duas vezes) e o lixo de cada fase ficam vivos até o fim.

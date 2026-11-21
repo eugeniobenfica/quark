@@ -1242,7 +1242,7 @@ fn Writer.signature(var self, a: Ast, d: Decl) {
             params.push(if p.isVar { "var " + p.name } else { p.name })
             continue
         }
-        var w = Writer(p.name + ": ", noWrap: true)
+        var w = Writer((if p.owned { "owned " } else { "" }) + p.name + ": ", noWrap: true)
         w.typeExpr(a, p.ty)
         if p.fallback >= 0 {
             w.put(" = ")

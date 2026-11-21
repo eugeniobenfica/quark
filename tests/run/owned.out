@@ -1,0 +1,5 @@
+Doc(title: first, lines: [a]) Doc(title: first*, lines: [a, b])
+Doc(title: second, lines: [x, z]) Doc(title: second*, lines: [x, y])
+Shelf(docs: [Doc(title: third*, lines: [only])], count: 1)
+106 [1, 2, 3] 105
+[Doc(title: d0*, lines: [#0]), Doc(title: d1*, lines: [#1]), Doc(title: d2*, lines: [#2])]

@@ -387,7 +387,13 @@ fn signatureOf(p: Program, d: Decl) -> Text {
     var s = "fn {d.name}("
     for (i, prm) in d.params.enumerate() {
         let param = p.ast.params[prm]
-        s += (if i > 0 { ", " } else { "" }) + (if param.isVar { "var " } else { "" }) + param.name
+        s += (if i > 0 { ", " } else { "" }) + (if param.isVar {
+            "var "
+        } else if param.owned {
+            "owned "
+        } else {
+            ""
+        }) + param.name
         if i == 0 and (param.ty < 0 or d.impliedSelf) {
             continue // fn Vec2.length(self), fn Parser.next(var self)
         }

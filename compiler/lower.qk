@@ -655,8 +655,9 @@ fn Lower.paramByRef(var self, d: Int, i: Int) -> Bool {
         or x.isExtern
         or x.lifted
         or self.isCFunction(d)
-        or self.asValue[x.index] {
-        return false
+        or self.asValue[x.index]
+        or i < len(x.params) and self.p.ast.params[x.params[i]].owned {
+        return false // (an owned value is the function's: never the caller's place)
     }
     if i == 0 and self.own.changesSelf(d) {
         return false
@@ -5214,8 +5215,14 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
                 byRef[i] = true
                 continue
             }
-            var v = self.lowerExpr(values[i])
+            let owned = i < len(dx.params) and self.p.ast.params[dx.params[i]].owned
+            var v = if owned {
+                self.lowerOwned(values[i], true) // the function's own: a var at its last use handed over, else a copy
+            } else {
+                self.lowerExpr(values[i])
+            }
             if changes
+                and not owned
                 and self.holdsContainers(self.ty(values[i]))
                 and self.own.aliasesDeep(values[i])
                 and self.own.sharedWithCall(values[i], selfRoot) {

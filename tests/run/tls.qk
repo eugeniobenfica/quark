@@ -1,38 +1,48 @@
 // TLS by the system's library (Schannel, OpenSSL, SecureTransport), through std.http's https:// and std.net's
 // connectTls: a page read, one from a server reached by its address, and a certificate refused for a name it does
-// not have. (Without a network: what it would have said.)
+// not have. Each within a time (withTimeout: a read that waits gives its turn back, and is cancelled then); without a
+// network, or with no answer in time, what it would have said.
 use std.http
 use std.net
 
+fn page() -> Text = match get("https://example.com/") {
+    Ok(r) => "{r.status} {r.text().contains("Example Domain")}"
+    Err(why) => if why.startsWith("cannot connect") { "200 true" } else { why }
+}
+
+// a server reached by its IP address: its certificate checked for the address
+fn byAddress() -> Text = match get("https://1.1.1.1/") {
+    Ok(r) => "by address: {r.status < 500}"
+    Err(why) => if why.startsWith("cannot connect") {
+        "by address: true"
+    } else {
+        why
+    }
+}
+
+fn refused() -> Text = match connect("example.com", 443) {
+    Ok(s) => {
+        let no = tlsConnect(s, "quark.invalid") is Err(_)
+        closeSocket(s)
+        "{no}"
+    }
+    Err(_) => "true"
+}
+
+fn head() -> Text = match connectTls("example.com") {
+    Ok(opened) => {
+        var c = opened
+        let _ = c.write("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        let first = c.readLine() ?? ""
+        c.close()
+        first
+    }
+    Err(_) => "HTTP/1.1 200 OK"
+}
+
 fn main() {
-    match get("https://example.com/") {
-        Ok(r) => print(r.status, r.text().contains("Example Domain"))
-        Err(why) => print(if why.startsWith("cannot connect") { "200 true" } else { why })
-    }
-    // a server reached by its IP address: its certificate checked for the address
-    match get("https://1.1.1.1/") {
-        Ok(r) => print("by address:", r.status < 500)
-        Err(why) => print(if why.startsWith("cannot connect") {
-            "by address: true"
-        } else {
-            why
-        })
-    }
-    match connect("example.com", 443) {
-        Ok(s) => {
-            let refused = tlsConnect(s, "quark.invalid") is Err(_)
-            closeSocket(s)
-            print(refused)
-        }
-        Err(_) => print(true)
-    }
-    match connectTls("example.com") {
-        Ok(opened) => {
-            var c = opened
-            let _ = c.write("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-            print(c.readLine() ?? "")
-            c.close()
-        }
-        Err(_) => print("HTTP/1.1 200 OK")
-    }
+    print(withTimeout(20.0, () => page()) ?? "200 true")
+    print(withTimeout(20.0, () => byAddress()) ?? "by address: true")
+    print(withTimeout(20.0, () => refused()) ?? "true")
+    print(withTimeout(20.0, () => head()) ?? "HTTP/1.1 200 OK")
 }

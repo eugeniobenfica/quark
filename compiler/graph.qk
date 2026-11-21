@@ -662,7 +662,7 @@ fn Out.withParams(var self, d: Decl, given: g.Decl) -> g.Decl {
         if prm.binding >= 0 {
             self.wire[prm.binding] = pid
         }
-        var p = g.Param(id: pid, name: prm.name, mutable: prm.isVar, key: d.name + "/" + prm.name) // var self
+        var p = g.Param(id: pid, name: prm.name, mutable: prm.isVar, owned: prm.owned, key: d.name + "/" + prm.name)
         if k > 0 or not d.impliedSelf {
             p.typeName = self.typeString(prm.ty) // fn Vec2.length(self): its type is the type's
         }
@@ -1562,7 +1562,7 @@ pub fn programOfGraph(gr: g.Graph, path: Text) -> Imported {
             r.startDecl(dj)
             for p in dj.params {
                 let ty = if p.typeName != "" { r.typeOf(p.typeName) } else { -1 }
-                var prm = Param(p.name, ty, 0, 0, isVar: p.mutable)
+                var prm = Param(p.name, ty, 0, 0, isVar: p.mutable, owned: p.owned)
                 if p.id > 0 and p.id <= r.maxId {
                     r.names[p.id] = prm.name
                 }

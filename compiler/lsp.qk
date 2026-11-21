@@ -612,7 +612,13 @@ fn signature(p: Program, d: Int) -> Text {
     s += if len(x.typeParams) > 0 { ">(" } else { "(" }
     for (i, k) in x.params.enumerate() {
         let prm = p.ast.params[k]
-        s += (if i > 0 { ", " } else { "" }) + (if prm.isVar { "var " } else { "" }) + prm.name
+        s += (if i > 0 { ", " } else { "" }) + (if prm.isVar {
+            "var "
+        } else if prm.owned {
+            "owned "
+        } else {
+            ""
+        }) + prm.name
         if i == 0 and (prm.ty < 0 or x.impliedSelf) {
             continue // fn Point.scaled(self, k: Int), fn Parser.next(var self)
         }

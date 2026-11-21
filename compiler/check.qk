@@ -4002,7 +4002,9 @@ fn Checker.instantiate(var self, d: Int, bound: [Int], lambdas: [Int], takesFn: 
         let x = self.p.ast.params[prm]
         let t = self.resolveType(x.ty)
         let lambda = if self.kindOf(t) == Kind.Fn { lambdas[f] } else { -1 }
-        self.p.bindings.push(Binding(x.name, t, mutable: x.isVar, isParam: true, lambda: lambda))
+        self.p.bindings.push(
+            Binding(x.name, t, mutable: x.isVar or x.owned, isParam: true, lambda: lambda, deep: x.owned),
+        )
         self.p.ast.params[prm].binding = len(self.p.bindings) - 1
     }
     for prm in inst.params {
@@ -4915,7 +4917,7 @@ fn Checker.notChangeable(var self, at: Int, root: Int, fnName: Text) {
     } else if r.isParam and r.name == "self" {
         why += "self is a parameter (parameters never change): make the function a var self method, fn T.name(var self, ...)"
     } else if r.isParam {
-        why += "\"{r.name}\" is a parameter (parameters never change): copy it into a var, or make the function a var self method"
+        why += "\"{r.name}\" is a parameter (parameters never change): make it the function's own (owned {r.name}: T), copy it into a var, or make the function a var self method"
     } else if fnName != "" {
         why += "{r.name} must be a var"
     } else {
@@ -8512,7 +8514,8 @@ fn Checker.run(var self, needMain: Bool) -> Bool {
                 Binding(
                     q.name,
                     t,
-                    mutable: q.isVar,
+                    mutable: q.isVar or q.owned,
+                    deep: q.owned,
                     isParam: true,
                     fnParam: fnParam,
                     paramOf: d,
@@ -8521,6 +8524,7 @@ fn Checker.run(var self, needMain: Bool) -> Bool {
                     col: q.col,
                 ),
             )
+            // owned: the function's own value, a var of it
             self.p.ast.params[prm].binding = len(self.p.bindings) - 1
             if t == x.ty and x.ty >= 0 {
                 self.say(q.line, q.col, "{x.name} cannot hold itself")

@@ -127,6 +127,7 @@ fn GWriter.param(var self, p: g.Param) {
     self.int("id", p.id)
     self.text("name", p.name)
     self.flag("var", p.mutable)
+    self.flag("owned", p.owned)
     self.text("type", p.typeName)
     self.text("key", p.key)
     self.pin("default", p.default)
@@ -467,6 +468,7 @@ fn GReader.param(self, v: Int) -> g.Param =
         typeName: self.str(v, "type"),
         key: self.str(v, "key"),
         mutable: self.flag(v, "var"),
+        owned: self.flag(v, "owned"),
         default: self.pin(self.j.get(v, "default")),
     )
 

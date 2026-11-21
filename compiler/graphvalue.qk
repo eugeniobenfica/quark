@@ -96,6 +96,7 @@ pub type Param {
     typeName: Text = ""
     key: Text = ""
     mutable: Bool = false
+    owned: Bool = false // fn f(owned p: T)
     default: Pin = Pin()
 }
 

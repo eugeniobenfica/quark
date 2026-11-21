@@ -1835,6 +1835,11 @@ fn Parser.parseFn(var self) -> Decl {
             break
         }
         let isVar = self.accept(.Var) // fn Parser.next(var self): it changes the value it is called on
+        // owned (a word only here: before a parameter's name): the function's own value
+        let owned = not isVar and self.atName("owned") and self.peekAt(1).kind == .Name
+        if owned {
+            let _ = self.next()
+        }
         let pn = self.expect(.Name, "for a parameter (a camelCase name)")
         let isSelf = len(self.ints) == start and typeFn and self.text(pn) == "self" and not self.at(.Colon)
         if isVar and not isSelf {
@@ -1857,7 +1862,12 @@ fn Parser.parseFn(var self) -> Decl {
         } else {
             -1
         }
-        let param = self.ast.param(Param(self.text(pn), ty, pn.line, pn.col, fallback, isVar and isSelf))
+        if owned and isSelf {
+            self.fail(pn, "self is not owned: var self changes the value it is called on, and self only reads it")
+        }
+        let param = self.ast.param(
+            Param(self.text(pn), ty, pn.line, pn.col, fallback, isVar and isSelf, owned: owned and not isSelf),
+        )
         self.ints.push(param)
         if not self.accept(.Comma) {
             break

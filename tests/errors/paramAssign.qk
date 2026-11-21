@@ -1,4 +1,4 @@
-// error: "p" is a parameter (parameters never change): copy it into a var
+// error: "p" is a parameter (parameters never change): make it the function's own (owned p: T)
 fn bump(p: Int) -> Int {
     p = p + 1
     p

@@ -582,6 +582,13 @@ of one (`st.parser.next()`, `parsers[i].next()`); on a `let` or a parameter it i
 changes its value: p must be a var`). Only `self` can be `var`, and such a function is not an effect.
 In a graph its call is a statement node, as `xs.push(v)` is.
 
+**`owned`** before a parameter makes its value the function's own: it can change it and keep it (in what it makes,
+in what it gives back) with no copy, `fn appended(owned d: Doc, line: Text) -> Doc`. Its caller sees nothing of
+that: a `var` at its last use, or a value just made, is handed over as it is; any other value (a `let`, a `var`
+read again later, a parameter of the caller's) is copied first. So `owned` changes what a call costs, never what
+it means. A function that keeps a large value it is given (a compiler's phase that takes the program) is where it
+pays. (`owned` is a word only there; `self` is never owned: `var self` changes the caller's value.)
+
 <!-- given
 type Token { text: Text }
 -->
@@ -1403,6 +1410,12 @@ array or map of a type it can hold is changed through that `var`, there or in a 
 (pushing into `self.code`, or setting one of its elements, changes nothing `ins` holds), and no function value or
 `defer` takes it. And when the `var`'s place is then given a new value in the same block (`let done = self.cur`,
 then `self.cur = IrFn("")`), the `let` takes what the place held: it is its own, kept anywhere with no copy.
+
+A `var` is handed over at its last use, not copied: given to a function's `owned` parameter, kept in a record or a
+case being made, pushed, given back. That holds for an array or a map, and for a value that holds them when the `var`
+owns all it holds: one changed in place (every value put in it was copied all through), one given only values all
+its own (made there, or a function's result that is all its own), or a function's `var self`. A whole new value
+(`x = ...`) ends a stretch: the last use before it is a last use too.
 
 ## Memory
 

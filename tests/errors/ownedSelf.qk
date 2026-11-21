@@ -1,0 +1,8 @@
+// error: self is not owned
+type Doc { lines: [Text] }
+
+fn Doc.add(owned self) -> Doc = self
+
+fn main() {
+    print(Doc([]).add())
+}

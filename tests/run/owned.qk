@@ -1,0 +1,45 @@
+// owned parameters: the function's own value, changed and kept with no copy. A caller's var at its last use (or a value
+// just made) is handed over; any other value is copied first, so the caller never sees the function's changes.
+type Doc { title: Text, lines: [Text] }
+type Shelf { docs: [Doc], count: Int }
+
+// changes what it is given, and gives it back
+fn appended(owned d: Doc, line: Text) -> Doc {
+    d.lines.push(line)
+    d.title = d.title + "*"
+    d
+}
+
+// keeps what it is given in what it makes
+fn shelved(owned d: Doc) -> Shelf = Shelf([d], 1)
+
+fn total(owned xs: [Int]) -> Int {
+    xs.push(100)
+    xs.sum()
+}
+
+fn main() {
+    // a let: copied, unchanged after
+    let first = Doc("first", ["a"])
+    let changed = appended(first, "b")
+    print(first, changed)
+    // a var used again later: copied
+    var second = Doc("second", ["x"])
+    let more = appended(second, "y")
+    second.lines.push("z")
+    print(second, more)
+    // a var at its last use: handed over
+    var third = Doc("third", [])
+    let shelf = shelved(appended(third, "only"))
+    print(shelf)
+    // an array, from a var used again after
+    var xs = [1, 2, 3]
+    print(total(xs), xs, total([5]))
+    // in a loop: each turn's value its own
+    var docs: [Doc] = []
+    for i in 0..3 {
+        var d = Doc("d{i}", [])
+        docs.push(appended(d, "#{i}"))
+    }
+    print(docs)
+}

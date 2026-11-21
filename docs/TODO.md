@@ -85,6 +85,8 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
 - [x] `pub` por campo (num tipo opaco)
 - [x] `T` dentro de uma lambda de uma função genérica; `r.f(x)` chama o campo `f` mesmo com um valor `f` ao alcance
 - [x] uma lambda guarda uma função dada à função genérica em volta (também dentro de um construtor genérico)
+- [x] parâmetros `owned`: a função muda e guarda o valor sem cópia; quem chama entrega uma `var` no último uso ou
+  copia (o significado não muda, só o custo)
 
 ### D. Backends e sistema
 

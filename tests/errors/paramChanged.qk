@@ -1,0 +1,11 @@
+// error: "d" is a parameter (parameters never change): make it the function's own (owned d: T)
+type Doc { lines: [Text] }
+
+fn add(d: Doc) -> Doc {
+    d.lines.push("x")
+    d
+}
+
+fn main() {
+    print(add(Doc([])))
+}

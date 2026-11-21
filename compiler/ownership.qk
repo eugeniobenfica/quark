@@ -8,6 +8,7 @@ use types
 
 pub type Ownership {
     p: Program
+    defs: [[Int]] = [] // each var's values (decideTakes: ownsAll)
     debug: Bool = false // --debug: every value its own (nothing borrowed)
     inBlock: Int = -1 // the block whose statements are being decided (decideAliases)
     changes: [[Int]] = [] // each var self function's changes in place (container types), by declaration (borrows)
@@ -1191,8 +1192,27 @@ fn Ownership.aliasBlock(var self, b: Int) {
 // whose value is its caller's var's.
 pub fn Ownership.decideTakes(var self) {
     self.takes = [false] * len(self.p.ast.exprs)
+    let noDefs: [Int] = []
+    self.defs = [noDefs] * len(self.p.bindings)
     if self.debug {
         return
+    }
+    // each var's values: its first, and each whole new one (x = v); -1 for one that changes it otherwise
+    for st in self.p.ast.stmts {
+        match st.node {
+            Let(mutable, _, _, value, pattern, _) => {
+                if mutable and pattern < 0 and st.binding >= 0 {
+                    self.defs[st.binding].push(value)
+                }
+            }
+            Assign(target, op, value) => {
+                let b = self.p.ast.exprs[target].binding
+                if self.p.ast.exprs[target].node is Name(_) and b >= 0 {
+                    self.defs[b].push(if op == .Assign { value } else { -1 })
+                }
+            }
+            _ => {}
+        }
     }
     var captured: Set<Int> = []
     for x in self.p.bindings {
@@ -1216,29 +1236,44 @@ pub fn Ownership.decideTakes(var self) {
             self.takeLast(stmts[i + 1..], bnd)
         }
     }
-    // a function's var self: in its body
+    // a function's var self, and its owned parameters: in its body
     for d in self.p.decls {
         let x = self.p.ast.decls[d]
-        if x.kind != DeclKind.Fn or x.body < 0 or len(x.params) == 0 or x.isTemplate {
+        if x.kind != DeclKind.Fn or x.body < 0 or x.isTemplate {
             continue
         }
-        let prm = self.p.ast.params[x.params[0]]
-        let bnd = prm.binding
-        if not prm.isVar or bnd < 0 or captured.contains(bnd) or not self.holdsContainers(self.p.bindings[bnd].ty) {
+        let BlockExpr(block, _) = self.p.ast.exprs[x.body].node else {
             continue
         }
-        if self.p.ast.exprs[x.body].node is BlockExpr(block, _) {
+        for k in x.params {
+            let prm = self.p.ast.params[k]
+            let bnd = prm.binding
+            if not (prm.isVar or prm.owned)
+                or bnd < 0
+                or captured.contains(bnd)
+                or not self.holdsContainers(self.p.bindings[bnd].ty) {
+                continue
+            }
             self.takeLast(self.p.ast.blocks[block].stmts, bnd)
         }
     }
 }
 
 // may a var's value be handed over at its last use: an array or a map; a value that holds them, when the var owns
-// them all (a deep var)
+// them all (a deep var, or one given only values all their own)
 fn Ownership.handedOver(self, bnd: Int) -> Bool {
     let t = self.p.bindings[bnd].ty
-    self.tk(t) is Array | Map or self.holdsContainers(t) and self.p.bindings[bnd].deep
+    self.tk(t) is Array | Map or self.holdsContainers(t) and (self.p.bindings[bnd].deep or len(self.defs[bnd]) > 0)
 }
+
+// a var never changed in place whose every value (its first, and each x = v) is all its own: it shares nothing
+// (a value read from another name is not counted: that one's own values are its question)
+fn Ownership.ownsAll(self, b: Int) -> Bool =
+    b < len(self.defs)
+        and len(self.defs[b]) > 0
+        and self.defs[b].all(
+            v => v >= 0 and not self.p.ast.exprs[v].node is Name(_) | Field(_, _) and self.deepFresh(v),
+        )
 
 // is e a var's mention handed over all through (a taken name, or a field of one: k.p at k's last use), of a var that
 // owns all it holds (a deep var, or a function's var self)?
@@ -1249,7 +1284,7 @@ pub fn Ownership.taken(self, e: Int) -> Bool {
     match self.p.ast.exprs[e].node {
         Name(_) => {
             let b = self.p.ast.exprs[e].binding
-            self.takes[e] and b >= 0 and (self.p.bindings[b].deep or self.p.bindings[b].isParam)
+            self.takes[e] and b >= 0 and (self.p.bindings[b].deep or self.p.bindings[b].isParam or self.ownsAll(b))
         }
         Field(target, _) => self.taken(target)
         _ => false

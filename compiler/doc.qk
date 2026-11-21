@@ -22,7 +22,13 @@ fn fnSignature(p: Program, d: Decl) -> Text {
         let prm = a.params[k]
         if i == 0 and (prm.ty < 0 or d.impliedSelf) {
             // fn Vec2.length(self), fn Parser.next(var self)
-            out += (if prm.isVar { "var " } else { "" }) + prm.name
+            out += (if prm.isVar {
+                "var "
+            } else if prm.owned {
+                "owned "
+            } else {
+                ""
+            }) + prm.name
             continue
         }
         out += (if i > 0 { ", " } else { "" }) + prm.name + ": " + (if prm.ty >= 0 { typeText(a, prm.ty) } else { "" })

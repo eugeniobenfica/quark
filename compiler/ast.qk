@@ -190,6 +190,9 @@ pub type Param {
     col: Int
     fallback: Int = -1
     isVar: Bool = false
+    // fn f(owned p: T): the function's own value, kept or changed with no copy (a caller's var at its last use is handed
+    // over; any other value, copied first)
+    owned: Bool = false
     binding: Int = -1
     boxed: Bool = false
     isPub: Bool = false // a field of an opaque type its module lets others read and change (pub balance: Int)

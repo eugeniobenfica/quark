@@ -564,6 +564,18 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 >   Cortar isso pede parâmetros que consomem (como o `consuming` do Swift ou o move do Rust), uma mudança de linguagem;
 >   ou fases escritas como métodos de `var self`, que a entrega do `var self` já cobre, com uma ferramenta que diga onde
 >   cada cópia acontece (o perfil mostra o tempo das cópias, não a memória que elas guardam).
+>
+> **Parâmetros que consomem: `owned` (21/11/2026).**
+> - **O que é:** `fn f(owned p: T)` faz do valor o da função, que o muda e o guarda sem cópia. Quem chama não vê
+>   diferença nenhuma: uma `var` no último uso (ou um valor recém-feito) é entregue; qualquer outro valor é copiado
+>   antes. O `owned` muda o custo da chamada, nunca o significado. É uma palavra só nesse lugar, como o `owned` do Mojo.
+> - **Junto:** uma `var` que só recebeu valores todos seus (como o resultado de `loadProgram`) também é entregue no
+>   último uso, mesmo sem nunca mudar no lugar; e os parâmetros `owned` são entregues dentro da função.
+> - **Medido:** um registro de 80 MB guardado pela função que o recebe, de 152 para 76 MB (sem cópia).
+> - **No compilador: medido e não usado ainda.** Com `owned` na checagem e no lowering, o pico foi de ~3,1 para
+>   ~3,05 GB, e o tempo ficou igual. Os blocos grandes que sobram são, pelos tamanhos que dobram (40, 80 MB), as
+>   versões velhas dos arrays da árvore quando crescem, não cópias do programa. E usar a palavra nas fontes do
+>   compilador pede uma versão publicada que a conheça (a CI começa da 0.9.2): fica para depois da próxima versão.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

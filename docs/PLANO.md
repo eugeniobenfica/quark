@@ -639,11 +639,16 @@ fatos dos chamados (o que um `var self` muda, se um resultado é todo seu, o tam
   mesmo lugar e lê o arquivo para lá: todo ponteiro vale sem correção, menos a descrição de cada mapa, que mora nos
   dados do executável e é gravada relativa a eles. Dois lugares, usados em turnos. Uma imagem de 44 MB é lida em
   9 ms.
-- **Etapa 3a, feita e medida, à espera da próxima versão:** o programa checado (com as constantes) guardado numa
-  imagem e lido de volta quando nenhum arquivo mudou. Ler e checar o compilador: de ~550 para ~20 ms, com o mesmo
-  executável. Não está no `main` porque o compilador é compilado com a std do compilador que o constrói, e a da
-  0.12.0 não tem `saveImage`; o `build.sh` também precisa rodar o estágio 1 com `QUARK_IMAGES=off` (o runtime dele é o
-  do compilador que o construiu).
+- **Etapa 3a, feita (com a 0.12.1, de onde o CI parte):** o programa checado (com as constantes) guardado numa
+  imagem (`quark-check-*.bin`) e lido de volta quando cada arquivo que ele leu está como estava. Ler e checar o
+  compilador: de ~550 para ~17 ms, com o mesmo executável. Só um programa que levou mais de 150 ms para ler e checar
+  guarda a sua. O `build.sh` roda o estágio 1 com `QUARK_IMAGES=off`: ele tem o runtime do compilador que o construiu.
+  Dois processos que gravam a mesma imagem ao mesmo tempo podem estragá-la (o runtime não tem como renomear um
+  arquivo); uma lida no meio de uma gravação falha com segurança.
+- **A ordem daqui em diante:** as etapas 2 e 3b viram uma só, o build incremental sobre a imagem do build anterior
+  inteiro (o programa, as tabelas do lowering e o código de cada função). Partindo dela, um build só acrescenta: as
+  funções que não mudaram guardam seus números e deslocamentos, e o código delas vale como está, com as linhas
+  corrigidas pelo quanto cada uma andou no arquivo.
 
 ### B11. A memória de uma chamada: devolvida na volta
 

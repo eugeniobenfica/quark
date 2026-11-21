@@ -147,7 +147,7 @@ pub const embeddedRuntime = "<quark>/runtime/"
 
 // a file's text: the standard library's as the compiler keeps it (compiler/stdlib.qk; else from std/ next to where
 // quark runs, or $QUARK_STD), the runtime's as the compiler keeps it, another one from disk
-fn readModule(file: Text, std: Bool, hostFiles: [Text: Text]?) -> Text? {
+pub fn readModule(file: Text, std: Bool, hostFiles: [Text: Text]?) -> Text? {
     if std and stdText(file[4..len(file) - 3]) is Some(text) {
         return text
     }

@@ -113,38 +113,29 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         preludeSrc = Source(o.prelude, text)
     }
-    // read and checked as a task: what those two work with (most of the memory they make, little of it kept) goes
-    // when the task ends, and only the checked program is copied out. (Not on ARM64 until the compiler that builds
-    // this one gives a task more than 8 MB of stack, 0.12.0's: checking the compiler takes more there.)
-    var checked: Program? = None
-    if host.arm {
-        checked = readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)
+    // read, checked and its constants worked out: as an earlier build left it (its image), when every file it read is
+    // as it was; else here, and its image kept for the next build (docs/PLANO.md B13)
+    let imageKey = "{compilerSources}|{src.path}|{purpose.needMain}|{o.allowed ?? "-"}|{o.prelude}"
+    // (QUARK_IMAGES=off: none; build.sh's stage1 runs so: a compiler built by an older one has its runtime, which may
+    // have no images)
+    let imageAt = if purpose.runtime or env("QUARK_CACHE") == Some("off") or env("QUARK_IMAGES") == Some("off") {
+        ""
     } else {
-        let out: Channel<Program?> = channel()
-        let _ = go(() => send(out, readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)))
-        if receive(out) is Some(got) {
-            checked = got
-        }
-        closeChannel(out)
+        var h = Hash128()
+        h.add(imageKey.bytes())
+        cachePath("quark-check-{h.text()}.bin")
     }
-    let Some(program) = checked else {
-        return None
-    }
-    var checkedProgram = program
-    if not purpose.runtime {
-        let problems = checkedProgram.runConsts(host)
-        if len(problems) > 0 {
-            var errors = Errors()
-            for problem in problems {
-                errors.add(checkedProgram.modules[problem.module].src, problem.line, problem.col, problem.message)
-            }
-            if not quiet {
-                for e in errors.shown {
-                    printErr(e)
-                }
-            }
-            return None
+    var fromImage: Program? = None
+    if imageAt != "" {
+        let kept: CheckImage? = machine.loadImage(imageAt)
+        if kept is Some(image) and image.key == imageKey and sameSources(image.program, src, preludeSrc) {
+            fromImage = Some(image.program)
         }
+    }
+    var checkedProgram = fromImage ?? (checkedHere(host, src, preludeSrc, o, purpose, quiet) ?? return None)
+    // (kept when reading and checking it took long enough for its image to be read faster: not a small program's)
+    if fromImage is None and imageAt != "" and monotonicTime() - t0 > 0.15 {
+        let _ = machine.saveImage(CheckImage(imageKey, checkedProgram), imageAt)
     }
     let t1 = monotonicTime()
     let cpu = machine.cpu()
@@ -278,6 +269,61 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     let prog = low.program // taken
     low.program = IrProgram()
     Compiled(prog, mc, low.data, low.inlines, testsOf(checkedProgram), if avx { 1 } else { 0 }, os, purpose.linked)
+}
+
+// a checked program as a build left it, for the next one (its key: the compiler, the file, what checking it took)
+type CheckImage { key: Text, program: Program }
+
+// is every file p was read from as it was (the file given, the prelude, the standard library's, the others')
+fn sameSources(p: Program, src: Source, preludeSrc: Source?) -> Bool {
+    for (k, m) in p.modules.enumerate() {
+        let now = if k == 0 {
+            Some(src.text)
+        } else if m.path == preludePath {
+            Some(preludeText())
+        } else if preludeSrc is Some(given) and m.path == given.path {
+            Some(given.text)
+        } else {
+            readModule(m.path, m.path.startsWith("std/"), None)
+        }
+        if now != Some(m.src.text) {
+            return false
+        }
+    }
+    true
+}
+
+// the program read, checked, and its constants worked out; its errors said (unless quiet); None when it has any
+fn checkedHere(host: Host, src: Source, preludeSrc: Source?, o: RunOptions, purpose: Purpose, quiet: Bool) -> Program? {
+    // read and checked as a task: what those two work with (most of the memory they make, little of it kept) goes
+    // when the task ends, and only the checked program is copied out
+    var checked: Program? = None
+    let out: Channel<Program?> = channel()
+    let _ = go(() => send(out, readAndCheck(src, preludeSrc, purpose, o.allowed, quiet)))
+    if receive(out) is Some(got) {
+        checked = got
+    }
+    closeChannel(out)
+    let Some(program) = checked else {
+        return None
+    }
+    var checkedProgram = program
+    if not purpose.runtime {
+        let problems = checkedProgram.runConsts(host)
+        if len(problems) > 0 {
+            var errors = Errors()
+            for problem in problems {
+                errors.add(checkedProgram.modules[problem.module].src, problem.line, problem.col, problem.message)
+            }
+            if not quiet {
+                for e in errors.shown {
+                    printErr(e)
+                }
+            }
+            return None
+        }
+    }
+    Some(checkedProgram)
 }
 
 // the program read and checked, its errors said (unless quiet); None when it has any

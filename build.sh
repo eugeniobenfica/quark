@@ -33,12 +33,16 @@ mkdir -p "$B"
 # the standard library and the runtime, as texts the compiler keeps: compiler/stdlib.qk
 bash compiler/embed.sh
 
-# stage NAME QUARK OUT [quick]: compiler/ built by QUARK into OUT, with the optimizing tier (unless quick), timed
+# stage NAME QUARK OUT [quick]: compiler/ built by QUARK into OUT, with the optimizing tier (unless quick), timed.
+# stage1 runs with QUARK_IMAGES=off: built by another compiler, it has that one's runtime, which may not have the
+# images today's compiler keeps its checked programs in (docs/PLANO.md B13)
 stage() {
     local start=$SECONDS tier=--release
     [ "$4" = quick ] && tier=
     mkdir -p "$(dirname "$3")"
-    if ! "$2" build "$main" $tier -o "$3.new" > /dev/null 2> "$B/stage.err"; then
+    local images=
+    [ "$2" = "$B/stage1/quark.exe" ] && images=off
+    if ! QUARK_IMAGES=$images "$2" build "$main" $tier -o "$3.new" > /dev/null 2> "$B/stage.err"; then
         cat "$B/stage.err" >&2
         exit 1
     fi

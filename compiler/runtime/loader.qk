@@ -170,8 +170,16 @@ fn stackLimit() -> Int {
     }
 }
 
+// f called with its slots from args, its results to results: 1; 0 where code is loaded (WebAssembly's: the program
+// is in the runtime's own module, and f its function's number)
+extern effect fn osRunSlots(f: Int64, args: Int64, argCount: Int64, results: Int64, resultCount: Int64) -> Int64 as "qkosRunSlots"
+
 // calls fn (in l's code) through the trampoline; false when it panicked (the panic text says why)
 pub fn runEntry(l: Int, f: Int, args: Int, argCount: Int, results: Int, resultCount: Int) -> Bool {
+    if l == 0 {
+        // no code loaded: the program is the runtime's own (WebAssembly), and a panic ends it
+        return osRunSlots(f, args, argCount, results, resultCount) != 0
+    }
     let c = ctx()
     if word(c, ctxEscapeRsp) == 0 {
         arenaReset()

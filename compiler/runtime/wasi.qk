@@ -58,6 +58,7 @@ extern effect fn procExit(code: Int64) in "wasi_snapshot_preview1" as "proc_exit
 extern effect fn memoryGrow(pages: Int64) -> Int64 as "__wasm_memory_grow"
 extern effect fn memorySize() -> Int64 as "__wasm_memory_size"
 extern effect fn heapBase() -> Int64 as "__wasm_heap_base"
+extern effect fn slotsBase() -> Int64 as "__wasm_slots_base" // f's way in by slots: at f + this in the table
 
 // ---- the runtime's words here (cell(): the globals, the context, errno, the heap's state) ----
 fn wasiCell() -> Int = textAt("quark-wasi-runtime-cell-words-64-bytes-of-state-kept-here!!!!!!")
@@ -330,6 +331,14 @@ pub extern effect fn wasiLocalOffset(seconds: Float64) -> Int64 as "qkosLocalOff
     toInt(seconds - seconds) // UTC
 
 pub extern effect fn wasiProcessors() -> Int64 as "qkosProcessors" = 1
+
+// f (a function's number) called with its argument slots from args and its results to results (parallelMap's way,
+// on this one thread): its slots' way in (compiler/wasm.qk makes one for each function whose address is taken)
+pub extern effect fn wasiRunSlots(f: Int64, args: Int64, argCount: Int64, results: Int64, resultCount: Int64) -> Int64 as "qkosRunSlots" {
+    let _ = machine.call(Pointer<UInt8>(f + slotsBase()), args, results, 0, 0)
+    let _ = argCount + resultCount
+    1
+}
 
 // ---- files: over the folders the runtime was given (wasmtime --dir: the preopens) ----
 fn preopens() -> Int {

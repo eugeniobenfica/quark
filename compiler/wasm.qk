@@ -129,6 +129,8 @@ type Module {
     thunkOf: [Int: Int] = [:] // such a function: its thunk's number
     count: Int = 0 // the functions made (imports, the parts', the thunks, _start)
     reached: [Bool] = [] // by the module's function number (past the imports): code made for it (else a trap)
+    slotsBase: Int = 0 // a function's way in by slots: at its number plus this in the table
+    valueBase: [Int: Int] = [:] // a call through a function value with n arguments: at its number plus this
     heapBase: Int = 0
     missing: [Text] = []
 }
@@ -200,6 +202,67 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     let startFn = m.count
     m.count += 1
     m.reached = reachedOf(m, rt, p)
+    // each function whose address is taken: a way in by its slots (four i64s in, as C's; the arguments read from the
+    // first's memory, the results written to the second's), for parallelMap on this one thread (runtime/wasi.qk)
+    let nFns = len(rt.fns) + len(p.fns)
+    let tableSlots = m.count
+    m.slotsBase = tableSlots - first0
+    var slotted: [Int] = []
+    var seen = [false] * nFns
+    for (part, prog) in [rt, p].enumerate() {
+        for (k, f) in prog.fns.enumerate() {
+            if not m.reached[m.fnIndex(part, k) - first0] {
+                continue
+            }
+            for ins in f.code {
+                if ins.op == Op.Const and ins.c == 2 {
+                    let g = m.fnIndex(part, ins.imm)
+                    if not seen[g - first0] {
+                        seen[g - first0] = true
+                        slotted.push(g)
+                    }
+                }
+            }
+        }
+    }
+    let firstSlotFn = m.count
+    m.count += len(slotted)
+    // calls through function values: the callee's number in a part of the table for the call's count of arguments,
+    // where a function that takes one fewer (a named one: the value's environment is the last argument) has an
+    // adapter that leaves the environment out
+    var arities: [Int] = []
+    for (part, prog) in [rt, p].enumerate() {
+        for (k, f) in prog.fns.enumerate() {
+            if m.reached[m.fnIndex(part, k) - first0] {
+                for ins in f.code {
+                    if ins.op == Op.Call and ins.a >= 0 and not arities.contains(ins.argCount) {
+                        arities.push(ins.argCount)
+                    }
+                }
+            }
+        }
+    }
+    var tableSize = tableSlots + nFns
+    var valueElems: [(Int, Int)] = [] // (table place, function)
+    var adapters: [(Int, Int)] = [] // (function, arguments)
+    for n in arities {
+        m.valueBase[n] = tableSize - first0
+        for target in slotted {
+            let f = if target - first0 < len(rt.fns) {
+                rt.fns[target - first0]
+            } else {
+                p.fns[target - first0 - len(rt.fns)]
+            }
+            if len(f.params) == n {
+                valueElems.push((tableSize + target - first0, target))
+            } else if len(f.params) == n - 1 {
+                valueElems.push((tableSize + target - first0, m.count))
+                adapters.push((target, n))
+                m.count += 1
+            }
+        }
+        tableSize += nFns
+    }
     // the code
     var bodies: [Bytes] = []
     var fnTypes: [Int] = []
@@ -299,6 +362,61 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     s.u8(0x0B)
     bodies.push(s.b)
     fnTypes.push(m.typeOf([], []))
+    for target in slotted {
+        let f = if target - first0 < len(rt.fns) {
+            rt.fns[target - first0]
+        } else {
+            p.fns[target - first0 - len(rt.fns)]
+        }
+        var b = W()
+        let rets = f.resultCount
+        if rets > 0 {
+            b.uleb(1)
+            b.uleb(rets)
+            b.u8(tI64)
+        } else {
+            b.uleb(0)
+        }
+        for j in 0..len(f.params) {
+            b.add([0x20, 0, 0xA7, 0x29, 3])
+            b.uleb(8 * j)
+        }
+        b.u8(0x10)
+        b.uleb(target)
+        var j = rets - 1
+        while j >= 0 {
+            b.u8(0x21)
+            b.uleb(4 + j)
+            j -= 1
+        }
+        for r in 0..rets {
+            b.add([0x20, 1, 0xA7, 0x20])
+            b.uleb(4 + r)
+            b.add([0x37, 3])
+            b.uleb(8 * r)
+        }
+        b.add([0x42, 1, 0x0B])
+        bodies.push(b.b)
+        fnTypes.push(cType)
+    }
+    for (target, n) in adapters {
+        let f = if target - first0 < len(rt.fns) {
+            rt.fns[target - first0]
+        } else {
+            p.fns[target - first0 - len(rt.fns)]
+        }
+        var b = W()
+        b.uleb(0)
+        for j in 0..len(f.params) {
+            b.u8(0x20)
+            b.uleb(j)
+        }
+        b.u8(0x10)
+        b.uleb(target)
+        b.u8(0x0B)
+        bodies.push(b.b)
+        fnTypes.push(m.quarkType(n, f.resultCount))
+    }
     // the import types
     var importTypes: [Int] = []
     for name in m.imports {
@@ -332,7 +450,7 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     table.uleb(1)
     table.u8(0x70)
     table.u8(0)
-    table.uleb(m.count)
+    table.uleb(tableSize)
     out.section(4, table.b)
     var mem = W()
     mem.uleb(1)
@@ -361,7 +479,7 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     out.section(7, exports.b)
     // the table: each function at its own number (one C calls: its thunk); the imports' places empty
     var elems = W()
-    elems.uleb(1)
+    elems.uleb(1 + len(slotted) + len(valueElems))
     elems.u8(0)
     elems.add([0x41])
     elems.sleb(first0)
@@ -370,6 +488,22 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     for i in 0..len(m.cEntries) {
         let at = first0 + i
         elems.uleb(m.thunkOf[at] ?? at)
+    }
+    for (i, target) in slotted.enumerate() {
+        elems.u8(0)
+        elems.u8(0x41)
+        elems.sleb(target + m.slotsBase)
+        elems.u8(0x0B)
+        elems.uleb(1)
+        elems.uleb(firstSlotFn + i)
+    }
+    for (place, target) in valueElems {
+        elems.u8(0)
+        elems.u8(0x41)
+        elems.sleb(place)
+        elems.u8(0x0B)
+        elems.uleb(1)
+        elems.uleb(target)
     }
     out.section(9, elems.b)
     var code = W()
@@ -415,6 +549,16 @@ pub fn wasmModule(rt: IrProgram, rtData: Bytes, p: IrProgram, pData: Bytes, fuel
     entries.uleb(startFn)
     entries.name("_start")
     count += 1
+    for (i, target) in slotted.enumerate() {
+        entries.uleb(firstSlotFn + i)
+        entries.name("slots' way in to {target}")
+        count += 1
+    }
+    for (i, (target, n)) in adapters.enumerate() {
+        entries.uleb(firstSlotFn + len(slotted) + i)
+        entries.name("{target} as a value of {n} arguments")
+        count += 1
+    }
     var fnNames = W()
     fnNames.uleb(count)
     fnNames.add(entries.b)
@@ -1031,7 +1175,10 @@ fn Gen.ins(var self, ins: IrIns) {
         Call => {
             self.args(ins)
             if ins.a >= 0 {
+                // the function's place for calls of this many arguments
                 self.bits(ins.a)
+                self.k(self.m.valueBase[ins.argCount] ?? 0)
+                self.op(0x7C)
                 self.op(0xA7)
                 self.out.u8(0x11)
                 self.out.uleb(self.m.quarkType(ins.argCount, ins.retCount))
@@ -1201,11 +1348,11 @@ fn Gen.divide(var self, ins: IrIns, line: Int) {
     self.op(0x81)
     self.set(self.t2)
     if ins.op == .Mod {
-        // r != 0 and (r ^ b) < 0: r + b
-        self.get(self.t2)
+        // r != 0 and (r ^ b) < 0: r + b (select gives its first where the test holds)
         self.get(self.t2)
         self.get(self.t1)
         self.op(0x7C)
+        self.get(self.t2)
         self.get(self.t2)
         self.k(0)
         self.op(0x52)
@@ -1340,6 +1487,11 @@ fn Gen.hostCall(var self, ins: IrIns) {
     if name == "__wasm_memory_size" and rets == 1 {
         self.out.add([0x3F, 0])
         self.op(0xAD)
+        self.results(ins)
+        return
+    }
+    if name == "__wasm_slots_base" and rets == 1 {
+        self.k(self.m.slotsBase)
         self.results(ins)
         return
     }

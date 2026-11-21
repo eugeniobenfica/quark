@@ -217,6 +217,16 @@ pub extern effect fn osTimeImpl() -> Float64 as "qkosTime" {
     toFloat(ticks / 10000000) + toFloat(ticks % 10000000) * 0.0000001
 }
 
+// (code is loaded here: a program is never the runtime's own, as in WebAssembly)
+pub extern effect fn osRunSlotsImpl(
+    f: Int64,
+    args: Int64,
+    argCount: Int64,
+    results: Int64,
+    resultCount: Int64,
+) -> Int64 as "qkosRunSlots" =
+    f - f + args - args + argCount - argCount + results - results + resultCount - resultCount
+
 pub extern effect fn osSleepImpl(ms: Int64) as "qkosSleep" = winSleep(ms)
 
 // ---- files and folders ----

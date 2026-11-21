@@ -96,6 +96,16 @@ pub extern effect fn osNowImpl() -> Float64 as "qkosNow" = clock(6) // CLOCK_MON
 
 pub extern effect fn osTimeImpl() -> Float64 as "qkosTime" = clock(0) // CLOCK_REALTIME
 
+// (code is loaded here: a program is never the runtime's own, as in WebAssembly)
+pub extern effect fn osRunSlotsImpl(
+    f: Int64,
+    args: Int64,
+    argCount: Int64,
+    results: Int64,
+    resultCount: Int64,
+) -> Int64 as "qkosRunSlots" =
+    f - f + args - args + argCount - argCount + results - results + resultCount - resultCount
+
 pub extern effect fn osSleepImpl(ms: Int64) as "qkosSleep" {
     let _ = usleep(1000 * ms)
 }

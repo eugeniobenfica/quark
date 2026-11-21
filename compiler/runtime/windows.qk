@@ -807,6 +807,9 @@ pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
     let _ = virtualFree(p, 0, 32768) + n - n
 }
 
+// a task's stack: 8 MB (the heap commits all of it at once)
+pub extern effect fn osTaskStackImpl() -> Int64 as "qkosTaskStack" = 8388608
+
 pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
     let lh = calloc(2, 8)
     getCurrentThreadStackLimits(lh, lh + 8)

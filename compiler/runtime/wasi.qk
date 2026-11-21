@@ -654,6 +654,8 @@ pub extern effect fn wasiThreadStart(f: Int64, arg: Int64) -> Int64 as "qkosThre
 
 pub extern effect fn wasiStackLow() -> Int64 as "qkosStackLow" = 0
 
+pub extern effect fn wasiTaskStack() -> Int64 as "qkosTaskStack" = 8388608
+
 pub extern effect fn wasiCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" {
     let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(": WebAssembly links no C library")
     let _ = lib

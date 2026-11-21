@@ -4040,7 +4040,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "2007559587-2461268"
+pub const compilerSources = "435493847-2461935"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -8243,6 +8243,9 @@ pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
     let _ = munmap(p, n)
 }
 
+// a task's stack: 64 MB (malloc maps it; a page is taken when touched)
+pub extern effect fn osTaskStackImpl() -> Int64 as "qkosTaskStack" = 67108864
+
 pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
     let attr = calloc(1, 256)
     var low = 0
@@ -10731,6 +10734,9 @@ pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
     let _ = munmap(p, n)
 }
 
+// a task's stack: 64 MB (malloc maps it; a page is taken when touched)
+pub extern effect fn osTaskStackImpl() -> Int64 as "qkosTaskStack" = 67108864
+
 pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
     let t = pthreadSelf()
     pthreadStackTop(t) - pthreadStackSize(t)
@@ -12668,7 +12674,8 @@ use loader
 use numbers
 use text
 
-const taskStack = 8388608
+// a task's stack: the system's size (where memory is taken as it is touched, a large one costs no more)
+extern effect fn osTaskStack() -> Int64 as "qkosTaskStack"
 
 // a task's words: its state, then the context's per-call fields (its own while it runs, the caller's kept), then
 // its registers and its caller's (machine.switchStack's 29 words each)
@@ -12782,7 +12789,7 @@ pub fn taskNew(l: Int, f: Int, args: Int, argCount: Int) -> Int {
         a = word(at, 1)
         gSet(gTaskSpareCount, spares - 1)
     } else {
-        stack = malloc(taskStack)
+        stack = malloc(osTaskStack())
         a = arenaLike()
     }
     if t == 0 or stack == 0 or a == 0 {
@@ -12803,7 +12810,7 @@ pub fn taskNew(l: Int, f: Int, args: Int, argCount: Int) -> Int {
     copyBytes(t + 8 * tArgs, args, 8 * argCount)
     setWord(t, tCode, l)
     setWord(t, tStackLimit, stack + 65536)
-    let top = (stack + taskStack) & -16
+    let top = (stack + osTaskStack()) & -16
     let start = startAddress(() => taskStart())
     if byte(start, 0) == 85 {
         // x86-64 (push rbp): the start's address on top, as a call leaves it
@@ -12895,7 +12902,7 @@ pub extern effect fn rtWait(seconds: Float64) as "qk_wait" {
 pub extern effect fn rtSpawn(f: Int64, env: Int64) -> Int64 as "qk_spawn" {
     let t = taskNew(ctxGet(ctxRunning), f, 0, 0)
     if t == 0 {
-        panicNow(panicSize, 0, taskStack, 0)
+        panicNow(panicSize, 0, osTaskStack(), 0)
     }
     setWord(t, tArgs, copyIntoArena(word(t, tArena), env)) // what it captured, its own
     setWord(t, tArgCount, 1)
@@ -15525,6 +15532,8 @@ pub extern effect fn wasiThreadStart(f: Int64, arg: Int64) -> Int64 as "qkosThre
 
 pub extern effect fn wasiStackLow() -> Int64 as "qkosStackLow" = 0
 
+pub extern effect fn wasiTaskStack() -> Int64 as "qkosTaskStack" = 8388608
+
 pub extern effect fn wasiCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as "qkosCFunction" {
     let _ = bufAt(why, 512).text("cannot find ").zeroText(symbol).text(": WebAssembly links no C library")
     let _ = lib
@@ -17138,6 +17147,9 @@ pub extern effect fn osCommitImpl(p: Int64, n: Int64) -> Int64 as "qkosCommit" =
 pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
     let _ = virtualFree(p, 0, 32768) + n - n
 }
+
+// a task's stack: 8 MB (the heap commits all of it at once)
+pub extern effect fn osTaskStackImpl() -> Int64 as "qkosTaskStack" = 8388608
 
 pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
     let lh = calloc(2, 8)

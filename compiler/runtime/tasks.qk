@@ -9,7 +9,8 @@ use loader
 use numbers
 use text
 
-const taskStack = 8388608
+// a task's stack: the system's size (where memory is taken as it is touched, a large one costs no more)
+extern effect fn osTaskStack() -> Int64 as "qkosTaskStack"
 
 // a task's words: its state, then the context's per-call fields (its own while it runs, the caller's kept), then
 // its registers and its caller's (machine.switchStack's 29 words each)
@@ -123,7 +124,7 @@ pub fn taskNew(l: Int, f: Int, args: Int, argCount: Int) -> Int {
         a = word(at, 1)
         gSet(gTaskSpareCount, spares - 1)
     } else {
-        stack = malloc(taskStack)
+        stack = malloc(osTaskStack())
         a = arenaLike()
     }
     if t == 0 or stack == 0 or a == 0 {
@@ -144,7 +145,7 @@ pub fn taskNew(l: Int, f: Int, args: Int, argCount: Int) -> Int {
     copyBytes(t + 8 * tArgs, args, 8 * argCount)
     setWord(t, tCode, l)
     setWord(t, tStackLimit, stack + 65536)
-    let top = (stack + taskStack) & -16
+    let top = (stack + osTaskStack()) & -16
     let start = startAddress(() => taskStart())
     if byte(start, 0) == 85 {
         // x86-64 (push rbp): the start's address on top, as a call leaves it
@@ -236,7 +237,7 @@ pub extern effect fn rtWait(seconds: Float64) as "qk_wait" {
 pub extern effect fn rtSpawn(f: Int64, env: Int64) -> Int64 as "qk_spawn" {
     let t = taskNew(ctxGet(ctxRunning), f, 0, 0)
     if t == 0 {
-        panicNow(panicSize, 0, taskStack, 0)
+        panicNow(panicSize, 0, osTaskStack(), 0)
     }
     setWord(t, tArgs, copyIntoArena(word(t, tArena), env)) // what it captured, its own
     setWord(t, tArgCount, 1)

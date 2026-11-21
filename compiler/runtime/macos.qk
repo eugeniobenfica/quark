@@ -478,6 +478,9 @@ pub extern effect fn osReleaseImpl(p: Int64, n: Int64) as "qkosRelease" {
     let _ = munmap(p, n)
 }
 
+// a task's stack: 64 MB (malloc maps it; a page is taken when touched)
+pub extern effect fn osTaskStackImpl() -> Int64 as "qkosTaskStack" = 67108864
+
 pub extern effect fn osStackLowImpl() -> Int64 as "qkosStackLow" {
     let t = pthreadSelf()
     pthreadStackTop(t) - pthreadStackSize(t)

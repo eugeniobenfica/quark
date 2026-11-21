@@ -591,6 +591,45 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 >   do modelo de memória (uma coleta na volta de uma função, ou uma região por chamada), não de cópia, e pede um
 >   desenho próprio.
 
+### B13. O rebuild incremental: refazer só o que mudou
+
+> **Desenho de 21/11/2026; começado.** É o que falta para o marco 0.12 (o rebuild do compilador abaixo de 0,5 s;
+> hoje ~1,75 s: ler e checar 0,5 s, constantes, lowering, otimização e código de máquina 1,23 s). Nenhuma fase tem
+> um ponto quente barato: o perfil espalha o tempo em cópias, alocação e laços. Só não refazendo chega-se lá.
+
+**Por que hoje nada se reaproveita.** O código de máquina de uma função depende de posições do programa inteiro:
+- o número de cada função que ela chama ou cujo endereço toma;
+- o deslocamento de cada texto e de cada tabela de interface no bloco de dados;
+- os índices dos auxiliares (impressão e cópia por tipo), dos externs e das assinaturas C;
+- as linhas, em imediatos (`line | inl << 32`, nos pânicos e nas chamadas ao runtime), com o índice da chamada
+  embutida numa lista global. Editar uma função desloca as linhas de todas as que vêm depois no arquivo.
+
+E o que ela vira depende de outras funções: o inlining copia o corpo do chamado, e as decisões de memória leem
+fatos dos chamados (o que um `var self` muda, se um resultado é todo seu, o tamanho para embutir).
+
+**O desenho, em etapas que se medem uma a uma:**
+1. **O código de uma função independente da sua posição** (o que torna um cache por função possível):
+   - as linhas relativas ao começo da função, com a linha dela numa tabela que o runtime lê num pânico e o `-g`
+     soma; as chamadas embutidas numeradas por função;
+   - as referências por símbolo: uma função por sua declaração, um auxiliar por seu tipo, um extern por nome, um texto
+     por conteúdo. O bloco de dados de cada função é dela, e a junção liga tudo (um linker dentro do compilador:
+     junta os dados, numera, corrige as relocações).
+   - Medida: os mesmos bytes de executável não são a meta aqui (a ordem dos dados muda); o ponto fixo e a suíte, sim,
+     e o tempo do build inteiro igual.
+2. **O cache por função:** o código e os dados de cada função guardados pela chave do que a fez:
+   - o texto canônico dela (com linhas relativas), os tipos que usa, e de cada chamado os fatos que a decisão leu
+     (registrados durante o lowering: o corpo de um embutido, o `changes` de um `var self`...);
+   - num acerto, o lowering, a otimização e o código dela são pulados. Medida: um rebuild depois de editar uma
+     função refaz só ela e as que a embutem.
+3. **A leitura e o check por módulo:** um retrato do programa checado (gravado em binário, lido de volta com uma
+   cópia por tipo, como o copiador da coleta faz); num rebuild, só os corpos que mudaram são lidos e checados de novo
+   sobre o retrato, quando as assinaturas, os tipos, as constantes e os `use` de cada arquivo ficaram iguais (senão,
+   o caminho inteiro). Medida: ler e checar de 0,5 s para ~0,1 s.
+4. **As decisões de memória por função:** refeitas só para o que mudou, e os chamadores refeitos quando um fato que
+   leram mudou.
+
+**Meta:** o rebuild do compilador depois de editar uma função abaixo de 0,5 s; um build sem cache igual ao de hoje.
+
 ### B11. A memória de uma chamada: devolvida na volta
 
 > **Feita, medida e desfeita (21/11/2026).** Funcionou e passou a suíte inteira com toda volta coletando, mas o pico do

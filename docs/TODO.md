@@ -12,8 +12,13 @@ passando.
 
 ## Em ordem
 
-1. [~] **Fechar o marco 0.12: o rebuild do compilador abaixo de 0,5 s** (hoje ~1,7 s).
-   - [ ] o cache por módulo: leitura, checagem e lowering guardados por módulo (o que leva de ~1,2 s a 0,5 s)
+1. [~] **Fechar o marco 0.12: o rebuild do compilador abaixo de 0,5 s** (hoje ~1,75 s): a B13 no
+   [PLANO.md](PLANO.md), em etapas
+   - [ ] 1. o código de uma função independente da sua posição (linhas relativas, referências por símbolo, a
+     junção como um linker)
+   - [ ] 2. o cache por função (código e dados, pela chave do que a fez)
+   - [ ] 3. a leitura e o check por módulo (um retrato do programa checado; só os corpos que mudaram de novo)
+   - [ ] 4. as decisões de memória refeitas só para o que mudou
 2. [~] **O fim da B12:**
    - [ ] no ARM64, a carga e o check numa tarefa esperam a próxima versão: as tarefas da 0.12.0 têm 8 MB de pilha,
      pouco para checar o compilador ali (o `main` já dá 64 MB a uma tarefa no Linux e no macOS);

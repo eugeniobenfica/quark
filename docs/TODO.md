@@ -69,7 +69,8 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
   - [x] `quark run` de um programa pequeno abaixo de 30 ms (38,5 → 20,6 ms)
   - [x] otimizar e o código de máquina nas threads, em partes (o compilador no tier rápido: 2,4 → 1,75 s)
   - [x] as constantes guardadas por conteúdo (`quark-consts-*.bin`): ler e checar 0,62 → 0,50 s, os mesmos bytes
-  - [ ] o lowering das funções em threads (604 ms das 0,8 s)
+  - [-] o lowering das funções em threads: feito e medido (800 → 650 ms, mas +700 MB de pico e +0,6 s de kernel: cada
+    thread copia o programa); desfeito, o plano diz o que o faria valer
   - [ ] menos cópias da árvore e menos memória (3,5 GB no pico; 1,1 s de kernel em falhas de página)
   - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 

@@ -529,6 +529,19 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 >      página em todas as fases.
 >   3. O cache por módulo (leitura, checagem, lowering), para a meta de 0,5 s: os passos 1 e 2 levam a ~1,2 s; abaixo
 >      disso, só não refazendo o que não mudou.
+>
+> **O lowering das funções em threads: feito, medido e desfeito (21/11/2026).**
+> - **Como foi feito:** as funções em partes de tamanho fixo, cada uma baixada numa thread a partir do mesmo estado,
+>   e juntadas em ordem. As tabelas compartilhadas foram renumeradas: dados, textos (um só lugar por texto, porque os
+>   globais do runtime moram num, `cell()`), externs, assinaturas C, tabelas de interface, auxiliares, entradas C e as
+>   chamadas embutidas (também as que viajam numa constante de linha, `lineHere`).
+> - **Estava certo:** a suíte inteira passou com todo programa, runtime incluído, indo pelas partes e threads.
+> - **Não compensou.** Cada thread começa copiando o `Lower`, e com ele o programa inteiro: na semântica de valores,
+>   iniciar uma `var` com um valor que veio de fora o copia. 16 partes vazias já levam 160 ms. Com 4 ou 8 partes
+>   (alternando as funções, para equilibrar), o lowering foi de 800 para ~650 ms. Mas o pico de memória subiu de 3,2
+>   para 3,9 GB e o kernel de 1,05 para 1,66 s de CPU, e numa máquina com menos núcleos o ganho é menor.
+> - **O que o faria valer:** o `Lower` ler o programa sem guardá-lo como valor seu (o contexto só de leitura passado à
+>   parte). É uma reforma do `lower.qk` inteiro, e vem depois de cortar a memória (passo 2), que barateia tudo.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

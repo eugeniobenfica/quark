@@ -133,7 +133,14 @@ type X64 {
 // A big program's functions are made in parts on the processor's threads, each part's code from 0, then joined (the
 // same bytes: each function at its 16-byte boundary either way).
 pub fn genX64(p: IrProgram) -> MachineCode =
-    genX64Join(p.target, p.runtime, p.externs, p.cSigs, len(p.fns), genX64Parts(p.target, p.runtime, p.externs, p.cSigs, numbered(p.fns), false))
+    genX64Join(
+        p.target,
+        p.runtime,
+        p.externs,
+        p.cSigs,
+        len(p.fns),
+        genX64Parts(p.target, p.runtime, p.externs, p.cSigs, numbered(p.fns), false),
+    )
 
 // the machine code of some functions (each with its number), in parts on the processor's threads when they are many
 // (quick: each optimized there first, the quick tier: compiler/memory.qk's batches); joined by genX64Join
@@ -144,15 +151,21 @@ pub fn genX64Parts(
     sigs: [IrExtern],
     fns: [(Int, IrFn)],
     quick: Bool,
-) -> [CodePart] =
-    if instructionsOf(fns) >= threadsFrom {
-        partsOf(fns).parallelMap(part => x64Part(target, runtime, externs, sigs, part, quick))
-    } else {
-        [x64Part(target, runtime, externs, sigs, fns, quick)]
-    }
+) -> [CodePart] = if instructionsOf(fns) >= threadsFrom {
+    partsOf(fns).parallelMap(part => x64Part(target, runtime, externs, sigs, part, quick))
+} else {
+    [x64Part(target, runtime, externs, sigs, fns, quick)]
+}
 
 // the parts joined, in order: count functions in all
-pub fn genX64Join(target: Target, runtime: [RtSig], externs: [IrExtern], sigs: [IrExtern], count: Int, parts: [CodePart]) -> MachineCode {
+pub fn genX64Join(
+    target: Target,
+    runtime: [RtSig],
+    externs: [IrExtern],
+    sigs: [IrExtern],
+    count: Int,
+    parts: [CodePart],
+) -> MachineCode {
     let sysv = target.sysv
     var g = X64(target, runtime, externs, sysv, if sysv { 8 } else { 6 })
     g.sigs = sigs

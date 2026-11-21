@@ -202,7 +202,18 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         let prog = low.program // taken
         low.program = IrProgram()
-        return Some(Compiled(prog, mc, low.data, low.inlines, testsOf(checkedProgram), if avx { 1 } else { 0 }, os, purpose.linked))
+        return Some(
+            Compiled(
+                prog,
+                mc,
+                low.data,
+                low.inlines,
+                testsOf(checkedProgram),
+                if avx { 1 } else { 0 },
+                os,
+                purpose.linked,
+            ),
+        )
     }
     var low = Lowered(IrProgram(), [], []) // lowered, optimized and made code in place: the program is never copied
     low.lowerFrom(checkedProgram, lowering)
@@ -268,7 +279,12 @@ fn readAndCheck(src: Source, preludeSrc: Source?, purpose: Purpose, allowed: Tex
         }
         return None
     }
-    let checked = checkProgram(loaded.program, loaded.errors, purpose.needMain, if purpose.runtime { None } else { allowed })
+    let checked = checkProgram(
+        loaded.program,
+        loaded.errors,
+        purpose.needMain,
+        if purpose.runtime { None } else { allowed },
+    )
     if not quiet {
         for e in checked.errors.shown {
             printErr(e)

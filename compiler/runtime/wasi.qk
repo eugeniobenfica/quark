@@ -407,7 +407,9 @@ fn resolve(path: Int) -> (Int, Int) {
 }
 
 const allRights = 536870911 // every right WASI names (29)
+const folderRights = 2383872 // a folder's: path_open, fd_readdir, path_filestat_get, fd_filestat_get (reading or
 
+// writing it as a file is refused: EISDIR)
 // path opened: its fd, or -1 (errno set); oflags 1 create, 2 a folder, 8 truncate; fdflags 1 append
 fn openPath(path: Int, oflags: Int, fdflags: Int) -> Int {
     let (dir, rest) = resolve(path)
@@ -416,7 +418,8 @@ fn openPath(path: Int, oflags: Int, fdflags: Int) -> Int {
         return -1
     }
     let out = calloc(1, 8)
-    let e = pathOpen(dir, 1, rest, strlen(rest), oflags, allRights, allRights, fdflags, out)
+    let rights = if oflags & 2 != 0 { folderRights } else { allRights }
+    let e = pathOpen(dir, 1, rest, strlen(rest), oflags, rights, allRights, fdflags, out)
     let fd = int32At(out, 0)
     free(out)
     if e != 0 {

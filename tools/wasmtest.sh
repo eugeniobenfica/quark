@@ -5,7 +5,7 @@
 #   bash tools/wasmtest.sh [path/to/quark.exe]     WASM_RUN: the runtime's command (default: wasmtime run --dir=.)
 cd "$(dirname "$0")/.."
 Q=${1:-build/quark.exe}
-RUN=${WASM_RUN:-wasmtime run --dir=.}
+RUN=${WASM_RUN:-wasmtime run --dir=. --dir=/tmp}
 # a program that waits on nothing it can have (stdin, a task) stops after 30 s
 if command -v timeout > /dev/null 2>&1; then RUN="timeout 30 $RUN"; fi
 tmp=$(mktemp -d)

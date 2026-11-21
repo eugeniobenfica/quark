@@ -55,11 +55,13 @@ pub fn loadProgram(
         // the list grows as files name more files
         var i = 0
         while i < len(tree.decls) {
-            let d = tree.decls[i]
-            i += 1
-            if d.kind != DeclKind.Use or d.module != m {
+            // (looked at in place: a copy of each declaration, for each file, would be most of reading a program)
+            if tree.decls[i].kind != DeclKind.Use or tree.decls[i].module != m {
+                i += 1
                 continue
             }
+            let d = tree.decls[i]
+            i += 1
             let from = modules[m].src
             let std = d.name.startsWith("std.")
             var file = modulePath(if std { "" } else { modules[m].path }, d.name)

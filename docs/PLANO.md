@@ -507,6 +507,28 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 > - O que sobra é ler e checar (0,6 s) e o lowering (0,8 s), que são do programa inteiro. Chegar a 0,5 s continua
 >   pedindo guardá-los por módulo. Isso é uma arquitetura nova: as instâncias de genéricos, os textos do bloco de dados
 >   e as decisões de inlining cruzam os módulos. Não foi feito.
+>
+> **21/11/2026: começado. Medido por dentro e o primeiro passo feito.**
+> - **Onde está o tempo** (o compilador compilando a si mesmo, ~1,75 s de relógio): ler 0,2 s, constantes 0,12 s,
+>   checar 0,25 s, lowering 0,8 s (aliases 79 ms, modificação no lugar 47 ms, as funções uma a uma 604 ms, o resto
+>   ~70 ms), otimizar 0,17 s, código de máquina 0,15 s.
+> - **E a memória:** 3,5 GB no pico; 1,1 s de CPU no kernel, em falhas de página (memória nova zerada pelo sistema).
+>   No perfil, `memcpy` são 22% da checagem, e cópias inteiras do array de expressões aparecem em `loadProgram`,
+>   `checkFile`, `runConsts` e `lowerFrom`.
+> - **Feito: o cache de constantes.** As constantes deixaram de ser compiladas e executadas de novo a cada build.
+>   - A chave resume o texto canônico de cada declaração que elas alcançam, todos os tipos do programa (o número de
+>     um caso e o lugar de um campo estão no despejo), os nomes delas, o compilador e a máquina.
+>   - O despejo de cada uma é guardado por arquivo e nome (`quark-consts-*.bin`). Num acerto, os despejos são só lidos
+>     de volta.
+>   - Ler e checar: 0,62 → 0,50 s. O executável sai com os mesmos bytes, com o cache frio ou quente.
+> - **O que falta, em ordem de ganho por risco:**
+>   1. O lowering das funções em threads (604 ms → ~90 ms). Cada thread baixa uma faixa das funções, e as tabelas
+>      compartilhadas são renumeradas ao juntar: dados, externs, assinaturas C, tabelas de interface, auxiliares,
+>      entradas C, chamadas embutidas. `asValue` já é decidido antes, então nada depende da ordem.
+>   2. Cortar as cópias inteiras da árvore e a memória que nada devolve (3,5 GB), que custam `memcpy` e falhas de
+>      página em todas as fases.
+>   3. O cache por módulo (leitura, checagem, lowering), para a meta de 0,5 s: os passos 1 e 2 levam a ~1,2 s; abaixo
+>      disso, só não refazendo o que não mudou.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

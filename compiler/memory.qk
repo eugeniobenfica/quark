@@ -12,6 +12,7 @@ use ir
 use lower
 use release
 use cachedir
+use format
 use construn
 use cache
 use x64
@@ -400,6 +401,27 @@ pub fn Program.runConsts(var self, host: Host) -> [ConstProblem] {
         }
         reached = self.reachedFrom(which)
     }
+    // worked out before, from the same code: each one's dump read back, nothing compiled or run
+    let key = self.constsKey(which, reached, host)
+    let cacheName = "quark-consts-{key}.bin"
+    if readBytes(cachePath(cacheName)) is Ok(saved) {
+        let kept = constDumps(saved)
+        if which.all(d => kept.contains(self.constId(d))) {
+            var r = ConstReader(self)
+            for d in which {
+                let x = r.p.ast.decls[d]
+                r.begin(kept[self.constId(d)] ?? [], x.line, x.col)
+                let node = r.value(x.retType)
+                if r.ok and r.at == len(r.b) {
+                    r.p.ast.decls[d].folded = node
+                    r.p.ast.decls[d].foldedAgain = false
+                }
+            }
+            self = r.p
+            cacheUsed(cacheName, len(saved))
+            return problems
+        }
+    }
     // the program with every constant as written, what they do not reach a hole, and a function that dumps each
     var p2 = self
     for d in p2.decls {
@@ -472,6 +494,8 @@ pub fn Program.runConsts(var self, host: Host) -> [ConstProblem] {
     }
     let sink = m.call("qkHostKeepOutput", 0, 0, 0, 0)
     var r = ConstReader(self)
+    var dumps: Bytes = [] // what goes into the cache: each one's name and dump
+    var all = true
     for d in which {
         var f = -1
         for (k, fx) in c.prog.fns.enumerate() {
@@ -480,6 +504,7 @@ pub fn Program.runConsts(var self, host: Host) -> [ConstProblem] {
             }
         }
         if f < 0 {
+            all = false
             continue
         }
         let ok = m.call("qkHostCall", l, code.fnAt[f], constFuel, 0) != 0
@@ -499,8 +524,15 @@ pub fn Program.runConsts(var self, host: Host) -> [ConstProblem] {
                 "constant {x.name} cannot be worked out when the program is compiled: {why}"
             }
             problems.push(ConstProblem(x.module, x.line, x.col, message))
+            all = false
             continue
         }
+        dumps += self.constId(d).bytes()
+        dumps.push(0)
+        for k in 0..8 {
+            dumps.push(len(bytes) >> (8 * k) & 255)
+        }
+        dumps += bytes
         r.begin(bytes, x.line, x.col)
         let node = r.value(x.retType)
         if not r.ok or r.at != len(r.b) {
@@ -509,8 +541,83 @@ pub fn Program.runConsts(var self, host: Host) -> [ConstProblem] {
         r.p.ast.decls[d].folded = node
         r.p.ast.decls[d].foldedAgain = false
     }
+    if all and writeBytes(cachePath(cacheName), dumps) is Ok(_) {
+        cacheUsed(cacheName, len(dumps))
+    }
     self = r.p
     problems
+}
+
+// a constant by what names it from one build to the next: its file and its name (not its number, which other
+// declarations move)
+fn Program.constId(self, d: Int) -> Text {
+    let x = self.ast.decls[d]
+    let file = if x.module >= 0 and x.module < len(self.modules) {
+        self.modules[x.module].path
+    } else {
+        ""
+    }
+    "{file}:{x.name}"
+}
+
+// The constants' cache key: what their values depend on. The text of every declaration they reach (as the
+// formatter writes it), every type of the program (a case's number, a field's place, is in a dump), the constants'
+// names, the compiler and the machine: two FNV-1a sums of it, as hex.
+fn Program.constsKey(self, which: [Int], reached: [Bool], host: Host) -> Text {
+    var a = -3750763034362895579 ^ compilerId(host)
+    var b = 1469598103934665603 ^ (if host.arm { 1 } else { 2 }) ^ (match host.os {
+        Windows => 4
+        Linux => 8
+        Macos => 16
+    })
+    var texts: [Text] = []
+    for d in which {
+        texts.push(self.constId(d))
+    }
+    for d in self.decls {
+        let x = self.ast.decls[d]
+        if x.templateOf >= 0 or x.lifted or x.fromDefault {
+            continue
+        }
+        if reached[d] or x.kind is Type | Enum {
+            texts.push("{self.constId(d)}\n{declText(self.ast, d)}")
+        }
+    }
+    for t in texts {
+        for c in t.bytes() {
+            a = (a ^ c) *% 1099511628211
+            b = (b ^ c) *% 1099511628211 +% 7
+        }
+        a = (a ^ 255) *% 1099511628211
+    }
+    "{hex64(a)}{hex64(b)}"
+}
+
+// a cache file's dumps, by constant
+fn constDumps(saved: Bytes) -> [Text: Bytes] {
+    var out: [Text: Bytes] = [:]
+    var at = 0
+    while at < len(saved) {
+        var end = at
+        while end < len(saved) and saved[end] != 0 {
+            end += 1
+        }
+        if end + 9 > len(saved) {
+            return [:]
+        }
+        let id = Text(saved[at..end]) ?? return [:]
+        var n = 0
+        for k in 0..8 {
+            n |= saved[end + 1 + k] << (8 * k)
+        }
+        let from = end + 9
+        if n < 0 or from + n > len(saved) {
+            return [:]
+        }
+        out[id] = saved[from..from + n]
+        at = from + n
+    }
+    out
 }
 
 pub fn compileFile(host: Host, path: Text, o: RunOptions, purpose: Purpose) -> Compiled? {

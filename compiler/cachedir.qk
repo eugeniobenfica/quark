@@ -1,6 +1,6 @@
 // The compiler's caches, in a folder of their own in the system's temporary folder (quark-cache): the runtime made
 // for this machine (quark-runtime-*.bin), the executables' runtime part (quark-exe-*.bin), each program's optimized
-// functions (quark-cache-*.bin). An index there (index.txt: a line "name bytes time" for each file) says when each
+// functions (quark-cache-*.bin), its constants' values (quark-consts-*.bin, by what they depend on). An index there (index.txt: a line "name bytes time" for each file) says when each
 // was last used; each use writes it again and lets go of the files not used for 30 days, then of the least recently
 // used ones while they take more than 1 GB in all. quark clean empties the folder (and the files older compilers
 // left in the temporary folder itself). A cache file that goes is only made again: nothing else depends on it.

@@ -68,6 +68,10 @@ se reconstruindo nos mesmos bytes e a suíte inteira passando.
 - [~] B10 compilação incremental de ponta a ponta (o que falta está em "ficou para trás")
   - [x] `quark run` de um programa pequeno abaixo de 30 ms (38,5 → 20,6 ms)
   - [x] otimizar e o código de máquina nas threads, em partes (o compilador no tier rápido: 2,4 → 1,75 s)
+  - [x] as constantes guardadas por conteúdo (`quark-consts-*.bin`): ler e checar 0,62 → 0,50 s, os mesmos bytes
+  - [ ] o lowering das funções em threads (604 ms das 0,8 s)
+  - [ ] menos cópias da árvore e menos memória (3,5 GB no pico; 1,1 s de kernel em falhas de página)
+  - [ ] o cache por módulo: leitura, checagem, lowering (o que leva de ~1,2 s a 0,5 s)
 
 ### C. A linguagem
 
@@ -126,10 +130,9 @@ O que as fases A a E pediam e não está feito. Cada item diz o que falta e por 
 - [ ] **A6 assinar o `quark.exe` no Windows.** Depende de um certificado de assinatura de código (Azure Trusted
   Signing, OV ou EV), que só o dono do projeto pode tirar. Sem ele, o Smart App Control e o SmartScreen barram
   executáveis novos.
-- [ ] **B10 rebuild do compilador abaixo de 0,5 s** (meta do marco 0.12; hoje ~1,75 s: ler e checar 0,62 s, lowering
-  0,80 s, otimizar 0,17 s, código de máquina 0,16 s). Os dois primeiros são do programa inteiro. Chegar a 0,5 s pede
-  guardá-los por módulo, o que é uma arquitetura nova: as instâncias de genéricos, os textos do bloco de dados e o
-  inlining cruzam os módulos ([PLANO.md](PLANO.md), B10).
+- [~] **B10 rebuild do compilador abaixo de 0,5 s** (meta do marco 0.12; hoje ~1,6 s: ler e checar 0,50 s com as
+  constantes guardadas, lowering 0,80 s, otimizar 0,17 s, código de máquina 0,15 s). Começado em 21/11; os três
+  passos que faltam, medidos e em ordem, estão acima em B10 e no [PLANO.md](PLANO.md).
 - [ ] **SIMD fora do `--release`:** os laços só são vetorizados no tier otimizador.
 - [-] **TLS do lado do servidor:** decidido que não por ora; um servidor Quark fala HTTP e o TLS fica num proxy
   na frente ([SERVERS.md](SERVERS.md)).

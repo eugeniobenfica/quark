@@ -126,17 +126,17 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         cachePath("quark-check-{h.text()}.bin")
     }
     var fromImage: Program? = None
+    var wasBuilt: Built? = None
     if imageAt != "" {
         let kept: CheckImage? = machine.loadImage(imageAt)
         if kept is Some(image) and image.key == imageKey and sameSources(image.program, src, preludeSrc) {
             fromImage = Some(image.program)
+            wasBuilt = image.built
         }
     }
     var checkedProgram = fromImage ?? (checkedHere(host, src, preludeSrc, o, purpose, quiet) ?? return None)
     // (kept when reading and checking it took long enough for its image to be read faster: not a small program's)
-    if fromImage is None and imageAt != "" and monotonicTime() - t0 > 0.15 {
-        let _ = machine.saveImage(CheckImage(imageKey, checkedProgram), imageAt)
-    }
+    let keepImage = fromImage is None and imageAt != "" and monotonicTime() - t0 > 0.15
     let t1 = monotonicTime()
     let cpu = machine.cpu()
     let target = purpose.target
@@ -187,6 +187,27 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         checks: false,
     )
     if not runtime and not release and not wasm {
+        // as the image's build made it, when the files and what they are built for are the same
+        let builtKey = "{arch}|{sysv}|{avx}|{lanes}|{target}|{purpose.object}|{purpose.linked}|{debug}|{o.fuel > 0}|{o.coverage}|{o.debugInfo}|{len(purpose.used)}"
+        if wasBuilt is Some(b) and b.key == builtKey {
+            if o.timed {
+                printErr(
+                    "quark: parsed and checked in {fixed((t1 - t0) * 1000, 2)} ms, compiled in {fixed((monotonicTime() - t1) * 1000, 2)} ms ({len(b.mc.code)} bytes of machine code): as the last build made it",
+                )
+            }
+            return Some(
+                Compiled(
+                    b.prog,
+                    b.mc,
+                    b.data,
+                    b.inlines,
+                    testsOf(checkedProgram),
+                    if avx { 1 } else { 0 },
+                    os,
+                    purpose.linked,
+                ),
+            )
+        }
         // in batches: each lowered, then optimized (the quick tier, which makes no vector loops) and made machine code
         // on the threads while the next is lowered; only the code is kept, so the whole program's IR never is at once
         var l = lowerBegin(checkedProgram, lowering)
@@ -205,6 +226,13 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         }
         let prog = low.program // taken
         low.program = IrProgram()
+        if keepImage or fromImage is Some(_) and imageAt != "" {
+            // the program and what it was built into, for the next build
+            let _ = machine.saveImage(
+                CheckImage(imageKey, checkedProgram, Some(Built(builtKey, prog, mc, low.data, low.inlines))),
+                imageAt,
+            )
+        }
         return Some(
             Compiled(
                 prog,
@@ -217,6 +245,9 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
                 purpose.linked,
             ),
         )
+    }
+    if keepImage {
+        let _ = machine.saveImage(CheckImage(imageKey, checkedProgram), imageAt)
     }
     var low = Lowered(IrProgram(), [], []) // lowered, optimized and made code in place: the program is never copied
     low.lowerFrom(checkedProgram, lowering)
@@ -271,8 +302,10 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     Compiled(prog, mc, low.data, low.inlines, testsOf(checkedProgram), if avx { 1 } else { 0 }, os, purpose.linked)
 }
 
-// a checked program as a build left it, for the next one (its key: the compiler, the file, what checking it took)
-type CheckImage { key: Text, program: Program }
+// a checked program as a build left it, for the next one (its key: the compiler, the file, what checking it took),
+// and what that build made of it (its key: what it was built for)
+type CheckImage { key: Text, program: Program, built: Built? = None }
+type Built { key: Text, prog: IrProgram, mc: MachineCode, data: Bytes, inlines: [InlineCall] }
 
 // is every file p was read from as it was (the file given, the prelude, the standard library's, the others')
 fn sameSources(p: Program, src: Source, preludeSrc: Source?) -> Bool {

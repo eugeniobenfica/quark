@@ -2944,7 +2944,7 @@ pub fn localNow() -> DateTime = local(unixTime())
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "1120599135-2286843"
+pub const compilerSources = "1740290396-2288143"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -2982,7 +2982,7 @@ pub const aLarge = 17 // the large blocks, the latest first
 pub const aSpare = 18 // large blocks given back, kept for one of the same size (a few: memory touched already)
 pub const aSpareCount = 19
 pub const aGrowingEvicted = 20 // rooms a full bucket gave its place away to make, since the table was made
-pub const aUnused21 = 21 // (free)
+pub const aLastRemembered = 21 // the entry remember found last (a loop writes one container again and again), or 0
 pub const aSide = 22 // the loop collections' side table (loops.qk sideSlot), kept from one to the next
 pub const aSideBytes = 23
 pub const aSideEpoch = 24 // the collection its entries are of (1 to 15): an entry of another is empty
@@ -3139,6 +3139,7 @@ pub fn rememberedFree(a: Int) {
     setWord(a, aRemembered, 0)
     setWord(a, aRememberedCap, 0)
     setWord(a, aRememberedCount, 0)
+    setWord(a, aLastRemembered, 0)
 }
 
 pub fn arenaFree(a: Int) {
@@ -3521,11 +3522,27 @@ pub fn rememberedGrow(a: Int, cap: Int) {
     free(old)
     setWord(a, aRemembered, grown)
     setWord(a, aRememberedCap, cap)
+    setWord(a, aLastRemembered, 0) // (the entries moved)
 }
 
 pub fn remember(p: Int, n: Int, desc: Int) {
     let a = arena()
-    if word(a, aMarked) == 0 or p == 0 or newSinceMark(a, p) {
+    if word(a, aMarked) == 0 or p == 0 {
+        return
+    }
+    let seen = word(a, aLastRemembered)
+    if seen != 0 and word(seen, rPtr) == p and n > 0 and n <= word(seen, rLen) and byte(desc, 0) == 'A' {
+        // the array remembered last, written again inside what it held: its time and that element's card
+        let k = shr(n - 1, cardShift)
+        if k < word(seen, rCardCap) {
+            let clock = word(a, aClock)
+            setWord(seen, rDesc, desc)
+            setWord(seen, rTime, clock)
+            setWord(word(seen, rCards), k, clock)
+            return
+        }
+    }
+    if newSinceMark(a, p) {
         return
     }
     if (word(a, aRememberedCount) + 1) * 2 > word(a, aRememberedCap) {
@@ -3536,6 +3553,7 @@ pub fn remember(p: Int, n: Int, desc: Int) {
         })
     }
     let r = rememberedAt(word(a, aRemembered), word(a, aRememberedCap), p)
+    setWord(a, aLastRemembered, r)
     let clock = word(a, aClock)
     var from = if n > 0 {
         n - 1 // the element written (a map's: 0, all of it)
@@ -7878,9 +7896,23 @@ fn copyArray(c: Int, slots: Int, elem: Int) {
     }
     if word(elem, sCount) == 0 and n * each <= smallCopy {
         // a small one of plain values: copied where it is met, without the table of what was copied (two holders of
-        // it get a copy each, of a few words; values have no identity)
-        let q = survive(c, n * each)
-        copyBytes(q, from, n * each)
+        // it get a copy each, of a few words; values have no identity), word by word into the survivor being filled
+        let bytes = n * each
+        let room = align16(bytes)
+        let now = word(c, cNow)
+        let q = if word(c, cFresh) == 0 and now != 0 and word(now, xUsed) + room <= word(now, xSize) {
+            let at = word(now, xData) + word(now, xUsed)
+            setWord(now, xUsed, word(now, xUsed) + room)
+            setWord(c, cTotal, word(c, cTotal) + room)
+            at
+        } else {
+            survive(c, bytes)
+        }
+        var i = 0
+        while i < bytes {
+            setWord(q + i, 0, word(from + i, 0))
+            i += 8
+        }
         setWord(slots, 0, q)
         return
     }

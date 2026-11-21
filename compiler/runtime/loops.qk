@@ -694,9 +694,23 @@ fn copyArray(c: Int, slots: Int, elem: Int) {
     }
     if word(elem, sCount) == 0 and n * each <= smallCopy {
         // a small one of plain values: copied where it is met, without the table of what was copied (two holders of
-        // it get a copy each, of a few words; values have no identity)
-        let q = survive(c, n * each)
-        copyBytes(q, from, n * each)
+        // it get a copy each, of a few words; values have no identity), word by word into the survivor being filled
+        let bytes = n * each
+        let room = align16(bytes)
+        let now = word(c, cNow)
+        let q = if word(c, cFresh) == 0 and now != 0 and word(now, xUsed) + room <= word(now, xSize) {
+            let at = word(now, xData) + word(now, xUsed)
+            setWord(now, xUsed, word(now, xUsed) + room)
+            setWord(c, cTotal, word(c, cTotal) + room)
+            at
+        } else {
+            survive(c, bytes)
+        }
+        var i = 0
+        while i < bytes {
+            setWord(q + i, 0, word(from + i, 0))
+            i += 8
+        }
         setWord(slots, 0, q)
         return
     }

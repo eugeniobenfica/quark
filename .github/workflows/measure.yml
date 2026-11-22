@@ -60,8 +60,7 @@ jobs:
               n=$(basename "$f" .qk)
               ../base/build/quark.exe build --release "$f" -o "/tmp/$n-b" > /dev/null
               ../cand/build/quark.exe build --release "$f" -o "/tmp/$n-c" > /dev/null
-              "/tmp/$n-b" | head -3 >&2
-              valgrind --smc-check=all-non-file "/tmp/$n-b" 2>&1 | tail -5 >&2
+              [ "$n" = counting ] && valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null --smc-check=all-non-file "/tmp/$n-b" >&2
               row "$n" "$(count "/tmp/$n-b")" "$(count "/tmp/$n-c")"
             done
           } | tee table.md

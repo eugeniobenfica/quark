@@ -54,6 +54,13 @@ jobs:
             b=$(count ../base/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qb)
             c=$(count ../cand/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qc)
             row "building the compiler" "$b" "$c"
+            # by function (the runtime's have names; the program's own code is ???)
+            for side in base cand; do
+              valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/tmp/cg-$side --smc-check=all-non-file                 ../$side/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/q-$side > /dev/null 2>&1 || true
+              cg_annotate --show-percs=no /tmp/cg-$side 2>/dev/null | grep -E "^ *[0-9,]+ +\(" | head -40 > /tmp/fns-$side || true
+            done
+            echo "base's top functions:" >&2; cat /tmp/fns-base >&2
+            echo "cand's top functions:" >&2; cat /tmp/fns-cand >&2
             # cand's compiler as base's makes it: what cand's compiler does more (its code as base makes code)
             ../base/build/quark.exe build --release ../cand/compiler/mainlinux.qk -o ../base/build/qx > /dev/null
             row "... cand's work, base's code" "$b" "$(count ../base/build/qx build ../base/compiler/mainlinux.qk -o /tmp/qd)"

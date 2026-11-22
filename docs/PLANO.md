@@ -478,7 +478,10 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 >   - `allocOld`/`arrayJoinOld` (um array novo de valores simples guardado em `xs[k] = ...`, `k` o nome do laço)
 >     tiram do topo os deixados (um frame vive só se é mais raso que tudo acima dele) e escolhem o laço mais de fora,
 >     entre os três de dentro, que não fez o recipiente; a coleta de um laço tira os de cima antes de soltar memória;
->   - os bytes velhos contam na arena na hora, fora da janela dos laços entre o topo e o alvo.
+>   - os bytes velhos contam na arena na hora, fora da janela dos laços entre o topo e o alvo;
+>   - um programa sem nenhum sítio (visto uma vez, passando só pelas instruções) não põe laço nenhum na pilha: o
+>     começo de seus laços nem lê o frame. Sem isso, `json` (muitos laços curtos, nenhum sítio) ficava ~10% mais lento
+>     no Linux ARM64; com isso, igual (868 → 867 ms), e `records` lá 1,87× → 1,40× o C.
 > - **Fica para depois:** os ~0,7% não atribuídos, a pilha mais barata, e a etapa 2 (a montagem: `build()` devolve o
 >   que vai para `fns`), que pede análise entre funções.
 

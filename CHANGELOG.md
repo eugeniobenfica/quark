@@ -11,7 +11,8 @@
 - **Arrays written into a container from before the loops running are made old for them:** `xs[k] = v` in
   `for k in ...`, `v` a new array of plain values (or a record holding such), goes straight to memory the loops' minor
   collections neither copy nor look at; a full collection of the outermost of them takes back what of it is
-  overwritten. `records` (an array of records rewritten in place) went from 84 to about 68 ms on Windows.
+  overwritten. `records` (an array of records rewritten in place) went from 84 to about 68 ms on Windows. A program
+  with no such write pays nothing for it.
 - **A value received from a channel is not copied again:** `send` copies it once, into memory of its own, and
   `receive` makes that memory the receiver's whole. The same for `parallelMap`'s results: each thread's are the
   caller's memory as the thread kept them. The compiler's cold build is 7% faster for it (its checked program comes

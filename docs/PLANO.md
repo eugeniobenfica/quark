@@ -593,7 +593,8 @@ função, threads que não recarregam o código (o custo de 10 ms). Meta: rebuil
 
 ### B13. O rebuild incremental: refazer só o que mudou
 
-> **Desenho de 21/11/2026; começado.** É o que falta para o marco 0.12 (o rebuild do compilador abaixo de 0,5 s;
+> **Feita (22/11/2026): o rebuild do compilador depois de editar uma função em 0,35 s** (era ~1,75 s; o resultado
+> está no fim desta seção). Era o que faltava para o marco 0.12 (o rebuild do compilador abaixo de 0,5 s;
 > hoje ~1,75 s: ler e checar 0,5 s, constantes, lowering, otimização e código de máquina 1,23 s). Nenhuma fase tem
 > um ponto quente barato: o perfil espalha o tempo em cópias, alocação e laços. Só não refazendo chega-se lá.
 
@@ -678,6 +679,28 @@ fatos dos chamados (o que um `var self` muda, se um resultado é todo seu, o tam
      as que leram um fato que mudou (o que um `var self` muda, um resultado todo seu) também;
   4. uma função nova ganha o próximo número (depois de tudo, auxiliares e tardias inclusive); um auxiliar novo também;
   5. o código: o das funções refeitas, novo; o das outras, o da base; juntados na ordem dos números.
+- **Etapas 2, 3b e 4, feitas (22/11/2026).** Um build depois de uma edição parte da base:
+  - **3b:** cada arquivo mudado lido uma vez; cada declaração comparada pelo seu texto (as linhas até a próxima). A
+    que tem o mesmo texto só andou (de quantas linhas); a de texto novo tem o cabeçalho conferido (lido sozinho, nas
+    suas linhas) e o corpo trocado e checado de novo sobre o programa da base (`recheckBodies`). Um cabeçalho, um tipo,
+    uma constante, um `use`, uma função genérica ou de C, um efeito ou um tipo de resultado inferido que mudou: o
+    caminho inteiro;
+  - **o que andou:** as linhas na árvore (da função, das suas instâncias e lambdas), no IR resumido, nas chamadas
+    embutidas e no código guardado (`rebased`);
+  - **2:** baixadas de novo só as funções com corpo novo, as declarações novas, as que embutiram alguma delas
+    (`Lower.inliners`) e as que leram um fato dela que mudou (o que um `var self` muda, um resultado todo seu: os
+    chamadores; uma função que passou a ser tomada como valor: ela mesma), até nada mais mudar; o código das outras é o
+    da base. Os números novos (funções, auxiliares, tardias, dados) vêm depois de todos;
+  - **4:** as decisões de memória só para essas funções e as que elas podem embutir (`Ownership.setScope`); os fatos
+    das outras, os da base (`Lower.kept` os guarda).
+- **Medido** (o compilador, uma linha a mais numa função no meio do `lower.qk`, o maior arquivo): 1 corpo checado
+  de novo, 8 funções baixadas, 175 que só andaram; ~155 ms para ler a imagem, comparar e checar, ~150 ms para baixar,
+  fazer o código e juntar; **0,35 s de relógio** (um executável recém-escrito, sobrescrito, custa ~0,9 s a mais no
+  Windows, fora do compilador). O compilador assim feito faz o mesmo compilador, byte a byte, que o da base; na suíte,
+  um programa editado roda como o mesmo programa feito do zero (a linha do pânico também).
+- **Fica de fora, por ora:** um executável feito depois de uma edição não tem os mesmos bytes que um feito do zero (a
+  ordem dos dados e das funções novas); uma lambda que andou guarda o nome com a linha antiga (`lambda at line N`, só
+  nos rastros); a base é gravada de novo só por um build frio.
 - **A ordem daqui em diante:** as etapas 2 e 3b viram uma só, o build incremental sobre a imagem do build anterior
   inteiro (o programa, as tabelas do lowering e o código de cada função). Partindo dela, um build só acrescenta: as
   funções que não mudaram guardam seus números e deslocamentos, e o código delas vale como está, com as linhas

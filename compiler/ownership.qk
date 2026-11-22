@@ -24,6 +24,30 @@ pub type Ownership {
     inlineCost: [Int] = [] // by declaration index: what putting it in line costs (inlineCostOf), 0 not known yet
     selfMemo: [Int] = [] // by declaration index: keepsSelfInMemory's answer (0 not known, 3 being worked out)
     local: Set<Int> = [] // array literals whose value never leaves the function (decideEscapes)
+    // a build after an edit (docs/PLANO.md B13): the decisions made only for these functions (their statements and
+    // expressions), and the facts of the others (changes, ownedResults) as they were; None: every function
+    scopeDecls: [Int]? = None
+    scopeStmts: Set<Int> = []
+    scopeExprs: Set<Int> = []
+}
+
+// the functions the decisions are made for (setScope), every one when none is set
+pub fn Ownership.scoped(self) -> [Int] = self.scopeDecls ?? self.p.decls
+
+fn Ownership.inScope(self, s: Int) -> Bool = self.scopeDecls is None or self.scopeStmts.contains(s)
+
+// the decisions to be made for decls only (their bodies walked once, lambdas within too)
+pub fn Ownership.setScope(var self, decls: [Int]) {
+    var stmts: Set<Int> = []
+    var exprs: Set<Int> = []
+    for d in decls {
+        for it in self.visitExpr(self.p.ast.decls[d].body, []) {
+            if it >= 0 { exprs.add(it) } else { stmts.add(-1 - it) }
+        }
+    }
+    self.scopeDecls = Some(decls)
+    self.scopeStmts = stmts
+    self.scopeExprs = exprs
 }
 
 // ---- the tree, as these questions read it ----
@@ -241,10 +265,12 @@ pub fn Ownership.makeChanges(var self) {
     self.changesMade = true
     let n = len(self.p.ast.decls)
     let none: [Int] = []
-    self.changes = [none] * n
+    if self.scopeDecls is None or len(self.changes) != n {
+        self.changes = [none] * n
+    }
     var fns: [Int] = []
     var calls: [[Int]] = []
-    for d in self.p.decls {
+    for d in self.scoped() {
         let x = self.dl(d)
         if x.kind != DeclKind.Fn or x.body < 0 or not self.changesSelf(d) or x.isTemplate {
             continue
@@ -1038,7 +1064,7 @@ pub fn Ownership.decideAliases(var self) {
     self.borrowed = [0] * len(self.p.ast.stmts)
     let none: [Int] = []
     self.returns = [none] * len(self.p.ast.decls)
-    for d in self.p.decls {
+    for d in self.scoped() {
         let x = self.p.ast.decls[d]
         if x.body >= 0 and not x.isTemplate {
             self.walking = d
@@ -1198,7 +1224,10 @@ pub fn Ownership.decideTakes(var self) {
         return
     }
     // each var's values: its first, and each whole new one (x = v); -1 for one that changes it otherwise
-    for st in self.p.ast.stmts {
+    for (si, st) in self.p.ast.stmts.enumerate() {
+        if not self.inScope(si) {
+            continue
+        }
         match st.node {
             Let(mutable, _, _, value, pattern, _) => {
                 if mutable and pattern < 0 and st.binding >= 0 {
@@ -1222,6 +1251,9 @@ pub fn Ownership.decideTakes(var self) {
     }
     for b in 0..len(self.p.ast.blocks) {
         let stmts = self.p.ast.blocks[b].stmts
+        if len(stmts) > 0 and not self.inScope(stmts[0]) {
+            continue
+        }
         for (i, s) in stmts.enumerate() {
             let bnd = self.p.ast.stmts[s].binding
             let Let(mutable, _, _, _, pattern, _) = self.p.ast.stmts[s].node else {
@@ -1237,7 +1269,7 @@ pub fn Ownership.decideTakes(var self) {
         }
     }
     // a function's var self, and its owned parameters: in its body
-    for d in self.p.decls {
+    for d in self.scoped() {
         let x = self.p.ast.decls[d]
         if x.kind != DeclKind.Fn or x.body < 0 or x.isTemplate {
             continue
@@ -1469,9 +1501,11 @@ pub fn Uses.stmt(var self, l: Ownership, s: Int, loop: Bool) {
 // from "all of them are" down to what holds (a function that calls itself keeps its answer when nothing else says no).
 pub fn Ownership.decideResults(var self) {
     let n = len(self.p.ast.decls)
-    self.ownedResults = [false] * n
+    if self.scopeDecls is None or len(self.ownedResults) != n {
+        self.ownedResults = [false] * n
+    }
     var candidates: [Int] = []
-    for d in self.p.decls {
+    for d in self.scoped() {
         let x = self.p.ast.decls[d]
         if x.kind == DeclKind.Fn and x.body >= 0 and not x.isExtern and not x.isTemplate {
             self.ownedResults[d] = true
@@ -1793,7 +1827,10 @@ pub fn Ownership.decideEscapes(var self) {
         }
     }
     // a side of xs + [x]: the join copies both into a new array, the literal is read once and gone
-    for x in self.p.ast.exprs {
+    for (xe, x) in self.p.ast.exprs.enumerate() {
+        if self.scopeDecls is Some(_) and not self.scopeExprs.contains(xe) {
+            continue
+        }
         if x.node is Binary(op, l, r) and op == .Plus and x.ty >= 0 and self.tk(x.ty) == Kind.Array {
             for side in [l, r] {
                 if self.p.ast.exprs[side].node is ArrayLit(items) and len(items) > 0 and len(items) <= localMost {
@@ -1804,6 +1841,9 @@ pub fn Ownership.decideEscapes(var self) {
     }
     for b in 0..len(self.p.ast.blocks) {
         let stmts = self.p.ast.blocks[b].stmts
+        if len(stmts) > 0 and not self.inScope(stmts[0]) {
+            continue
+        }
         for (i, s) in stmts.enumerate() {
             let bnd = self.p.ast.stmts[s].binding
             let Let(mutable, _, _, value, pattern, _) = self.p.ast.stmts[s].node else {

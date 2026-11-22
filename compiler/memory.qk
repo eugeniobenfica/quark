@@ -130,20 +130,23 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     var fromImage: Program? = None
     var wasBuilt: Built? = None
     var base: CheckImage? = None // an image of files that have changed since: what a build after an edit goes on from
+    var baseTexts: [Text?] = [] // (and those files' texts now)
     if imageAt != "" {
         let kept: CheckImage? = machine.loadImage(imageAt)
         if kept is Some(image) and image.key == imageKey {
-            if sameSources(image.program, src, preludeSrc) {
+            let now = sourcesNow(image.program, src, preludeSrc)
+            if sameAs(image.program, now) {
                 fromImage = Some(image.program)
                 wasBuilt = image.built
             } else {
                 base = Some(image)
+                baseTexts = now
             }
         }
     }
     // after an edit of function bodies only: from the base, those bodies checked and lowered again
     if base is Some(image) and not purpose.runtime and not o.release and not purpose.target.startsWith("wasm32") {
-        match afterEdit(host, image, src, preludeSrc, o, purpose, quiet, t0) {
+        match afterEdit(host, image, baseTexts, src, preludeSrc, o, purpose, quiet, t0) {
             Done(c) => return Some(c)
             Failed => return None
             NotHere => {}
@@ -352,6 +355,7 @@ enum EditBuild { Done(c: Compiled), Failed, NotHere }
 fn afterEdit(
     host: Host,
     image: CheckImage,
+    texts: [Text?],
     src: Source,
     preludeSrc: Source?,
     o: RunOptions,
@@ -369,26 +373,18 @@ fn afterEdit(
     // each changed file: read as it was and as it is, declaration by declaration
     var again: [Int] = [] // the functions whose bodies are new
     var wasEffect: [Bool] = []
+    var wasType: [Int] = [] // (a result's type not written is the body's: its callers' then)
     var moved: [Int: Int] = [:] // the functions whose text is the same but its place moved: by how many lines
     for (k, m) in image.program.modules.enumerate() {
-        let now = if k == 0 {
-            Some(src.text)
-        } else if m.path == preludePath {
-            Some(preludeText())
-        } else if preludeSrc is Some(given) and m.path == given.path {
-            Some(given.text)
-        } else {
-            readModule(m.path, m.path.startsWith("std/"), None)
-        }
+        let now: Text? = if k < len(texts) { texts[k] } else { None }
         let Some(text) = now else {
             return .NotHere
         }
         if text == m.src.text {
             continue
         }
-        let old = parse(Source(m.path, m.src.text))
         let new = parse(Source(m.path, text))
-        if not new.ok or not old.ok or len(old.ast.decls) != len(new.ast.decls) {
+        if not new.ok {
             return .NotHere
         }
         // the program's declarations of this file, in their order (not the ones checking made)
@@ -402,19 +398,6 @@ fn afterEdit(
         if len(mine) != len(new.ast.decls) {
             return .NotHere
         }
-        // (each declaration's header: its text with an empty body)
-        var oldHeads = old.ast
-        var newHeads = new.ast
-        let oldEmpty = oldHeads.expr(.BlockExpr(oldHeads.block(Block()), false), 0, 0)
-        let newEmpty = newHeads.expr(.BlockExpr(newHeads.block(Block()), false), 0, 0)
-        for j in 0..len(new.ast.decls) {
-            if oldHeads.decls[j].body >= 0 {
-                oldHeads.decls[j].body = oldEmpty
-            }
-            if newHeads.decls[j].body >= 0 {
-                newHeads.decls[j].body = newEmpty
-            }
-        }
         let at = len(p.ast.decls)
         p.ast.append(new.ast)
         let oldLines = m.src.text.split("\n")
@@ -422,17 +405,31 @@ fn afterEdit(
         for j in 0..len(new.ast.decls) {
             let x = new.ast.decls[j]
             let d = mine[j]
-            if x.name != p.ast.decls[d].name or x.kind != old.ast.decls[j].kind {
+            if x.name != p.ast.decls[d].name or x.kind != p.ast.decls[d].kind {
                 return .NotHere
             }
+            let oldTo = if j + 1 < len(mine) {
+                p.ast.decls[mine[j + 1]].line - 1
+            } else {
+                len(oldLines)
+            }
+            let newTo = if j + 1 < len(new.ast.decls) {
+                new.ast.decls[j + 1].line - 1
+            } else {
+                len(newLines)
+            }
+            let oldSpan = linesOf(oldLines, p.ast.decls[d].line - 1, oldTo)
+            let newSpan = linesOf(newLines, x.line - 1, newTo)
             // the same text (each declaration's lines, to the next one's): the same declaration, moved if anything
-            if spanOf(oldLines, old.ast, j) == spanOf(newLines, new.ast, j) {
-                if x.kind == DeclKind.Fn and x.body >= 0 and x.line != old.ast.decls[j].line {
-                    moved[d] = x.line - old.ast.decls[j].line
+            if oldSpan == newSpan {
+                if x.kind == DeclKind.Fn and x.body >= 0 and x.line != p.ast.decls[d].line {
+                    moved[d] = x.line - p.ast.decls[d].line
                 }
                 continue
             }
-            if declText(oldHeads, j) != declText(newHeads, j) {
+            // its text changed: its header must not have (the old one read alone, at its own lines)
+            let was = parse(Source(m.path, "\n" * (p.ast.decls[d].line - 1) + oldSpan.join("\n")))
+            if not was.ok or len(was.ast.decls) != 1 or headerText(was.ast, 0) != headerText(new.ast, j) {
                 return .NotHere // a header, a type, a constant, a use
             }
             if x.kind != DeclKind.Fn or x.body < 0 {
@@ -444,6 +441,7 @@ fn afterEdit(
             }
             // its body: the new one (its lines moved, if nothing else)
             wasEffect.push(y.isEffect)
+            wasType.push(y.retType)
             p.ast.decls[d].body = p.ast.decls[at + j].body
             p.ast.decls[d].line = x.line
             p.ast.decls[d].col = x.col
@@ -486,8 +484,8 @@ fn afterEdit(
     }
     let q = checked.program
     for (i, d) in again.enumerate() {
-        if q.ast.decls[d].isEffect != wasEffect[i] {
-            return .NotHere // its callers' effects: the whole check
+        if q.ast.decls[d].isEffect != wasEffect[i] or q.ast.decls[d].retType != wasType[i] {
+            return .NotHere // its callers' effects, or its result's type: the whole check
         }
     }
     let t1 = monotonicTime()
@@ -524,23 +522,42 @@ fn afterEdit(
                 todo.add(e)
             }
         }
-        // a fact its callers read, changed: they are lowered again
-        let changesNow = l.own.changes.get(d) ?? []
-        let wasChanges = if d < len(kept.keptChanges) { kept.keptChanges[d] } else { [] }
-        let wasOwned = d < len(kept.keptResults) and kept.keptResults[d]
-        if changesNow != wasChanges or l.own.ownedResults[d] != wasOwned {
-            let slot = l.fnIndex[q.ast.decls[d].index]
+    }
+    // the memory decisions for those (the others' as they were), and again with more while a fact others read
+    // changed: a function's callers, when what it changes or whether its result is all its own did; a function kept
+    // as a value now, itself
+    var more = true
+    while more {
+        more = false
+        var scope: [Int] = []
+        for d in todo {
+            scope.push(d)
+        }
+        l.decideFor(scope)
+        for d in scope {
+            let changesNow = l.own.changes.get(d) ?? []
+            let wasChanges = if d < len(kept.keptChanges) { kept.keptChanges[d] } else { [] }
+            let wasOwned = d < len(kept.keptResults) and kept.keptResults[d]
+            if changesNow.sorted() == wasChanges.sorted() and l.own.ownedResults[d] == wasOwned {
+                continue
+            }
+            let i = q.ast.decls[d].index
+            let slot = if i >= 0 and i < len(l.fnIndex) { l.fnIndex[i] } else { -1 }
             for (s, f) in l.fns.enumerate() {
-                if f.code.any(ins => ins.op == Op.Call and ins.a < 0 and ins.imm == slot) and declAt[s] is Some(e) {
+                if slot >= 0
+                    and f.code.any(ins => ins.op == Op.Call and ins.a < 0 and ins.imm == slot)
+                    and declAt[s] is Some(e)
+                    and not todo.contains(e) {
                     todo.add(e)
+                    more = true
                 }
             }
         }
-    }
-    // a function kept as a value now, or no longer: called otherwise
-    for i in 0..min(len(kept.asValue), len(q.decls)) {
-        if kept.asValue[i] != l.asValue[i] {
-            todo.add(q.decls[i])
+        for i in 0..min(len(kept.asValue), len(q.decls)) {
+            if l.asValue[i] and not kept.asValue[i] and not todo.contains(q.decls[i]) {
+                todo.add(q.decls[i])
+                more = true
+            }
         }
     }
     var decls: [Int] = []
@@ -648,15 +665,20 @@ fn afterEdit(
     .Done(Compiled(prog, mc, low.data, low.inlines, testsOf(q), if avx { 1 } else { 0 }, os, purpose.linked))
 }
 
-// the lines of a file's j-th declaration, up to the next one's (comments above the next one among them)
-fn spanOf(lines: [Text], a: Ast, j: Int) -> [Text] {
-    let from = max(a.decls[j].line - 1, 0)
-    let to = if j + 1 < len(a.decls) {
-        a.decls[j + 1].line - 1
-    } else {
-        len(lines)
+// lines from to to (0-based, to excluded), none when to is not past from
+fn linesOf(lines: [Text], from: Int, to: Int) -> [Text] = if from < 0 or to <= from {
+    []
+} else {
+    lines[from..min(to, len(lines))]
+}
+
+// the j-th declaration's text with an empty body: its header (a function's), or all of it
+fn headerText(a: Ast, j: Int) -> Text {
+    var h = a
+    if h.decls[j].body >= 0 {
+        h.decls[j].body = h.expr(.BlockExpr(h.block(Block()), false), 0, 0)
     }
-    if to <= from { [] } else { lines[from..min(to, len(lines))] }
+    declText(h, j)
 }
 
 // each moved function's declarations (itself, the copy its instances are made from, its instances) with by how much
@@ -715,10 +737,12 @@ type Built {
     arm64: [Arm64Part] = []
 }
 
-// is every file p was read from as it was (the file given, the prelude, the standard library's, the others')
-fn sameSources(p: Program, src: Source, preludeSrc: Source?) -> Bool {
+// the text now of each file p was read from (the file given, the prelude, the standard library's, the others'):
+// None, one that cannot be read
+fn sourcesNow(p: Program, src: Source, preludeSrc: Source?) -> [Text?] {
+    var out: [Text?] = []
     for (k, m) in p.modules.enumerate() {
-        let now = if k == 0 {
+        out.push(if k == 0 {
             Some(src.text)
         } else if m.path == preludePath {
             Some(preludeText())
@@ -726,8 +750,15 @@ fn sameSources(p: Program, src: Source, preludeSrc: Source?) -> Bool {
             Some(given.text)
         } else {
             readModule(m.path, m.path.startsWith("std/"), None)
-        }
-        if now != Some(m.src.text) {
+        })
+    }
+    out
+}
+
+// is every file p was read from as it was
+fn sameAs(p: Program, now: [Text?]) -> Bool {
+    for (k, m) in p.modules.enumerate() {
+        if now[k] != Some(m.src.text) {
             return false
         }
     }

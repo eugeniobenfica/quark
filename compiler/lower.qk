@@ -7859,7 +7859,19 @@ pub fn lowerResume(
     while len(l.externIndex) < n {
         l.externIndex.push(-1)
     }
-    l.asValue = [false] * n
+    l.asValue = kept.asValue
+    while len(l.asValue) < n {
+        l.asValue.push(false)
+    }
+    l.own.changes = kept.keptChanges
+    l.own.ownedResults = kept.keptResults
+    let none: [Int] = []
+    while len(l.own.changes) < len(p.ast.decls) {
+        l.own.changes.push(none)
+    }
+    while len(l.own.ownedResults) < len(p.ast.decls) {
+        l.own.ownedResults.push(false)
+    }
     l.out = prog
     l.fns = prog.fns
     l.out.fns = []
@@ -7868,13 +7880,50 @@ pub fn lowerResume(
     l.latePatches = []
     l.held = []
     l.nextDecl = n
-    l.own.decideAliases()
-    l.own.decideTakes()
-    l.own.decideResults()
-    l.own.decideEscapes()
-    l.own.makeChanges()
-    l.markInPlace()
     l
+}
+
+// the memory decisions for decls (and the facts of theirs others read), the rest as they were (lowerResume)
+pub fn Lower.decideFor(var self, decls: [Int]) {
+    // (and for the functions they may put in line, as far as those go: inlined code is lowered by their decisions)
+    var scope: [Int] = []
+    var seen: Set<Int> = []
+    var todo = decls
+    while len(todo) > 0 {
+        let d = todo.pop() ?? -1
+        if d < 0 or seen.contains(d) {
+            continue
+        }
+        seen.add(d)
+        scope.push(d)
+        let body = self.dl(d).body
+        if body < 0 {
+            continue
+        }
+        for e in self.own.visitExpr(body, []) {
+            if e < 0 {
+                continue
+            }
+            let g = self.p.ast.exprs[e].decl
+            if g >= 0
+                and not seen.contains(g)
+                and self.dl(g).kind == DeclKind.Fn
+                and self.dl(g).body >= 0
+                and self.dl(g).index >= 0
+                and self.own.inlinedSmall(g) {
+                todo.push(g)
+            }
+        }
+    }
+    self.own.setScope(scope)
+    self.own.decideAliases()
+    self.own.decideTakes()
+    self.own.decideResults()
+    self.own.decideEscapes()
+    self.own.makeChanges()
+    let nb = len(self.p.bindings)
+    self.selfInPlace = [false] * nb
+    self.markInPlace()
 }
 
 // is d's function one this lowering gives a number to (not C's, a template, or one only put in line)
@@ -8096,7 +8145,7 @@ pub fn Lower.summaryOf(self, f: IrFn) -> IrFn {
 
 // The vars that calls want in memory (p.parse(), p.lexer.next()): kept there.
 fn Lower.markInPlace(var self) {
-    for d in self.p.decls {
+    for d in self.own.scoped() {
         let x = self.dl(d)
         if x.kind != DeclKind.Fn or x.body < 0 {
             continue

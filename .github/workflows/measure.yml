@@ -60,7 +60,15 @@ jobs:
               n=$(basename "$f" .qk)
               ../base/build/quark.exe build --release "$f" -o "/tmp/$n-b" > /dev/null
               ../cand/build/quark.exe build --release "$f" -o "/tmp/$n-c" > /dev/null
-              [ "$n" = counting ] && valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null --smc-check=all-non-file "/tmp/$n-b" >&2
+              if [ "$n" = counting ]; then
+                vg="valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null --smc-check=all-non-file"
+                cp "/tmp/$n-b" ./bench-here; cp ../base/build/quark.exe /tmp/quark-there
+                $vg ./bench-here > /tmp/o1 2>&1; echo "here: exit $? $(grep -c checksum /tmp/o1) $(grep 'I *refs' /tmp/o1)" >&2
+                $vg /tmp/quark-there version > /tmp/o2 2>&1; echo "there: exit $? $(grep 'I *refs' /tmp/o2)" >&2; head -3 /tmp/o2 >&2
+                $vg ../base/build/quark.exe version > /tmp/o3 2>&1; echo "build: exit $? $(grep 'I *refs' /tmp/o3)" >&2; head -3 /tmp/o3 >&2
+                $vg "/tmp/$n-b" > /tmp/o4 2>&1; echo "tmp: exit $?" >&2; cat /tmp/o4 | grep -v "^==" >&2
+                file "/tmp/$n-b" ../base/build/quark.exe >&2
+              fi
               row "$n" "$(count "/tmp/$n-b")" "$(count "/tmp/$n-c")"
             done
           } | tee table.md

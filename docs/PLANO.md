@@ -444,6 +444,20 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 > - **Para fechar:** o alcance sem passear o programa (no checker, que já percorre cada corpo, ou só quando há um
 >   sítio), e o fim de laço mais barato. Depois, a etapa 2: a montagem (`build()` devolve o que vai para `fns`), que
 >   pede análise entre funções.
+> - **Segunda rodada (22/11/2026), sem o alcance e sem código no fim de laço** (branch `b7-pretenure`, 1a5725a):
+>   - o runtime acha os laços deixados no começo do próximo: cada frame guarda o frame da sua função e sua
+>     profundidade nela, e sai da pilha o de uma função mais funda (que voltou) ou o da mesma, tão fundo ou mais (que
+>     acabou); a coleta de um laço tira os de cima. Um deixado e ainda não tirado é inofensivo: seu frame fica até um
+>     laço de fora coletar, e esse tira antes;
+>   - os bytes velhos contam na hora, fora da janela dos laços de dentro do alvo (uma coleta cuja janela foi quase só
+>     de bytes velhos só adia o prazo);
+>   - medido no build do compilador (pareado, num grupo de núcleos, prioridade alta): +6,7% com a pilha, +3,8% sem
+>     ela; mas o mesmo compilador com o código só deslocado (um ramo morto) dá −2,4%. O ruído de posição do código é
+>     ~±2,5%, do tamanho do que se quer medir.
+>   - Também medidos: o fim de laço como chamada (+4%), em linha com 2 ou 4 instruções (+3 a +6%); o alcance
+>     devolvido como array (+10%, copiado a cada laço).
+> - **Falta para decidir:** uma medida que separe o custo do ruído de posição (contadores de instruções, ou vários
+>   programas além do compilador), e reduzir o que sobrar.
 
 ### B8. O grafo sem JSON por dentro
 

@@ -12,17 +12,15 @@ inteira passando.
 
 ## Em ordem
 
-1. [ ] **O tempo de volta da B12** (a carga e o check numa tarefa custam +5% de relógio num build frio): workers do
-   `parallelMap` que vivem entre chamadas; um canal que entrega o valor sem copiá-lo.
-2. [ ] **As ferramentas onde as pessoas estão.** Cada uma é pública: precisa do OK do dono.
+1. [ ] **As ferramentas onde as pessoas estão.** Cada uma é pública: precisa do OK do dono.
    - uma extensão de editor (VS Code) que leve o `quark lsp` e o `quark dap`;
    - um registro de pacotes público (o repositório `index.toml`);
    - um playground no navegador (o compilador em wasm32);
    - instaladores por sistema.
-3. [ ] **Desempenho, de novo medido nos três sistemas,** e o próximo alvo escolhido pelo que estiver mais longe do C.
+2. [ ] **Desempenho, de novo medido nos três sistemas,** e o próximo alvo escolhido pelo que estiver mais longe do C.
    No Windows, em 21/11/2026 (`bash tools/bench.sh`): records 1,44×, mandelbrot 1,06×, counting 1,04×, words 1,00×;
    mais rápidos que o C: sorting 0,77×, strings 0,64×, pipeline 0,42×, trees 0,19×.
-4. [ ] **1.0:** o STABILITY.md revisto uma última vez, o changelog, o anúncio.
+3. [ ] **1.0:** o STABILITY.md revisto uma última vez, o changelog, o anúncio.
 
 ## Sem data
 

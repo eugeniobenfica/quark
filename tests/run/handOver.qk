@@ -1,0 +1,73 @@
+// Values handed over whole: a value received keeps the memory send copied it into (no second copy), the receiver's
+// from then on, through its loops' collections; parallelMap's results the caller's memory as the threads made them;
+// and the threads' copies of the program kept from one call to the next.
+type Entry { key: Text, values: [Int], index: [Text: Int] }
+
+fn entry(i: Int) -> Entry {
+    var index: [Text: Int] = [:]
+    for j in 0..i % 5 {
+        index["k{j}"] = i * j
+    }
+    Entry("entry {i}", (0..i % 7).map(j => i + j).toArray(), index)
+}
+
+fn check(e: Entry, i: Int) -> Bool =
+    e.key == "entry {i}" and e.values == (0..i % 7).map(j => i + j).toArray() and len(e.index) == i % 5
+
+fn kept() {
+    let ch: Channel<Entry> = channel()
+    let _ = go(() => {
+        for i in 0..3000 {
+            send(ch, entry(i))
+        }
+        closeChannel(ch)
+    })
+    // each received value kept while the loop makes garbage: its collections keep what is reached
+    var all: [Entry] = []
+    var noise = 0
+    while receive(ch) is Some(e) {
+        all.push(e)
+        let junk = "{e.key} {e.values} and more text that goes".split(" ")
+        noise += len(junk)
+    }
+    var ok = len(all) == 3000
+    for (i, e) in all.enumerate() {
+        ok = ok and check(e, i)
+    }
+    print(ok, noise > 0)
+    // a large one: its long arrays (large blocks) taken as they are
+    let big: Channel<([Int], Text)> = channel()
+    send(big, ((0..200000).toArray(), "x" * 100000))
+    let (xs, t) = receive(big) ?? ([], "")
+    print(len(xs), xs[199999], len(t))
+}
+
+fn label(x: Float) -> Text = "{x * 1.5} at {x}"
+
+fn repeated() {
+    // many calls: each thread's copy of the program, and its context, made once
+    var ok = true
+    for round in 0..40 {
+        let texts = (0..64).parallelMap(i => label(toFloat(i + round)))
+        ok = ok and texts[3] == label(toFloat(3 + round))
+        let entries = (0..50).parallelMap(i => entry(i + round))
+        for (i, e) in entries.enumerate() {
+            ok = ok and check(e, i + round)
+        }
+    }
+    print(ok)
+}
+
+fn inTask() {
+    // parallelMap inside a task, its results sent out of it
+    let out: Channel<[Text]> = channel()
+    let _ = go(() => send(out, (0..100).parallelMap(i => "t{i * i}")))
+    let got = receive(out) ?? []
+    print(len(got), got[99])
+}
+
+fn main() {
+    kept()
+    repeated()
+    inTask()
+}

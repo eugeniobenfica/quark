@@ -812,7 +812,8 @@ resultado.
 
 ### B12. A compilação em fluxo
 
-> **Feita (21/11/2026).** O pico do rebuild do compilador caiu de 3,1 GB para ~1,5 GB, com +5% de tempo de relógio.
+> **Feita (21/11/2026), e o tempo de volta em 22/11/2026.** O pico do rebuild do compilador caiu de 3,1 GB para
+> 1,41 GB, e o build frio ficou mais rápido que o de antes da B12 (1,81 s contra 1,86 s, medidos com o mesmo runtime).
 > A carga e o check numa tarefa esperaram a 0.12.0, de onde o CI agora parte; no ARM64 esperam a próxima versão, porque
 > as tarefas da 0.12.0 têm 8 MB de pilha, pouco para checar o compilador ali (agora são 64 MB no Linux e no macOS,
 > onde a memória só é tomada quando tocada). O resultado está no fim desta seção.
@@ -859,13 +860,40 @@ tempo do rebuild igual ou menor.
 
   Com a tarefa, o pico fica abaixo da meta e o tempo ~5% acima: ~50 ms copiando o programa checado para fora da
   tarefa (o canal copia duas vezes) e a recarga do programa em cada thread a cada lote.
-- **Medido e deixado de lado:**
-  - lotes pequenos (200 mil instruções): menos pico, mas cada lote recarrega o programa em 16 threads (+0,3 s);
-  - guardar a cópia de cada worker para a chamada seguinte: quebrou (uma cópia reaproveitada por outra thread acaba
-    em "too many calls deep"); a causa não foi achada.
-- **O que ainda daria o tempo de volta:**
-  - workers que vivem entre chamadas do `parallelMap`;
-  - receber de um canal adotando a memória do valor, em vez de copiá-lo.
+- **Medido e deixado de lado:** lotes pequenos (200 mil instruções): menos pico, mas cada lote recarregava o
+  programa em 16 threads (+0,3 s).
+
+**O tempo de volta (22/11/2026).** Medido primeiro, por fase, no build frio do compilador (Windows, 16 threads):
+
+- **Onde estava:**
+  - o canal da tarefa do check copiava o programa duas vezes: 32 ms no `send` (para a arena dos canais) e 55 ms no
+    `receive` (para a memória de quem recebe);
+  - a recarga do programa a cada lote quase não pesava (~1–2%): são só 2 lotes de 2 milhões de instruções;
+  - os lotes em si já não custam nada: com um lote só, o mesmo tempo.
+- **Um canal que entrega a memória do valor** (`runtime/tasks.qk`, `arena.qk`, `loops.qk`):
+  - `send` copia o valor uma vez, para memória só dele: blocos de sobreviventes e blocos grandes, como os que a coleta
+    de um laço faz (`copierHolding`, de 256 bytes em diante, para que um valor curto tome pouco);
+  - `receive` toma essas duas listas inteiras para a arena de quem recebe (`arenaTake`), com o relógio dela de agora:
+    para os laços dela é memória jovem, como uma alocação nova, e vai embora com ela;
+  - a arena dos canais, refeita e esvaziada, deixou de existir.
+- **Os resultados do `parallelMap`** são guardados por cada worker num holder do mesmo tipo, e a arena de quem chamou
+  o toma inteiro (`arenaAdopt`), em vez de copiar cada resultado outra vez.
+- **A cópia de cada worker vive entre chamadas** (`loader.qk`, `contextFor` e `copyFor`). A causa do "too many calls
+  deep" de antes: as relocações do combustível, do escape, do frame do pânico e do limite da pilha são endereços
+  absolutos no contexto da thread que carregou a cópia. Agora o contexto também é guardado com a cópia, por número de
+  worker, e a thread nova o usa.
+- **Medido** (`quark build compiler/main.qk`, frio, 4 rodadas; "antes da B12" é a mesma árvore com o check fora da
+  tarefa e um lote só, com o runtime novo):
+
+  | | pico | relógio |
+  |---|---|---|
+  | antes da B12 | 2,45 GB | 1,86 s |
+  | a B12 como estava (dc83649) | 1,53 GB | 1,94 s |
+  | a B12 agora | 1,41 GB | 1,81 s |
+
+  O check caiu de 520 para 480 ms (uma cópia a menos), e o lowering e o código de máquina também ficaram mais
+  rápidos (menos memória tocada). O que sobra entre o `send` e o `receive` (~35 ms) é a tarefa devolvendo a arena
+  dela (~1 GB) ao sistema: é o que mantém o pico baixo.
 
 ## 4. Fase C: a linguagem (decidir antes de congelar)
 

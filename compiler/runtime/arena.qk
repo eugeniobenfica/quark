@@ -120,6 +120,63 @@ pub fn regionArenaFree(a: Int) {
     free(a)
 }
 
+// A holder: memory of a value's own, made by a copier into it (copierHolding, copierInto) as survivors and large
+// blocks, never blocks, that an arena takes whole (arenaAdopt): a value sent to another task's memory, a thread's
+// results. (Its table of rooms is the least there is: nothing grows in it.)
+pub fn holderNew() -> Int {
+    let h = calloc(1, 8 * arenaWords)
+    setWord(h, aGrowing, calloc(2 * growingWays, 16))
+    setWord(h, aGrowingBits, 1)
+    h
+}
+
+// h's memory (a holder's) made a's own (arenaTake), and h let go of
+pub fn arenaAdopt(a: Int, h: Int) {
+    arenaTake(a, word(h, aExtras), word(h, aLarge))
+    setWord(h, aExtras, 0)
+    setWord(h, aLarge, 0)
+    arenaFree(h)
+}
+
+// a holder's memory, as its lists (survivors, large blocks), made a's own as if a made it now: young to a's loops,
+// gone with a
+pub fn arenaTake(a: Int, extras: Int, large: Int) {
+    setWord(a, aClock, word(a, aClock) + 1)
+    let now = word(a, aClock)
+    var bytes = 0
+    // each list newest first: these, made now, go before a's
+    var x = extras
+    if x != 0 {
+        while x != 0 {
+            setWord(x, xTime, now)
+            bytes += word(x, xSize)
+            if word(x, xNext) == 0 {
+                setWord(x, xNext, word(a, aExtras))
+                x = 0
+            } else {
+                x = word(x, xNext)
+            }
+        }
+        setWord(a, aExtras, extras)
+    }
+    var big = large
+    if big != 0 {
+        while big != 0 {
+            setWord(big, bigTime, now)
+            bytes += word(big, bigSize)
+            setWord(a, aReserved, word(a, aReserved) + word(big, bigSize))
+            if word(big, bigNext) == 0 {
+                setWord(big, bigNext, word(a, aLarge))
+                big = 0
+            } else {
+                big = word(big, bigNext)
+            }
+        }
+        setWord(a, aLarge, large)
+    }
+    setWord(a, aAllocated, word(a, aAllocated) + bytes)
+}
+
 pub fn arenaNew() -> Int {
     let a = calloc(1, 8 * arenaWords)
     if a != 0 {

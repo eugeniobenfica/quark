@@ -1,0 +1,40 @@
+name: Benchmarks
+
+# By hand (gh workflow run bench.yml): Quark built as the Linux and macOS jobs build it, then every benchmark in
+# bench/ against C (tools/bench.sh, the best of 5 runs), the table in the run's summary. Shared machines: a ratio is
+# worth more than a time.
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            os: ubuntu-latest
+            quark: quark-x86_64-linux
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            quark: quark-arm64-linux
+          - name: macOS Apple silicon
+            os: macos-15
+            quark: quark-arm64-macos
+          - name: macOS Intel
+            os: macos-15-intel
+            quark: quark-x86_64-macos
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern ${{ matrix.quark }} --dir boot && chmod 755 boot/${{ matrix.quark }}
+      - name: Build (to the fixed point)
+        run: QUARK=boot/${{ matrix.quark }} ./build.sh --check
+      - name: Benchmarks
+        run: |
+          CC=cc bash tools/bench.sh 5 | tee build/bench.txt
+          { echo "### ${{ matrix.name }}"; echo '```'; cat build/bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

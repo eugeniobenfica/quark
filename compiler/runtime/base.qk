@@ -324,10 +324,9 @@ pub const gBackgroundCap = 26
 pub const gChannels = 27 // channel()'s queues, by number
 pub const gChannelCount = 28
 pub const gChannelCap = 29
-pub const gChannelArena = 30 // where the values in the channels' queues are, apart from any task's memory (or 0)
-pub const gChannelQueued = 31 // values in all the queues: none, and the arena is emptied
-pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
-pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
+pub const gChannelHolder = 30 // what a value sent is copied into (arena.qk holderNew), its memory then the item's
+// (31 and 32: free)
+pub const gChannelCopier = 33 // the copier the channels' values go through (copierHolding), kept
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
 pub const gTaskSpares = 35 // the stacks and arenas of tasks that ended, kept for new ones: (stack, arena) pairs
 pub const gTaskSpareCount = 36

@@ -113,7 +113,8 @@ pub const cMaps = 28 // with cLogMaps: each map copied, its address (an image's:
 pub const cMapCount = 29
 const cMapCap = 30
 pub const cLogMaps = 31
-const copierWords = 32
+const cSmall = 32 // one value at a time (a channel's, an image's): the table of what was copied starts small
+const copierWords = 33
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -430,7 +431,8 @@ fn survive(c: Int, bytes0: Int) -> Int {
     var now = word(c, cNow)
     if now == 0 or word(now, xUsed) + bytes > word(now, xSize) {
         // small blocks first: an inner loop that keeps a little, collected at each call, makes a little
-        var step = if now != 0 { word(now, xSize) * 2 } else { 65536 }
+        // (one value at a time: from 256 bytes, so a short one takes little)
+        var step = if now != 0 { word(now, xSize) * 2 } else if word(c, cSmall) != 0 { 256 } else { 65536 }
         if step > 1048576 {
             step = 1048576
         }
@@ -551,7 +553,7 @@ fn movedSlot(c: Int, from: Int, n: Int, kind: Int) -> Slot {
         // a channel's copier (one value at a time) starts small: forgetting clears all of it
         let cap = if word(c, cMovedCap) != 0 {
             word(c, cMovedCap) * 2
-        } else if word(c, cFresh) != 0 {
+        } else if word(c, cSmall) != 0 {
             16
         } else {
             1024
@@ -1061,7 +1063,32 @@ pub fn copierFresh(c0: Int) -> Int {
     let c = copierNew(a, word(a, aClock))
     setWord(c, cAll, 1)
     setWord(c, cFresh, 1)
+    setWord(c, cSmall, 1)
     c
+}
+
+// A copier of a value, with all it points to, into the holder h (arena.qk holderNew), which an arena then takes whole
+// (arenaAdopt): a value sent on a channel. c0: one used before (copierHeld), kept for what it worked out about the
+// types; 0, a new one. Then copyValue, and copierHeld.
+pub fn copierHolding(c0: Int, h: Int) -> Int {
+    var c = c0
+    if c == 0 {
+        c = copierNew(h, 0)
+        setWord(c, cAll, 1)
+        setWord(c, cSmall, 1)
+    }
+    setWord(c, cA, h)
+    setWord(c, cNow, 0)
+    c
+}
+
+// the holder's copy done: what it made counted in it, and the copier ready for copierHolding again
+pub fn copierHeld(c: Int) {
+    let h = word(c, cA)
+    setWord(h, aAllocated, word(h, aAllocated) + word(c, cMade))
+    setWord(c, cMade, 0)
+    setWord(c, cNow, 0)
+    copierFreshDone(c)
 }
 
 // what was copied forgotten (the next copies share nothing with these): the copier ready for copierFresh again

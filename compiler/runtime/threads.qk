@@ -1,8 +1,8 @@
-// parallelMap and parallelFold: the elements shared out to threads. Each worker has a context of its own and loads the
-// code again (its addresses are its thread's), then runs f on its elements (parallelFold: folds its part from the
-// start); a panic in one stops the call with its message. Results that hold memory (texts, arrays, maps) are copied
-// out of the worker's memory as each is made, into memory the worker keeps, and from there into the caller's when
-// every worker is done.
+// parallelMap and parallelFold: the elements shared out to threads. Each worker has a context of its own and a copy of
+// the code (its addresses are the context's), both kept from one call to the next (loader.qk copyFor), and runs f on
+// its elements (parallelFold: folds its part from the start); a panic in one stops the call with its message. Results
+// that hold memory (texts, arrays, maps) are copied out of the worker's memory as each is made, into memory the worker
+// keeps (a holder), which the caller's memory takes whole when every worker is done.
 use base
 use arena
 use loader
@@ -33,17 +33,22 @@ const wDesc = 15 // results that hold memory: an array of them's description (el
 const wKeep = 16 // ... and the arena they are kept in
 const wStride = 17 // the worker's elements: wFirst, then every wStride-th before wLast
 const wText = 18 // 512 bytes
-const workerWords = 82
+const wIndex = 82 // the worker's number: its kept copy and context (loader.qk copyFor)
+const workerWords = 83
 
 fn runWorker(w: Int) -> Int {
-    let c = calloc(ctxWords, 8)
+    let c = contextFor(word(w, wFrom), word(w, wIndex))
+    // the context as a new one, but for the Float work room it made (the copy's code knows these cells)
+    let work = word(c, ctxFloatWork)
+    zeroBytes(c, 8 * ctxWords)
+    setWord(c, ctxFloatWork, work)
     setWord(c, ctxFuel, word(w, wFuel))
     let a = arenaNew()
     setWord(c, ctxArena, a)
     setWord(c, ctxGlobals, word(w, wGlobals))
     let was = ctx()
     setCtx(c)
-    let copy = loadAgain(word(w, wFrom))
+    let copy = copyFor(word(w, wFrom), word(w, wIndex))
     if copy == 0 {
         setWord(w, wFailed, 1)
         let _ = bufAt(w + 8 * wText, panicTextSize).text("parallelMap: a thread could not load the program")
@@ -61,7 +66,7 @@ fn runWorker(w: Int) -> Int {
         var keeper = 0
         if desc != 0 {
             let main = word(w, wFrom)
-            setWord(w, wKeep, arenaNew())
+            setWord(w, wKeep, holderNew())
             keeper = copierInto(word(w, wKeep), word(copy, lData), word(main, lDataLen), word(main, lData))
         }
         var i = word(w, wFirst)
@@ -86,11 +91,9 @@ fn runWorker(w: Int) -> Int {
         if keeper != 0 {
             copierDone(keeper)
         }
-        unload(copy)
     }
     arenaFree(word(c, ctxArena))
     setCtx(was)
-    free(c)
     0
 }
 
@@ -127,6 +130,7 @@ pub extern effect fn rtParallelMap(
     }
     // the elements dealt out in turn (worker t: t, t + threads, ...): the slow ones, often side by side, are shared
     let ws = calloc(threads * workerWords, 8)
+    copiesReady(l)
     for t in 0..threads {
         let w = ws + 8 * workerWords * t
         setWord(w, wFrom, l)
@@ -142,6 +146,7 @@ pub extern effect fn rtParallelMap(
         setWord(w, wFuel, ctxGet(ctxFuel))
         setWord(w, wGlobals, globals())
         setWord(w, wDesc, desc)
+        setWord(w, wIndex, t)
     }
     let start = workerAddress(w => runWorker(w))
     for t in 0..threads {
@@ -157,23 +162,19 @@ pub extern effect fn rtParallelMap(
         }
     }
     var failed = -1
-    let into = if desc != 0 { copierInto(arena(), 0, 0, 0) } else { 0 }
     for t in 0..threads {
-        let w = ws + 8 * workerWords * t
-        if word(w, wFailed) != 0 and failed < 0 {
+        if word(ws + 8 * workerWords * t, wFailed) != 0 and failed < 0 {
             failed = t
         }
-        if word(w, wKeep) != 0 {
-            var i = t
-            while failed < 0 and i < n {
-                copyValue(into, out + 8 * i * outSlots, desc)
-                i += threads
-            }
-            arenaFree(word(w, wKeep))
-        }
     }
-    if into != 0 {
-        copierDone(into)
+    for t in 0..threads {
+        // the results' memory, as the workers kept it: the caller's
+        let keep = word(ws + 8 * workerWords * t, wKeep)
+        if keep != 0 and failed < 0 {
+            arenaAdopt(arena(), keep)
+        } else if keep != 0 {
+            arenaFree(keep)
+        }
     }
     if failed >= 0 {
         copyBytes(panicText(), ws + 8 * workerWords * failed + 8 * wText, panicTextSize)
@@ -237,6 +238,7 @@ pub extern effect fn rtParallelFold(b: Int64) -> Int64 as "qk_parallelFold" {
         return out
     }
     let ws = calloc(threads * workerWords, 8)
+    copiesReady(l)
     let each = (n + threads - 1) / threads
     for t in 0..threads {
         let w = ws + 8 * workerWords * t
@@ -254,6 +256,7 @@ pub extern effect fn rtParallelFold(b: Int64) -> Int64 as "qk_parallelFold" {
         setWord(w, wFuel, ctxGet(ctxFuel))
         setWord(w, wGlobals, globals())
         setWord(w, wFold, acc)
+        setWord(w, wIndex, t)
     }
     let start = workerAddress(w => runWorker(w))
     for t in 0..threads {

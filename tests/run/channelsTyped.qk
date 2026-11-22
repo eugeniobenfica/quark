@@ -1,6 +1,6 @@
 // Channels of any type: records, tuples with arrays, enums, Floats, functions, maps, channels, interfaces, Unit,
-// optionals and results; each value a copy of its own. Many values queued and received: the channels' memory made
-// again from what is queued, and emptied when every queue is.
+// optionals and results; each value a copy of its own. Many values queued and received: each one's memory its own,
+// the receiver's as it is.
 type Job { id: Int, name: Text, tags: [Text] }
 enum Msg { Work(job: Job), Score(value: Float), Done }
 
@@ -43,7 +43,7 @@ fn workers() {
     let floats: Channel<Float> = channel()
     send(floats, 1.25)
     print(receive(floats))
-    // many values, received at once, then more: the channels' memory made again and emptied
+    // many values, received at once, then more
     let texts: Channel<Text> = channel()
     var made = 0
     for round in 0..5 {

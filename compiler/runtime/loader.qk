@@ -21,6 +21,7 @@ pub const lCodeLen = 1
 pub const lData = 2
 pub const lEnter = 3
 pub const lEscape = 4
+pub const lCopies = 5 // the copies parallelMap's workers run (threads.qk), kept from one call to the next: or 0
 pub const lSource = 6 // what another thread's copy is loaded from: code, then data
 pub const lDataLen = 7
 pub const lRelocs = 8
@@ -29,6 +30,7 @@ pub const lEnterAt = 10
 pub const lEscapeAt = 11
 pub const lHosts = 12
 pub const lHostCount = 13
+// (14: its trace, trace.qk's lTrace)
 pub const lShared = 15 // its source and relocations are another's (a copy's): not freed with it
 pub const loadedWords = 16
 const relocRuntime = 0
@@ -147,6 +149,36 @@ fn loadShared(
     l
 }
 
+// A worker's copy of l and the context its thread runs it with, made at the worker's first call and kept for the
+// next: the copy's code holds the addresses of the context's cells, whatever thread runs it. t: the worker, below
+// copySlots.
+pub const copySlots = 64
+
+// worker t's context (the same one each call)
+pub fn contextFor(l: Int, t: Int) -> Int {
+    let copies = word(l, lCopies)
+    if word(copies, 2 * t + 1) == 0 {
+        setWord(copies, 2 * t + 1, calloc(ctxWords, 8))
+    }
+    word(copies, 2 * t + 1)
+}
+
+// worker t's copy, loaded with its context as this thread's (contextFor, set), or 0 when it could not be
+pub fn copyFor(l: Int, t: Int) -> Int {
+    let copies = word(l, lCopies)
+    if word(copies, 2 * t) == 0 {
+        setWord(copies, 2 * t, loadAgain(l))
+    }
+    word(copies, 2 * t)
+}
+
+// the room for l's copies, made before the workers start (each then fills its own)
+pub fn copiesReady(l: Int) {
+    if word(l, lCopies) == 0 {
+        setWord(l, lCopies, calloc(2 * copySlots, 8))
+    }
+}
+
 // another thread's copy: the same code, its addresses this thread's
 pub fn loadAgain(l: Int) -> Int {
     let s = word(l, lSource)
@@ -165,6 +197,20 @@ pub fn loadAgain(l: Int) -> Int {
 }
 
 pub fn unload(l: Int) {
+    let copies = word(l, lCopies)
+    if copies != 0 {
+        for t in 0..copySlots {
+            if word(copies, 2 * t) != 0 {
+                unload(word(copies, 2 * t))
+            }
+            let c = word(copies, 2 * t + 1)
+            if c != 0 {
+                free(word(c, ctxFloatWork))
+                free(c)
+            }
+        }
+        free(copies)
+    }
     osUnmapCode(word(l, lCode), word(l, lCodeLen))
     free(word(l, lData))
     if word(l, lShared) == 0 {

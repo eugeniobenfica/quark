@@ -4049,7 +4049,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "1151376141-2510196"
+pub const compilerSources = "3885206178-2513789"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -4178,6 +4178,63 @@ pub fn regionArenaFree(a: Int) {
     free(word(a, aGrowingLog))
     free(word(a, aSide))
     free(a)
+}
+
+// A holder: memory of a value's own, made by a copier into it (copierHolding, copierInto) as survivors and large
+// blocks, never blocks, that an arena takes whole (arenaAdopt): a value sent to another task's memory, a thread's
+// results. (Its table of rooms is the least there is: nothing grows in it.)
+pub fn holderNew() -> Int {
+    let h = calloc(1, 8 * arenaWords)
+    setWord(h, aGrowing, calloc(2 * growingWays, 16))
+    setWord(h, aGrowingBits, 1)
+    h
+}
+
+// h's memory (a holder's) made a's own (arenaTake), and h let go of
+pub fn arenaAdopt(a: Int, h: Int) {
+    arenaTake(a, word(h, aExtras), word(h, aLarge))
+    setWord(h, aExtras, 0)
+    setWord(h, aLarge, 0)
+    arenaFree(h)
+}
+
+// a holder's memory, as its lists (survivors, large blocks), made a's own as if a made it now: young to a's loops,
+// gone with a
+pub fn arenaTake(a: Int, extras: Int, large: Int) {
+    setWord(a, aClock, word(a, aClock) + 1)
+    let now = word(a, aClock)
+    var bytes = 0
+    // each list newest first: these, made now, go before a's
+    var x = extras
+    if x != 0 {
+        while x != 0 {
+            setWord(x, xTime, now)
+            bytes += word(x, xSize)
+            if word(x, xNext) == 0 {
+                setWord(x, xNext, word(a, aExtras))
+                x = 0
+            } else {
+                x = word(x, xNext)
+            }
+        }
+        setWord(a, aExtras, extras)
+    }
+    var big = large
+    if big != 0 {
+        while big != 0 {
+            setWord(big, bigTime, now)
+            bytes += word(big, bigSize)
+            setWord(a, aReserved, word(a, aReserved) + word(big, bigSize))
+            if word(big, bigNext) == 0 {
+                setWord(big, bigNext, word(a, aLarge))
+                big = 0
+            } else {
+                big = word(big, bigNext)
+            }
+        }
+        setWord(a, aLarge, large)
+    }
+    setWord(a, aAllocated, word(a, aAllocated) + bytes)
 }
 
 pub fn arenaNew() -> Int {
@@ -5209,10 +5266,9 @@ pub const gBackgroundCap = 26
 pub const gChannels = 27 // channel()'s queues, by number
 pub const gChannelCount = 28
 pub const gChannelCap = 29
-pub const gChannelArena = 30 // where the values in the channels' queues are, apart from any task's memory (or 0)
-pub const gChannelQueued = 31 // values in all the queues: none, and the arena is emptied
-pub const gChannelKept = 32 // what the arena held when it was last made again from the queued values
-pub const gChannelCopier = 33 // the copier the channels' values go through (copierFresh), kept
+pub const gChannelHolder = 30 // what a value sent is copied into (arena.qk holderNew), its memory then the item's
+// (31 and 32: free)
+pub const gChannelCopier = 33 // the copier the channels' values go through (copierHolding), kept
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
 pub const gTaskSpares = 35 // the stacks and arenas of tasks that ended, kept for new ones: (stack, arena) pairs
 pub const gTaskSpareCount = 36
@@ -9083,6 +9139,7 @@ pub const lCodeLen = 1
 pub const lData = 2
 pub const lEnter = 3
 pub const lEscape = 4
+pub const lCopies = 5 // the copies parallelMap's workers run (threads.qk), kept from one call to the next: or 0
 pub const lSource = 6 // what another thread's copy is loaded from: code, then data
 pub const lDataLen = 7
 pub const lRelocs = 8
@@ -9091,6 +9148,7 @@ pub const lEnterAt = 10
 pub const lEscapeAt = 11
 pub const lHosts = 12
 pub const lHostCount = 13
+// (14: its trace, trace.qk's lTrace)
 pub const lShared = 15 // its source and relocations are another's (a copy's): not freed with it
 pub const loadedWords = 16
 const relocRuntime = 0
@@ -9209,6 +9267,36 @@ fn loadShared(
     l
 }
 
+// A worker's copy of l and the context its thread runs it with, made at the worker's first call and kept for the
+// next: the copy's code holds the addresses of the context's cells, whatever thread runs it. t: the worker, below
+// copySlots.
+pub const copySlots = 64
+
+// worker t's context (the same one each call)
+pub fn contextFor(l: Int, t: Int) -> Int {
+    let copies = word(l, lCopies)
+    if word(copies, 2 * t + 1) == 0 {
+        setWord(copies, 2 * t + 1, calloc(ctxWords, 8))
+    }
+    word(copies, 2 * t + 1)
+}
+
+// worker t's copy, loaded with its context as this thread's (contextFor, set), or 0 when it could not be
+pub fn copyFor(l: Int, t: Int) -> Int {
+    let copies = word(l, lCopies)
+    if word(copies, 2 * t) == 0 {
+        setWord(copies, 2 * t, loadAgain(l))
+    }
+    word(copies, 2 * t)
+}
+
+// the room for l's copies, made before the workers start (each then fills its own)
+pub fn copiesReady(l: Int) {
+    if word(l, lCopies) == 0 {
+        setWord(l, lCopies, calloc(2 * copySlots, 8))
+    }
+}
+
 // another thread's copy: the same code, its addresses this thread's
 pub fn loadAgain(l: Int) -> Int {
     let s = word(l, lSource)
@@ -9227,6 +9315,20 @@ pub fn loadAgain(l: Int) -> Int {
 }
 
 pub fn unload(l: Int) {
+    let copies = word(l, lCopies)
+    if copies != 0 {
+        for t in 0..copySlots {
+            if word(copies, 2 * t) != 0 {
+                unload(word(copies, 2 * t))
+            }
+            let c = word(copies, 2 * t + 1)
+            if c != 0 {
+                free(word(c, ctxFloatWork))
+                free(c)
+            }
+        }
+        free(copies)
+    }
     osUnmapCode(word(l, lCode), word(l, lCodeLen))
     free(word(l, lData))
     if word(l, lShared) == 0 {
@@ -9425,7 +9527,8 @@ pub const cMaps = 28 // with cLogMaps: each map copied, its address (an image's:
 pub const cMapCount = 29
 const cMapCap = 30
 pub const cLogMaps = 31
-const copierWords = 32
+const cSmall = 32 // one value at a time (a channel's, an image's): the table of what was copied starts small
+const copierWords = 33
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -9742,7 +9845,8 @@ fn survive(c: Int, bytes0: Int) -> Int {
     var now = word(c, cNow)
     if now == 0 or word(now, xUsed) + bytes > word(now, xSize) {
         // small blocks first: an inner loop that keeps a little, collected at each call, makes a little
-        var step = if now != 0 { word(now, xSize) * 2 } else { 65536 }
+        // (one value at a time: from 256 bytes, so a short one takes little)
+        var step = if now != 0 { word(now, xSize) * 2 } else if word(c, cSmall) != 0 { 256 } else { 65536 }
         if step > 1048576 {
             step = 1048576
         }
@@ -9863,7 +9967,7 @@ fn movedSlot(c: Int, from: Int, n: Int, kind: Int) -> Slot {
         // a channel's copier (one value at a time) starts small: forgetting clears all of it
         let cap = if word(c, cMovedCap) != 0 {
             word(c, cMovedCap) * 2
-        } else if word(c, cFresh) != 0 {
+        } else if word(c, cSmall) != 0 {
             16
         } else {
             1024
@@ -10373,7 +10477,32 @@ pub fn copierFresh(c0: Int) -> Int {
     let c = copierNew(a, word(a, aClock))
     setWord(c, cAll, 1)
     setWord(c, cFresh, 1)
+    setWord(c, cSmall, 1)
     c
+}
+
+// A copier of a value, with all it points to, into the holder h (arena.qk holderNew), which an arena then takes whole
+// (arenaAdopt): a value sent on a channel. c0: one used before (copierHeld), kept for what it worked out about the
+// types; 0, a new one. Then copyValue, and copierHeld.
+pub fn copierHolding(c0: Int, h: Int) -> Int {
+    var c = c0
+    if c == 0 {
+        c = copierNew(h, 0)
+        setWord(c, cAll, 1)
+        setWord(c, cSmall, 1)
+    }
+    setWord(c, cA, h)
+    setWord(c, cNow, 0)
+    c
+}
+
+// the holder's copy done: what it made counted in it, and the copier ready for copierHolding again
+pub fn copierHeld(c: Int) {
+    let h = word(c, cA)
+    setWord(h, aAllocated, word(h, aAllocated) + word(c, cMade))
+    setWord(c, cMade, 0)
+    setWord(c, cNow, 0)
+    copierFreshDone(c)
 }
 
 // what was copied forgotten (the next copies share nothing with these): the copier ready for copierFresh again
@@ -13273,69 +13402,40 @@ pub fn jobBegins(job: Int) {
 fn waitsOnThread(t: Int) -> Bool =
     word(t, tWaitThread) != 0 and word(word(t, tWaitThread), jobDone) == 0
 
-// A channel: [closed][count][capacity][head][slots][description][items: a value's slots each]. The values in the
-// queues are copies, in an arena of the channels' own (gChannelArena): they go from one task's memory to another's.
-// It is emptied when every queue is, and made again from what they hold when it grows to twice what that was.
+// A channel: [closed][count][capacity][head][slots][description][an item's words][items]. An item is a value's
+// slots and, when its type holds memory, that memory's two lists (survivors, large blocks: arena.qk arenaTake): a copy
+// of its own, made by send out of the sender's memory, that receive makes the receiver's whole without copying it
+// again.
 const chClosed = 0
 const chCount = 1
 const chCap = 2
 const chHead = 3
 const chSlots = 4 // the values' slots
 const chDesc = 5 // an array of their type's description (lower.qk's Desc), 0 when they hold no memory
-const chItems = 6
-const channelArenaLeast = 1048576 // made again only past this
+const chStride = 6 // an item's words: its slots, and its memory's two (when chDesc is not 0)
+const chItems = 7
 
-// the place of the queue's i-th value (from its head)
+// the place of the queue's i-th item (from its head)
 fn channelItem(c: Int, i: Int) -> Int =
-    c + 8 * (chItems + word(c, chSlots) * ((word(c, chHead) + i) % word(c, chCap)))
+    c + 8 * (chItems + word(c, chStride) * ((word(c, chHead) + i) % word(c, chCap)))
 
-// the channels' arena a made the one the running code allocates in: the one it was, to put back
-fn inChannelArena(a: Int) -> Int {
-    let was = ctxGet(ctxArena)
-    setWord(ctx(), ctxArena, a)
-    was
-}
-
-// the channels' copier, into the arena the running code allocates in
-fn channelCopier() -> Int {
-    let c = copierFresh(gGet(gChannelCopier))
+// the item's value (slots of it), its memory copied into memory of its own (as it is now), its lists after the slots
+fn channelKeep(item: Int, slots: Int, desc: Int) {
+    var h = gGet(gChannelHolder)
+    if h == 0 {
+        h = holderNew()
+        gSet(gChannelHolder, h)
+    }
+    let c = copierHolding(gGet(gChannelCopier), h)
     gSet(gChannelCopier, c)
-    c
-}
-
-// the value of slots at the place, its memory copied into the channels' arena (as it is now)
-fn channelKeep(slotsAt: Int, desc: Int) {
-    var a = gGet(gChannelArena)
-    if a == 0 {
-        a = arenaNew()
-        gSet(gChannelArena, a)
-    }
-    let was = inChannelArena(a)
-    let c = channelCopier()
-    copyValue(c, slotsAt, desc)
-    copierFreshDone(c)
-    setWord(ctx(), ctxArena, was)
-}
-
-// the channels' arena made again from the values queued (what was received goes)
-fn channelArenaRemade() {
-    let old = gGet(gChannelArena)
-    let a = arenaNew()
-    let was = inChannelArena(a)
-    let c = channelCopier()
-    for n in 0..gGet(gChannelCount) {
-        let ch = word(channelEntry(n), 0)
-        if ch != 0 and word(ch, chDesc) != 0 {
-            for i in 0..word(ch, chCount) {
-                copyValue(c, channelItem(ch, i), word(ch, chDesc))
-            }
-        }
-    }
-    copierFreshDone(c)
-    setWord(ctx(), ctxArena, was)
-    arenaFree(old)
-    gSet(gChannelArena, a)
-    gSet(gChannelKept, word(a, aAllocated))
+    copyValue(c, item, desc)
+    copierHeld(c)
+    setWord(item, slots, word(h, aExtras))
+    setWord(item, slots + 1, word(h, aLarge))
+    setWord(h, aExtras, 0)
+    setWord(h, aLarge, 0)
+    setWord(h, aReserved, 0)
+    setWord(h, aAllocated, 0)
 }
 
 // A channel's number: its place in the table, and the place's generation above bit 32. A channel closed and empty
@@ -13539,6 +13639,7 @@ pub extern effect fn rtChannel(desc: Int64, slots: Int64) -> Int64 as "qk_channe
     let c = calloc(chItems, 8)
     setWord(c, chSlots, slots)
     setWord(c, chDesc, desc)
+    setWord(c, chStride, if desc != 0 { slots + 2 } else { slots })
     if word(g, gChannelFree) != 0 {
         // a place let go of, a generation later
         let slot = word(g, gChannelFree) - 1
@@ -13568,13 +13669,14 @@ pub extern effect fn rtSend(n: Int64, p: Int64, line: Int64) as "qk_send" {
         panicNow(panicClosedChannel, line, n, 0)
     }
     let slots = word(c, chSlots)
+    let stride = word(c, chStride)
     if word(c, chCount) == word(c, chCap) {
         // grown, its values from the head on put back at the start
         let cap = if word(c, chCap) != 0 { word(c, chCap) * 2 } else { 8 }
-        let grown = calloc(chItems + slots * cap, 8)
+        let grown = calloc(chItems + stride * cap, 8)
         copyBytes(grown, c, 8 * chItems)
         for i in 0..word(c, chCount) {
-            copyBytes(grown + 8 * (chItems + slots * i), channelItem(c, i), 8 * slots)
+            copyBytes(grown + 8 * (chItems + stride * i), channelItem(c, i), 8 * stride)
         }
         setWord(grown, chHead, 0)
         setWord(grown, chCap, cap)
@@ -13584,15 +13686,10 @@ pub extern effect fn rtSend(n: Int64, p: Int64, line: Int64) as "qk_send" {
     }
     let at = channelItem(c, word(c, chCount))
     copyBytes(at, p, 8 * slots)
-    setWord(c, chCount, word(c, chCount) + 1)
-    gSet(gChannelQueued, gGet(gChannelQueued) + 1)
     if word(c, chDesc) != 0 {
-        channelKeep(at, word(c, chDesc))
-        let made = word(gGet(gChannelArena), aAllocated)
-        if made > channelArenaLeast and made > 2 * gGet(gChannelKept) {
-            channelArenaRemade()
-        }
+        channelKeep(at, slots, word(c, chDesc))
     }
+    setWord(c, chCount, word(c, chCount) + 1)
 }
 
 // receive(channel) -> T? (within: seconds at most, -1 as long as it takes; optSlots: the T?'s slots): the first
@@ -13630,23 +13727,15 @@ pub extern effect fn rtReceive(n: Int64, within: Float64, optSlots: Int64, line:
         return p
     }
     setWord(p, 0, 1)
-    copyBytes(p + 8, channelItem(c, 0), 8 * slots)
+    let item = channelItem(c, 0)
+    copyBytes(p + 8, item, 8 * slots)
+    if word(c, chDesc) != 0 {
+        arenaTake(arena(), word(item, slots), word(item, slots + 1)) // its memory this task's, as it is
+    }
     setWord(c, chHead, (word(c, chHead) + 1) % word(c, chCap))
     setWord(c, chCount, word(c, chCount) - 1)
-    if word(c, chDesc) != 0 {
-        let k = channelCopier() // into this task's memory
-        copyValue(k, p + 8, word(c, chDesc))
-        copierFreshDone(k)
-    }
     if word(c, chCount) == 0 and word(c, chClosed) != 0 {
         channelGone(n)
-    }
-    gSet(gChannelQueued, gGet(gChannelQueued) - 1)
-    if gGet(gChannelQueued) == 0 and gGet(gChannelArena) != 0 {
-        let was = inChannelArena(gGet(gChannelArena))
-        arenaReset()
-        setWord(ctx(), ctxArena, was)
-        gSet(gChannelKept, 0)
     }
     p
 }
@@ -14613,11 +14702,11 @@ pub extern effect fn rtParseFloat(t: Int64, n: Int64) -> Int64 as "qk_parseFloat
     }
     if name == "threads" {
         return r"""
-// parallelMap and parallelFold: the elements shared out to threads. Each worker has a context of its own and loads the
-// code again (its addresses are its thread's), then runs f on its elements (parallelFold: folds its part from the
-// start); a panic in one stops the call with its message. Results that hold memory (texts, arrays, maps) are copied
-// out of the worker's memory as each is made, into memory the worker keeps, and from there into the caller's when
-// every worker is done.
+// parallelMap and parallelFold: the elements shared out to threads. Each worker has a context of its own and a copy of
+// the code (its addresses are the context's), both kept from one call to the next (loader.qk copyFor), and runs f on
+// its elements (parallelFold: folds its part from the start); a panic in one stops the call with its message. Results
+// that hold memory (texts, arrays, maps) are copied out of the worker's memory as each is made, into memory the worker
+// keeps (a holder), which the caller's memory takes whole when every worker is done.
 use base
 use arena
 use loader
@@ -14648,17 +14737,22 @@ const wDesc = 15 // results that hold memory: an array of them's description (el
 const wKeep = 16 // ... and the arena they are kept in
 const wStride = 17 // the worker's elements: wFirst, then every wStride-th before wLast
 const wText = 18 // 512 bytes
-const workerWords = 82
+const wIndex = 82 // the worker's number: its kept copy and context (loader.qk copyFor)
+const workerWords = 83
 
 fn runWorker(w: Int) -> Int {
-    let c = calloc(ctxWords, 8)
+    let c = contextFor(word(w, wFrom), word(w, wIndex))
+    // the context as a new one, but for the Float work room it made (the copy's code knows these cells)
+    let work = word(c, ctxFloatWork)
+    zeroBytes(c, 8 * ctxWords)
+    setWord(c, ctxFloatWork, work)
     setWord(c, ctxFuel, word(w, wFuel))
     let a = arenaNew()
     setWord(c, ctxArena, a)
     setWord(c, ctxGlobals, word(w, wGlobals))
     let was = ctx()
     setCtx(c)
-    let copy = loadAgain(word(w, wFrom))
+    let copy = copyFor(word(w, wFrom), word(w, wIndex))
     if copy == 0 {
         setWord(w, wFailed, 1)
         let _ = bufAt(w + 8 * wText, panicTextSize).text("parallelMap: a thread could not load the program")
@@ -14676,7 +14770,7 @@ fn runWorker(w: Int) -> Int {
         var keeper = 0
         if desc != 0 {
             let main = word(w, wFrom)
-            setWord(w, wKeep, arenaNew())
+            setWord(w, wKeep, holderNew())
             keeper = copierInto(word(w, wKeep), word(copy, lData), word(main, lDataLen), word(main, lData))
         }
         var i = word(w, wFirst)
@@ -14701,11 +14795,9 @@ fn runWorker(w: Int) -> Int {
         if keeper != 0 {
             copierDone(keeper)
         }
-        unload(copy)
     }
     arenaFree(word(c, ctxArena))
     setCtx(was)
-    free(c)
     0
 }
 
@@ -14742,6 +14834,7 @@ pub extern effect fn rtParallelMap(
     }
     // the elements dealt out in turn (worker t: t, t + threads, ...): the slow ones, often side by side, are shared
     let ws = calloc(threads * workerWords, 8)
+    copiesReady(l)
     for t in 0..threads {
         let w = ws + 8 * workerWords * t
         setWord(w, wFrom, l)
@@ -14757,6 +14850,7 @@ pub extern effect fn rtParallelMap(
         setWord(w, wFuel, ctxGet(ctxFuel))
         setWord(w, wGlobals, globals())
         setWord(w, wDesc, desc)
+        setWord(w, wIndex, t)
     }
     let start = workerAddress(w => runWorker(w))
     for t in 0..threads {
@@ -14772,23 +14866,19 @@ pub extern effect fn rtParallelMap(
         }
     }
     var failed = -1
-    let into = if desc != 0 { copierInto(arena(), 0, 0, 0) } else { 0 }
     for t in 0..threads {
-        let w = ws + 8 * workerWords * t
-        if word(w, wFailed) != 0 and failed < 0 {
+        if word(ws + 8 * workerWords * t, wFailed) != 0 and failed < 0 {
             failed = t
         }
-        if word(w, wKeep) != 0 {
-            var i = t
-            while failed < 0 and i < n {
-                copyValue(into, out + 8 * i * outSlots, desc)
-                i += threads
-            }
-            arenaFree(word(w, wKeep))
-        }
     }
-    if into != 0 {
-        copierDone(into)
+    for t in 0..threads {
+        // the results' memory, as the workers kept it: the caller's
+        let keep = word(ws + 8 * workerWords * t, wKeep)
+        if keep != 0 and failed < 0 {
+            arenaAdopt(arena(), keep)
+        } else if keep != 0 {
+            arenaFree(keep)
+        }
     }
     if failed >= 0 {
         copyBytes(panicText(), ws + 8 * workerWords * failed + 8 * wText, panicTextSize)
@@ -14852,6 +14942,7 @@ pub extern effect fn rtParallelFold(b: Int64) -> Int64 as "qk_parallelFold" {
         return out
     }
     let ws = calloc(threads * workerWords, 8)
+    copiesReady(l)
     let each = (n + threads - 1) / threads
     for t in 0..threads {
         let w = ws + 8 * workerWords * t
@@ -14869,6 +14960,7 @@ pub extern effect fn rtParallelFold(b: Int64) -> Int64 as "qk_parallelFold" {
         setWord(w, wFuel, ctxGet(ctxFuel))
         setWord(w, wGlobals, globals())
         setWord(w, wFold, acc)
+        setWord(w, wIndex, t)
     }
     let start = workerAddress(w => runWorker(w))
     for t in 0..threads {
@@ -14916,7 +15008,7 @@ pub extern effect fn rtParallelFold(b: Int64) -> Int64 as "qk_parallelFold" {
 // program it loads its trace (host.qk); a built executable has none, and its panics say only the line.
 use base
 
-// a Loaded's word that holds its trace, 0 for none (loader.qk's words end before it)
+// a Loaded's word that holds its trace, 0 for none (loader.qk's others are around it)
 pub const lTrace = 14
 
 // a trace's words: what the command line fills in (compiler/memory.qk)

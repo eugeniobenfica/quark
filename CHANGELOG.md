@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Incremental builds:** a program whose reading and checking take more than 150 ms is kept as an image after a cold
+  build, with its machine code function by function. A build of the same files then comes from it (the compiler's in
+  65 ms), and a build after an edit of function bodies checks and lowers again only those functions, and those that
+  put one of them in line or read a fact of one that changed (the compiler's in 0.35 s). `QUARK_IMAGES=off` turns it
+  off, `always` keeps every program's.
+- **Fixed:** a built program's bounds or division panic crashed instead of saying where it was.
+- **A value received from a channel is not copied again:** `send` copies it once, into memory of its own, and
+  `receive` makes that memory the receiver's whole. The same for `parallelMap`'s results: each thread's are the
+  caller's memory as the thread kept them. The compiler's cold build is 7% faster for it (its checked program comes
+  out of a task), and peaks lower (1.41 GB).
+- **`parallelMap`'s threads keep their copy of the program** from one call to the next, rather than loading it again.
+
 ## 0.12.1
 
 What the next compiler builds on (it is built by this one, with this one's standard library and runtime).

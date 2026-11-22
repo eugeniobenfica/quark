@@ -4,7 +4,7 @@
 // program it loads its trace (host.qk); a built executable has none, and its panics say only the line.
 use base
 
-// a Loaded's word that holds its trace, 0 for none (loader.qk's words end before it)
+// a Loaded's word that holds its trace, 0 for none (loader.qk's others are around it)
 pub const lTrace = 14
 
 // a trace's words: what the command line fills in (compiler/memory.qk)

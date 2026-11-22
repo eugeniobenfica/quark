@@ -30,6 +30,7 @@ pub const lEnterAt = 10
 pub const lEscapeAt = 11
 pub const lHosts = 12
 pub const lHostCount = 13
+
 // (14: its trace, trace.qk's lTrace)
 pub const lShared = 15 // its source and relocations are another's (a copy's): not freed with it
 pub const loadedWords = 16

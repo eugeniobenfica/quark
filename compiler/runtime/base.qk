@@ -325,6 +325,7 @@ pub const gChannels = 27 // channel()'s queues, by number
 pub const gChannelCount = 28
 pub const gChannelCap = 29
 pub const gChannelHolder = 30 // what a value sent is copied into (arena.qk holderNew), its memory then the item's
+
 // (31 and 32: free)
 pub const gChannelCopier = 33 // the copier the channels' values go through (copierHolding), kept
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)

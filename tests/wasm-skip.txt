@@ -14,3 +14,4 @@ tests/panics/trace.qk the calls a panic went through: read from the machine's fr
 tests/run/processStream.qk other programs (WASI has none)
 tests/run/tls.qk TLS (WASI has none)
 tests/run/image.qk images at a fixed address (WebAssembly reserves none)
+tests/run/handOver.qk tasks on stacks of their own

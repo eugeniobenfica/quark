@@ -432,7 +432,13 @@ fn survive(c: Int, bytes0: Int) -> Int {
     if now == 0 or word(now, xUsed) + bytes > word(now, xSize) {
         // small blocks first: an inner loop that keeps a little, collected at each call, makes a little
         // (one value at a time: from 256 bytes, so a short one takes little)
-        var step = if now != 0 { word(now, xSize) * 2 } else if word(c, cSmall) != 0 { 256 } else { 65536 }
+        var step = if now != 0 {
+            word(now, xSize) * 2
+        } else if word(c, cSmall) != 0 {
+            256
+        } else {
+            65536
+        }
         if step > 1048576 {
             step = 1048576
         }

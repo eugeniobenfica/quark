@@ -4049,7 +4049,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "3885206178-2513789"
+pub const compilerSources = "2899300939-2513851"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -5267,6 +5267,7 @@ pub const gChannels = 27 // channel()'s queues, by number
 pub const gChannelCount = 28
 pub const gChannelCap = 29
 pub const gChannelHolder = 30 // what a value sent is copied into (arena.qk holderNew), its memory then the item's
+
 // (31 and 32: free)
 pub const gChannelCopier = 33 // the copier the channels' values go through (copierHolding), kept
 pub const gChannelFree = 34 // the first place in the channels' table let go of, + 1 (0 none)
@@ -9148,6 +9149,7 @@ pub const lEnterAt = 10
 pub const lEscapeAt = 11
 pub const lHosts = 12
 pub const lHostCount = 13
+
 // (14: its trace, trace.qk's lTrace)
 pub const lShared = 15 // its source and relocations are another's (a copy's): not freed with it
 pub const loadedWords = 16
@@ -9846,7 +9848,13 @@ fn survive(c: Int, bytes0: Int) -> Int {
     if now == 0 or word(now, xUsed) + bytes > word(now, xSize) {
         // small blocks first: an inner loop that keeps a little, collected at each call, makes a little
         // (one value at a time: from 256 bytes, so a short one takes little)
-        var step = if now != 0 { word(now, xSize) * 2 } else if word(c, cSmall) != 0 { 256 } else { 65536 }
+        var step = if now != 0 {
+            word(now, xSize) * 2
+        } else if word(c, cSmall) != 0 {
+            256
+        } else {
+            65536
+        }
         if step > 1048576 {
             step = 1048576
         }

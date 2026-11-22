@@ -3,7 +3,8 @@ name: Measure
 # By hand (gh workflow run measure.yml -f cand=REF [-f base=REF]): two refs' compilers built as build.sh builds them,
 # then the instructions each executes (Valgrind's cachegrind: counted, not timed, so neither a shared machine's load
 # nor where the code happens to lie moves them) for the same work: compiling base's compiler, and every benchmark as
-# each one builds it. The table in the run's summary.
+# each one builds it. The table in the run's summary. (Each program run from its build/: one copied elsewhere stops at
+# once under Valgrind, for a reason not found yet.)
 on:
   workflow_dispatch:
     inputs:
@@ -54,22 +55,13 @@ jobs:
             c=$(count ../cand/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qc)
             row "building the compiler" "$b" "$c"
             # cand's compiler as base's makes it: what cand's compiler does more (its code as base makes code)
-            ../base/build/quark.exe build --release ../cand/compiler/mainlinux.qk -o /tmp/qx > /dev/null
-            row "... cand's work, base's code" "$b" "$(count /tmp/qx build ../base/compiler/mainlinux.qk -o /tmp/qd)"
+            ../base/build/quark.exe build --release ../cand/compiler/mainlinux.qk -o ../base/build/qx > /dev/null
+            row "... cand's work, base's code" "$b" "$(count ../base/build/qx build ../base/compiler/mainlinux.qk -o /tmp/qd)"
             for f in ../base/bench/*.qk; do
               n=$(basename "$f" .qk)
-              ../base/build/quark.exe build --release "$f" -o "/tmp/$n-b" > /dev/null
-              ../cand/build/quark.exe build --release "$f" -o "/tmp/$n-c" > /dev/null
-              if [ "$n" = counting ]; then
-                vg="valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null --smc-check=all-non-file"
-                cp "/tmp/$n-b" ./bench-here; cp ../base/build/quark.exe /tmp/quark-there
-                $vg ./bench-here > /tmp/o1 2>&1 || echo "here failed $?" >&2; echo "here: exit $? $(grep -c checksum /tmp/o1) $(grep 'I *refs' /tmp/o1)" >&2
-                $vg /tmp/quark-there version > /tmp/o2 2>&1 || echo "there failed $?" >&2; echo "there: exit $? $(grep 'I *refs' /tmp/o2)" >&2; head -3 /tmp/o2 >&2
-                $vg ../base/build/quark.exe version > /tmp/o3 2>&1 || echo "build failed $?" >&2; echo "build: exit $? $(grep 'I *refs' /tmp/o3)" >&2; head -3 /tmp/o3 >&2
-                $vg "/tmp/$n-b" > /tmp/o4 2>&1 || echo "tmp failed $?" >&2; grep -v "^==" /tmp/o4 >&2 || true
-                file "/tmp/$n-b" ../base/build/quark.exe >&2 || true
-              fi
-              row "$n" "$(count "/tmp/$n-b")" "$(count "/tmp/$n-c")"
+              ../base/build/quark.exe build --release "$f" -o "../base/build/$n" > /dev/null
+              ../cand/build/quark.exe build --release "$f" -o "../cand/build/$n" > /dev/null
+              row "$n" "$(count "../base/build/$n")" "$(count "../cand/build/$n")"
             done
           } | tee table.md
           cat table.md >> "$GITHUB_STEP_SUMMARY"

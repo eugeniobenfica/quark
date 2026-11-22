@@ -62,7 +62,8 @@ const fullWaitMost = 8
 // loops running
 pub extern effect fn rtLoopStart(rootSlots: Int64, depth: Int64) -> Int64 as "qk_loopStart" {
     let a = arena()
-    let fp = word(machine.frame().address, 0) // its function's frame (0: none known, as in WebAssembly)
+    // its function's frame (0: none known, as in WebAssembly); not looked at for a loop not among them
+    let fp = if depth >= 0 { word(machine.frame().address, 0) } else { 0 }
     if word(a, aCurrent) == 0 {
         let _ = alloc(1, 16) // a block to mark (the first allocations may all have been large)
     }

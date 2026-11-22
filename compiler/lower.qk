@@ -385,6 +385,7 @@ pub type Lower {
     // expressions) made old for the loops that did not make the container (runtime/loops.qk allocOld), at this address
     oldInto: Int = -1
     oldSites: Set<Int> = []
+    oldSitesFound: Int = -1 // anyOldSite: -1 not worked out yet, 0 none, 1 some
     slotCache: [Int] = []
     kindCache: [Bytes] = []
     caseStarts: [Int: [Int]] = [:] // by enum declaration
@@ -6691,7 +6692,7 @@ fn Lower.loopBegin(var self, body: Int, counter: Int = -1) -> Int {
         self.emit(.Nop, -1, -1, -1)
     }
     let frame = self.newReg('I')
-    let tracked = not self.opts.linked and not self.opts.runtime
+    let tracked = not self.opts.linked and not self.opts.runtime and self.anyOldSite()
     self.memories.push(
         LoopMemory(
             tracked: tracked,
@@ -6770,6 +6771,44 @@ fn Lower.oldEnd(var self) {
 }
 
 // a value's own arrays of plain values: itself, or a record's fields
+// Does the program put a value made old anywhere (oldBegin's sites, as its statements read: xs[k] = v, k a for
+// loop's name, v with an array of plain values of its own)? Worked out once, going over the statements alone. A
+// program that does not keeps no loops running for the runtime: its loops' starts do no more than before.
+fn Lower.anyOldSite(var self) -> Bool {
+    if self.oldSitesFound < 0 {
+        var counters: Set<Int> = []
+        for st in self.p.ast.stmts {
+            if st.node is For(_, _, _, _) and st.binding >= 0 {
+                counters.add(st.binding)
+            }
+        }
+        self.oldSitesFound = 0
+        var i = 0
+        while i < len(self.p.ast.stmts) and self.oldSitesFound == 0 {
+            let st = self.p.ast.stmts[i]
+            i += 1
+            let Assign(target, op, value) = st.node else {
+                continue
+            }
+            if op != .Assign or value < 0 or not self.p.ast.exprs[target].node is Index(_, _) {
+                continue
+            }
+            let Index(arr, key) = self.p.ast.exprs[target].node else {
+                continue
+            }
+            let k = self.p.ast.exprs[self.stripImplicit(key)]
+            if self.p.ast.exprs[arr].ty >= 0
+                and self.ek(arr) == Kind.Array
+                and k.node is Name(_)
+                and counters.contains(k.binding)
+                and len(self.oldSitesOf(value)) > 0 {
+                self.oldSitesFound = 1
+            }
+        }
+    }
+    self.oldSitesFound == 1
+}
+
 fn Lower.oldSitesOf(var self, value: Int) -> Set<Int> {
     var sites: Set<Int> = []
     let v = self.stripImplicit(value)

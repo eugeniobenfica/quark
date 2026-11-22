@@ -4049,7 +4049,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "1889486189-2517042"
+pub const compilerSources = "2899300939-2513851"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -4104,8 +4104,7 @@ pub const aInPlace = 28 // the large blocks that grow where they are (reserved),
 pub const aRegion = 29 // an image's arena (runtime/files.qk): where its next memory goes in its reserved range (0: none)
 pub const aRegionEnd = 30
 pub const aRegionMade = 31 // the range's pages taken so far, up to here
-pub const aKept = 32 // what the last minor collection that copied kept, in thousandths (a new loop's guess: loops.qk)
-pub const arenaWords = 33
+pub const arenaWords = 32
 
 // a block's words, then its bytes (16-aligned)
 pub const bNext = 0
@@ -9457,17 +9456,7 @@ const gBlock = 3
 const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
 const gWait = 5 // how many times what the last full one kept minor ones keep before the next is full (fullWait)
 const gMade = 6 // what the turns made that minor ones looked through since the last full one
-const gYoungBlock = 7 // where a minor one's young memory starts: the mark, or past what was kept in place (tenured)
-const gYoungUsed = 8
-const gKept = 9 // of what the turns made, how much (in thousandths) the last minor one that copied kept
-const gTenured = 10 // minor ones that kept everything in place since that one
-const genWords = 11
-
-// A minor collection that finds nearly everything kept (data that grows: two thirds of what the turns made, or more)
-// copies it all for nothing. So the next ones keep the turns' memory where it is instead (tenured): what they made is
-// old from then on, garbage among it too, until a full collection, which copies from the mark as always. After
-// tenureMost of them one copies again, to see whether the turns still keep that much. Not with a memory limit.
-const tenureMost = 3
+const genWords = 7
 
 // A full collection copies everything since the mark again: worth it when there is garbage among what minor ones
 // kept. One that kept nearly all it looked at (data that grows) makes the next wait twice as long, up to fullWaitMost;
@@ -9494,11 +9483,6 @@ pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
     setWord(gen, gLast, word(a, aClock))
     setWord(gen, gArena, a)
     setWord(gen, gWait, 1)
-    setWord(gen, gYoungBlock, cur)
-    setWord(gen, gYoungUsed, word(cur, bUsed))
-    // what the last loop's turns kept: this one's guess, until its own first copy (one tenure at most before it)
-    setWord(gen, gKept, word(a, aKept))
-    setWord(gen, gTenured, tenureMost - 1)
     setMark(a, cur, word(cur, bUsed))
     f
 }
@@ -9546,8 +9530,7 @@ pub const cMapCount = 29
 const cMapCap = 30
 pub const cLogMaps = 31
 const cSmall = 32 // one value at a time (a channel's, an image's): the table of what was copied starts small
-const cKept = 33 // bytes kept: copied, or large blocks kept in place
-const copierWords = 34
+const copierWords = 33
 
 pub fn copierNew(a: Int, time: Int) -> Int {
     let c = calloc(copierWords, 8)
@@ -9855,7 +9838,6 @@ fn survive(c: Int, bytes0: Int) -> Int {
         setWord(c, cTotal, word(c, cTotal) + bytes)
         return alloc(bytes, 1)
     }
-    setWord(c, cKept, word(c, cKept) + bytes)
     if bytes >= largeFrom {
         // a large block of its own, made now: the next collection keeps it in place
         setWord(c, cMade, word(c, cMade) + bytes)
@@ -10116,9 +10098,6 @@ fn copyText(c: Int, slots: Int) {
     let large = largeAt(c, p)
     if large != 0 {
         // a long text: it stays where it is
-        if word(large, bigMarked) == 0 {
-            setWord(c, cKept, word(c, cKept) + word(large, bigSize))
-        }
         setWord(large, bigMarked, 1)
         return
     }
@@ -10158,7 +10137,6 @@ fn copyArray(c: Int, slots: Int, elem: Int) {
             let at = word(now, xData) + word(now, xUsed)
             setWord(now, xUsed, word(now, xUsed) + room)
             setWord(c, cTotal, word(c, cTotal) + room)
-            setWord(c, cKept, word(c, cKept) + room)
             at
         } else {
             survive(c, bytes)
@@ -10182,9 +10160,6 @@ fn copyArray(c: Int, slots: Int, elem: Int) {
         // a long array: it stays where it is (with its room), and only what it holds is copied
         if word(large, bigMarked) == 0 and word(elem, sCount) > 0 {
             setWord(c, cTotal, word(c, cTotal) + word(large, bigSize))
-        }
-        if word(large, bigMarked) == 0 {
-            setWord(c, cKept, word(c, cKept) + word(large, bigSize))
         }
         setWord(large, bigMarked, 1)
     } else {
@@ -10365,10 +10340,6 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     let least = limited(a, if growing { 4 * nurseryMost } else { nurseryMost })
     let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), least)
     let looked = word(gen, gLive) + word(gen, gPromoted) // what a full one looks through: its last, and what came since
-    if not full and word(a, aLimit) == 0 and word(gen, gKept) * 3 >= 2000 and word(gen, gTenured) < tenureMost {
-        tenure(a, f, gen)
-        return
-    }
     // young: made at this time or later (a full collection: since the mark)
     let since = if full { word(f, frameTime) } else { word(gen, gLast) }
     setWord(a, aClock, word(a, aClock) + 1)
@@ -10376,10 +10347,8 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     if not full {
         setWord(c, cNow, word(gen, gBlock)) // old values go on where the last ones went
     }
-    // young: the arena's blocks past the mark (a full one), or past what minor ones kept in place
-    let mark = if full { word(f, frameBlock) } else { word(gen, gYoungBlock) }
-    let used = if full { word(f, frameUsed) } else { word(gen, gYoungUsed) }
-    let made = word(a, aAllocated) - word(f, frameAllocated)
+    let mark = word(f, frameBlock)
+    let used = word(f, frameUsed)
     var b = mark
     while b != 0 {
         addYoung(c, if b == mark { word(b, bData) + used } else { word(b, bData) }, word(b, bData) + word(b, bSize), 0)
@@ -10458,13 +10427,6 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         setWord(gen, gMade, word(gen, gMade) + word(f, frameLimit)) // (it collects once they made more than that)
     }
     setWord(gen, gBlock, word(c, cNow))
-    setWord(gen, gYoungBlock, mark)
-    setWord(gen, gYoungUsed, used)
-    setWord(gen, gKept, if full { 0 } else { min(word(c, cKept), made) * 1000 / max(made, 1) })
-    setWord(gen, gTenured, 0)
-    if not full {
-        setWord(a, aKept, word(gen, gKept))
-    }
     setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was kept
     setWord(gen, gLast, word(a, aClock))
     setWord(f, frameAllocated, word(a, aAllocated))
@@ -10472,23 +10434,6 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     // through tables of a fixed size: they run no more often than that)
     setWord(f, frameLimit, max(2 * word(c, cTotal), min(2 * word(f, frameLimit), limited(a, nurseryMost))))
     freeCopier(c)
-}
-
-// A minor collection that keeps the turns' memory where it is: all of it old from now on (the barrier's mark past it,
-// so what changes in it is remembered), copied only by the next full one
-fn tenure(a: Int, f: Int, gen: Int) {
-    let cur = word(a, aCurrent)
-    setWord(gen, gYoungBlock, cur)
-    setWord(gen, gYoungUsed, word(cur, bUsed))
-    setMark(a, cur, word(cur, bUsed))
-    setWord(a, aLastText, 0)
-    setWord(gen, gPromoted, word(gen, gPromoted) + word(a, aAllocated) - word(f, frameAllocated))
-    setWord(gen, gMade, word(gen, gMade) + word(f, frameLimit))
-    setWord(gen, gTenured, word(gen, gTenured) + 1)
-    setWord(a, aClock, word(a, aClock) + 1) // what is made from now on is younger than what was kept
-    setWord(gen, gLast, word(a, aClock))
-    setWord(f, frameAllocated, word(a, aAllocated))
-    setWord(f, frameLimit, min(2 * word(f, frameLimit), limited(a, nurseryMost)))
 }
 
 // A copier of values, with all they point to, into arena to (copyValue for each, then copierDone). A map's description

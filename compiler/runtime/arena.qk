@@ -44,8 +44,7 @@ pub const aInPlace = 28 // the large blocks that grow where they are (reserved),
 pub const aRegion = 29 // an image's arena (runtime/files.qk): where its next memory goes in its reserved range (0: none)
 pub const aRegionEnd = 30
 pub const aRegionMade = 31 // the range's pages taken so far, up to here
-pub const aKept = 32 // what the last minor collection that copied kept, in thousandths (a new loop's guess: loops.qk)
-pub const arenaWords = 33
+pub const arenaWords = 32
 
 // a block's words, then its bytes (16-aligned)
 pub const bNext = 0

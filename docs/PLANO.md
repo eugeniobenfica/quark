@@ -660,6 +660,24 @@ fatos dos chamados (o que um `var self` muda, se um resultado é todo seu, o tam
   embutidas e o código de máquina), com a chave do que ele foi feito para (o alvo e as opções). Quando os arquivos e
   as opções são os mesmos, o build sai dela: o rebuild do compilador em 65 ms (sobrescrever um executável recém-escrito
   custa ~0,9 s a mais no Windows, fora do compilador).
+- **Etapa 2, passo A, feito:** a imagem guarda também o que o lowering deixou (`Lower.kept()`: as tabelas que as
+  funções dividem: dados, textos, auxiliares, externs, assinaturas C, tabelas de interface, chamadas embutidas, os
+  números das funções) e o código de cada função em separado (`splitX64Part`, `splitArm64Part`). A imagem do
+  compilador: 131 MB; gravá-la custa ~0,35 s, então ela é uma **base**: só um build frio a grava, e cada build depois de
+  uma edição parte dela e aplica tudo o que mudou desde então (uma base nova quando o que mudou ficar grande).
+- **Etapa 2, passo B, o desenho (em curso):** quando só corpos de funções mudaram:
+  1. cada arquivo mudado lido duas vezes (o texto da base e o de agora) e comparado declaração a declaração: o mesmo
+     número, os mesmos nomes e tipos, os mesmos cabeçalhos (o texto sem o corpo); só funções que não são genéricas nem
+     externas podem mudar de corpo. Qualquer outra diferença: o caminho inteiro;
+  2. o arquivo novo acrescentado à árvore da base (`Ast.append`); cada função do arquivo aponta para o seu corpo novo
+     (todas: as linhas andaram) e é checada de novo (`checkFnBody`, com o `Checker` refeito em volta do programa);
+     as lambdas e instâncias que surgirem são declarações novas, no fim. Um efeito de função que mudou: o caminho
+     inteiro;
+  3. o lowering parte do `Lower` da base: as análises de memória refeitas no programa novo; refeitas as funções dos
+     arquivos mudados, as declarações novas, e as que embutiram alguma delas (o lowering anota quem embutiu quem);
+     as que leram um fato que mudou (o que um `var self` muda, um resultado todo seu) também;
+  4. uma função nova ganha o próximo número (depois de tudo, auxiliares e tardias inclusive); um auxiliar novo também;
+  5. o código: o das funções refeitas, novo; o das outras, o da base; juntados na ordem dos números.
 - **A ordem daqui em diante:** as etapas 2 e 3b viram uma só, o build incremental sobre a imagem do build anterior
   inteiro (o programa, as tabelas do lowering e o código de cada função). Partindo dela, um build só acrescenta: as
   funções que não mudaram guardam seus números e deslocamentos, e o código delas vale como está, com as linhas

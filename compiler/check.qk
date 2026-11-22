@@ -112,6 +112,40 @@ pub fn checkProgram(p: Program, errors: Errors, needMain: Bool, allowed: Text?) 
     Checked(k.p, k.errors, ok)
 }
 
+// A checked program some of whose functions have new bodies (docs/PLANO.md B13: a build after an edit): each of decls
+// checked again, and the lambdas and instances that makes (at the end of p.decls); the rest as it was checked.
+pub fn recheckBodies(p: Program, decls: [Int], allowed: Text?) -> Checked {
+    var k = Checker(p, Errors(), allowed: allowed)
+    for (i, name) in builtinNames.enumerate() {
+        if i > 0 and not k.builtins.contains(name) {
+            k.builtins[name] = i
+        }
+    }
+    for d in k.p.decls {
+        k.named(d)
+    }
+    for d in k.p.decls {
+        let x = k.p.ast.decls[d]
+        if x.kind == DeclKind.Fn and not x.isTest and x.name.contains(".") and x.owner != "" {
+            k.methods.add(x.name[len(x.owner) + 1..])
+        }
+        if x.kind == DeclKind.Fn and x.name.contains(".") and k.changesSelf(d) {
+            k.changers.add(x.name[(x.name.indexOf(".") ?? 0) + 1..])
+        }
+    }
+    let before = len(k.p.decls)
+    for d in decls {
+        k.p.ast.decls[d].state = 0
+        k.c.scope = []
+        k.c.lets = []
+        k.checkFnBody(d)
+    }
+    k.checkBodiesFrom(before)
+    k.settleEffects()
+    let ok = k.errors.count == 0
+    Checked(k.p, k.errors, ok)
+}
+
 // An interface's functions with a body are its defaults: a type (not generic) that has each of its other functions
 // and not this one gets it, as if it were written fn Type.name(self, ...) = body in the interface's file (Self there
 // is the type, as in any of its functions). It is the type's own from then on: called on it, or through the interface.

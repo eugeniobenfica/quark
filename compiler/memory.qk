@@ -7,9 +7,11 @@ use source
 use types
 use ast
 use module
+use parser
 use check
 use ir
 use lower
+use ownership
 use release
 use cachedir
 use format
@@ -127,16 +129,32 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     }
     var fromImage: Program? = None
     var wasBuilt: Built? = None
+    var base: CheckImage? = None // an image of files that have changed since: what a build after an edit goes on from
     if imageAt != "" {
         let kept: CheckImage? = machine.loadImage(imageAt)
-        if kept is Some(image) and image.key == imageKey and sameSources(image.program, src, preludeSrc) {
-            fromImage = Some(image.program)
-            wasBuilt = image.built
+        if kept is Some(image) and image.key == imageKey {
+            if sameSources(image.program, src, preludeSrc) {
+                fromImage = Some(image.program)
+                wasBuilt = image.built
+            } else {
+                base = Some(image)
+            }
+        }
+    }
+    // after an edit of function bodies only: from the base, those bodies checked and lowered again
+    if base is Some(image) and not purpose.runtime and not o.release and not purpose.target.startsWith("wasm32") {
+        match afterEdit(host, image, src, preludeSrc, o, purpose, quiet, t0) {
+            Done(c) => return Some(c)
+            Failed => return None
+            NotHere => {}
         }
     }
     var checkedProgram = fromImage ?? (checkedHere(host, src, preludeSrc, o, purpose, quiet) ?? return None)
     // (kept when reading and checking it took long enough for its image to be read faster: not a small program's)
-    let keepImage = fromImage is None and imageAt != "" and monotonicTime() - t0 > 0.15
+    // (QUARK_IMAGES=always: whatever its size, for the tests)
+    let keepImage = fromImage is None
+        and imageAt != ""
+        and (monotonicTime() - t0 > 0.15 or env("QUARK_IMAGES") == Some("always"))
     let t1 = monotonicTime()
     let cpu = machine.cpu()
     let target = purpose.target
@@ -212,9 +230,17 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         // on the threads while the next is lowered; only the code is kept, so the whole program's IR never is at once
         var l = lowerBegin(checkedProgram, lowering)
         let quick = made with { lanes: 0 }
+        var x64Parts: [X64Part] = []
+        var arm64Parts: [Arm64Part] = []
         let mc = match arch {
-            X64 => l.streamX64(quick)
-            Arm64 => l.streamArm64(quick)
+            X64 => {
+                x64Parts = l.streamX64(quick)
+                genX64Join(quick, l.out.runtime, l.out.externs, l.out.cSigs, len(l.fns), x64Parts)
+            }
+            Arm64 => {
+                arm64Parts = l.streamArm64(quick)
+                genArm64Join(quick, l.out.runtime, l.out.externs, l.out.cSigs, len(l.fns), arm64Parts)
+            }
         }
         var low = l.lowered()
         low.program.target = quick
@@ -228,8 +254,21 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
         low.program = IrProgram()
         if keepImage or fromImage is Some(_) and imageAt != "" {
             // the program and what it was built into, for the next build
+            // (with what lowering worked out, and each function's code on its own: what a build after an edit takes up)
+            var x64Kept: [X64Part] = []
+            for p in x64Parts {
+                x64Kept += splitX64Part(p)
+            }
+            var arm64Kept: [Arm64Part] = []
+            for p in arm64Parts {
+                arm64Kept += splitArm64Part(p)
+            }
             let _ = machine.saveImage(
-                CheckImage(imageKey, checkedProgram, Some(Built(builtKey, prog, mc, low.data, low.inlines))),
+                CheckImage(
+                    imageKey,
+                    checkedProgram,
+                    Some(Built(builtKey, prog, mc, low.data, low.inlines, Some(l.kept()), x64Kept, arm64Kept)),
+                ),
                 imageAt,
             )
         }
@@ -302,10 +341,379 @@ pub fn compileText(host: Host, src: Source, o: RunOptions, purpose: Purpose, qui
     Compiled(prog, mc, low.data, low.inlines, testsOf(checkedProgram), if avx { 1 } else { 0 }, os, purpose.linked)
 }
 
+// ---- a build after an edit (docs/PLANO.md B13, step 2) ----
+// What afterEdit did: built the program, said its errors, or found it is not a build it can do (the whole one then).
+enum EditBuild { Done(c: Compiled), Failed, NotHere }
+
+// The program, when only bodies of its functions changed since image's build (no declaration came or went, no
+// header, type or constant changed): from image, each changed file's functions checked again (their bodies are new,
+// and their lines moved), and lowered again with those that put one of them in line or read a fact of one that
+// changed; every other function's machine code as image's build made it.
+fn afterEdit(
+    host: Host,
+    image: CheckImage,
+    src: Source,
+    preludeSrc: Source?,
+    o: RunOptions,
+    purpose: Purpose,
+    quiet: Bool,
+    t0: Float,
+) -> EditBuild {
+    let Some(b) = image.built else {
+        return .NotHere
+    }
+    let Some(kept) = b.lower else {
+        return .NotHere
+    }
+    var p = image.program
+    // each changed file: read as it was and as it is, declaration by declaration
+    var again: [Int] = [] // the functions whose bodies are new
+    var wasEffect: [Bool] = []
+    var moved: [Int: Int] = [:] // the functions whose text is the same but its place moved: by how many lines
+    for (k, m) in image.program.modules.enumerate() {
+        let now = if k == 0 {
+            Some(src.text)
+        } else if m.path == preludePath {
+            Some(preludeText())
+        } else if preludeSrc is Some(given) and m.path == given.path {
+            Some(given.text)
+        } else {
+            readModule(m.path, m.path.startsWith("std/"), None)
+        }
+        let Some(text) = now else {
+            return .NotHere
+        }
+        if text == m.src.text {
+            continue
+        }
+        let old = parse(Source(m.path, m.src.text))
+        let new = parse(Source(m.path, text))
+        if not new.ok or not old.ok or len(old.ast.decls) != len(new.ast.decls) {
+            return .NotHere
+        }
+        // the program's declarations of this file, in their order (not the ones checking made)
+        var mine: [Int] = []
+        for d in p.decls {
+            let x = p.ast.decls[d]
+            if x.module == k and not x.lifted and x.templateOf < 0 and not x.fromDefault {
+                mine.push(d)
+            }
+        }
+        if len(mine) != len(new.ast.decls) {
+            return .NotHere
+        }
+        // (each declaration's header: its text with an empty body)
+        var oldHeads = old.ast
+        var newHeads = new.ast
+        let oldEmpty = oldHeads.expr(.BlockExpr(oldHeads.block(Block()), false), 0, 0)
+        let newEmpty = newHeads.expr(.BlockExpr(newHeads.block(Block()), false), 0, 0)
+        for j in 0..len(new.ast.decls) {
+            if oldHeads.decls[j].body >= 0 {
+                oldHeads.decls[j].body = oldEmpty
+            }
+            if newHeads.decls[j].body >= 0 {
+                newHeads.decls[j].body = newEmpty
+            }
+        }
+        let at = len(p.ast.decls)
+        p.ast.append(new.ast)
+        let oldLines = m.src.text.split("\n")
+        let newLines = text.split("\n")
+        for j in 0..len(new.ast.decls) {
+            let x = new.ast.decls[j]
+            let d = mine[j]
+            if x.name != p.ast.decls[d].name or x.kind != old.ast.decls[j].kind {
+                return .NotHere
+            }
+            // the same text (each declaration's lines, to the next one's): the same declaration, moved if anything
+            if spanOf(oldLines, old.ast, j) == spanOf(newLines, new.ast, j) {
+                if x.kind == DeclKind.Fn and x.body >= 0 and x.line != old.ast.decls[j].line {
+                    moved[d] = x.line - old.ast.decls[j].line
+                }
+                continue
+            }
+            if declText(oldHeads, j) != declText(newHeads, j) {
+                return .NotHere // a header, a type, a constant, a use
+            }
+            if x.kind != DeclKind.Fn or x.body < 0 {
+                continue
+            }
+            let y = p.ast.decls[d]
+            if y.isTemplate or y.isExtern {
+                return .NotHere // a generic function's instances, or C's: made again by the whole build
+            }
+            // its body: the new one (its lines moved, if nothing else)
+            wasEffect.push(y.isEffect)
+            p.ast.decls[d].body = p.ast.decls[at + j].body
+            p.ast.decls[d].line = x.line
+            p.ast.decls[d].col = x.col
+            p.ast.decls[d].isEffect = x.isEffect
+            again.push(d)
+        }
+    }
+    if len(again) == 0 and len(moved) == 0 {
+        return .NotHere
+    }
+    // a moved function's lines in the tree (its instances' too, and its lambdas'), and by how much each one's
+    // machine code is moved
+    var delta: [Int: Int] = [:]
+    let walks = movedItems(p, moved)
+    for (e, by, items) in walks {
+        delta[e] = by
+        p.ast.decls[e].line += by
+        for it in items {
+            if it >= 0 {
+                p.ast.exprs[it].line += by
+            } else {
+                p.ast.stmts[-1 - it].line += by
+            }
+        }
+    }
+    for (f, by) in movedLambdas(p, walks) {
+        delta[f] = by
+        p.ast.decls[f].line += by
+    }
+    let oldCount = len(p.decls)
+    let oldInlines = len(b.inlines)
+    let checked = recheckBodies(p, again, o.allowed)
+    if not quiet {
+        for e in checked.errors.shown {
+            printErr(e)
+        }
+    }
+    if not checked.ok {
+        return .Failed
+    }
+    let q = checked.program
+    for (i, d) in again.enumerate() {
+        if q.ast.decls[d].isEffect != wasEffect[i] {
+            return .NotHere // its callers' effects: the whole check
+        }
+    }
+    let t1 = monotonicTime()
+    // lowered again: the new bodies, the new declarations, and those that depend on one of them
+    let lowering = LowerOptions(
+        fuel: o.fuel > 0,
+        runtime: false,
+        linked: purpose.linked,
+        arch: b.prog.target.arch,
+        sysv: b.prog.target.sysv,
+        debug: purpose.debug,
+        debugKeys: if purpose.debug { lineKeys(q) } else { [:] },
+        coverage: o.coverage,
+        runtimeUsed: purpose.used,
+    )
+    var l = lowerResume(kept, q, lowering, b.prog, b.data, b.inlines)
+    var todo: Set<Int> = []
+    for d in again {
+        todo.add(d)
+    }
+    for i in oldCount..len(q.decls) {
+        todo.add(q.decls[i])
+    }
+    // the number of each function, to its declaration
+    var declAt: [Int: Int] = [:]
+    for (i, d) in q.decls.enumerate() {
+        if i < len(l.fnIndex) and l.fnIndex[i] >= 0 and l.numbered(d) {
+            declAt[l.fnIndex[i]] = d
+        }
+    }
+    for d in again {
+        for slot in kept.inliners[d] ?? [] {
+            if declAt[slot] is Some(e) {
+                todo.add(e)
+            }
+        }
+        // a fact its callers read, changed: they are lowered again
+        let changesNow = l.own.changes.get(d) ?? []
+        let wasChanges = if d < len(kept.keptChanges) { kept.keptChanges[d] } else { [] }
+        let wasOwned = d < len(kept.keptResults) and kept.keptResults[d]
+        if changesNow != wasChanges or l.own.ownedResults[d] != wasOwned {
+            let slot = l.fnIndex[q.ast.decls[d].index]
+            for (s, f) in l.fns.enumerate() {
+                if f.code.any(ins => ins.op == Op.Call and ins.a < 0 and ins.imm == slot) and declAt[s] is Some(e) {
+                    todo.add(e)
+                }
+            }
+        }
+    }
+    // a function kept as a value now, or no longer: called otherwise
+    for i in 0..min(len(kept.asValue), len(q.decls)) {
+        if kept.asValue[i] != l.asValue[i] {
+            todo.add(q.decls[i])
+        }
+    }
+    var decls: [Int] = []
+    for d in q.decls {
+        if todo.contains(d) and l.numbered(d) {
+            decls.push(d)
+        }
+    }
+    let lowered = l.lowerAgain(decls)
+    let quick = b.prog.target
+    // what moved: each kept function's line, its inlined calls' lines, and its machine code's lines
+    var slotOf: [Int: Int] = [:]
+    for (s, d) in declAt {
+        slotOf[d] = s
+    }
+    for (d, by) in delta {
+        if slotOf[d] is Some(s) and s < len(l.fns) {
+            l.fns[s].line += by
+        }
+    }
+    let inl = l.inlines
+    for i in 0..min(oldInlines, len(inl)) {
+        let r = inl[i]
+        let frame = if r.parent == 0 { r.owner } else { inl[r.parent].decl }
+        if delta[frame] is Some(by) {
+            l.inlines[i].line = r.line + by
+        }
+    }
+    var rebase: Set<Int> = [] // the kept functions some of whose lines moved
+    for (d, _) in delta {
+        if slotOf[d] is Some(s) {
+            rebase.add(s)
+        }
+        for s in kept.inliners[d] ?? [] {
+            rebase.add(s)
+        }
+    }
+    let lineDelta = (slot: Int, frame: Int) => if frame == 0 {
+        delta[declAt[slot] ?? -1] ?? 0
+    } else if frame < len(inl) {
+        delta[inl[frame].decl] ?? 0
+    } else {
+        0
+    }
+    let mc = match quick.arch {
+        X64 => {
+            var made: [Int: X64Part] = [:]
+            for part in genX64Parts(quick, l.out.runtime, l.out.externs, l.out.cSigs, lowered, true) {
+                for f in splitX64Part(part) {
+                    made[f.numbers[0]] = f
+                }
+            }
+            var all: [X64Part] = []
+            for f in b.x64 {
+                let s = f.numbers[0]
+                if not made.contains(s) {
+                    all.push(if rebase.contains(s) {
+                        f.rebased(frame => lineDelta(s, frame))
+                    } else {
+                        f
+                    })
+                }
+            }
+            for (_, f) in made {
+                all.push(f)
+            }
+            genX64Join(quick, l.out.runtime, l.out.externs, l.out.cSigs, len(l.fns), all.sortedBy(f => f.numbers[0]))
+        }
+        Arm64 => {
+            var made: [Int: Arm64Part] = [:]
+            for part in genArm64Parts(quick, l.out.runtime, l.out.externs, l.out.cSigs, lowered, true) {
+                for f in splitArm64Part(part) {
+                    made[f.numbers[0]] = f
+                }
+            }
+            var all: [Arm64Part] = []
+            for f in b.arm64 {
+                let s = f.numbers[0]
+                if not made.contains(s) {
+                    all.push(if rebase.contains(s) {
+                        f.rebased(frame => lineDelta(s, frame))
+                    } else {
+                        f
+                    })
+                }
+            }
+            for (_, f) in made {
+                all.push(f)
+            }
+            genArm64Join(quick, l.out.runtime, l.out.externs, l.out.cSigs, len(l.fns), all.sortedBy(f => f.numbers[0]))
+        }
+    }
+    var low = l.lowered()
+    low.program.target = quick
+    if o.timed {
+        let t4 = monotonicTime()
+        printErr(
+            "quark: parsed and checked in {fixed((t1 - t0) * 1000, 2)} ms, compiled in {fixed((t4 - t1) * 1000, 2)} ms ({len(mc.code)} bytes of machine code): after an edit, {len(again)} bodies checked again, {len(lowered)} functions lowered again and {len(rebase)} moved",
+        )
+    }
+    let prog = low.program // taken
+    low.program = IrProgram()
+    let os = targetOs(host, purpose.target)
+    let avx = purpose.target == "" and not host.arm and not o.noAvx and machine.cpu() & 1 != 0
+    .Done(Compiled(prog, mc, low.data, low.inlines, testsOf(q), if avx { 1 } else { 0 }, os, purpose.linked))
+}
+
+// the lines of a file's j-th declaration, up to the next one's (comments above the next one among them)
+fn spanOf(lines: [Text], a: Ast, j: Int) -> [Text] {
+    let from = max(a.decls[j].line - 1, 0)
+    let to = if j + 1 < len(a.decls) {
+        a.decls[j + 1].line - 1
+    } else {
+        len(lines)
+    }
+    if to <= from { [] } else { lines[from..min(to, len(lines))] }
+}
+
+// each moved function's declarations (itself, the copy its instances are made from, its instances) with by how much
+// they moved and the nodes of their bodies (expressions, and statements as -1 - s)
+fn movedItems(p: Program, moved: [Int: Int]) -> [(Int, Int, [Int])] {
+    let walk = Ownership(p)
+    var out: [(Int, Int, [Int])] = []
+    for (d, by) in moved {
+        var these = [d]
+        if p.ast.decls[d].pristine >= 0 {
+            these.push(p.ast.decls[d].pristine)
+        }
+        for e in p.decls {
+            if p.ast.decls[e].templateOf == d {
+                these.push(e)
+            }
+        }
+        for e in these {
+            out.push((e, by, walk.visitExpr(p.ast.decls[e].body, [])))
+        }
+    }
+    out
+}
+
+// the lambdas lifted out of the moved functions (their bodies are among the walked nodes): by how much each moved
+fn movedLambdas(p: Program, walks: [(Int, Int, [Int])]) -> [(Int, Int)] {
+    var by: [Int: Int] = [:]
+    for (_, n, items) in walks {
+        for it in items {
+            if it >= 0 {
+                by[it] = n
+            }
+        }
+    }
+    var out: [(Int, Int)] = []
+    for f in p.decls {
+        if p.ast.decls[f].lifted and by[p.ast.decls[f].body] is Some(n) {
+            out.push((f, n))
+        }
+    }
+    out
+}
+
 // a checked program as a build left it, for the next one (its key: the compiler, the file, what checking it took),
 // and what that build made of it (its key: what it was built for)
 type CheckImage { key: Text, program: Program, built: Built? = None }
-type Built { key: Text, prog: IrProgram, mc: MachineCode, data: Bytes, inlines: [InlineCall] }
+
+type Built {
+    key: Text
+    prog: IrProgram
+    mc: MachineCode
+    data: Bytes
+    inlines: [InlineCall]
+    lower: Lower? = None // its state when it was done (its program's, data and functions given out)
+    x64: [X64Part] = [] // each function's code, on its own (x64's or ARM64's)
+    arm64: [Arm64Part] = []
+}
 
 // is every file p was read from as it was (the file given, the prelude, the standard library's, the others')
 fn sameSources(p: Program, src: Source, preludeSrc: Source?) -> Bool {
@@ -404,7 +812,7 @@ fn testsOf(p: Program) -> [(Text, Text)] {
 const streamBatch = 2000000
 
 // lowered in batches, each one's machine code made on the threads (compileText)
-fn Lower.streamX64(var self, target: Target) -> MachineCode {
+fn Lower.streamX64(var self, target: Target) -> [X64Part] {
     let shift = rebaseTest()
     var parts = genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, [], true)
     var batch: [(Int, IrFn)] = []
@@ -431,10 +839,10 @@ fn Lower.streamX64(var self, target: Target) -> MachineCode {
         rest
     }
     parts += genX64Proved(genX64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest2, true), shift)
-    genX64Join(target, self.out.runtime, self.out.externs, self.out.cSigs, len(self.fns), parts)
+    parts
 }
 
-fn Lower.streamArm64(var self, target: Target) -> MachineCode {
+fn Lower.streamArm64(var self, target: Target) -> [Arm64Part] {
     let shift = rebaseTest()
     var parts = genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, [], true)
     var batch: [(Int, IrFn)] = []
@@ -464,7 +872,7 @@ fn Lower.streamArm64(var self, target: Target) -> MachineCode {
         genArm64Parts(target, self.out.runtime, self.out.externs, self.out.cSigs, rest2, true),
         shift,
     )
-    genArm64Join(target, self.out.runtime, self.out.externs, self.out.cSigs, len(self.fns), parts)
+    parts
 }
 
 // quark build --target wasm32-wasi: the program and the runtime (runtime/wasi.qk) as one WebAssembly module
@@ -1681,7 +2089,10 @@ pub fn buildExecutable(host: Host, target: Text, c: Compiled, o: RunOptions) -> 
             }
         }
         let owner = if lo > 0 { starts[lo - 1].1 } else { -1 }
-        if owner < 0 or owner >= len(reached) or reached[owner] {
+        // (the way in and out, and the stubs the code calls the runtime through, are after every function: a cold
+        // path's panic calls rtPanic through one)
+        let outside = r.at >= min(c.mc.enter, c.mc.escape)
+        if outside or owner < 0 or owner >= len(reached) or reached[owner] {
             used[r.target] = true // (outside any function: the trampolines')
         }
     }

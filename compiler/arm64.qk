@@ -116,7 +116,7 @@ pub fn genArm64Parts(
     sigs: [IrExtern],
     fns: [(Int, IrFn)],
     quick: Bool,
-) -> [CodePart] = if instructionsOf(fns) >= threadsFrom {
+) -> [Arm64Part] = if instructionsOf(fns) >= threadsFrom {
     partsOf(fns).parallelMap(part => arm64Part(target, runtime, externs, sigs, part, quick))
 } else {
     [arm64Part(target, runtime, externs, sigs, fns, quick)]
@@ -124,8 +124,8 @@ pub fn genArm64Parts(
 
 // ---- a part's functions, each a part of its own; and their lines moved (B13: code kept from an earlier build) ----
 // part's functions, each its own part (its code from 0): joined in the same order, the same bytes
-pub fn splitPart(p: CodePart) -> [CodePart] {
-    var out: [CodePart] = []
+pub fn splitArm64Part(p: Arm64Part) -> [Arm64Part] {
+    var out: [Arm64Part] = []
     for k in 0..len(p.fnAt) {
         let from = p.fnAt[k]
         let to = if k + 1 < len(p.fnAt) { p.fnAt[k + 1] } else { len(p.code) }
@@ -153,7 +153,7 @@ pub fn splitPart(p: CodePart) -> [CodePart] {
             }
             i += 2
         }
-        out.push(CodePart(p.code[from..to], patches, p.relocs
+        out.push(Arm64Part(p.code[from..to], patches, p.relocs
             .filter(x => inside(x.at))
             .map(x => Reloc(x.at - from, x.kind, x.target))
             .toArray(), p.sites
@@ -169,7 +169,7 @@ pub fn splitPart(p: CodePart) -> [CodePart] {
 
 // the part with each line moved by its frame's delta (by the inlined call it is in, 0 the function's own): in the
 // code (its four patches), its calls' sites and its -g lines (a line of 0, no line, stays)
-pub fn CodePart.rebased(self, delta: (Int) -> Int) -> CodePart {
+pub fn Arm64Part.rebased(self, delta: (Int) -> Int) -> Arm64Part {
     var p = self
     for i in p.lineAt {
         var v = 0
@@ -205,12 +205,12 @@ fn movedLine(v: Int, delta: (Int) -> Int) -> Int {
 }
 
 // the parts as B13's proofs want them (ir.qk: rebaseTest, splitTest): split, their lines moved back by shift
-pub fn genArm64Proved(parts: [CodePart], shift: Int) -> [CodePart] {
+pub fn genArm64Proved(parts: [Arm64Part], shift: Int) -> [Arm64Part] {
     var out = parts
     if splitTest() {
         out = []
         for p in parts {
-            out += splitPart(p)
+            out += splitArm64Part(p)
         }
     }
     if shift != 0 {
@@ -226,7 +226,7 @@ pub fn genArm64Join(
     externs: [IrExtern],
     sigs: [IrExtern],
     count: Int,
-    parts: [CodePart],
+    parts: [Arm64Part],
 ) -> MachineCode {
     var g = Arm64(target, runtime, externs)
     g.sigs = sigs
@@ -262,7 +262,7 @@ pub fn genArm64Join(
 }
 
 // functions from number `from` on, made from offset 0: what genArm64 joins
-pub type CodePart {
+pub type Arm64Part {
     code: Bytes
     patches: [Patch]
     relocs: [Reloc]
@@ -282,7 +282,7 @@ fn arm64Part(
     sigs: [IrExtern],
     fns: [(Int, IrFn)],
     quick: Bool,
-) -> CodePart {
+) -> Arm64Part {
     var g = Arm64(target, runtime, externs)
     g.sigs = sigs
     var fnAt: [Int] = []
@@ -300,7 +300,7 @@ fn arm64Part(
             g.genFn(f)
         }
     }
-    CodePart(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt, g.lineAt, numbers)
+    Arm64Part(g.code, g.patches, g.relocs, g.sites, g.callFixups, g.lines, g.frames, fnAt, g.lineAt, numbers)
 }
 
 // -g: where ins's code starts, when its line is another than the last one's

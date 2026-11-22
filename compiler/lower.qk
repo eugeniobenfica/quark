@@ -34,7 +34,14 @@ pub type Lowered { program: IrProgram, data: Bytes, inlines: [InlineCall] }
 
 // inlined code: callee, inlined at line of the code around it (parent, or the function); file: the callee's (its
 // module's number)
-pub type InlineCall { parent: Int, callee: Text, line: Int, file: Int = 0 }
+pub type InlineCall {
+    parent: Int
+    callee: Text
+    line: Int
+    file: Int = 0
+    decl: Int = -1
+    owner: Int = -1
+}
 
 // the runtime functions: their numbers
 const rtPrintInt = 1
@@ -370,6 +377,23 @@ pub type Lower {
     slotCache: [Int] = []
     kindCache: [Bytes] = []
     caseStarts: [Int: [Int]] = [:] // by enum declaration
+    inliners: [Int: [Int]] = [:] // by declaration: the functions (their numbers) its body was put in line in (B13)
+    keptChanges: [[Int]] = [] // (kept): what each var self function changed, and which results were all their own
+    keptResults: [Bool] = []
+}
+
+// the function being lowered has d's body in it: when d changes, it is lowered again (docs/PLANO.md B13)
+fn Lower.noteInlined(var self, d: Int) {
+    if self.fnId < 0 {
+        return
+    }
+    if self.inliners[d] is Some(those) {
+        if not those.contains(self.fnId) {
+            self.inliners[d] = those + [self.fnId]
+        }
+    } else {
+        self.inliners[d] = [self.fnId]
+    }
 }
 
 // ---- the tree, as lowering reads it ----
@@ -5340,7 +5364,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
                 self.callerLine = x.line
             }
         } else {
-            let call = InlineCall(savedInl, self.shownName(d), x.line, file: dx.module)
+            let call = InlineCall(savedInl, self.shownName(d), x.line, file: dx.module, decl: d, owner: self.current)
             if len(self.inlines) == 0 {
                 self.inlines.push(call)
             }
@@ -5350,6 +5374,7 @@ fn Lower.callOperator(var self, e: Int) -> [Int] {
         let end = self.label()
         let result = self.valOf(dx.retType)
         self.inlining.push(Frame(d, end, result, outerCaller: savedCaller))
+        self.noteInlined(d)
         let savedBreak = self.userBreak
         let savedContinue = self.userContinue
         self.coverExpr(dx.body)
@@ -7799,6 +7824,159 @@ pub fn Lower.lowerNext(var self) -> (Int, IrFn)? {
 }
 
 pub fn Lower.allLowered(self) -> Bool = self.nextDecl >= len(self.p.decls)
+
+// ---- a build after an edit, going on from a kept lowering (docs/PLANO.md B13) ----
+// The kept lowering (Lower.kept) of a program that has changed since only by function bodies and by declarations at
+// its end (lambdas, instances): its program, its memory decisions and what each binding has made again; its shared
+// tables (data, texts, helpers, externs...) as they were, to be added to. prog: what it gave out (Lowered.program).
+pub fn lowerResume(
+    kept: Lower,
+    p: Program,
+    opts: LowerOptions,
+    prog: IrProgram,
+    data: Bytes,
+    inlines: [InlineCall],
+) -> Lower {
+    let n = len(p.decls)
+    let nb = len(p.bindings)
+    var l = kept
+    l.p = p
+    l.opts = opts
+    l.own = Ownership(p, debug: opts.debug)
+    let noRegs: [Int] = []
+    l.regs = [noRegs] * nb
+    l.bound = [false] * nb
+    l.atAddress = [false] * nb
+    l.addrReg = [-1] * nb
+    l.selfInPlace = [false] * nb
+    l.own.inlineCost = [0] * n
+    l.own.sizeMemo = [-1] * n
+    l.own.selfMemo = [0] * n
+    // the new declarations: no number yet (-1), not an extern's
+    while len(l.fnIndex) < n {
+        l.fnIndex.push(-1)
+    }
+    while len(l.externIndex) < n {
+        l.externIndex.push(-1)
+    }
+    l.asValue = [false] * n
+    l.out = prog
+    l.fns = prog.fns
+    l.out.fns = []
+    l.data = data
+    l.inlines = inlines
+    l.latePatches = []
+    l.held = []
+    l.nextDecl = n
+    l.own.decideAliases()
+    l.own.decideTakes()
+    l.own.decideResults()
+    l.own.decideEscapes()
+    l.own.makeChanges()
+    l.markInPlace()
+    l
+}
+
+// is d's function one this lowering gives a number to (not C's, a template, or one only put in line)
+pub fn Lower.numbered(self, d: Int) -> Bool {
+    let x = self.dl(d)
+    x.kind == DeclKind.Fn and not self.isCFunction(d) and not x.isTemplate and not x.inlineOnly
+}
+
+// the functions of decls lowered again (the new ones numbered after all), then the helpers and late functions they
+// asked for that were not there: each with its number
+pub fn Lower.lowerAgain(var self, decls: [Int]) -> [(Int, IrFn)] {
+    for d in decls {
+        let i = self.dl(d).index
+        if self.fnIndex[i] < 0 {
+            self.fnIndex[i] = self.outCount
+            self.outCount += 1
+            self.fns.push(IrFn(""))
+        }
+    }
+    var made: [Int] = []
+    let patchesFrom = len(self.latePatches)
+    for d in decls {
+        let x = self.dl(d)
+        let at = self.fnIndex[x.index]
+        self.lowerFn(d, at)
+        let sym = if x.externSymbol != "" { x.externSymbol } else { x.name }
+        if x.isExtern and sym.startsWith("qk_") and x.isPub {
+            self.cur.exportName = Some(sym)
+        }
+        self.fns[at] = self.cur // taken: self.cur gets a new function next
+        self.cur = IrFn("")
+        made.push(at)
+    }
+    var h = self.helpersDone
+    while h < len(self.helpers) {
+        let slot = self.outCount
+        self.outCount += 1
+        self.helpersDone += 1
+        self.fns.push(IrFn(""))
+        self.lowerHelper(self.helpers[h], slot)
+        self.fns[slot] = self.cur
+        self.cur = IrFn("")
+        made.push(slot)
+        h += 1
+    }
+    var k = 0
+    while k < len(self.lates) {
+        if self.lates[k].index < 0 {
+            let slot = self.outCount
+            self.lates[k].index = slot
+            self.outCount += 1
+            self.fns.push(IrFn(""))
+            self.fnId = slot
+            let late = self.lates[k]
+            if late.kind != 0 {
+                self.lowerMachine(late)
+            } else {
+                self.lowerCEntry(late)
+            }
+            self.fns[slot] = self.cur
+            self.cur = IrFn("")
+            made.push(slot)
+        }
+        k += 1
+    }
+    for lp in self.latePatches[patchesFrom..] {
+        self.fns[lp.fnId].code[lp.at].imm = self.lates[lp.late].index
+    }
+    var out: [(Int, IrFn)] = []
+    for at in made {
+        var done = self.fns[at]
+        done.isConst = [false] * len(done.kinds)
+        done.constValue = [0] * len(done.kinds)
+        self.fns[at] = self.summaryOf(done)
+        out.push((at, done))
+    }
+    out
+}
+
+// what is kept of a lowering when it is done, for a build after an edit to go on from (docs/PLANO.md B13): its
+// tables shared by every function (the data, the texts, the helpers, the externs, the inlined calls...), not its
+// program (the build keeps it) nor what each binding or expression had (made again for the program then)
+pub fn Lower.kept(self) -> Lower {
+    var k = self
+    var o = self.own
+    if not o.changesMade {
+        o.makeChanges()
+    }
+    k.keptChanges = o.changes
+    k.keptResults = self.own.ownedResults
+    k.p = Program(Ast())
+    k.own = Ownership(Program(Ast()))
+    k.regs = []
+    k.bound = []
+    k.atAddress = []
+    k.addrReg = []
+    k.selfInPlace = []
+    k.slotCache = []
+    k.kindCache = []
+    k.cur = IrFn("")
+    k
+}
 
 // what lowerSome leaves: the way in (main's caller), the helpers and the late functions, and the held functions
 pub fn Lower.lowerRest(var self) -> [(Int, IrFn)] {

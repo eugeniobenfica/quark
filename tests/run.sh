@@ -540,6 +540,72 @@ printf 'type Pair<A, B> { first: A, second: B }
 fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> = Pair(p.second, p.first)
 ' > "$tmp/pair.qk"
 if "$Q" catalog "$tmp/pair.qk" | grep -qF '"returns": "Pair<B, A>", "result": {"kind": "named", "name": "Pair", "args": [{"kind": "param", "name": "B"}, {"kind": "param", "name": "A"}]}'; then ok; else bad "catalog pins (a program's)"; fi
+# a built program's panics: a bounds check's and a division's (their cold paths call the runtime through a stub after
+# every function: it is kept however the program's functions are trimmed)
+printf 'fn at(xs: [Int], i: Int) -> Int = xs[i]
+
+fn main() {
+    print(at([1], 0))
+    print(at([1], 5))
+}
+' > "$tmp/panics.qk"
+if "$Q" build "$tmp/panics.qk" -o "$tmp/panics.exe" > /dev/null 2>&1; then
+    "$tmp/panics.exe" > "$tmp/panics.out" 2>&1
+    st=$?
+    if [ $st -eq 1 ] && tr -d '' < "$tmp/panics.out" | grep -q "index 5 is outside the array"; then ok; else bad "a built program's bounds panic (status $st)"; fi
+else bad "a built program's bounds panic (build)"; fi
+# a build after an edit (docs/PLANO.md B13): from the first build's image, one body changed and the functions below it
+# moved; it runs as a build of the edited file from nothing does, its panic's line too
+printf 'fn head(xs: [Int]) -> Int = xs[0]
+
+fn total(xs: [Int]) -> Int {
+    var t = 0
+    for x in xs {
+        t += x
+    }
+    t
+}
+
+fn at(xs: [Int], i: Int) -> Int {
+    let y = xs[i]
+    y + 1
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    print(total(xs), at(xs, 1), head(xs))
+    print(at(xs, 9))
+}
+' > "$tmp/edit.qk"
+QUARK_IMAGES=always "$Q" build "$tmp/edit.qk" -o "$tmp/edit0.exe" > /dev/null 2>&1
+printf 'fn head(xs: [Int]) -> Int = xs[0]
+
+fn total(xs: [Int]) -> Int {
+    // more
+
+    var t = 10
+    for x in xs {
+        t += x
+    }
+    t
+}
+
+fn at(xs: [Int], i: Int) -> Int {
+    let y = xs[i]
+    y + 1
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    print(total(xs), at(xs, 1), head(xs))
+    print(at(xs, 9))
+}
+' > "$tmp/edit.qk"
+QUARK_IMAGES=always "$Q" build "$tmp/edit.qk" -o "$tmp/edit1.exe" --time > "$tmp/edit1.txt" 2>&1
+QUARK_IMAGES=off "$Q" build "$tmp/edit.qk" -o "$tmp/edit2.exe" > /dev/null 2>&1
+"$tmp/edit1.exe" > "$tmp/edit1.out" 2>&1
+"$tmp/edit2.exe" > "$tmp/edit2.out" 2>&1
+if grep -q "after an edit, 1 bodies" "$tmp/edit1.txt" && [ -s "$tmp/edit2.out" ] && cmp -s "$tmp/edit1.out" "$tmp/edit2.out"; then ok; else bad "a build after an edit"; cat "$tmp/edit1.txt" "$tmp/edit1.out" | head -5; fi
 # kept code (docs/PLANO.md B13): each function's own part, and its lines moved and moved back, give the same bytes
 # (each written under one name and moved: macOS signs an executable with its file's name)
 parts() { # parts OUT [--target T]: language.qk built, with the proofs when PROVE is set

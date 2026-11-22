@@ -1,0 +1,49 @@
+// Loops whose turns keep nearly everything they make (data that grows): collections keep it where it is (tenured)
+// instead of copying it. What is later written into that memory (new values in old records) is still found by the
+// next collection, garbage made meanwhile still goes, and the values read back are the ones written.
+type Node { id: Int, tags: [Text], next: [Int] }
+
+fn grow(n: Int) -> [Node] {
+    var nodes: [Node] = []
+    for i in 0..n {
+        nodes.push(Node(i, ["n{i}", "{i % 7}"], [i, i + 1]))
+    }
+    nodes
+}
+
+fn ok(x: Node, round: Int) -> Bool =
+    x.tags[0] == "n{x.id}" and x.next[0] == x.id + round and len(x.next) == 2 + min(round, 1)
+
+fn main() {
+    var all: [[Node]] = []
+    for s in 0..40 {
+        all.push(grow(5000 + s))
+    }
+    // new values written into the old records, with garbage made in each turn
+    for round in 1..6 {
+        var junk = 0
+        for (i, nodes) in all.enumerate() {
+            for k in 0..len(nodes) {
+                let x = all[i][k]
+                if round == 1 {
+                    all[i][k] = Node(x.id, x.tags, [x.next[0] + 1, x.next[1], round])
+                } else {
+                    all[i][k].next[0] += 1
+                }
+                junk += len("{x.tags} garbage {k}".split(" "))
+            }
+        }
+        var good = true
+        for nodes in all {
+            for x in nodes {
+                good = good and ok(x, round)
+            }
+        }
+        print(round, good, junk > 0)
+    }
+    var total = 0
+    for nodes in all {
+        total += len(nodes)
+    }
+    print(total)
+}

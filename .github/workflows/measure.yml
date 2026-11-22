@@ -57,7 +57,7 @@ jobs:
             # by function (the runtime's have names; the program's own code is ???)
             for side in base cand; do
               valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/tmp/cg-$side --smc-check=all-non-file                 ../$side/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/q-$side > /dev/null 2>&1 || true
-              cg_annotate --show-percs=no /tmp/cg-$side 2>/dev/null | grep -E "^ *[0-9,]+ +\(" | head -40 > /tmp/fns-$side || true
+              cg_annotate /tmp/cg-$side 2>/dev/null | sed -n '/Function summary/,$p' | head -70 > /tmp/fns-$side || true
             done
             echo "base's top functions:" >&2; cat /tmp/fns-base >&2
             echo "cand's top functions:" >&2; cat /tmp/fns-cand >&2

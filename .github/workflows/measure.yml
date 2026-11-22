@@ -53,10 +53,15 @@ jobs:
             b=$(count ../base/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qb)
             c=$(count ../cand/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qc)
             row "building the compiler" "$b" "$c"
+            # cand's compiler as base's makes it: what cand's compiler does more (its code as base makes code)
+            ../base/build/quark.exe build --release ../cand/compiler/mainlinux.qk -o /tmp/qx > /dev/null
+            row "... cand's work, base's code" "$b" "$(count /tmp/qx build ../base/compiler/mainlinux.qk -o /tmp/qd)"
             for f in ../base/bench/*.qk; do
               n=$(basename "$f" .qk)
               ../base/build/quark.exe build --release "$f" -o "/tmp/$n-b" > /dev/null
               ../cand/build/quark.exe build --release "$f" -o "/tmp/$n-c" > /dev/null
+              "/tmp/$n-b" | head -3 >&2
+              valgrind --smc-check=all-non-file "/tmp/$n-b" 2>&1 | tail -5 >&2
               row "$n" "$(count "/tmp/$n-b")" "$(count "/tmp/$n-c")"
             done
           } | tee table.md

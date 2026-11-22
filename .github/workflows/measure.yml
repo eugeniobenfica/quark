@@ -1,0 +1,63 @@
+name: Measure
+
+# By hand (gh workflow run measure.yml -f cand=REF [-f base=REF]): two refs' compilers built as build.sh builds them,
+# then the instructions each executes (Valgrind's cachegrind: counted, not timed, so neither a shared machine's load
+# nor where the code happens to lie moves them) for the same work: compiling base's compiler, and every benchmark as
+# each one builds it. The table in the run's summary.
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "the ref measured against"
+        default: main
+      cand:
+        description: "the ref measured"
+        required: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      QUARK_IMAGES: "off"
+      QUARK_CACHE: "off"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Valgrind
+        run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: The bootstrap compiler
+        run: gh release download --repo ${{ github.repository }} --pattern quark-x86_64-linux --dir boot && chmod 755 boot/quark-x86_64-linux
+      - name: Build both
+        run: |
+          for side in base cand; do
+            ref=${{ inputs.base }}
+            [ $side = cand ] && ref=${{ inputs.cand }}
+            git worktree add -q "../$side" "origin/$ref" 2> /dev/null || git worktree add -q "../$side" "$ref"
+            (cd "../$side" && QUARK="$GITHUB_WORKSPACE/boot/quark-x86_64-linux" ./build.sh > /dev/null)
+            echo "$side: $ref $(git -C "../$side" rev-parse --short HEAD)"
+          done
+      - name: Count
+        run: |
+          count() { # the instructions a command executes (every thread's)
+            valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null --smc-check=all-non-file "$@" 2>&1 >/dev/null |
+              awk '/I *refs:/ {gsub(",", "", $NF); print $NF}'
+          }
+          row() { # name, base's count, cand's
+            awk -v n="$1" -v b="$2" -v c="$3" 'BEGIN {printf "| %s | %d | %d | %+.2f%% |\n", n, b, c, (c - b) * 100 / b}'
+          }
+          {
+            echo "| work | base | cand | cand vs base |"
+            echo "|---|---|---|---|"
+            b=$(count ../base/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qb)
+            c=$(count ../cand/build/quark.exe build ../base/compiler/mainlinux.qk -o /tmp/qc)
+            row "building the compiler" "$b" "$c"
+            for f in ../base/bench/*.qk; do
+              n=$(basename "$f" .qk)
+              ../base/build/quark.exe build --release "$f" -o "/tmp/$n-b" > /dev/null
+              ../cand/build/quark.exe build --release "$f" -o "/tmp/$n-c" > /dev/null
+              row "$n" "$(count "/tmp/$n-b")" "$(count "/tmp/$n-c")"
+            done
+          } | tee table.md
+          cat table.md >> "$GITHUB_STEP_SUMMARY"

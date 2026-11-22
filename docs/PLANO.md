@@ -456,8 +456,23 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 >     ~±2,5%, do tamanho do que se quer medir.
 >   - Também medidos: o fim de laço como chamada (+4%), em linha com 2 ou 4 instruções (+3 a +6%); o alcance
 >     devolvido como array (+10%, copiado a cada laço).
-> - **Falta para decidir:** uma medida que separe o custo do ruído de posição (contadores de instruções, ou vários
->   programas além do compilador), e reduzir o que sobrar.
+> - **Medido com precisão (22/11/2026):** o workflow `measure.yml`, à mão, conta as instruções executadas (cachegrind,
+>   no Linux da CI: nem a carga da máquina nem a posição do código as mudam; ±0,04% entre rodadas) de dois compiladores
+>   fazendo o mesmo trabalho, construir o compilador de `main`:
+>
+>   | | instruções |
+>   |---|---|
+>   | a primeira versão (pilha limpa no começo de cada laço) | +3,53% |
+>   | o começo só empilha; os deixados saem do topo ao fazer velho, ou na coleta | +2,05% |
+>   | ... sem a pilha | +1,00% |
+>   | ... sem a pilha e sem os sítios, ou com o começo e a coleta de `main` | +1,06% a +1,11% |
+>   | `main` só com 56 bytes a mais por frame de laço | +0,44% |
+>
+>   A pilha custa ~1%; o tamanho maior do frame e das gerações (+40 bytes por laço), ~0,3%; ~0,7% não foi
+>   atribuído (o cachegrind não nomeia as funções de Quark). Os benchmarks não rodam sob o Valgrind fora `mandelbrot`
+>   (param no começo, causa não achada).
+> - **Falta para decidir:** achar os ~0,7% e baixar a pilha; ou aceitar ~2% no build do compilador por `records`
+>   1,46× → ~1,2× o C.
 
 ### B8. O grafo sem JSON por dentro
 

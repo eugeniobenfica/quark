@@ -17,9 +17,23 @@ inteira passando.
    - um registro de pacotes público (o repositório `index.toml`);
    - um playground no navegador (o compilador em wasm32);
    - instaladores por sistema.
-2. [ ] **Desempenho, de novo medido nos três sistemas,** e o próximo alvo escolhido pelo que estiver mais longe do C.
-   No Windows, em 21/11/2026 (`bash tools/bench.sh`): records 1,44×, mandelbrot 1,06×, counting 1,04×, words 1,00×;
-   mais rápidos que o C: sorting 0,77×, strings 0,64×, pipeline 0,42×, trees 0,19×.
+2. [ ] **Desempenho: o próximo alvo**, escolhido pelo que está mais longe do C nos três sistemas. Medido em 22/11/2026
+   (`bash tools/bench.sh 5` no Windows; o workflow `bench.yml`, à mão, nas máquinas da CI: tempo de Quark / tempo do C):
+
+   | | Windows | Linux x86-64 | Linux ARM64 | macOS Intel | macOS Apple |
+   |---|---|---|---|---|---|
+   | records | 1,46 | 1,58 | 1,69 | 1,80 | 1,34 |
+   | counting | 1,04 | 1,68 | 1,40 | 1,53 | 1,86 |
+   | sorting | 0,74 | 1,66 | 1,12 | 0,61 | 0,96 |
+   | strings | 0,61 | 1,40 | 1,17 | 1,10 | 0,93 |
+   | words | 1,02 | 1,48 | 1,17 | 0,75 | 0,78 |
+   | pipeline | 0,42 | 0,39 | 1,31 | 0,86 | 1,45 |
+   | mandelbrot | 1,03 | 1,08 | 1,12 | 1,03 | 1,02 |
+   | trees | 0,19 | 0,33 | 0,48 | 0,18 | 0,31 |
+
+   **records** (registros num array) passa de 1,3× em todos os sistemas, e **counting** (um mapa de contagem) em
+   todos fora do Windows; sorting, strings e words ficam acima de 1,4× no Linux x86-64. (Máquinas compartilhadas: a
+   razão vale mais que o tempo.)
 3. [ ] **1.0:** o STABILITY.md revisto uma última vez, o changelog, o anúncio.
 
 ## Sem data

@@ -399,6 +399,25 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 > - **Medido e desfeito:** calcular `i × 40` uma vez por elemento (em vez de um `imul` por campo) ficou mais lento, pelo
 >   registro a mais; esperar mais nas coletas menores que guardam 2/3 não mudou nada.
 > - `json` também ganhou (489 → 460 ms); os outros ficaram iguais, dentro do ruído.
+>
+> **Rodada de 22/11/2026: medida nos três sistemas, e o tenure tentado de novo e desfeito.** Fora do Windows a
+> distância é maior (Linux x86-64 1,58×, ARM64 1,69×, macOS Intel 1,80×, Apple 1,34×). Medido por fase contra o C fase
+> a fase (Windows): montar 24 ms (C 21), reescrever 61 ms (C 43). As 39 passadas que só fazem `args[0] += 1` empatam
+> com o C (~1 ms cada); a distância está nas coletas, ~27 ms das 85, instrumentadas uma a uma: ~11 ms na montagem (os
+> dados crescem, tudo é copiado uma vez) e ~16 ms na passada que aloca (os cartões do `code` varridos e os `args`
+> novos copiados, uma vez pelo laço de dentro e outra pelo de fora, que começa sem medida).
+> - **Tenure com o limiar de 2/3 e uma medida herdada** (um laço novo começa com a medida da última coleta que copiou
+>   na arena, com um tenure só antes de medir a sua; no máximo três seguidos): `records` 85 → 65 ms no Windows, e nos
+>   tempos absolutos da CI 145 → 114 ms (Linux x86-64), 150 → 103 (ARM64), 249 → 209 (macOS Intel), 193 → 132
+>   (Apple). O teste dos laços aninhados não fez nenhum tenure.
+> - **Desfeito: `json` ficou 7–26% mais lento no Linux.** Contado: a medida herdada de outro laço levou um turno de
+>   62 MB, quase todo lixo (a coleta seguinte guardou 0%), a ficar no lugar; e um começo que guardou 69% promoveu
+>   ~12 MB que depois se mostraram 11% vivos. Com as regras seguras (80%, e só turnos de até o dobro do que foi
+>   medido), `json` não faz tenure, mas `records` também não: o laço de fora vê 2,07× o que o de dentro mediu. Um
+>   limiar entre os dois seria ajustado a um benchmark.
+> - **A conclusão de 20/11 se confirma:** o que falta é saber, ao alocar, o que vai sobreviver. É a pré-promoção por
+>   lugar: o que um laço guarda num recipiente de fora alocado já na área do laço ativo mais de fora, com cada saída
+>   de laço marcada no lowering (`break`, `return`, `?`, pânico).
 
 ### B8. O grafo sem JSON por dentro
 

@@ -34,6 +34,9 @@ inteira passando.
    **records** (registros num array) passa de 1,3× em todos os sistemas, e **counting** (um mapa de contagem) em
    todos fora do Windows; sorting, strings e words ficam acima de 1,4× no Linux x86-64. (Máquinas compartilhadas: a
    razão vale mais que o tempo.)
+   - **records:** a distância é toda das coletas dos laços (a primeira cópia do que sobrevive). O tenure na coleta
+     foi tentado de novo em 22/11 e desfeito (`json` mais lento no Linux, PLANO B7). O próximo passo é a
+     pré-promoção por lugar, com cada saída de laço marcada no lowering.
 3. [ ] **1.0:** o STABILITY.md revisto uma última vez, o changelog, o anúncio.
 
 ## Sem data

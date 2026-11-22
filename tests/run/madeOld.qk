@@ -1,0 +1,87 @@
+// Arrays put into containers from before the loops running (records' fields, arrays of numbers) are made old for
+// those loops, so their collections do not copy them. The loops are left by their end, a break, a return, an inlined
+// function's return; values overwritten again and again are garbage that a full collection takes back.
+type Item { id: Int, vals: [Int], tags: [Int] }
+type Batch { xs: [Item] }
+
+fn items(n: Int) -> [Item] {
+    var xs: [Item] = []
+    for i in 0..n {
+        xs.push(Item(i, [i], [i, i]))
+    }
+    xs
+}
+
+// a return from inside a loop that makes memory
+fn Batch.fill(var self, round: Int, stop: Int) -> Int {
+    for k in 0..len(self.xs) {
+        if k == stop {
+            return k
+        }
+        let x = self.xs[k]
+        self.xs[k] = Item(x.id, x.vals + [round], [round, k])
+    }
+    -1
+}
+
+// small: put in line where it is called, its loop left by its return
+fn grownTo(n: Int) -> [Int] {
+    var t = [0]
+    for i in 0..n * 2 {
+        t = t + [i]
+        if len(t) > n {
+            return t
+        }
+    }
+    t
+}
+
+fn ok(xs: [Item], rounds: Int) -> Bool {
+    var good = true
+    for (i, x) in xs.enumerate() {
+        good = good and x.id == i and x.vals[0] == i and len(x.vals) >= 1 and len(x.vals) <= rounds + 1
+        good = good and (len(x.vals) == 1 or x.tags[1] == i)
+    }
+    good
+}
+
+fn main() {
+    var all: [Batch] = []
+    for s in 0..20 {
+        all.push(Batch(items(3000 + s)))
+    }
+    // rounds of writes into the old arrays, with breaks and returns out of the loops that make memory
+    var stops = 0
+    for round in 1..8 {
+        for i in 0..len(all) {
+            if i == 15 and round == 4 {
+                break
+            }
+            stops += if all[i].fill(round, if i % 3 == 0 { 1000 } else { -1 }) >= 0 {
+                1
+            } else {
+                0
+            }
+            let g = grownTo(i + round)
+            stops += len(g) - len(g)
+        }
+    }
+    var good = true
+    for b in all {
+        good = good and ok(b.xs, 7)
+    }
+    print(good, stops)
+    // the same few places written a million times: the values that go are taken back
+    var keep: [Item] = []
+    for i in 0..100 {
+        keep.push(Item(i, [], []))
+    }
+    for t in 0..1000000 {
+        keep[t % 100] = Item(t, [t, t + 1, t + 2], [t])
+    }
+    var sum = 0
+    for x in keep {
+        sum += x.vals[2] - x.id + x.tags[0]
+    }
+    print(sum)
+}

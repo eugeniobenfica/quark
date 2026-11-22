@@ -419,7 +419,8 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 >   lugar: o que um laço guarda num recipiente de fora alocado já na área do laço ativo mais de fora, com cada saída
 >   de laço marcada no lowering (`break`, `return`, `?`, pânico).
 >
-> **Pré-promoção por lugar, etapa 1 (22/11/2026): feita e medida; no branch local `b7-pretenure`, fora do `main`.**
+> **Pré-promoção por lugar, etapa 1 (22/11/2026): feita, medida e aceita no `main` por ~2% de instruções no build do
+> compilador.** O que segue é a história: as rodadas, o que foi medido e descartado; o desenho que ficou está na última.
 > - **O desenho:**
 >   - o runtime sabe os laços rodando: cada frame aponta o de fora (`aLoops`, `frameOuter`). O lowering desempilha
 >     no fim do laço (o `break` cai lá) e em cada `return` dentro dele, inclusive de função posta em linha;
@@ -471,8 +472,15 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 >   A pilha custa ~1%; o tamanho maior do frame e das gerações (+40 bytes por laço), ~0,3%; ~0,7% não foi
 >   atribuído (o cachegrind não nomeia as funções de Quark). Os benchmarks não rodam sob o Valgrind fora `mandelbrot`
 >   (param no começo, causa não achada).
-> - **Falta para decidir:** achar os ~0,7% e baixar a pilha; ou aceitar ~2% no build do compilador por `records`
->   1,46× → ~1,2× o C.
+> - **Aceito (22/11/2026):** ~2% no build do compilador por `records` 1,46× → ~1,2× o C. O desenho que ficou:
+>   - `rtLoopStart` põe o frame no topo da lista dos laços rodando (com o frame da sua função e sua profundidade
+>     nela, numa palavra); nada marca o fim de um laço no código;
+>   - `allocOld`/`arrayJoinOld` (um array novo de valores simples guardado em `xs[k] = ...`, `k` o nome do laço)
+>     tiram do topo os deixados (um frame vive só se é mais raso que tudo acima dele) e escolhem o laço mais de fora,
+>     entre os três de dentro, que não fez o recipiente; a coleta de um laço tira os de cima antes de soltar memória;
+>   - os bytes velhos contam na arena na hora, fora da janela dos laços entre o topo e o alvo.
+> - **Fica para depois:** os ~0,7% não atribuídos, a pilha mais barata, e a etapa 2 (a montagem: `build()` devolve o
+>   que vai para `fns`), que pede análise entre funções.
 
 ### B8. O grafo sem JSON por dentro
 

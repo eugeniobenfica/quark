@@ -34,10 +34,9 @@ inteira passando.
    **records** (registros num array) passa de 1,3× em todos os sistemas, e **counting** (um mapa de contagem) em
    todos fora do Windows; sorting, strings e words ficam acima de 1,4× no Linux x86-64. (Máquinas compartilhadas: a
    razão vale mais que o tempo.)
-   - **records:** a distância é toda das coletas dos laços (a primeira cópia do que sobrevive). A pré-promoção por
-     lugar (etapa 1, branch local `b7-pretenure`) leva `records` de 84 para 66 ms, mas deixa o build do compilador
-     5–6% mais lento. Falta o alcance sem passear o programa e um fim de laço mais barato (PLANO B7); depois, a
-     etapa 2 (a montagem, entre funções).
+   - **records:** a distância é das coletas dos laços (a primeira cópia do que sobrevive). A pré-promoção por lugar,
+     etapa 1, levou a passada que aloca a empatar com o C (`records` 84 → ~68 ms no Windows), por ~2% de instruções no
+     build do compilador. Falta a etapa 2: a montagem, entre funções (PLANO B7).
 3. [ ] **1.0:** o STABILITY.md revisto uma última vez, o changelog, o anúncio.
 
 ## Sem data

@@ -141,7 +141,7 @@ pub const runtimeNames = [
     "readSocket", "writeSocket", "closeSocket", "go", "runTasks", "channel", "send", "receive", "closeChannel",
     "localOffset", "cancel", "interp", "scopeOpen", "scopeStart", "scopeClose", "startProcess", "processWrite",
     "processCloseInput", "processRead", "processWait", "processKill", "tlsConnect", "readTls", "writeTls", "closeTls",
-    "coverLine", "imageSave", "imageLoad",
+    "coverLine", "imageSave", "imageLoad", "allocOld", "arrayJoinOld",
 ]
 
 // the runtime's functions that make nothing in the arena: a loop's turn that calls only these (and pushes onto vars

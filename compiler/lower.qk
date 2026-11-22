@@ -128,6 +128,8 @@ const rtDebugEnter = 80
 const rtDebugLeave = 81
 const rtDebugLine = 82
 const rtCoverLine = 137
+const rtAllocOld = 140
+const rtArrayJoinOld = 141
 const rtDebugValue = 83
 const rtCodePointCount = 84
 const rtJoinTask = 85
@@ -226,6 +228,9 @@ type LoopMemory {
     deadline: Int = 0 // what it will have made when the next collection is due
     bodyStart: Int = 0
     started: Bool = false
+    tracked: Bool = false // among the runtime's loops running (runtime/loops.qk aLoops)
+    depth: Int = 0 // the loops around it being lowered in the same function (inlined ones counting)
+    counter: Int = -1 // a for loop's name (its binding)
     roots: [Int] = []
     inside: [Int] = []
     changed: [Int] = []
@@ -374,6 +379,12 @@ pub type Lower {
     lates: [Late] = []
     latePatches: [LatePatch] = []
     memories: [LoopMemory] = []
+    loopStack: [Int] = [] // the loops being lowered, outermost first (their memories), and each one's inlining depth
+    loopDepths: [Int] = []
+    // a value put into a container from before the loop (oldBegin): its allocations that are its own (these
+    // expressions) made old for the loops that did not make the container (runtime/loops.qk allocOld), at this address
+    oldInto: Int = -1
+    oldSites: Set<Int> = []
     slotCache: [Int] = []
     kindCache: [Bytes] = []
     caseStarts: [Int: [Int]] = [:] // by enum declaration
@@ -5684,7 +5695,12 @@ fn Lower.lowerBinary(var self, e: Int) -> [Int] {
     }
     if ka == Kind.Array and op == .Plus {
         let eb = self.iconst(self.elemBytes(ta))
-        let p = self.rtcall(rtArrayJoin, [a[0], a[1], b[0], b[1], eb], 'I', x.line)
+        let p = if self.oldInto >= 0 and self.oldSites.contains(e) {
+            let depth = self.iconst(len(self.loopStack))
+            self.rtcall(rtArrayJoinOld, [a[0], a[1], b[0], b[1], eb, self.oldInto, depth], 'I', x.line)
+        } else {
+            self.rtcall(rtArrayJoin, [a[0], a[1], b[0], b[1], eb], 'I', x.line)
+        }
         let n = self.op2(.Add, a[1], b[1], 'I')
         return [p, n]
     }
@@ -6306,6 +6322,10 @@ fn Lower.lowerExprInner(var self, e: Int) -> [Int] {
             // one that never leaves the function: in its area (Ownership.decideEscapes)
             let ptr = if self.own.local.contains(e) and self.areaAt >= 0 {
                 self.areaTake(len(items) * bytes / 8)
+            } else if self.oldInto >= 0 and self.oldSites.contains(e) {
+                let b = self.iconst(bytes)
+                let depth = self.iconst(len(self.loopStack))
+                self.rtcall(rtAllocOld, [n, b, self.oldInto, depth], 'I', line)
             } else {
                 self.alloc(n, bytes, line)
             }
@@ -6651,7 +6671,7 @@ fn Lower.typeDesc(self, t: Int) -> Bytes {
     d.out
 }
 
-fn Lower.loopBegin(var self, body: Int) -> Int {
+fn Lower.loopBegin(var self, body: Int, counter: Int = -1) -> Int {
     let scan = self.own.scanLoop(body)
     var kept: [Int] = []
     var slots = 0
@@ -6671,8 +6691,12 @@ fn Lower.loopBegin(var self, body: Int) -> Int {
         self.emit(.Nop, -1, -1, -1)
     }
     let frame = self.newReg('I')
+    let tracked = not self.opts.linked and not self.opts.runtime
     self.memories.push(
         LoopMemory(
+            tracked: tracked,
+            depth: len(self.loopStack),
+            counter: counter,
             frame: frame,
             slotsReg: slotsReg,
             nopAt: nopAt,
@@ -6686,6 +6710,96 @@ fn Lower.loopBegin(var self, body: Int) -> Int {
         ),
     )
     len(self.memories) - 1
+}
+
+// a loop being lowered (its memory), and left (the runtime finds it left at the next loop's start: its frame's address
+// and its depth, the loops being lowered around it in the same function, inlined ones counting)
+fn Lower.loopEnter(var self, mem: Int) {
+    self.loopStack.push(mem)
+    self.loopDepths.push(len(self.inlining))
+}
+
+fn Lower.loopLeave(var self) {
+    let _ = self.loopStack.pop()
+    let _ = self.loopDepths.pop()
+}
+
+// A value put into the container c (an array, its elements: a Name or Field path) inside a loop, the container from
+// before it, where it is likely to stay as long as the container: written at the loop's own name (each element once
+// a pass, as xs[k] = ... in for k in 0..len(xs); not xs[t % 100], which a later turn overwrites). (Not what is pushed:
+// most containers pushed onto are the turn's own, and each push would ask the runtime.)
+// The value's own arrays of plain values (itself, or a record's fields: new literals and joins) are made old for the
+// loops running that did not make the container, as the container's address tells the runtime. Ended by oldEnd.
+fn Lower.oldBegin(var self, c: Int, value: Int, index: Int) {
+    if len(self.loopStack) == 0 or self.opts.linked or self.opts.runtime {
+        return
+    }
+    let k = len(self.loopStack) - 1
+    if self.loopDepths[k] != len(self.inlining) {
+        return
+    }
+    let ix = self.p.ast.exprs[self.stripImplicit(index)]
+    let counter = self.memories[self.loopStack[k]].counter
+    if not ix.node is Name(_) or counter < 0 or ix.binding != counter {
+        return
+    }
+    var path = c
+    while self.p.ast.exprs[path].node is Field(t, _) {
+        path = t
+    }
+    let root = self.p.ast.exprs[path].binding
+    if not self.p.ast.exprs[path].node is Name(_) or root < 0 or not self.bound[root] {
+        return
+    }
+    if self.memories[self.loopStack[k]].inside.contains(root) {
+        return
+    }
+    let sites = self.oldSitesOf(value)
+    if len(sites) == 0 {
+        return
+    }
+    let place = self.placeOf(c)
+    let held = self.readPlace(place, self.ty(c))
+    self.oldInto = held[0]
+    self.oldSites = sites
+}
+
+fn Lower.oldEnd(var self) {
+    self.oldInto = -1
+    self.oldSites = []
+}
+
+// a value's own arrays of plain values: itself, or a record's fields
+fn Lower.oldSitesOf(var self, value: Int) -> Set<Int> {
+    var sites: Set<Int> = []
+    let v = self.stripImplicit(value)
+    if self.oldSite(v) {
+        sites.add(v)
+    } else if self.p.ast.exprs[v].node is Call(_, _, _, _, _, _) and self.p.ast.exprs[v].decl >= 0 {
+        let d = self.boundExtern(self.p.ast.exprs[v].decl)
+        if self.dl(d).kind == DeclKind.Type {
+            for a in self.p.ast.exprs[v].ordered {
+                let s = self.stripImplicit(a)
+                if self.oldSite(s) {
+                    sites.add(s)
+                }
+            }
+        }
+    }
+    sites
+}
+
+// an array made here of plain values (a literal, a join): its memory its own
+fn Lower.oldSite(self, e: Int) -> Bool {
+    let x = self.p.ast.exprs[e]
+    if x.ty < 0 or self.tk(x.ty) != Kind.Array or self.own.holdsMemory(self.elemOf(x.ty)) {
+        return false
+    }
+    match x.node {
+        ArrayLit(items) => len(items) > 0 and not self.own.local.contains(e)
+        Binary(op, _, _) => op == .Plus
+        _ => false
+    }
 }
 
 // the instructions a loop's start keeps room for after rtLoopStart: the turn's check's values (loopTurnEnd)
@@ -6723,10 +6837,12 @@ fn Lower.loopTurnEnd(var self, mi: Int, line: Int) {
         ins.imm = rtLoopStart
         ins.line = line
         self.cur.code[m.nopAt] = ins
-        self.cur.setOperands(m.nopAt, [m.slotsReg], [m.frame])
+        let track = self.iconst(if m.tracked { m.depth } else { -1 })
+        self.cur.setOperands(m.nopAt, [m.slotsReg, track], [m.frame])
         self.touch(m.slotsReg)
+        self.touch(track)
         self.touch(m.frame)
-        self.maxOut(1)
+        self.maxOut(2)
         // before the loop, once: the arena (the frame's generations, word 5, hold it at word 4), and the deadline
         let gen = self.newReg('I')
         let since = self.newReg('I')
@@ -6749,7 +6865,7 @@ fn Lower.loopTurnEnd(var self, mi: Int, line: Int) {
     self.jz(check, skip)
     var desc = Desc() // the vars' types, one description (a reference counts from its start)
     let zero = self.iconst(0)
-    var at = 48
+    var at = 64
     for b in m.roots {
         // the vars into the frame (one in memory: its address, P)
         let v = if self.atAddress[b] { [self.addrReg[b]] } else { self.regsOf(b) }
@@ -6767,7 +6883,7 @@ fn Lower.loopTurnEnd(var self, mi: Int, line: Int) {
     let since = self.loadMem('I', m.frame, -1, 1, 16, mem64)
     let limit = self.loadMem('I', m.frame, -1, 1, 24, mem64)
     self.emit(.Add, m.deadline, since, limit)
-    at = 48
+    at = 64
     for b in m.roots {
         // and back, where the copies are (one in memory: changed there)
         if self.atAddress[b] {
@@ -7192,11 +7308,15 @@ fn Lower.lowerAssign(var self, s: Int) {
         return
     }
     if opNum == 0 or st.opValue >= 0 {
+        if opNum == 0 and tx.node is Index(arr, key) and self.ek(arr) == Kind.Array {
+            self.oldBegin(arr, value, key)
+        }
         let v = if opNum == 0 {
             self.lowerInto(value, root)
         } else {
             self.lowerStored(st.opValue)
         }
+        self.oldEnd()
         let fresh = self.copyVal(v)
         let p = self.changePlace(target)
         self.writePlace(p, fresh)
@@ -7441,7 +7561,9 @@ fn Lower.lowerStmtInner(var self, s: Int) {
                     }
                 }
                 let mem = self.loopBegin(body)
+                self.loopEnter(mem)
                 self.forEachEntry(m, it, .ForEntry(s, mem), line)
+                self.loopLeave()
             } else {
                 var base = self.stripImplicit(iter)
                 while self.p.ast.exprs[base].node is Call(_, _, _, _, _, _)
@@ -7460,12 +7582,15 @@ fn Lower.lowerStmtInner(var self, s: Int) {
                 }
                 self.preLowerSource(iter)
                 self.snapshot = -1
-                let mem = self.loopBegin(body)
+                let mem = self.loopBegin(body, self.p.ast.stmts[s].binding)
+                self.loopEnter(mem)
                 self.forEach(iter, .ForBody(s, mem))
+                self.loopLeave()
             }
         }
         While(cond, body) => {
             let mem = self.loopBegin(body)
+            self.loopEnter(mem)
             let top = self.label()
             let test = self.label()
             let done = self.label()
@@ -7505,6 +7630,7 @@ fn Lower.lowerStmtInner(var self, s: Int) {
             }
             self.depth -= 1
             self.place(done)
+            self.loopLeave()
         }
         Defer(_) => {}
         Return(value) => {
@@ -7610,6 +7736,8 @@ fn Lower.lowerFn(var self, d: Int, index: Int) {
         self.rtv(rtDebugLeave, [], 0)
     }
     self.emitReturn(if self.slots(ret) > 0 and len(v) > 0 { v } else { [] })
+    self.loopStack = []
+    self.loopDepths = []
     self.areaAt = -1
     self.selfHome = -1
 }

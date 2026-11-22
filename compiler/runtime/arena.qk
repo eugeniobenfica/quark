@@ -44,7 +44,11 @@ pub const aInPlace = 28 // the large blocks that grow where they are (reserved),
 pub const aRegion = 29 // an image's arena (runtime/files.qk): where its next memory goes in its reserved range (0: none)
 pub const aRegionEnd = 30
 pub const aRegionMade = 31 // the range's pages taken so far, up to here
-pub const arenaWords = 32
+pub const aLoops = 32 // the innermost loop running (its frame: loops.qk), each one's outer at its frameOuter; 0 none
+pub const aOldFor = 33 // the last container allocOld placed for (loops.qk oldFrame), with the loops then, and where
+pub const aOldLoops = 34
+pub const aOldFrame = 35
+pub const arenaWords = 36
 
 // a block's words, then its bytes (16-aligned)
 pub const bNext = 0
@@ -431,6 +435,8 @@ pub fn arenaReset() {
     setWord(a, aMarked, 0)
     setWord(a, aMarkBlock, 0)
     setWord(a, aLastText, 0)
+    setWord(a, aLoops, 0)
+    setWord(a, aOldFor, 0)
 }
 
 pub extern effect fn qkArenaReset() as "qkArenaReset" = arenaReset()

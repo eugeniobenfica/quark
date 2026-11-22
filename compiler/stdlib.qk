@@ -4049,7 +4049,7 @@ pub const zoneRules = [
 
 // what this compiler is: the checksum (CRC and length, by cksum) of its sources, the runtime and the standard library:
 // what it makes of the runtime depends on them alone (memory.qk keeps the runtime it compiled under it)
-pub const compilerSources = "2899300939-2513851"
+pub const compilerSources = "1024500411-2529675"
 
 // the runtime's files
 pub const runtimeFiles: [Text] = ["arena", "base", "counted", "debug", "files", "host", "io", "linux", "loader", "loops", "macos", "map", "numbers", "panic", "print", "start", "tasks", "text", "threads", "trace", "wasi", "wasimath", "windows"]
@@ -4104,7 +4104,11 @@ pub const aInPlace = 28 // the large blocks that grow where they are (reserved),
 pub const aRegion = 29 // an image's arena (runtime/files.qk): where its next memory goes in its reserved range (0: none)
 pub const aRegionEnd = 30
 pub const aRegionMade = 31 // the range's pages taken so far, up to here
-pub const arenaWords = 32
+pub const aLoops = 32 // the innermost loop running (its frame: loops.qk), each one's outer at its frameOuter; 0 none
+pub const aOldFor = 33 // the last container allocOld placed for (loops.qk oldFrame), with the loops then, and where
+pub const aOldLoops = 34
+pub const aOldFrame = 35
+pub const arenaWords = 36
 
 // a block's words, then its bytes (16-aligned)
 pub const bNext = 0
@@ -4491,6 +4495,8 @@ pub fn arenaReset() {
     setWord(a, aMarked, 0)
     setWord(a, aMarkBlock, 0)
     setWord(a, aLastText, 0)
+    setWord(a, aLoops, 0)
+    setWord(a, aOldFor, 0)
 }
 
 pub extern effect fn qkArenaReset() as "qkArenaReset" = arenaReset()
@@ -9416,13 +9422,15 @@ pub extern effect fn qkRunEntry(
         return r"""
 // Loops: a mark at the start, and what the turns made that the vars still hold, copied out. A loop's frame: [0] the
 // mark's block, [1] its used bytes, [2] what had been allocated at the mark, [3] how much may be made before the next
-// collection, [4] the mark's time, [5] its generations (below), [6...] the vars' slots. Spawn copies what a task
-// captured the same way.
+// collection, [4] the mark's time, [5] its generations (below), [6] the loop it runs in (the arena's loops running,
+// innermost first: aLoops), [7] its function's frame and its depth there, [8...] the vars' slots. Spawn copies what a
+// task captured the same way.
 //
 // Generations: what a collection kept is old to the next one, which copies only what the turns made since (a minor
 // collection), and what old values were changed to hold. When what minor collections kept since the last full one
 // is as much as that one kept (16 MB at least), the next is full: everything since the mark, so garbage among the old
 // values goes too, and a loop that runs for ever stays at a few times what its vars hold.
+use std.machine as machine
 use base
 use arena
 use text
@@ -9434,7 +9442,9 @@ const frameAllocated = 2
 const frameLimit = 3
 const frameTime = 4
 const frameGen = 5
-const frameRoots = 6
+const frameOuter = 6
+const frameAt = 7 // its function's frame and its depth there: frame * 256 + depth (0: not among the loops running)
+const frameRoots = 8
 
 // a loop's first collection after 4 MB made, then after up to 16 MB (a loop that runs briefly never collects: an
 // outer one takes back what it left); with a memory limit (--memory), at most a sixteenth of it, from 64 KB
@@ -9456,7 +9466,12 @@ const gBlock = 3
 const gArena = 4 // the arena the loop allocates in: its turns' check reads what it made (compiler/lower.qk)
 const gWait = 5 // how many times what the last full one kept minor ones keep before the next is full (fullWait)
 const gMade = 6 // what the turns made that minor ones looked through since the last full one
-const genWords = 7
+const gOld = 7 // the block what is made old for this loop goes into (allocOld), or 0
+const gOldMade = 8 // the bytes of such blocks made since the last collection; -1: nothing more is made old for it (a
+
+// full collection found most of what it looked at gone)
+const gOldWindow = 9 // what was made old for it or the loops around it since its last collection (not its turns')
+const genWords = 10
 
 // A full collection copies everything since the mark again: worth it when there is garbage among what minor ones
 // kept. One that kept nearly all it looked at (data that grows) makes the next wait twice as long, up to fullWaitMost;
@@ -9465,8 +9480,11 @@ const genWords = 7
 // the least too: copying it all again would give nothing back.
 const fullWaitMost = 8
 
-pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
+// depth: the loops around it in its function (compiler/lower.qk LoopMemory.depth), -1 when it is not among the arena's
+// loops running
+pub extern effect fn rtLoopStart(rootSlots: Int64, depth: Int64) -> Int64 as "qk_loopStart" {
     let a = arena()
+    let fp = word(machine.frame().address, 0) // its function's frame (0: none known, as in WebAssembly)
     if word(a, aCurrent) == 0 {
         let _ = alloc(1, 16) // a block to mark (the first allocations may all have been large)
     }
@@ -9480,11 +9498,215 @@ pub extern effect fn rtLoopStart(rootSlots: Int64) -> Int64 as "qk_loopStart" {
     setWord(f, frameLimit, limited(a, loopFirstLimit))
     setWord(a, aClock, word(a, aClock) + 1)
     setWord(f, frameTime, word(a, aClock))
+    // what is made from now on is younger than the mark's time: that time is the old blocks' (allocOld)
+    setWord(a, aClock, word(a, aClock) + 1)
     setWord(gen, gLast, word(a, aClock))
     setWord(gen, gArena, a)
     setWord(gen, gWait, 1)
     setMark(a, cur, word(cur, bUsed))
+    if depth >= 0 and fp != 0 {
+        setWord(f, frameOuter, word(a, aLoops))
+        setWord(f, frameAt, fp * 256 + min(depth, 255))
+        setWord(a, aLoops, f)
+    }
     f
+}
+
+// The loops running, as code in the function with frame fp, inside depth loops of its own there, finds them (the
+// innermost oldLoops of them): those left taken off. Nothing marks a loop's end in the code, and a loop's start only puts it on top: one left is taken
+// off here, when a value is made old, or by the collection of a loop under it, which takes off all those above it
+// before it lets any memory go (so a frame on the list is never memory let go of). Each is taken off once.
+fn loopsHere(a: Int, fp: Int, depth: Int) {
+    // running: each one shallower than all those above it (a function further out, or a loop further out in the same
+    // function); one that is not was left before something above it started
+    var at = a + 8 * aLoops
+    var (atFp, atDepth) = (fp, min(depth, 255))
+    var running = 0
+    while word(at, 0) != 0 and running < oldLoops {
+        let g = word(at, 0)
+        let (gFp, gDepth) = (shr(word(g, frameAt), 8), word(g, frameAt) & 255)
+        if gFp > atFp or gFp == atFp and gDepth < atDepth {
+            atFp = gFp
+            atDepth = gDepth
+            running += 1
+            at = g + 8 * frameOuter
+        } else {
+            setWord(at, 0, word(g, frameOuter))
+        }
+    }
+}
+
+// (A loop is left, by its end, a break or a return, in the code: the arena's loops running from its outer one on.
+// compiler/lower.qk patchLoopEnds.)
+// ---- made old: what a loop keeps in a container from before it ----
+// A value put into a container that loops running now did not make (an array of theirs, written in a turn) would be
+// copied by each of their collections. Made old instead, for the outermost of them (oldFrame): in a block with that
+// loop's mark's time, its minor collections take it as made before them (no copy, no look), a full one as its own
+// (garbage among it goes then), and the loops around it as theirs. Not with a memory limit, nor past what a loop may
+// make between two collections (then as usual): what such blocks hold waits for the loop's next full collection.
+const oldLoops = 3
+const oldLook = 64
+
+// the outermost loop running that did not make the container at p (and none inside it did), or 0
+fn oldFrame(a: Int, p: Int) -> Int {
+    let top = word(a, aLoops)
+    if top == 0 or word(a, aLimit) != 0 or p == 0 {
+        return 0
+    }
+    if word(a, aOldFor) == p and word(a, aOldLoops) == top {
+        return word(a, aOldFrame)
+    }
+    // where p is, once: a survivor's or a large block's time (younger than the outermost loop looked at), or -1. At
+    // most oldLoops loops and oldLook blocks are looked at: one not found is taken as older (at worst, a value made
+    // old waits for a full collection)
+    var outer = top
+    var depth = 1
+    while word(outer, frameOuter) != 0 and depth < oldLoops {
+        outer = word(outer, frameOuter)
+        depth += 1
+    }
+    let since = word(outer, frameTime)
+    var t = -1
+    var looked = 0
+    var lb = word(a, aLarge)
+    while t < 0 and lb != 0 and word(lb, bigTime) >= since and looked < oldLook {
+        if p >= word(lb, bigData) and p < word(lb, bigData) + word(lb, bigSize) {
+            t = word(lb, bigTime)
+        }
+        lb = word(lb, bigNext)
+        looked += 1
+    }
+    looked = 0
+    var x = word(a, aExtras)
+    while t < 0 and x != 0 and word(x, xTime) >= since and looked < oldLook {
+        if p >= word(x, xData) and p < word(x, xData) + word(x, xSize) {
+            t = word(x, xTime)
+        }
+        x = word(x, xNext)
+        looked += 1
+    }
+    // the loops that did not make it, from the innermost out
+    var found = 0
+    var g = top
+    depth = 0
+    while g != 0 and depth < oldLoops and t < word(g, frameTime) and not inTurns(a, g, p) {
+        found = g
+        g = word(g, frameOuter)
+        depth += 1
+    }
+    if found != 0 and word(word(found, frameGen), gOldMade) < 0 {
+        found = 0
+    }
+    setWord(a, aOldFor, p)
+    setWord(a, aOldLoops, top)
+    setWord(a, aOldFrame, found)
+    found
+}
+
+// is p in the arena's blocks past loop f's mark (made by its turns)
+fn inTurns(a: Int, f: Int, p: Int) -> Bool {
+    var b = word(f, frameBlock)
+    var from = word(b, bData) + word(f, frameUsed)
+    while b != 0 {
+        if p >= from and p < word(b, bData) + word(b, bSize) {
+            return true
+        }
+        if b == word(a, aCurrent) {
+            return false
+        }
+        b = word(b, bNext)
+        if b != 0 {
+            from = word(b, bData)
+        }
+    }
+    false
+}
+
+// bytes (16-aligned, below largeFrom) made old for loop f, zeroed; 0 when it may not make more
+fn oldBytes(a: Int, f: Int, bytes: Int) -> Int {
+    let gen = word(f, frameGen)
+    var x = word(gen, gOld)
+    if x == 0 or word(x, xUsed) + bytes > word(x, xSize) {
+        if word(gen, gOldMade) >= limited(a, nurseryMost) {
+            return 0
+        }
+        // (from 256 bytes, doubling: a loop that makes a little old takes little)
+        var size = if x != 0 { min(word(x, xSize) * 2, 1048576) } else { 256 }
+        if bytes > size {
+            size = bytes
+        }
+        x = calloc(1, size + 64)
+        if x == 0 {
+            return 0
+        }
+        setWord(x, xSize, size)
+        setWord(x, xTime, word(f, frameTime))
+        setWord(x, xData, align16(x + 40))
+        // into the survivors, newest first: after those younger than the loop
+        var at = a + 8 * aExtras
+        while word(at, 0) != 0 and word(word(at, 0), xTime) > word(f, frameTime) {
+            at = word(at, 0) + 8 * xNext
+        }
+        setWord(x, xNext, word(at, 0))
+        setWord(at, 0, x)
+        setWord(gen, gOld, x)
+        setWord(gen, gOldMade, word(gen, gOldMade) + size)
+        // the arena's from now on; not the young memory of f's turns, nor of the loops inside it (their collections
+        // would find nothing of it to copy)
+        setWord(a, aAllocated, word(a, aAllocated) + size)
+        var g = word(a, aLoops)
+        while g != 0 {
+            let gg = word(g, frameGen)
+            setWord(gg, gOldWindow, word(gg, gOldWindow) + size)
+            if g == f {
+                break
+            }
+            g = word(g, frameOuter)
+        }
+    }
+    let p = word(x, xData) + word(x, xUsed)
+    setWord(x, xUsed, word(x, xUsed) + bytes)
+    p
+}
+
+// count elements of bytesEach bytes, to be put into the container at c (an array's elements, or memory it points to):
+// made old for the loops running that did not make c, else as alloc makes them
+pub fn allocOld(count: Int, bytesEach: Int, c: Int, fp: Int, depth: Int) -> Int {
+    let a = arena()
+    if fp != 0 {
+        loopsHere(a, fp, depth)
+    }
+    if count > 0 and count < 16777216 and bytesEach > 0 and bytesEach < 65536 and count * bytesEach < largeFrom {
+        let f = oldFrame(a, c)
+        if f != 0 {
+            let bytes = align16(count * bytesEach)
+            let p = oldBytes(a, f, bytes)
+            if p != 0 {
+                return p
+            }
+        }
+    }
+    alloc(count, bytesEach)
+}
+
+// (depth: the loops around the code that calls it in its function, as rtLoopStart's)
+pub extern effect fn rtAllocOld(count: Int64, bytesEach: Int64, c: Int64, depth: Int64) -> Int64 as "qk_allocOld" =
+    allocOld(count, bytesEach, c, word(machine.frame().address, 0), depth)
+
+// x + y (arrays) put into the container at c: made old as allocOld makes it
+pub extern effect fn rtArrayJoinOld(
+    x: Int64,
+    xn: Int64,
+    y: Int64,
+    yn: Int64,
+    bytesEach: Int64,
+    c: Int64,
+    depth: Int64,
+) -> Int64 as "qk_arrayJoinOld" {
+    let p = allocOld(xn + yn, bytesEach, c, word(machine.frame().address, 0), depth)
+    copyBytes(p, x, xn * bytesEach)
+    copyBytes(p + xn * bytesEach, y, yn * bytesEach)
+    p
 }
 
 pub extern effect fn rtLoopCheck(f: Int64) -> Int64 as "qk_loopCheck" = if word(arena(), aAllocated) - word(
@@ -10336,9 +10558,31 @@ fn lookAgain(c: Int, r: Int, since: Int) {
 pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
     let a = arena()
     let gen = word(f, frameGen)
+    // the loops above it ended in its turns: taken off before any memory is let go of
+    if word(f, frameAt) != 0 {
+        var top = word(a, aLoops)
+        while top != 0 and top != f {
+            top = word(top, frameOuter)
+        }
+        if top == f {
+            setWord(a, aLoops, f)
+        }
+    }
+    // what was made old meanwhile: not the turns' young memory; its own, kept by minor ones (no look), looked through
+    // by the next full one
+    let window = word(gen, gOldWindow)
+    setWord(gen, gOldWindow, 0)
+    if word(gen, gOldMade) > 0 {
+        setWord(gen, gPromoted, word(gen, gPromoted) + word(gen, gOldMade))
+        setWord(gen, gOldMade, 0)
+    }
     let growing = word(gen, gPromoted) * 3 >= word(gen, gMade) * 2
     let least = limited(a, if growing { 4 * nurseryMost } else { nurseryMost })
     let full = word(gen, gPromoted) >= max(word(gen, gWait) * word(gen, gLive), least)
+    if not full and word(a, aAllocated) - word(f, frameAllocated) - window <= word(f, frameLimit) {
+        setWord(f, frameAllocated, word(a, aAllocated)) // the turns made little young memory: nothing to collect yet
+        return
+    }
     let looked = word(gen, gLive) + word(gen, gPromoted) // what a full one looks through: its last, and what came since
     // young: made at this time or later (a full collection: since the mark)
     let since = if full { word(f, frameTime) } else { word(gen, gLast) }
@@ -10410,6 +10654,11 @@ pub extern effect fn rtLoopCollect(f: Int64, desc: Int64) as "qk_loopCollect" {
         growingAdd(a, word(r, 0), word(r, 1))
     }
     if full {
+        setWord(gen, gOld, 0) // its old blocks were looked through and let go of, as everything since the mark
+        if word(c, cTotal) * 2 < looked {
+            setWord(gen, gOldMade, -1) // what was made old for it did not stay: it is made as usual from now on
+            setWord(a, aOldFor, 0)
+        }
         // kept nearly all it looked at: the next waits longer; found much garbage: sooner
         let wait = word(gen, gWait)
         if word(a, aLimit) != 0 {
@@ -12859,7 +13108,7 @@ extern effect fn osCFunction(symbol: Int64, lib: Int64, why: Int64) -> Int64 as 
 // ---- the debugger's hooks are debug.qk's (an executable has none: they do nothing there) ----
 // ---- each runtime function's address, by its number: its Quark function, which the
 // program calls the Quark way ----
-const runtimeCount = 140 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
+const runtimeCount = 142 // len(runtimeNames) in compiler/ir.qk: one more there, one more here
 
 fn runtimeTable() -> Int {
     let t = calloc(runtimeCount, 8)

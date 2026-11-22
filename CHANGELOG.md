@@ -8,6 +8,10 @@
   put one of them in line or read a fact of one that changed (the compiler's in 0.35 s). `QUARK_IMAGES=off` turns it
   off, `always` keeps every program's.
 - **Fixed:** a built program's bounds or division panic crashed instead of saying where it was.
+- **Arrays written into a container from before the loops running are made old for them:** `xs[k] = v` in
+  `for k in ...`, `v` a new array of plain values (or a record holding such), goes straight to memory the loops' minor
+  collections neither copy nor look at; a full collection of the outermost of them takes back what of it is
+  overwritten. `records` (an array of records rewritten in place) went from 84 to about 68 ms on Windows.
 - **A value received from a channel is not copied again:** `send` copies it once, into memory of its own, and
   `receive` makes that memory the receiver's whole. The same for `parallelMap`'s results: each thread's are the
   caller's memory as the thread kept them. The compiler's cold build is 7% faster for it (its checked program comes

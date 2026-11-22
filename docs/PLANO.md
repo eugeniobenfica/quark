@@ -418,6 +418,32 @@ Meta: `records` de 2,2× para menos de 1,5× o C.
 > - **A conclusão de 20/11 se confirma:** o que falta é saber, ao alocar, o que vai sobreviver. É a pré-promoção por
 >   lugar: o que um laço guarda num recipiente de fora alocado já na área do laço ativo mais de fora, com cada saída
 >   de laço marcada no lowering (`break`, `return`, `?`, pânico).
+>
+> **Pré-promoção por lugar, etapa 1 (22/11/2026): feita e medida; no branch local `b7-pretenure`, fora do `main`.**
+> - **O desenho:**
+>   - o runtime sabe os laços rodando: cada frame aponta o de fora (`aLoops`, `frameOuter`). O lowering desempilha
+>     no fim do laço (o `break` cai lá) e em cada `return` dentro dele, inclusive de função posta em linha;
+>   - um array novo de valores simples (literal, junção), guardado em `xs[k] = ...` com `k` o nome do próprio laço
+>     (cada elemento uma vez por passada), vai para `allocOld`/`arrayJoinOld` com o endereço do recipiente;
+>   - o runtime acha uma vez onde o recipiente está (bloco grande, sobrevivente ou bloco da arena) e escolhe o laço
+>     mais de fora que não o fez. O valor vai para um bloco com o tempo da marca desse laço: velho para as coletas
+>     menores dele e de dentro, jovem para a completa dele e para os de fora;
+>   - os bytes velhos não disparam as coletas de dentro. São contados na coleta do laço-alvo ou no fim dele, no
+>     máximo 16 MB entre duas coletas. Uma coleta completa que acha mais lixo que vivo desliga o laço.
+> - **Medido:** `records` 84 → 66 ms (a reescrita empata com o C, 43 ms); os outros benchmarks iguais. Um laço que
+>   sobrescreve os mesmos 100 lugares 10 milhões de vezes, igual ao de antes (a regra do nome do laço o deixa de fora;
+>   com `push` e `xs[t % 100]` incluídos, ficava 2× mais lento, com o dobro do pico).
+> - **O que impede o `main`: o build do compilador fica 5–6% mais lento.** Medido por partes:
+>   - ~1,8% é o alcance: saber quais funções podem chegar a um sítio, para rastrear só os laços delas (um passeio
+>     pelo programa inteiro, ~33 ms; 105 funções do compilador alcançam um sítio);
+>   - ~1% é o trabalho a mais do lowering;
+>   - ~2% é o código gerado nessas 105 funções.
+>   - Medido e descartado: rastrear todo laço que começa (o fim como chamada, +4%; em linha, +8%, mais IR e registros
+>     vivos até cada saída); blocos velhos de 64 KB por laço (milhares de laços curtos: agora de 256 bytes);
+>     devolver o array do alcance a cada laço (copiado: +10%).
+> - **Para fechar:** o alcance sem passear o programa (no checker, que já percorre cada corpo, ou só quando há um
+>   sítio), e o fim de laço mais barato. Depois, a etapa 2: a montagem (`build()` devolve o que vai para `fns`), que
+>   pede análise entre funções.
 
 ### B8. O grafo sem JSON por dentro
 
